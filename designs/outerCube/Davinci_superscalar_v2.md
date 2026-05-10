@@ -855,11 +855,11 @@ The 7-bit opcode field encodes the instruction domain:
  │  ┌─────────────────────────── EXECUTE ────────────────────────────────────────────────────┐  │
  │  │       ▼              ▼             ▼             ▼              ▼                      │  │
  │  │  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐              │  │
- │  │  │ 4x ALU   │  │  Load /  │  │  VEC-    │  │outerCube │  │   MTE    │              │  │
- │  │  │ 1x MUL   │  │  Store   │  │  4K-v2   │  │   MXU    │  │  Engine  │              │  │
- │  │  │ 1x BRU   │  │  Unit    │  │ 3R/2W    │  │(4096 MAC)│  │(LD/ST/  │              │  │
- │  │  │ (alu_iq) │  │  + SSB   │  │ tiles    │  │          │  │G/S/MOVE)│              │  │
- │  │  │          │  │ (lsu_iq) │  │(vec_iq)  │  │          │  │+ STQ(8) │              │  │
+ │  │  │ 4x ALU   │  │  Load /  │  │  VEC-    │  │outerCube │  │   TMA    │              │  │
+ │  │  │ 1x MUL   │  │  Store   │  │  4K-v2   │  │   MXU    │  │          │              │  │
+ │  │  │ 1x BRU   │  │  Unit    │  │ 3R/2W    │  │(4096 MAC)│  │(TLoad/   │              │  │
+ │  │  │ (alu_iq) │  │  + SSB   │  │ tiles    │  │          │  │TStore/   │              │  │
+ │  │  │          │  │ (lsu_iq) │  │(vec_iq)  │  │          │  │MG/MS/    │              │  │
  │  │  └────┬─────┘  └────┬─────┘  └────┬─────┘  └────┬─────┘  └────┬─────┘              │  │
  │  └────────┼─────────────┼─────────────┼─────────────┼──────────────┼────────────────────┘  │
  │           │             │             │             │              │                          │
@@ -901,7 +901,7 @@ The 7-bit opcode field encodes the instruction domain:
 - Tile Metadata RAT (32 b per physical tile) co-located with the Tile RAT (unchanged).
 - VEC-4K-v2 unit; 3R / 2W tile interface (unchanged).
 - Speculative Store Buffer (SSB, 24 entries) gates scalar stores by branch tag (unchanged).
-- Speculative Tile-Store Queue (STQ, 8 entries) gates MTE bulk stores by branch tag (unchanged).
+- Speculative Tile-Store Queue (STQ, 8 entries) gates TMA bulk stores by branch tag (unchanged).
 
 ---
 
@@ -910,7 +910,7 @@ The 7-bit opcode field encodes the instruction domain:
 
 ## 4. Pipeline Overview
 
-The Davinci-v2 scalar pipeline is extended to **17+ stages** with the BCC-style scalar frontend. Branch-tag administration adds zero cycles — tags are allocated at D2 (alongside MapQ entry push) and propagated forward as one extra metadata field per IQ entry. The Tile RAT, Vector RS, Cube RS, MTE RS, and memory subsystems are unchanged by the BCC scalar pipeline change.
+The Davinci-v2 scalar pipeline is extended to **17+ stages** with the BCC-style scalar frontend. Branch-tag administration adds zero cycles — tags are allocated at D2 (alongside MapQ entry push) and propagated forward as one extra metadata field per IQ entry. The Tile RAT, Vector RS, Cube RS, TMA RS, and memory subsystems are unchanged by the BCC scalar pipeline change.
 
 ```
 F0 → F1 → F2 → F3 → IB → F4 → D1 → D2 → D3 → S1 → S2 → P1 → I1 → I2 → E1 → … → EX_n → W1
@@ -2060,22 +2060,22 @@ The cube unit reads tile data from TRegFile-4K ports R0 (A operand) and R1–R4 
 
 The cube unit benefits indirectly from the TRegFile-4K `is_transpose` enhancement: software can now feed the cube either row-major or col-major B-operand tiles by setting `is_xpose` on the cube's B-operand tile-RAT entries (the cube pipeline controller propagates the bit to TRegFile read ports R1–R4), eliminating the need for `TILE.TRANSPOSE` predecessors in many GEMM kernels. The cube ALU, accumulator, and pipeline are otherwise unchanged.
 
-### 8.5 MTE Unit
+### 8.5 TMA Unit
 
 > **(v1 → v2: §8.5.A / §8.5.B / §8.5.C / §8.5.D 完整复制自 v1 §8.5.1 / §8.5.2 / §8.5.3 / §8.5.4 / §8.5.5。v2 增量集中在 §8.5.1 (TRANSPOSE 缩减) 与 §8.5.2 (STQ)。)**
 
-The MTE unit is the **bridge between three domains**: memory ↔ TRegFile-4K (bulk tile transfers) and scalar GPR ↔ TRegFile-4K (single-element access via TILE.GET/TILE.PUT). All MTE instructions go through full **dual-RAT rename** at D2: scalar operands are renamed via the Scalar RAT, and tile operands are renamed via the Tile RAT. Instructions that produce a new tile (TILE.LD, TILE.ZERO, TILE.COPY, TILE.GATHER, TILE.PUT) allocate a fresh physical tile from the tile free list. TILE.GET produces a scalar GPR result and broadcasts on the CDB.
+The TMA unit is the **bridge between three domains**: memory ↔ TRegFile-4K (bulk tile transfers) and scalar GPR ↔ TRegFile-4K (single-element access via TILE.GET/TILE.PUT). All TMA instructions go through full **dual-RAT rename** at D2: scalar operands are renamed via the Scalar RAT, and tile operands are renamed via the Tile RAT. Instructions that produce a new tile (TILE.LD, TILE.ZERO, TILE.COPY, TILE.GATHER, TILE.PUT) allocate a fresh physical tile from the tile free list. TILE.GET produces a scalar GPR result and broadcasts on the CDB.
 
 #### 8.5.A Architecture (v1 §8.5.1, 未变更)
 
 ```
   ┌──────────────────────────────────────────────────────────────────┐
-  │  Memory Tile Engine (MTE)                                        │
+  │  Tile Memory Access (TMA) Unit                                  │
   │                                                                  │
-  │  MTE RS (16 entries) ──┬──▶ Load Tile Pipeline                  │
-  │                        ├──▶ Store Tile Pipeline ──▶ STQ (v2)    │
+  │  TMA RS (16 entries) ──┬──▶ Load Tile Pipeline                  │
+  │                        ├──▶ Store Tile Pipeline                 │
   │                        ├──▶ Gather Pipeline                     │
-  │                        ├──▶ Scatter Pipeline ──▶ STQ (v2)       │
+  │                        ├──▶ Scatter Pipeline                    │
   │                        ├──▶ TILE.GET Pipeline (tile→GPR)        │
   │                        └──▶ TILE.PUT Pipeline (GPR→tile, RMW)   │
   │                                                                  │
@@ -2123,7 +2123,7 @@ The MTE unit is the **bridge between three domains**: memory ↔ TRegFile-4K (bu
 | Max concurrent TILE.ST | up to **3** (1 per read port) |
 | Outstanding request buffer | **32** entries (supports deep memory-level parallelism) |
 | Gather/scatter | Uses index tile (Tidx) for non-contiguous access patterns |
-| L2 → MTE bandwidth | **64 B/cy** (1 cache line/cy) → 1 tile in **64 cycles** from L2 |
+| L2 → TMA bandwidth | **64 B/cy** (1 cache line/cy) → 1 tile in **64 cycles** from L2 |
 | TILE.COPY / TILE.TRANSPOSE latency | **16 cycles** (8 cy TRegFile read epoch + 8 cy write epoch) |
 | TILE.ZERO latency | **8 cycles** (1 write epoch, no read needed) |
 | **TILE.GET latency** | **9 cycles** (8 cy TRegFile read epoch + 1 cy element extract → CDB) |
@@ -2131,7 +2131,7 @@ The MTE unit is the **bridge between three domains**: memory ↔ TRegFile-4K (bu
 | TILE.GET throughput | **1 per 8 cycles** (read port occupied for full epoch even for single element) |
 | TILE.PUT throughput | **1 per 16 cycles** (read + write port, 2 epochs); **1 per 8 cy** with elision |
 
-#### 8.5.C MTE Rename → Issue → Execute Flow (Bulk Transfer) — (v1 §8.5.3, 未变更)
+#### 8.5.C TMA Rename → Issue → Execute Flow (Bulk Transfer) — (v1 §8.5.3, 未变更)
 
 ```
   D2 (Rename):
@@ -2142,7 +2142,7 @@ The MTE unit is the **bridge between three domains**: memory ↔ TRegFile-4K (bu
       Tile RAT ready[PT200] ← 0
 
   DS (Dispatch):
-    MTE RS entry: {op=TILE.LD, pscalar=P40, srdy=<from Scalar RAT>, ptdst=PT200, ckpt=...}
+    TMA RS entry: {op=TILE.LD, pscalar=P40, srdy=<from Scalar RAT>, ptdst=PT200, ckpt=...}
 
   IS (Issue):
     Wait for pscalar P40 ready (CDB wakeup from scalar ALU)
@@ -2150,8 +2150,8 @@ The MTE unit is the **bridge between three domains**: memory ↔ TRegFile-4K (bu
 
   EX (Execute — memory fetch + 1 TRegFile write epoch):
     Memory phase (≈64 cycles from L2):
-        MTE Address Gen: compute contiguous address range from base address
-        MTE Data Path:   request 64 cache lines from L2 (64 B/cy)
+        TMA Address Gen: compute contiguous address range from base address
+        TMA Data Path:   request 64 cache lines from L2 (64 B/cy)
         MTE Buffer:      accumulate 4 KB in outstanding request buffer
     TRegFile write epoch (8 cycles):
         Reserve write port, program reg_idx = PT200
@@ -2381,15 +2381,15 @@ Both modes deliver **512 B/cy** through the 8-cycle epoch — same throughput, n
 
 #### 9.2.4 Port allocation
 
-Port assignment across vector, cube, and MTE units is **identical to v1 §9.2** (table reproduced below for reference). The introduction of `is_transpose` does not change which port serves which client; it only changes the data delivery order on each read port.
+Port assignment across vector, cube, and TMA units is **identical to v1 §9.2** (table reproduced below for reference). The introduction of `is_transpose` does not change which port serves which client; it only changes the data delivery order on each read port.
 
 | Port | Cube active — MXFP4/HiFP4 | Cube active — FP16/BF16/FP8 | Cube idle |
 |------|----------------------------|------------------------------|-----------|
-| R0 | Cube A (1 tile/epoch) | Cube A (1 tile/epoch) | VEC-4K-v2 / MTE — free |
-| R1–R4 | Cube B operands | Cube B (R1–R2) | VEC-4K-v2 / MTE — free |
-| R5–R7 | Vector / MTE | Vector / MTE | Vector / MTE — free |
-| W0 | Cube C drain | Cube C drain | VEC-4K-v2 / MTE — free |
-| W1–W7 | Vector / MTE | Vector / MTE | Vector / MTE — free |
+| R0 | Cube A (1 tile/epoch) | Cube A (1 tile/epoch) | VEC-4K-v2 / TMA — free |
+| R1–R4 | Cube B operands | Cube B (R1–R2) | VEC-4K-v2 / TMA — free |
+| R5–R7 | Vector / TMA | Vector / TMA | Vector / TMA — free |
+| W0 | Cube C drain | Cube C drain | VEC-4K-v2 / TMA — free |
+| W1–W7 | Vector / TMA | Vector / TMA | Vector / TMA — free |
 
 VEC-4K-v2 binding: **R0 (Port A, with `is_xpose_A`)**, **R4 (Port B, with `is_xpose_B`)**, **W0 (D0)**, **W4 (D1)**. Mask `C` rides on whichever value-tile read port is idle (1–2 strips per fetch).
 
