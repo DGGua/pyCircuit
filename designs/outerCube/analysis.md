@@ -1036,6 +1036,17 @@
   SORT NETWORK  (Batcher bitonic)  — shared across formats & shapes
 ══════════════════════════════════════════════════════════════════════════════
 
+  ╔══════════════════════════════════════════════════════════════════╗
+  ║  REVISION NOTE :                                                  ║
+  ║  This section quotes the FULL-PIPELINE area (~28 K cells, 1.4 M  ║
+  ║  gates). The FINAL design uses a TIME-MULTIPLEXED 1-stage variant ║
+  ║  that achieves the same latency at ~85 K gates (16× smaller).    ║
+  ║  The wiring tables, format-tier and shape-tier mechanisms below  ║
+  ║  remain valid for either implementation.                         ║
+  ║  See `python3 vector32_v2.py --time-muxed-sort` for the FINAL     ║
+  ║  recommendation.                                                  ║
+  ╚══════════════════════════════════════════════════════════════════╝
+
   Q : how do we sort tile data inside the VEC unit, with ONE physical
       network supporting all (shape × format) combinations ?
 
@@ -1454,6 +1465,1350 @@
                 1 extra copy for reduce-of-reduce (rare).
 
     This is the recommended FINAL design.
+
+══════════════════════════════════════════════════════════════════════════════
+  REVISED SORT NETWORK : TIME-MULTIPLEXED  (trade speed for area)
+══════════════════════════════════════════════════════════════════════════════
+
+  This section SUPERSEDES the area estimate in --sort-network. The
+  earlier section quoted ~28 K cells (~1.4 M gates) for a fully-
+  pipelined N=1024 bitonic sort. Here we exploit the fact that every
+  stage of bitonic sort uses the SAME cell type (CMP_SWAP), differing
+  only in WIRING and DIRECTION pattern. Build ONE stage and time-mux
+  it across 55 beats — same latency, ~16× area saving.
+
+  ─── Insight ───────────────────────────────────────────────────────────
+
+    Full pipeline  =  SPACE expansion  : 55 stages physically present,
+                                          1 sort flows through in 55 cy
+                                          (latency)  AT 1 sort/cy
+                                          (throughput, after fill)
+
+    Time-muxed     =  TIME expansion   : 1 stage physically, looped
+                                          55 times for 1 sort = 55 cy
+                                          latency, 1/55 sort/cy
+
+    LATENCY for a single sort is the SAME (55 cycles either way).
+    Only THROUGHPUT differs (55× lower for time-muxed).
+
+    Sort is rare in DL inference (top-K sampling, beam search,
+    occasional median) → throughput penalty is invisible. ⇒ time-mux.
+
+  ─── Four-option comparison ────────────────────────────────────────────
+
+    option                        cells      ~gates    latency   throughput
+    ───────────────────────────   ────────   ───────   ───────   ──────────
+    A. Full pipeline (current)    28160      ~1.4 M    55 cy     1 sort/cy
+    B. 1-stage time-muxed         512        ~85 K     55 cy     1/55 cy
+    C. K-stage part-pipelined     K·512      ~K·25 K   55 cy     K/55 cy
+       (K=5)                      2560       ~250 K    55 cy     1/11 cy
+       (K=11)                     5632       ~310 K    55 cy     1/5  cy
+    D. Reuse REDUCE L0 cells      0  (free)  ~70 K *   55 cy *   1/55 cy *
+
+    * D's incremental cost ; sort blocks REDUCE during its 55 cy
+
+    All options have IDENTICAL latency.  B and D save ~16-20× area
+    over A.  Recommended : B for clean modularity, D for tightest area.
+
+  ─── Architecture B : 1-stage time-multiplexed sort ────────────────────
+
+                     RFS_A   (4 KB)   ← sort scratch (no extra FF needed)
+                        │
+                   ┌────┴────┐
+                   │         │
+              read 1024 B   write 1024 B
+                   │         │
+                   ▼         ▲
+            ┌──────────────────────────┐
+            │  PERMUTE NETWORK          │
+            │  configurable butterfly,  │
+            │  stride d ∈ {1,2,4,...,   │
+            │  256,512}                  │
+            │  10 levels × 1024 MUX     │
+            │  ≈ 50 K gates             │
+            └─────────────┬─────────────┘
+                          │ paired lanes
+                          ▼
+            ┌──────────────────────────┐
+            │  1 STAGE OF SORT NETWORK  │
+            │  512 × CMP_SWAP cells     │
+            │  per-cell asc/desc bit    │
+            │  ≈ 25 K gates             │
+            └─────────────┬─────────────┘
+                          │
+                          ▼
+                      back to RFS_A
+
+            ┌──────────────────────────┐
+            │  SEQUENCER + SCHEDULE ROM │
+            │  for stage in 0..54 :     │
+            │    (d, dir_pat) = ROM[s]  │
+            │    drive permute & cells  │
+            │  ≈ 10 K gates             │
+            └──────────────────────────┘
+
+  ─── Detailed cost breakdown for option B ──────────────────────────────
+
+    block                                        ~gates
+    ──────────────────────────────────────────   ───────
+    Permute network (10-level butterfly,
+       1024 byte-MUXes per level × 10 levels        50 K
+       × 5 gates per byte-MUX)
+    CMP_SWAP cells (512 × 50 gates)                25 K
+    Per-cell direction logic (5 K) +
+       sequencer ROM/FSM (5 K)                     10 K
+    State storage (use RFS_A as scratch)            0
+    ──────────────────────────────────────────   ───────
+    TOTAL                                         ~85 K
+
+    vs full pipeline (option A) : ~1.4 M gates  ⇒  16.5× reduction
+
+  ─── Permute network design (configurable butterfly) ───────────────────
+
+    Bitonic sort's per-stage wiring is always 'pair lane k with lane k+d'
+    for some stride d ∈ {1, 2, 4, ..., 512}. This is the perfect-shuffle
+    pattern, which is what a butterfly network does.
+
+    A 10-LEVEL configurable butterfly works as :
+
+           level 0 : optional swap at stride 1   (stride-1 perm)
+           level 1 : optional swap at stride 2
+           level 2 : optional swap at stride 4
+           ...
+           level 9 : optional swap at stride 512
+
+    Per-level enable bit picks 'apply this stride' or 'pass through'.
+    To realise stride-d for the current sort stage, enable level log₂(d)
+    and disable all others.
+
+    Cost : 10 levels × 1024 byte positions × 1 byte-MUX (8b 2:1 + 1 sel)
+           = 10 K MUXes × ~5 gates each ≈ 50 K gates
+
+  ─── Direction pattern logic ───────────────────────────────────────────
+
+    Each cell needs an asc/desc bit per stage. For Batcher's bitonic, the
+    direction pattern is determined by (phase_k, sub_block_size) and is
+    a function of cell_index :
+
+        dir(k, j, cell) = bit_j_of_(cell >> log₂(d))   (or similar)
+
+    Either compute combinationally (~10 gates / cell × 512 = 5 K), or
+    pre-compute and store in a 55 × 512-bit pattern ROM (~3 KB ROM).
+
+  ─── Sequencer / SCHEDULE ROM ──────────────────────────────────────────
+
+    State :  6-bit stage counter (0..54)
+    ROM   :  for each of 55 stages, store :
+               • stride d                    4 bits (log₂ {1..512})
+               • direction pattern id         4 bits
+               • TOP-truncate skip flag       1 bit (per format)
+               • BOTTOM-truncate stop flag    1 bit (per shape)
+             total ~12 bits × 55 stages = 660 bits ROM
+
+    FSM controls the 55-cycle sequencing, applying TOP/BOTTOM truncation
+    by SKIPPING stages in the count (saves more cycles for narrow
+    formats / sub-tile sorts).
+
+  ─── Why throughput drops to 1/55  (resource-conservation view) ────────
+
+    Total work for one N=1024 bitonic sort :
+       55 stages × 512 cells = 28160 CMP_SWAP operations
+
+    Hardware throughput (ops per cycle) :
+       option A (full pipeline) : 28160 cells, each 1 op/cy → 28160 op/cy
+       option B (1-stage muxed) :   512 cells, each 1 op/cy →   512 op/cy
+
+    Sort throughput =  cells_in_use_per_cycle / cells_needed_per_sort
+
+       option A : 28160 / 28160 = 1 sort/cy
+       option B :   512 / 28160 = 1/55 sort/cy
+
+    The 1/55 is a HARD resource-conservation limit, not an artefact of
+    a particular schedule. No clever pipelining can change it because
+    the total ops needed is fixed and the ops/cy supplied is fixed.
+
+  ─── Why pipelining cannot rescue option B ─────────────────────────────
+
+    Normal pipeline (option A) runs at 1 sort/cy because there are 55
+    INDEPENDENT physical stages, each doing 1 op-stage of work for a
+    DIFFERENT in-flight sort :
+
+        cycle 100 :  sort_A at stage 54   ← completes this cycle
+                     sort_B at stage 53
+                     sort_C at stage 52
+                     ...
+                     sort_X at stage 0    ← starts this cycle
+
+        55 sorts in flight, 1 sort retires per cycle.
+
+    Time-muxed (option B) has only 1 physical stage — there is no
+    'spatial pipeline' to fill. Trying to interleave two sorts only
+    halves each one's progress :
+
+        cycle 0   :  stage_0 of sort_A
+        cycle 1   :  stage_0 of sort_B
+        cycle 2   :  stage_1 of sort_A
+        cycle 3   :  stage_1 of sort_B
+        ...
+        cycle 108 :  stage_54 of sort_A   ← sort_A done at 110 cy
+        cycle 109 :  stage_54 of sort_B   ← sort_B done at 110 cy
+
+        2 sorts / 110 cy  =  1/55 sort/cy   ← SAME as one-at-a-time !
+
+    Resource conservation is the bottom line.
+
+  ─── Where throughput CAN be recovered (special cases) ─────────────────
+
+    1) SUB-TILE PARALLEL SORTS (lane-level parallelism) :
+
+       The hardware has 1024 byte-lanes wide. A sort of N elements
+       (N < 1024) only uses N lanes ; the rest are idle. Pack
+       multiple parallel sorts into one pass :
+
+           parallel sorts   each sort     stages    throughput
+           in 1024 lanes    size N        used      (sorts/cy)
+           ──────────────   ──────────    ──────    ───────────
+           1                1024            55        1/55
+           2                 512            45        2/45  = 0.044
+           4                 256            36        4/36  = 0.111
+           8                 128            28        8/28  = 0.286
+           16                 64            21       16/21  = 0.762
+           32                 32            15       32/15  = 2.13 *
+
+           * 32× small sorts of N=32 actually exceed full-pipeline
+             single-N=1024 throughput, because total work shrinks
+
+    2) WIDE FORMATS skip leading stages (TOP truncation) :
+
+           format   N (full tile)   stages used   throughput
+           ──────   ─────────────   ───────────   ──────────
+           FP8      1024            55            1/55
+           FP16      512            45            1/45
+           FP32      256            36            1/36
+           FP64      128            28            1/28
+
+       Wider formats need fewer comparisons, so each sort takes fewer
+       cycles even on the same time-muxed hardware.
+
+    3) BOTTOM TRUNCATION for partial / sub-tile sorts (already in
+       --sort-network and --time-muxed-sort sequencer) reduces stage
+       count further when only K parallel sub-sorts of N/K each
+       are needed.
+
+  ─── Why this is OK for DL workloads ───────────────────────────────────
+
+    sort frequency in typical DL :
+
+       inference  : 0-1 sort per output token  (top-K sampling, beam)
+       training   : 0 sorts per microbatch     (no sort in fwd/bwd)
+       attention  : 0 sorts (just softmax = ROW_MAX + ROW_SUM_EXP)
+       layernorm  : 0 sorts (mean, var = REDUCE)
+
+    Even for sort-heavy decode (worst case 1 sort/token, 50 tokens/sec):
+
+       sort cost time-muxed : 50 × 55 cy × 1 ns = 2.75 µs / sec
+       fraction of 1 sec    : 0.000275 %
+
+    Save 1.3 M gates for a 0.000275 % perf hit.  Trivial trade.
+
+  ─── Throughput / latency comparison in absolute time ──────────────────
+
+    Suppose 1 cycle = 1 ns. 1024 sorts back-to-back :
+
+       option A (full pipe)    : 55 cy fill + 1024 cy steady = 1079 cy
+       option B (time-muxed)   : 1024 × 55 cy                = 56320 cy
+
+    Sort-heavy code is 52× slower with option B. But typical DL :
+
+       option A : 1 sort per inference call             →  55 cy / 100 ms
+                                                            (negligible)
+       option B : 1 sort per inference call             →  55 cy / 100 ms
+                                                            (identical !)
+
+    Picking B is correct iff your workload doesn't sort > 1/55 of the
+    total cycles. Almost all DL workloads pass this bar with margin.
+
+  ─── Option D : reuse REDUCE L0 cells (most aggressive) ────────────────
+
+    REDUCE tree's L0 already has 512 CMP_SWAP cells. Add :
+
+       • permute network upstream of L0    : ~50 K gates
+       • input-mode MUX (reduce vs sort)   :  ~5 K gates
+       • sort sequencer + direction logic  : ~10 K gates
+       • cell output 2-port mode           :  ~3 K gates
+       (CMP_SWAP for sort outputs both values ; for reduce
+        only the winning value)
+       ─────────────────────────────────────────────────
+       TOTAL incremental cost              : ~70 K gates
+
+    Saves another ~15 K gates over option B (no separate cell array).
+
+    Trade-off : SORT and REDUCE share L0 cells → cannot run concurrent.
+    Acceptable for sort (independent op, 55 cy duration).
+
+  ─── Final recommendation ──────────────────────────────────────────────
+
+    PRIMARY :  option B (1-stage time-muxed standalone)  ~85 K gates
+               • clean modular block (own permute, own cells)
+               • sort and reduce can run concurrently if needed
+               • simple to verify, simple to floorplan
+
+    AGGRESSIVE :  option D (reuse REDUCE L0)              ~70 K gates
+               • saves another 15 K gates
+               • introduces reduce-sort interlock
+               • use only if area extremely tight
+
+    AVOID :  option A (full pipeline)  unless throughput-bound
+    AVOID :  option C unless the workload genuinely needs 5-10× sort tput
+
+  ─── Updated recommendation table ──────────────────────────────────────
+
+    item                          OLD recommendation    NEW recommendation
+    ───────────────────────────   ───────────────────   ───────────────────
+    Sort impl                     full pipeline         1-stage time-muxed
+    Sort cells                    28 K                  512  (54× fewer)
+    Sort gates                    ~1.4 M                ~85 K  (16× fewer)
+    Sort latency (1 sort)         55 cy                 55 cy  (same)
+    Sort throughput               1 / cy                1 / 55 cy
+    Sort scratch                  external 4 KB         RFS_A (reused)
+
+  Combined with the unary-REDUCE revision, total VEC-area savings
+  vs. the original (binary-REDUCE + full-pipeline-sort) design :
+
+       reduce tree halves   :  −350 K gates
+       sort time-muxed      :  −1300 K gates
+       acc bank in RFS_B    :   −50 K gates
+       ACC_SPILL grows      :   +43 K gates
+       ───────────────────────────────────────
+       NET                  :  ~−1.66 M gates
+
+       ≈ HALF of the original VEC-unit area.
+
+══════════════════════════════════════════════════════════════════════════════
+  FINAL  VEC-4K-v2  BLOCK DIAGRAM
+  All revisions applied : unary REDUCE + RFS_B-as-acc + 512 B half tree
+                          + time-muxed sort + simplified broadcast
+══════════════════════════════════════════════════════════════════════════════
+
+  ─── Top-level datapath ────────────────────────────────────────────────
+
+    INSTRUCTION DISPATCH
+           │
+           ▼
+    ┌──────────────────────────────────────────────────────────────────┐
+    │                  INSTRUCTION CLASS DECODE                         │
+    │   binary │ unary REDUCE │ unary SORT │ FMA(3-src) │ MOV/COPY      │
+    └──────┬─────────┬──────────┬───────────┬──────────────┬───────────┘
+           │         │          │           │              │
+    ╔══════╪═════════╪══════════╪═══════════╪══════════════╪═══════════╗
+    ║      ▼         ▼          ▼           ▼              ▼           ║
+    ║  ┌─────────────────────────────────────────────────────────┐     ║
+    ║  │           STORAGE  (4 KB each, total 16 KB)              │     ║
+    ║  │                                                         │     ║
+    ║  │  RFS_A  (4 KB)        RFS_B  (4 KB, DUAL ROLE)          │     ║
+    ║  │  ── operand A         ── operand B (binary class)       │     ║
+    ║  │  ── sort scratch      ── operand C (3-src FMA)          │     ║
+    ║  │                       ── ACC + broadcast output         │     ║
+    ║  │                          (REDUCE class)                 │     ║
+    ║  │                                                         │     ║
+    ║  │  RFA_A  (4 KB)        RFA_B  (4 KB)                     │     ║
+    ║  │  ── per-lane FMA acc  ── per-lane FMA acc (ping-pong)   │     ║
+    ║  └────┬────────┬─────────────────┬─────────────────────────┘     ║
+    ║       │        │                 │                                ║
+    ║       │512 B   │512 B            │512 B                           ║
+    ║       ▼        ▼                 ▼                                ║
+    ║                                                                  ║
+    ║                            BINARY-CLASS DISPATCH                  ║
+    ║      (instruction routed to EXACTLY ONE of the 5 paths below)     ║
+    ║                                                                  ║
+    ║       │              │              │              │              ║
+    ║       ▼              ▼              ▼              ▼              ║
+    ║  ┌─────────┐   ┌─────────┐   ┌─────────┐   ┌─────────┐           ║
+    ║  │ PER-LANE│   │ PER-LANE│   │ 16-COPY  │   │ MOV /    │           ║
+    ║  │ FMA     │   │ ELEM-   │   │ GENERAL  │   │ COPY /   │           ║
+    ║  │ ARRAY   │   │ WISE    │   │ SF       │   │ MASK     │           ║
+    ║  │         │   │ ALU     │   │ ENGINE   │   │ APPLY    │           ║
+    ║  │         │   │ ARRAY   │   │ (FP16+32)│   │          │           ║
+    ║  ├─────────┤   ├─────────┤   ├─────────┤   ├─────────┤           ║
+    ║  │ ops:    │   │ ops:    │   │ ops:    │   │ ops:    │           ║
+    ║  │ FMUL    │   │ AND/OR/ │   │ sigmoid │   │ MOV     │           ║
+    ║  │ FADD    │   │ XOR/NOT │   │ tanh    │   │ LOAD    │           ║
+    ║  │ FMA     │   │ ==,!=,  │   │ log     │   │ STORE   │           ║
+    ║  │ FNMA    │   │ <,>,<=, │   │ sqrt    │   │ MASK    │           ║
+    ║  │ A·B+C   │   │ >=      │   │ recip   │   │         │           ║
+    ║  │ (3-src) │   │ MIN/MAX │   │ rsqrt   │   │         │           ║
+    ║  │ VLERP   │   │ ABS/NEG │   │ (NO exp │   │         │           ║
+    ║  │         │   │ /SIGN   │   │  here)  │   │         │           ║
+    ║  │         │   │ shift   │   │         │   │         │           ║
+    ║  │         │   │ clamp   │   │         │   │         │           ║
+    ║  │         │   │ sat     │   │         │   │         │           ║
+    ║  ├─────────┤   ├─────────┤   ├─────────┤   ├─────────┤           ║
+    ║  │ 128 ×   │   │ 128 ×   │   │ 16 units│   │ DMA-    │           ║
+    ║  │ 8 B FMA │   │ ~700 g  │   │ each    │   │ style   │           ║
+    ║  │ lanes   │   │ /lane   │   │ muxes   │   │         │           ║
+    ║  │         │   │         │   │ 8 lanes │   │         │           ║
+    ║  │         │   │         │   │ ~ 8 cy  │   │         │           ║
+    ║  │         │   │         │   │ /tile   │   │         │           ║
+    ║  ├─────────┤   ├─────────┤   ├─────────┤   ├─────────┤           ║
+    ║  │ ~1.28 M │   │ ~90 K   │   │ ~215 K  │   │ <1 K    │           ║
+    ║  │ gates   │   │ gates   │   │ gates   │   │ gates   │           ║
+    ║  │         │   │         │   │ (LUT    │   │         │           ║
+    ║  │         │   │         │   │ shared) │   │         │           ║
+    ║  └────┬────┘   └────┬────┘   └────┬────┘   └────┬────┘           ║
+    ║       │             │             │             │                 ║
+    ║       │             │             │             │                 ║
+    ║                                                                  ║
+    ║                  ┌──────────────────────────────┐                ║
+    ║                  │  64-COPY DEDICATED EXP UNIT   │ ← softmax-fused║
+    ║                  │  (FP16 4-th order minimax)    │   exp routed   ║
+    ║                  │  range-reduction + 4-coeff    │   here only.   ║
+    ║                  │  poly + scale (k-bit shift)   │                ║
+    ║                  │  ~5 K g/copy × 64 = 320 K g   │                ║
+    ║                  │  64 elem/cy → 4 cy/tile (FP16)│                ║
+    ║                  │  matches cube GEMM throughput │                ║
+    ║                  │  for d_h ≥ 64 attention       │                ║
+    ║                  └────────────┬─────────────────┘                 ║
+    ║                               │                                  ║
+    ║       └──────┬──────┴────┬────┴─────┬──────┴──────┐               ║
+    ║              │           │          │             │               ║
+    ║              ▼           ▼          ▼             ▼               ║
+    ║       to  RFS_B  /  RFA_A  /  RFA_B    (per-instruction dest)     ║
+    ║                                                                  ║
+    ║       (the 5 BINARY paths share RFS_A and RFS_B read ports —     ║
+    ║        only 1 path active per cycle, no port contention)         ║
+    ║                                                                  ║
+    ║  ───────────────────────────────────────────────────────────     ║
+    ║                                                                  ║
+    ║                            UNARY-REDUCE-CLASS DISPATCH            ║
+    ║         (single-source A from RFS_A,  acc/out lives in RFS_B)     ║
+    ║                                                                  ║
+    ║                                                                  ║
+    ║  ┌──────────────────────────────┐                                 ║
+    ║  │  REDUCE TREE   (512 B input)  │  ← unary class only            ║
+    ║  │  9 levels × ~250 gates/cell-B │     reads 1 × 512 B from RFS_A ║
+    ║  │  with format-tier INJECT MUX  │     produces K partials        ║
+    ║  │  + stop-bit BOTTOM MUX        │     ~175 K gates               ║
+    ║  └────────────┬─────────────────┘                                 ║
+    ║               │ K · E_out partials at chosen stop level           ║
+    ║               ▼                                                   ║
+    ║  ┌──────────────────────────────┐                                 ║
+    ║  │  K-WIDE RMW ALU + LOCAL FB    │ ◀─── acc[r] from RFS_B         ║
+    ║  │  acc[r] := acc[r] ⊕ part[r]   │      (small read, ≤ 2 KB)      ║
+    ║  │  ~30 K gates  + same-cy fb    │                                ║
+    ║  └────────────┬─────────────────┘                                 ║
+    ║               │ updated acc[]                                     ║
+    ║               ▼                                                   ║
+    ║          RFS_B  (in-place RMW, 'acc role')                       ║
+    ║                                                                  ║
+    ║  ───────── (broadcast phase, after reduce ends) ─────────         ║
+    ║                                                                  ║
+    ║  ┌──────────────────────────────┐                                 ║
+    ║  │  ACC_SPILL latch (~64 B)      │ ← final acc snapshot           ║
+    ║  │  reverse-order broadcast trick│   (avoids RAW with overwrite)  ║
+    ║  └────────────┬─────────────────┘                                 ║
+    ║               │ K acc seeds                                       ║
+    ║               ▼                                                   ║
+    ║  ┌──────────────────────────────┐                                 ║
+    ║  │  BROADCAST TREE  (1 → 512 B)  │  ← 9 levels of FANOUT cells    ║
+    ║  │  ~24 gate/cell × 511 cells    │     selects sub-tree per row   ║
+    ║  │  ~60 K gates  (3× smaller     │     no ALU, just wire fan-out  ║
+    ║  │   than REDUCE tree)           │     + buffer + stop-bit MUX    ║
+    ║  └────────────┬─────────────────┘                                 ║
+    ║               │ 512 B / beat                                      ║
+    ║               ▼                                                   ║
+    ║          RFS_B (overwritten in REVERSE row order)                 ║
+    ║                                                                  ║
+    ║  ───────────────────────────────────────────────────────────     ║
+    ║                                                                  ║
+    ║  ┌──────────────────────────────┐                                 ║
+    ║  │  TIME-MUXED SORT NETWORK      │  ← unary SORT class            ║
+    ║  │                                │     reads from RFS_A,          ║
+    ║  │  ┌─────────────────────────┐  │     writes back RFS_A          ║
+    ║  │  │ PERMUTE  (10-lvl bfly)   │  │     in 55 cy                   ║
+    ║  │  │ stride d ∈ {1..512}      │  │                                ║
+    ║  │  │ ~50 K gates              │  │                                ║
+    ║  │  └────────┬────────────────┘  │                                ║
+    ║  │           ▼                   │                                ║
+    ║  │  ┌─────────────────────────┐  │                                ║
+    ║  │  │ 1 STAGE × 512 CMP_SWAP   │  │                                ║
+    ║  │  │ + per-cell asc/desc bit  │  │                                ║
+    ║  │  │ ~25 K gates              │  │                                ║
+    ║  │  └────────┬────────────────┘  │                                ║
+    ║  │           ▼                   │                                ║
+    ║  │  ┌─────────────────────────┐  │                                ║
+    ║  │  │ SCHEDULE ROM + FSM       │  │                                ║
+    ║  │  │ 660 b ROM + ~10 K g      │  │                                ║
+    ║  │  └─────────────────────────┘  │                                ║
+    ║  │                                │                                ║
+    ║  │  total ~85 K gates             │                                ║
+    ║  │  (vs 1.4 M full pipeline)      │                                ║
+    ║  └────────────┬─────────────────┘                                 ║
+    ║               │ sorted result (after 55 cy)                       ║
+    ║               ▼                                                   ║
+    ║          RFS_A (in place)                                        ║
+    ║                                                                  ║
+    ╚══════════════════════════════════════════════════════════════════╝
+
+  ─── Storage  ──────────────────────────────────────────────────────────
+
+    name      size    role(s)
+    ──────    ─────   ──────────────────────────────────────────────────
+    RFS_A     4 KB    operand A staging  +  sort scratch
+    RFS_B     4 KB    operand B staging  (binary class)
+                       operand C staging  (3-src FMA)
+                       accumulator + broadcast output (REDUCE class)
+    RFA_A     4 KB    per-lane FMA accumulator  (ping)
+    RFA_B     4 KB    per-lane FMA accumulator  (pong)
+    ────────────────────────────────────────────────────────────────────
+    TOTAL    16 KB    storage  (32 K bytes × 8 b = 128 K FFs ≈ 320 K g)
+
+    Plus:  ACC_SPILL latch  ~64 B    (~1.5 K gates)
+           Stage-Sort scratch  uses RFS_A  (no extra)
+
+  ─── Compute blocks  ─────────────────────────────────────────────────
+
+    block                              gates    notes
+    ──────────────────────────────     ──────   ────────────────────────
+    Per-lane FMA array                 1.28 M   128 lanes × 8 B FMA
+    Per-lane element-wise ALU            90 K   128 × ~700 g (logical,
+                                                compare, min/max, abs,
+                                                neg, shift, clamp)
+    16-copy general SF engine           215 K   16 SF units (8 lanes
+       (no exp ; exp is dedicated)              each, 8 cy/tile),
+                                                with shared LUT/seed
+                                                tables (~55 K shared)
+                                                + 16× datapath (~160 K)
+    64-copy dedicated exp unit          320 K   64 exp units (2 lanes
+       (FP16 4-th order minimax)                each, 4 cy/tile),
+                                                each ~5 K g, FP16-only
+                                                matches cube GEMM thrpt
+    REDUCE tree (512 B, unary)          175 K   9 lvl, format-tier MUX,
+                                                stop-bit MUX, ALU cells
+    K-wide RMW ALU + local feedback      30 K   acc fold (≤ 2 KB wide)
+    BROADCAST tree (1 → 512 B)           60 K   9 lvl, FANOUT only
+                                                (no ALU per cell)
+    SORT network (1-stage time-muxed)    85 K   permute 50 K + cells 25 K
+                                                + sequencer 10 K
+    ACC_SPILL latch + control             3 K
+    Microcode sequencer (top-level)       8 K   reduce/sort/broadcast FSM
+    ──────────────────────────────     ──────
+    TOTAL compute (excl per-lane FMA)   986 K   adds element-wise ALU
+                                                + 16-copy SF + 64-copy
+                                                exp + reduce + sort +
+                                                broadcast
+    TOTAL incl per-lane FMA            2.27 M
+
+  ─── REDUCE vs BROADCAST tree cost (the original question) ────────────
+
+    REDUCE tree  N=512, 9 levels  (unary, half-width final design)
+
+       level  cells  ALU bytes/cell   total byte-cells
+       ─────  ─────  ──────────────   ────────────────
+       L0      256        1                  256
+       L1      128        2                  256
+       L2       64        4                  256
+       L3       32        8                  256
+       L4       16        8                  128
+       L5        8        8                   64
+       L6        4        8                   32
+       L7        2        8                   16
+       L8        1        8                    8
+       ────────────────────────────────────────────
+       sum     511                          1272 byte-cells
+
+       byte-cell ALU (ADD/CMP_SWAP_MAX_MIN)   ~30 g
+       cell ALU subtotal                      1272 × 30 = ~38 K g
+       format-tier INJECT MUX                          ~40 K g
+       stop-bit BOTTOM MUX (9 stages)                  ~45 K g
+       pipeline registers (9 stages)                   ~50 K g
+       per-cell control + carry/index                   ~5 K g
+       ──────────────────────────────────────────
+       REDUCE tree TOTAL                              ~175 K g
+
+    BROADCAST tree  1 → 512, 9 levels  (FANOUT only)
+
+       level  cells  fanout    bytes wide
+       ─────  ─────  ──────    ──────────
+       L0        1   1 → 2     8 B
+       L1        2   1 → 2     8 B
+       ...     ...   1 → 2     8 B
+       L8      256   1 → 2     8 B
+       sum     511   simple wire fan-out + buffer (no ALU)
+
+       per-cell  =  8 B × 3 g (buffer/repeater)        =  24 g
+       cell subtotal                                   ~12 K g
+       stop-bit MUX (sub-tree select)                  ~20 K g
+       pipeline registers (small : K seeds)            ~25 K g
+       per-cell control                                 ~3 K g
+       ──────────────────────────────────────────
+       BROADCAST tree TOTAL                            ~60 K g
+
+    RATIO :  REDUCE / BROADCAST  =  175 / 60  ≈  2.9×
+
+    BROADCAST is ~3× CHEAPER than REDUCE because :
+      • cells are wire fan-out + buffer  (no ALU)        : 24 g vs 250 g
+      • no format-tier injection MUX                      : skips ~40 K
+      • no per-stage ALU width promotion                  : flat 8 B
+      • no carry/index propagation                        : skips per-cell
+      • smaller pipeline registers (K seeds vs full lane) : ~50 % smaller
+
+    But BROADCAST is NOT 'far less' — same cell count and similar wiring.
+    The factor of 3 is because each cell is much simpler, not because
+    fewer cells.
+
+  ─── Cumulative savings vs. naïve original (binary REDUCE + full sort) ─
+
+    component                     naïve         FINAL          delta
+    ───────────────────────────   ──────────    ──────────     ──────
+    REDUCE tree (1024 → 512 B)      ~350 K        ~175 K       −175 K
+    Dedicated acc FF bank            ~50 K         0 (RFS_B)    −50 K
+    ACC_SPILL latch                   ~7 K         ~1.5 K       −5 K
+    BROADCAST tree                  ~120 K         ~60 K       −60 K
+    SORT network (full → muxed)    ~1.4 M         ~85 K     −1315 K
+    L0 cross-AB MUX (now removed)    ~2.5 K        0           −2.5 K
+    ─────────────────────────────────────────────────────────  ──────
+    NET SAVINGS                                              ~−1.6 M g
+
+    Total VEC-unit area BEFORE :  ~3.6 M gates  (binary REDUCE +
+                                                  full-pipeline sort,
+                                                  no elem-wise ALU,
+                                                  no special-func)
+    Subtotal after revisions  :  ~2.0 M gates  (revisions only)
+    + element-wise ALU  (NEW) :  + 90 K gates
+    + 16-copy general SF      :  +215 K gates   (16 lane-throughput,
+                                                 LUT/seed shared,
+                                                 no exp inside)
+    + 64-copy dedicated exp   :  +320 K gates   (FP16 4-th minimax,
+                                                 64 elem/cy = matches
+                                                 cube GEMM throughput)
+    Total VEC-unit area FINAL :  ~2.63 M gates  ≈  27 % SMALLER
+                                                 (vs naïve baseline)
+
+    Performance impact :
+      • REDUCE / ROW_SUM_EXP  :  unchanged latency, unchanged throughput
+      • SORT throughput drops to 1/55  (acceptable for DL workloads)
+      • SORT latency unchanged (55 cy)
+      • All other ops (per-lane FMA, GEMM acc) unchanged
+      • + element-wise ALU enables : ReLU, GELU, Sigmoid, Tanh, SiLU,
+        exp, log, sqrt, comparisons, logical ops, type conversion
+
+  ─── TOTAL AREA COST TABLE  (28 nm equivalent gates, FINAL design) ────
+
+    category   block                                  gates    % of VEC
+    ────────   ────────────────────────────────────   ──────   ────────
+    STORAGE    RFS_A   (4 KB DFF + R/W ports)           80 K     3.0 %
+               RFS_B   (4 KB DFF, dual-role)            80 K     3.0 %
+               RFA_A   (4 KB DFF, per-lane acc ping)    80 K     3.0 %
+               RFA_B   (4 KB DFF, per-lane acc pong)    80 K     3.0 %
+               ACC_SPILL latch  (~64 B + ctrl)          1.5 K    0.1 %
+               Microcode ROM    (~4 KB instr table)     5 K      0.2 %
+               Schedule ROMs    (sort + reduce stage)   1.5 K    0.1 %
+               ──────────────────────────────────────────────────────
+               STORAGE subtotal                       328 K     12.5 %
+
+    COMPUTE    Per-lane FMA array  (128 lanes × 8B)  1280 K     48.7 %
+    DATAPATH   Per-lane element-wise ALU array         90 K      3.4 %
+                  ── logical (AND/OR/XOR/NOT)
+                  ── compare (==, !=, <, >, <=, >=)
+                  ── min/max element-wise + cmp_swap
+                  ── abs / neg / sign
+                  ── shift (LSL/LSR/ASR) + clamp/sat
+                  ── 128 lanes × ~700 g/lane
+               16-copy general SF engine              215 K      8.2 %
+                  ── 16 SF units, each serves 8 lanes,
+                     time-muxes over 8 cy per tile
+                  ── handles : sigmoid, tanh, log,
+                     sqrt, recip, rsqrt   (NO exp)
+                  ── shared LUT/seed tables (banked):
+                       sigmoid/tanh LUT          ~15 K shared
+                       log piecewise + LUT       ~25 K shared
+                       recip / rsqrt seed table  ~15 K shared
+                  ── per-copy datapath (×16):
+                       Newton-Raphson sub-engine  ~5 K × 16 = 80 K
+                       polynomial+sequencer       ~5 K × 16 = 80 K
+                  ── 16 lane-throughput, 8 cy/tile FP16
+                  ── FP16 + FP32 mixed (could be FP16-only
+                     to save ~50 K g)
+               64-copy dedicated exp unit             320 K     12.2 %
+                  ── 64 exp units, each serves 2 lanes,
+                     time-muxes over 4 cy per tile
+                  ── FP16 4-th order minimax polynomial
+                     (max relative error ~0.1 %)
+                  ── per-copy : ~5 K g (range red 0.5 K +
+                     poly MAC 3.5 K + scale 0.5 K + seq 0.5 K)
+                  ── 64 elem/cy → 4 cy/tile FP16, matches
+                     cube GEMM throughput for d_h ≥ 64
+                  ── used by: SOFTMAX, SOFTPLUS, exp(x),
+                     fused softmax-exp microcode
+                  ── alternative: i-BERT 2nd-order (~80 K total
+                     for INT8 quant inference)
+               REDUCE tree         (512 B unary)      175 K      6.6 %
+               K-wide RMW ALU + local feedback         30 K      1.1 %
+               BROADCAST tree      (1 → 512 B)         60 K      2.3 %
+               SORT network        (1-stage muxed)     85 K      3.2 %
+               ──────────────────────────────────────────────────────
+               COMPUTE subtotal                      2255 K     85.7 %
+
+    CONTROL    Top-level FSM / sequencer                8 K      0.3 %
+               Instruction class decode + dispatch      5 K      0.2 %
+               Format-tier / stop-bit / dir ctrl        3 K      0.1 %
+               Mask / predicate / lane-enable          5 K      0.2 %
+               ROB / scoreboard interface               5 K      0.2 %
+               Misc glue (clock, scan, debug)          10 K      0.4 %
+               ──────────────────────────────────────────────────────
+               CONTROL subtotal                        36 K      1.4 %
+
+    ════════════════════════════════════════════════════════════════
+    TOTAL  VEC-4K-v2  (FINAL design, K=16+K=64)       ~2.63 M  100.0 %
+    ════════════════════════════════════════════════════════════════
+
+  ─── BEFORE vs AFTER side-by-side ──────────────────────────────────────
+
+    block                              BEFORE      AFTER       delta
+    ──────────────────────────────     ──────      ──────      ─────
+    Per-lane FMA array                 1280 K      1280 K        0
+    Per-lane element-wise ALU             0 K        90 K      +90 K  ★ NEW
+    16-copy general SF (no exp)           0 K       215 K     +215 K  ★ NEW
+    64-copy dedicated exp                 0 K       320 K     +320 K  ★ NEW
+    REDUCE tree (1024B → 512B)          350 K       175 K     −175 K
+    BROADCAST tree (simplified)         120 K        60 K      −60 K
+    K-wide RMW ALU + local feedback      30 K        30 K        0
+    Dedicated acc FF bank (→ RFS_B)      50 K         0 K      −50 K
+    ACC_SPILL latch                       7 K         1.5 K     −5.5 K
+    SORT network (full → 1-stage mux)  1400 K        85 K   −1315 K
+    L0 cross-AB pair_mode MUX             2.5 K       0 K       −2.5 K
+    Storage RFs (RFS_A/B + RFA_A/B)     320 K       320 K        0
+    Microcode + schedule ROMs             5 K         6.5 K     +1.5 K
+    Control / dispatch / glue            36 K        36 K        0
+    ────────────────────────────────────────────────────────  ──────
+    TOTAL  VEC-4K-v2                  ~3.6 M      ~2.63 M  −0.97 M g
+                                                              (27 % saved)
+
+    Note : ★ NEW blocks (element-wise ALU + 16-copy general SF +
+           64-copy dedicated exp) together add 625 K gates, but ENABLE :
+            • full activation function set (ReLU/GELU/Sigmoid/Tanh/
+              SiLU/SwiGLU + sqrt/recip/log)
+            • softmax exp at FULL cube-matched throughput (long-context
+              attention now only 7 % slower than ideal)
+            • all logical / comparison / masking / bit ops
+           Net VEC area still drops 27 % vs naïve original, AND now
+           keeps up with cube GEMM on long-context attention workloads.
+
+  ─── Reference points  (28 nm, for context) ────────────────────────────
+
+    block                                        gates
+    ──────────────────────────────────────────   ──────
+    4 KB SRAM macro  (1-port dense)              ~30 K  *
+    4 KB DFF bank    (8K FF, full-port)          ~80 K
+    Single FMA lane  (8 B, FP8/16/32/64)         ~10 K
+    128 × FMA lane array                        ~1.28 M
+    Single CMP_SWAP cell  (8 B + sel + dir)         ~50
+    32-entry ROB w/ rename                         ~5 K
+    Branch-tag spec tracker (8 lvl)                ~3 K
+    L1 D-cache  (32 KB, 4-way set assoc)         ~500 K
+    Davinci scalar core (in-order, 1 lane)       ~3-5 M
+    Davinci OOO core (with VEC + acc paths)     ~10-15 M
+
+    * RFS_A/B/RFA_A/B use DFF (not SRAM) because they need
+      simultaneous multi-port access (read+RMW+write per cycle).
+      A SRAM macro could shave ~50 K each but loses the multi-port,
+      requiring banking → more area for banking logic. DFF is the
+      right choice for this access pattern.
+
+  ─── Where the 2.63 M gates go (visual percentage) ─────────────────────
+
+    Per-lane FMA array      ███████████████████████████     48.7 %
+    Storage RFs             ███████                         12.2 %
+    64-copy dedicated exp   ██████                          12.2 %  ★ NEW
+    16-copy general SF      ████                             8.2 %
+    REDUCE tree             ███▍                             6.6 %
+    Per-lane elem-wise ALU  █▊                               3.4 %
+    SORT network            █▋                               3.2 %
+    BROADCAST tree          █▎                               2.3 %
+    Control + glue          ▊                                1.4 %
+    K-wide RMW              ▌                                1.1 %
+    Microcode ROM           ▏                                0.3 %
+    ACC_SPILL latch         ▏                                0.1 %
+
+  ─── Key takeaways ─────────────────────────────────────────────────────
+
+    1) Per-lane FMA array still dominates  (49 %).  Untouched by these
+       revisions ; future area work should target there.
+
+    2) Dedicated exp + general SF together = 20 % of VEC, but enable :
+       • Long-context softmax (N=32 K) at 7 % overhead vs cube GEMM
+         (was 116 % overhead with K=8 SF only — 8× faster!)
+       • SwiGLU/GELU at 1.9 % overhead (was 3.8 %)
+       • All transcendental functions (sigmoid/tanh/log/sqrt/recip)
+       Splitting exp into a dedicated unit (FP16 4-th minimax, 5 K g/
+       copy) is the area/throughput sweet spot — costs 50 % less than
+       scaling the general SF to the same exp throughput.
+
+    3) Storage is now ~12 % of VEC (relatively smaller because compute
+       grew). The 4 RFs × 4 KB are the fundamental cost of the 4 KB
+       tile architecture ; cannot shrink without changing tile size.
+
+    4) Sort + Reduce + Broadcast tree = ~12 % of VEC after revisions
+       (was ~50 % before — the sort network alone was 39 % !).
+
+    5) The K=16 + K=64 SF/exp choice :
+       • K=16 general SF gives 1.9 % SwiGLU overhead, headroom for
+         future activation functions and multi-context concurrency
+       • K=64 dedicated exp gives 2× balanced for d_h=128 attention,
+         enables software pipelining of softmax with next ·V GEMM,
+         and is future-proof for next-gen larger cubes (8 K MAC/cy).
+       • Combined +400 K g vs base, but enables long-context inference
+         to be cube-bound (not exp-bound).
+
+    6) Control logic stays trivial  (~2 %)  — instruction-class-driven
+       design keeps the control path lightweight.
+
+    7) The 0.97 M-gate net saving (vs naïve baseline) is enough to add :
+        • another ROB level (for deeper OOO)            ~10 K
+        • a 32 KB L1 D-cache                            ~500 K
+        • a 16 KB L0 instruction cache                  ~80 K
+        • or move toward a second VEC unit (~2 M)
+       i.e. still enough budget for another major architectural feature.
+
+    8) Five binary-class compute paths (FMA, ALU, general SF, dedicated
+       exp, MOV) sit in PARALLEL, sharing the same operand read ports
+       of RFS_A and RFS_B. A binary instruction is routed to EXACTLY
+       ONE of them per cycle — they share lane bandwidth, not duplicate
+       it. The instruction-class decode (~5 K g) handles routing.
+
+══════════════════════════════════════════════════════════════════════════════
+  SF-COPY SCALING TRADE-OFF  (why K=16 general + K=64 dedicated exp)
+══════════════════════════════════════════════════════════════════════════════
+
+  HISTORY : the original design proposed K=8 general SF (with exp
+  inline). After analyzing softmax workload at long context, exp was
+  separated into a dedicated unit, and the configuration was upgraded
+  to K=16 general SF + K=64 dedicated exp. See --softmax and --exp-unit
+  for the full justification.
+
+  COMBINED SF/EXP SCALING (with exp separated) :
+
+    config                       general SF   ded exp   total   FFN time
+                                 (no exp)     (4-th)    cost    (long ctx)
+    ─────────────────────────    ──────────   ───────   ──────  ──────────
+    K=4 general only (extreme    90 K          —        90 K    1.55× ideal
+       budget, edge inference)
+    K=8 general only             135 K         —        135 K   1.58× ideal
+    K=8 + K=32 dedicated exp     135 K         160 K    295 K   1.18× ideal
+       (compact long-ctx)
+    K=16 + K=64 dedicated exp ★  215 K         320 K    535 K   1.09× ideal
+       (recommended default ★)
+    K=16 + K=128 (1/lane) exp    215 K         640 K    855 K   1.04× ideal
+       (extreme attention ASIC)
+
+  ★ K=16 + K=64 is the recommended sweet spot :
+    • Long-context attention only 7 % slower than ideal (cube-bound).
+    • SwiGLU/GELU ≤ 2 % overhead on cube GEMM.
+    • Headroom for new activation functions and multi-context serving.
+    • Future-proof for next-gen 8 K-MAC cubes (K_balanced doubles).
+
+  IMPLEMENTATION SKETCHES (K=16 general SF, K=64 dedicated exp):
+
+    GENERAL SF (16 copies, 8 lanes/copy, 8 cy/tile):
+
+       Lane 0..7    ──┐
+       Lane 8..15   ──┤
+       Lane 16..23  ──┤      ┌────────┐
+       Lane 24..31  ──┼─────►│ 16-port│  banked SRAM holds
+       ...           │      │ banked │  sigmoid/tanh/log/recip/
+       Lane 120..127──┘      │  LUT/  │  rsqrt seed (NO exp tables)
+                              │  seed  │  serves all 16 copies
+                              └───┬────┘
+                                  │
+                ┌─────────────────┼─────────────────┐
+           ┌────▼────┐       ┌────▼────┐       ┌────▼────┐
+           │  SF #0  │       │  SF #1  │  ...  │  SF #15 │  each ~10 K g
+           │ poly+NR │       │ poly+NR │       │ poly+NR │
+           └────┬────┘       └────┬────┘       └────┬────┘
+                │                 │                 │
+           lane 0..7         lane 8..15         lane 120..127
+           (8 cy MUX)        (8 cy MUX)         (8 cy MUX)
+
+    DEDICATED EXP (64 copies, 2 lanes/copy, 4 cy/tile):
+
+       Lane 0..1    ──┐
+       Lane 2..3    ──┤      ┌─────────┐
+       ...           │      │ shared  │  just 2 constants:
+       Lane 124..125──┤      │  ln2    │  ln2 ≈ 0.6931, 1/ln2 ≈ 1.4427
+       Lane 126..127──┘      │ 1/ln2   │
+                              └────┬────┘
+                                   │
+              ┌────────────────────┼────────────────────┐
+         ┌────▼────┐         ┌────▼────┐         ┌────▼────┐
+         │ EXP #0  │         │ EXP #1  │   ...   │ EXP #63 │  each ~5 K g
+         │range+   │         │range+   │         │range+   │  (FP16 4-th
+         │ poly    │         │ poly    │         │ poly    │   minimax)
+         └────┬────┘         └────┬────┘         └────┬────┘
+              │                   │                   │
+         lane 0..1            lane 2..3           lane 126..127
+         (4 cy MUX)           (4 cy MUX)          (4 cy MUX)
+
+  THROUGHPUT COMPARISON :
+    Per-lane FMA  : 128 elem/cy → 1 tilelet in  1 cy  (baseline)
+    General SF    :  16 elem/cy → 1 tilelet in  8 cy  (8× slower)
+    Dedicated exp :  64 elem/cy → 1 tilelet in  4 cy  (4× slower)
+    With cube C=4096 MACs/cy, dedicated exp matches cube exactly.
+
+══════════════════════════════════════════════════════════════════════════════
+  SOFTMAX  PERFORMANCE  ANALYSIS
+  (Do we need to specifically accelerate exp / div to match cube GEMM ?)
+══════════════════════════════════════════════════════════════════════════════
+
+  ─── Softmax operation breakdown ───────────────────────────────────────
+
+    softmax(x_i) = exp(x_i - max(x))  /  Σⱼ exp(xⱼ - max(x))
+
+    For a row of N elements :
+
+      step  op            hardware             throughput (per cycle)
+      ────  ──────────    ─────────────────    ──────────────────────
+      1     max          REDUCE tree           1 element / cy (pipelined)
+      2     sub max      per-lane ALU          128 elements / cy
+      3     exp          SF engine  ★          K elements / cy   ← bottleneck
+      4     sum          REDUCE tree           1 element / cy
+      5     1 / sum      SF engine (recip)     1 op / row  (scalar)
+      6     mul (1/sum)  per-lane FMA          128 elements / cy
+
+  ─── KEY INSIGHT : div is essentially FREE ─────────────────────────────
+
+    Naïve view     :  N divisions per row   →  N SF ops per row
+    Smart impl     :  1 reciprocal + N multiplications
+                      = 1 SF op + N per-lane FMA ops
+
+    Cycles per row for div phase :
+      • 1 / sum  :  ~6-8 cy   (one SF op, scalar)
+      • mul      :  N / 128  cy   (per-lane FMA)
+      • for N=512 row :  8 + 4 = 12 cy total
+
+    → div is NOT the bottleneck. No special hardware needed for div.
+    → only EXP throughput matters.
+
+  ─── Cube vs SF throughput balance ─────────────────────────────────────
+
+    Let  C  = cube MAC throughput          (e.g. 16×16×16 = 4096 MACs/cy)
+         K  = SF copies in VEC unit        (1, 8, 16, 32, 128)
+         d_h = attention head dim          (typically 64-256)
+         N   = sequence length             (typically 128-32 K)
+
+    Attention forward pass per head :
+
+      Q·Kᵀ  : N²·d_h MACs    →  N²·d_h / C   cycles  (cube)
+      softmax exp : N² ops   →  N² / K       cycles  (SF)
+      ·V    : N²·d_h MACs    →  N²·d_h / C   cycles  (cube)
+
+    BALANCE  :   N²·d_h / C  =  N² / K
+                        K_balanced  =  C / d_h
+
+    For typical Davinci cube  C = 4096 MACs/cy  (FP16) :
+
+      d_h (head dim)    K_balanced     comment
+      ──────────────    ──────────     ─────────────────────────────────
+      256               16             K=8 sufficient (2× slower OK)
+      128 (typical)     32             K=8 = 4× slow ; K=16 = 2× ; K=32 ★
+      64                64             K=8 = 8× slow ; K=32 = 2× ; K=64 ★
+      32  (small head)  128            need 1 SF / lane to match
+
+  ─── Full Transformer inference  (LLaMA-7B class) ─────────────────────
+
+    Per Transformer block per token (d=4096, H=32, d_h=128) :
+
+      • QKV proj + out proj + 2× FFN  =  12·N·d²        GEMM MACs
+      • Q·Kᵀ + ·V                     =  2·N²·d         GEMM MACs
+      • Softmax exp                   =  H·N²           SF ops
+      • GELU                          =  4·N·d          SF ops
+
+    With cube C = 4096 MACs/cy and various K (SF copies) :
+
+    seq N    GEMM cy    Exp cy K=1     K=8        K=16       K=32
+    ─────    ───────    ──────────     ────────   ────────   ────────
+    128      6.3 M      2.6 M  (40%)   325 K (5%) 162 K (3%) 81 K (1%)
+    2 K      108 M      167 M (155%)   21 M  (19%) 10 M (10%) 5 M  (5%)
+    8 K      540 M      2.1 G (390%)   268 M (50%) 134 M(25%) 67 M (12%)
+    32 K     3.7 G      34 G  (920%)   4.3 G(116%) 2.1 G(57%) 1.07 G(29%)
+
+    (% = exp time as fraction of GEMM time. > 100 % means exp is the
+     dominant bottleneck even after the cube finishes its work.)
+
+  ─── Recommendations by workload ───────────────────────────────────────
+
+    NOTE : the FINAL design splits exp into a DEDICATED unit. The
+    'K' below counts dedicated-exp copies (after exp is removed from
+    general SF). See --exp-unit for the full design split.
+
+    target workload                       config            VEC area
+    ───────────────────────────────────   ───────────────   ──────────
+    Edge / mobile (N ≤ 1 K)               K_gen=4 + K_exp=32 2.27 M
+    Compact long-ctx (N ≤ 8 K)            K_gen=8 + K_exp=32 2.39 M
+    Long-context infer (N = 16 K-32 K) ★  K_gen=16 + K_exp=64 2.63 M ★
+       (NEW DEFAULT)
+    Extreme long-ctx (N > 32 K)           K_gen=16 + K_exp=128 2.95 M
+    Training (FP32 backprop)              K_gen=16 (exp inline) 2.30 M
+                                          (no dedicated exp ; need
+                                           FP32 accuracy in N-R)
+
+  ─── Alternative optimizations  (don't just throw K at it) ────────────
+
+    1) ONLINE SOFTMAX (FlashAttention-style)
+       Fuse max + exp + sum + div into ONE pass per row.
+       Same exp count, but :
+        • saves N²·E bytes of intermediate storage / DMA
+        • allows attention tile fusion with cube GEMM
+        • does NOT reduce exp bottleneck — orthogonal to K.
+
+    2) LOW-PRECISION EXP  (FP16 piecewise + 16-entry LUT)
+       Use 16-segment polynomial + small LUT, accuracy ≈ 2 ULP.
+       Per SF copy: ~3 K gates instead of ~10 K.
+       Allows K = 16-32 within the same area as K = 8 today.
+       Suitable for inference (training may need higher precision).
+
+    3) i-BERT / I-EXP STYLE  (8-segment polynomial, no LUT)
+       Pure polynomial, no LUT — datapath ~3 K g per copy.
+       Easy to replicate to K = 16-32 cheaply.
+       Drop-in for INT8/FP8 quantized softmax (now standard in LLM infer).
+
+    4) DEDICATED ATTENTION-EXP UNIT  (orthogonal to general SF)
+       Build 16-32 narrow exp-only units (no sigmoid/log/sqrt) :
+        • single exp-only datapath  : ~5 K gates
+        • 16 copies                : 80 K gates
+        • 32 copies                : 160 K gates
+       Cheaper than scaling general SF engine to K=16-32 (would cost
+       ~75-225 K gates due to N-R, sigmoid, log overhead per copy).
+
+       Cost comparison for K=16-equivalent attention exp throughput :
+
+         option                                   gates   notes
+         ────────────────────────────────────     ─────   ─────────
+         scale general SF to K=16                 +75 K   reuses logic
+         dedicated 16-copy attention-exp unit     +80 K   parallel path
+         scale general SF to K=32                +225 K   serves all SF
+         dedicated 32-copy attention-exp unit    +160 K   parallel path
+
+       VERDICT : a dedicated exp-only path is competitive, especially
+       for long-context attention-heavy designs.
+
+  ─── Should we boost div ?  NO ────────────────────────────────────────
+
+    div in softmax = 1 reciprocal + N multiplies, NOT N divisions.
+    The reciprocal is ONE scalar SF op per row — a single SF copy at
+    K=1 already handles it in 8 cy. The multiplies are per-lane FMA at
+    full 128 elem/cy throughput.
+
+    Even for layer-norm (which has /σ), we use 1 rsqrt + N muls.
+    DEDICATED div hardware is NEVER worth it for DL workloads.
+
+  ─── Final verdict  (quick reference) ──────────────────────────────────
+
+    Question                                Answer
+    ─────────────────────────────────────   ──────────────────────────
+    Need to boost div ?                     NO  (recip + mul is enough)
+    Need to boost exp for short context ?   NO  (K=8 already enough)
+    Need to boost exp for typical infer ?   K=8 OK, K=16 better
+    Need to boost exp for long context ?    YES → K=16 or K=32
+    Best low-cost boost ?                   FP16 piecewise exp in SF
+    Best high-perf option ?                 Dedicated 16-32 copy exp
+    Use FlashAttention ?                    YES — orthogonal benefit
+
+══════════════════════════════════════════════════════════════════════════════
+  DEDICATED  EXP  UNIT  DESIGN
+  (Q1: i-BERT exp accuracy ?  Q2: is K=32 dedicated exp enough ?)
+══════════════════════════════════════════════════════════════════════════════
+
+  ─── Q1 : i-BERT exp accuracy analysis ──────────────────────────────
+
+  i-BERT (Kim et al, ICML'21) approximates exp via range reduction +
+  2nd-order polynomial in a small range :
+
+    Step 1  range reduction :  exp(x) = exp(p) · 2^k
+                               where  k = ⌊-x / ln2⌋
+                                      p = x + k·ln2  ∈ [-ln2, 0]
+
+    Step 2  polynomial in p ∈ [-ln2, 0] :
+              i-BERT (2nd) :  exp(p) ≈ 0.3585·(p + 1.353)² + 0.344
+              4th order    :  exp(p) ≈ Σ aᵢ·pⁱ  (5 coefficients)
+              5th order    :  6 coefficients
+
+    Step 3  apply scale  :  result = poly(p) << k   (integer shift)
+
+  Range reduction is essentially FREE (~50 g for the integer extract +
+  multiply-by-ln2). The polynomial dominates cost AND accuracy.
+
+  ACCURACY vs COST per exp unit copy :
+
+    impl                      max rel err     equivalent prec   gates/copy
+    ──────────────────────    ───────────     ──────────────    ─────────
+    i-BERT  (2nd order)       ~1 %            INT8 quant only      2.5 K
+    4th-order minimax         ~0.1 %          FP16 (~2 ULP)        5 K  ★
+    5th-order minimax         ~0.01 %         FP16 (~1 ULP)        6 K
+    2nd order + 16-entry LUT  ~0.05 %         FP16 (~1 ULP)        3 K + LUT
+    Full SF exp (6th + LUT)   < 1 ULP         FP32                10 K
+
+  → The classic i-BERT (2nd order) loses precision badly (~1 % rel err)
+    — fine for INT8 quantized inference, but TOO COARSE for FP16.
+
+  → 4th-order minimax matches FP16 precision (~2 ULP) at ~5 K gates/copy.
+    This is the sweet spot for FP16 LLM inference. ★
+
+  → For mixed-precision training or HPC, must keep exp inside the full
+    SF unit (10 K g) — cannot use the cheap dedicated path.
+
+  ─── Q2 : Is K=32 dedicated exp enough ? ───────────────────────────
+
+  ATTENTION SERIAL PATH (per head, per token, dominant at long ctx) :
+
+      Q · Kᵀ           : N² · d_h / C       cycles  (cube)
+      softmax exp      : N² / K_exp         cycles  (dedicated)
+      mul by (1/sum)   : N² / 128           cycles  (per-lane FMA)
+      · V              : N² · d_h / C       cycles  (cube)
+
+  BALANCE  :  N² / K_exp  ≤  N² · d_h / C
+
+              K_exp_min  =  C / d_h
+
+  For typical Davinci cube  C = 4096 MACs/cy (FP16) :
+
+    d_h    K_exp_min   model examples           K=32 enough ?
+    ───    ─────────   ──────────────────────   ─────────────
+    256    16          ViT-Huge, large LLM      YES (overkill)
+    128    32          LLaMA, Mistral, GPT-3 ★  YES (exact match)
+     96    43          some smaller LLMs        ALMOST (1.3× exp)
+     64    64          old transformers         NO (need K=64)
+     32   128          rare                     NO (need K=128)
+
+  → For ALL modern LLMs (d_h ≥ 128), K=32 exactly balances exp with cube.
+
+  ─── Long-context attention measurement (LLaMA-7B, N=32K) ──────────
+
+  config                            exp count  exp cy   exp/GEMM   atten
+                                                                   total
+                                                                   (vs ideal)
+  ──────────────────────────────    ─────────  ──────   ────────   ─────
+  K=8 general SF only (current)          8     4.3 G    116 %     1.58×
+  K=16 general SF                       16     2.1 G     57 %     1.29×
+  K=32 general SF                       32     1.07 G    29 %     1.14×
+  K=8 general + K=32 dedicated exp ★    32     1.07 G    29 %     1.14× ★
+  K=8 general + K=64 dedicated exp      64     0.54 G    14 %     1.07×
+  K=8 general + K=128 (1/lane) exp     128     0.27 G     7 %     1.04×
+
+  ★ K=32 dedicated exp gives the SAME attention performance as K=32
+    general SF (1.14× ideal), because attention exp throughput is the
+    only thing that matters here.
+
+  → K=32 DEDICATED EXP IS ENOUGH for long-context LLM inference :
+    • Attention overhead drops from 58 % slowdown to 14 %.
+    • Going to K=64 only saves another 7 % — diminishing returns.
+    • K=128 (1/lane) saves only 3 % more — never worth it.
+
+  ─── Cost comparison : dedicated exp vs scaling general SF ─────────
+
+  Scaling general SF replicates sqrt/log/sigmoid (which attention does
+  NOT use). Dedicated exp replicates ONLY the exp path :
+
+    config                          general SF   ded.exp   TOTAL  delta
+                                    cost         cost      cost
+    ────────────────────────────    ──────────   ───────   ─────  ──────
+    K=8 general only (baseline)      135 K        —        135 K     0
+    K=16 general (no ded. exp)       210 K        —        210 K   +75 K
+    K=32 general (no ded. exp)       360 K        —        360 K  +225 K
+    K=8 + K=32 i-BERT exp (INT8)     135 K       80 K      215 K   +80 K
+    K=8 + K=32 4th-order exp (FP16★) 135 K      160 K      295 K  +160 K  ★
+    K=8 + K=64 4th-order exp (FP16)  135 K      320 K      455 K  +320 K
+    K=4 + K=32 4th-order exp          90 K      160 K      250 K  +115 K
+
+  → K=8 general + K=32 dedicated 4th-order exp = +160 K vs +225 K for
+    K=32 general. Saves 65 K AND keeps all 6 SF functions at K=8 throughput.
+
+  → For INT8/FP8 quantized inference (modern LLM recipe), use i-BERT
+    2nd-order exp : K=32 only +80 K, total 215 K. Cheapest viable option.
+
+  ─── Why dedicated exp is much cheaper than general SF ─────────────
+
+  General SF (10 K g/copy) breakdown :
+
+      ┌────────────────────────────────────────┐
+      │ exp/log piecewise + range reduction   │  4 K g  ← we want THIS
+      │ sigmoid/tanh LUT                      │  1.5 K  (could share)
+      │ Newton-Raphson (sqrt / recip)         │  3 K    ← attention doesn't use
+      │ polynomial datapath + MUX             │  2 K
+      │ sequencer + control                   │  1.5 K
+      └────────────────────────────────────────┘
+
+    → Replicating general SF wastes 50 % on sqrt/log/sigmoid that
+      attention doesn't need.
+
+  Dedicated exp (5 K g/copy, 4th-order minimax FP16) :
+
+      ┌────────────────────────────────────────┐
+      │ range reduction (k, p split)          │  0.5 K
+      │ 4-coeff poly multiply-accumulate      │  3.5 K
+      │ scale (k-bit shift) + format conv     │  0.5 K
+      │ small sequencer                       │  0.5 K
+      └────────────────────────────────────────┘
+
+    → Half the cost, exp-only. 32 copies = 160 K g (vs 320 K g if we
+      scaled general SF to K=32 just for exp throughput).
+
+  ─── Implementation sketch : 32-copy dedicated exp unit ────────────
+
+    Lane 0..3   ──┐
+    Lane 4..7   ──┤    ┌─────────┐
+    Lane 8..11  ──┼───►│ shared  │   range reduction tables
+    Lane 12..15 ──┤    │ ln2     │   (just two constants : ln2, 1/ln2)
+    ...           │    │ const   │
+    Lane 124..127─┘    └────┬────┘
+                            │
+    ┌─────────────┬─────────┼─────────┬─────────────┐
+    │             │         │         │             │
+  ┌─▼──┐        ┌─▼──┐    ┌─▼──┐    ┌─▼──┐        ┌─▼──┐
+  │EXP │        │EXP │    │EXP │    │EXP │ ...    │EXP │  32 copies
+  │ #0 │        │ #1 │    │ #2 │    │ #3 │        │ #31│  ~5 K g each
+  │range+      │range+│   │range+│   │range+│      │range+│  (FP16 4-th
+  │ poly │     │ poly │   │ poly │   │ poly │      │ poly │   minimax)
+  └─┬──┘        └─┬──┘    └─┬──┘    └─┬──┘        └─┬──┘
+    │             │         │         │             │
+   lane 0..3    4..7      8..11    12..15        124..127
+   (4 cy MUX)   (4 cy)    (4 cy)   (4 cy)         (4 cy)
+
+  Per-copy throughput : 1 elem/cy  →  4 lanes/copy time-muxed in 4 cy.
+  Total throughput    : 32 elem/cy → entire 128-lane tile in 4 cy.
+  Pipeline depth      : 5 cy (range red 1 + poly 3 + scale 1).
+
+  COMPARED TO PER-LANE FMA  :
+    FMA throughput  : 128 elem/cy → 1 tilelet in 1 cy
+    Exp throughput  : 32  elem/cy → 1 tilelet in 4 cy
+    Exp is now only 4× slower than FMA per tilelet.
+    Was 128× slower with K=1 SF, 16× with K=8.
+
+  ─── Why K=8 general was originally chosen, and why we're upsizing ────
+
+  ORIGIN of K=8 general SF :
+    K=8 was sized BEFORE exp was offloaded to a dedicated unit. At
+    that time, exp was the dominant SF load (softmax + softplus +
+    GELU-via-erf/exp etc.), so K=8 was the sweet spot for exp
+    throughput. Now that exp is offloaded :
+
+    Workload        ops/layer (LLaMA, N=2K)    K=8 cycles    % of GEMM
+    ──────────      ──────────────────────     ──────────    ─────────
+    SwiGLU sigmoid  4·N·d = 33 M               4.1 M cy      3.8 %
+    LayerNorm rsq   2 per layer (negligible)   ~ 0           ~0 %
+    log / div       inference rarely uses      ~ 0           ~0 %
+
+    → After exp offload, K=8 has 50 % unused capacity. K=4 would
+      already give 7.6 % overhead — also acceptable. So why K=16 ?
+
+  REASONS TO UPSIZE GENERAL SF TO K=16 :
+    • Future activation functions (Mish, Swish-2, GeLU exact) may add
+      tanh / sigmoid ops not currently counted.
+    • Software pipelining : overlap activation with next FFN GEMM.
+    • Multi-context concurrent execution (KV-cache batched serving).
+    • LayerNorm + SwiGLU together can spike the SF queue briefly.
+    • Cost is moderate : 8→16 = +80 K gates (LUT shared, only datapath
+      replicates).
+
+  ─── Format/precision support of each SF flavor ────────────────────
+
+    block                 supported formats        gates / copy
+    ──────────────────    ──────────────────       ────────────
+    General SF (default)  FP16 + FP32 mixed        ~10 K  (LUT shared)
+                          (sigmoid, tanh, exp,     (~7 K datapath +
+                           log, sqrt, recip)       ~3 K LUT-share share)
+    Dedicated exp         FP16 only                ~5 K (4-th minimax)
+                                                   ~6 K (FP16 + FP32)
+                                                   ~2.5 K (i-BERT 2nd-
+                                                          order, INT8)
+
+    → General SF is NOT FP32-only ; it's mixed FP16+FP32. Could be
+      restricted to FP16-only (~6 K g/copy) for inference-only ASIC,
+      saving ~4 K g per copy.
+
+    → Dedicated exp is FP16-only by default (matches inference workloads).
+      Can be upgraded to FP16+FP32 (+1 K g/copy) if training is in scope.
+
+  ─── UPDATED FINAL recommendation matrix ─────────────────────────────
+
+    target product           recommended config           VEC area
+    ──────────────────────   ──────────────────────       ────────
+    Edge inference (FP8)     K=4 general + K=32           2.27 M
+                             i-BERT 2nd-order exp          (+45 K)
+    Mainstream LLM infer     K=8 general + K=32           2.39 M
+    (FP16, N ≤ 8K)           4th-order minimax exp         (+160 K)
+    Long-context infer       K=16 general + K=64          2.63 M ★ NEW
+    (FP16, N = 16K - 128K)   4th-order minimax exp         (+400 K)
+       ← user's preferred default ★
+    Pure attention ASIC      K=16 general + K=128         2.95 M
+    (extreme long ctx)       4th-order minimax exp         (+720 K)
+    Training (mixed prec)    K=16 general (exp inline)    2.30 M
+                             FP32 capable                   (+75 K)
+
+  ─── DEFAULT CHANGE : K=16 general + K=64 dedicated exp ★ ─────────
+
+    Per user's recommendation, the FINAL DEFAULT for the long-context
+    LLM inference target is :
+
+      • General SF       : K=16 mixed FP16+FP32     →  215 K g
+      • Dedicated exp    : K=64 FP16 4-th minimax   →  320 K g
+      • Combined SF/exp  :                          →  535 K g
+
+    vs old K=8 + K=32 design  : 295 K g  →  delta +240 K g (+1.4 % VEC)
+    vs original K=8 only base : 135 K g  →  delta +400 K g
+
+    PERFORMANCE (LLaMA-7B inference, N = 32 K) :
+
+      metric                         K=8 + K=32      K=16 + K=64 ★
+      ──────────────────────────     ───────────     ──────────────
+      attention time vs ideal        1.14×           1.07×
+      SwiGLU time / GEMM time        3.8 %           1.9 %
+      total inference vs ideal       1.18×           1.09×
+
+    +240 K gates (+10 % VEC area) gives ~9 % faster total inference
+    on long-context workloads.  Excellent trade for inference-
+    optimized ASICs ; for edge/short-context, the cheaper K=8 + K=32
+    config is recommended.
+
+  ─── Why K=64 exp matters even though K=32 'balances' attention ───
+
+  K_balanced = C / d_h gives the MINIMUM K to not bottleneck.  K=64
+  gives 2× headroom which enables :
+
+    1) SOFTWARE PIPELINING : while ·V runs on cube, next head's exp
+       can start in parallel — exp is no longer on critical path.
+
+    2) SMALLER d_h MODELS : ViT-Small (d_h=64), some MoE expert heads
+       (d_h=64-96), etc. K=32 doesn't balance these (need K=64-96).
+
+    3) MULTI-CONTEXT : KV-cache batched serving runs multiple
+       attentions concurrently. K=64 gives margin for 2× concurrency.
+
+    4) BIGGER CUBE FUTURE : if cube grows to 8 K MACs/cy (next gen),
+       K_balanced doubles to 64. K=64 today = future-proof.
+
+  All four reasons argue for the 2× headroom. K=64 is correct for a
+  forward-looking long-context inference design.
+
+  ─── Datapath integration ────────────────────────────────────────────
+
+  Both general SF (K=16) and dedicated exp (K=64) sit in PARALLEL
+  with the per-lane FMA and element-wise ALU. Instruction-class
+  decode routes :
+
+    op type                        →  routed to
+    ────────────────────────────      ─────────────────────
+    FMUL/FADD/FMA/FNMA/VLERP          per-lane FMA array (128 lanes)
+    AND/OR/XOR/CMP/MIN/MAX/SHIFT      per-lane elem-wise ALU (128 lanes)
+    SIGMOID/TANH/LOG/SQRT/RECIP       general SF engine (16 copies)
+    EXP / SOFTMAX-fused-EXP           dedicated exp unit (64 copies)
+    REDUCE_*  (sum/max/min/argmax)    REDUCE tree (1 path)
+    SORT / TOPK_LARGE                 time-muxed sort network
+    BROADCAST_* / EXPAND              broadcast tree
+    MOV / COPY / MASK_APPLY           DMA-style mover
+
+  Each cycle : ONE instruction issued, routed to ONE compute path.
+  All paths share the same operand read ports of RFS_A / RFS_B /
+  RFA_A / RFA_B (4 KB each). No additional storage cost.
 
 ══════════════════════════════════════════════════════════════════════════════
   PSEUDO-CODE  : row_sum_exp(in_spec, double_width=False)
