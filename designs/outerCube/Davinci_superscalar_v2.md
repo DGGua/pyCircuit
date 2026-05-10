@@ -856,10 +856,10 @@ The 7-bit opcode field encodes the instruction domain:
  │  │       ▼              ▼             ▼             ▼              ▼                      │  │
  │  │  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐              │  │
  │  │  │ 4x ALU   │  │  Load /  │  │  VEC-    │  │outerCube │  │   TMA    │              │  │
- │  │  │ 1x MUL   │  │  Store   │  │  4K-v2   │  │   MXU    │  │          │              │  │
- │  │  │ 1x BRU   │  │  Unit    │  │ 3R/2W    │  │(4096 MAC)│  │(TLoad/   │              │  │
- │  │  │ (alu_iq) │  │  + SSB   │  │ tiles    │  │          │  │TStore/   │              │  │
- │  │  │          │  │ (lsu_iq) │  │(vec_iq)  │  │          │  │MG/MS/    │              │  │
+ │  │  │ 1x MUL   │  │  Store   │  │  4K-v2   │  │   MXU    │  │LSU------>│              │  │
+ │  │  │ 1x BRU   │  │  Unit    │  │ 3R/2W    │  │(4096 MAC)│  │ TL / TS  │              │  │
+ │  │  │ (alu_iq) │  │  + SSB   │  │ tiles    │  │          │  │BISQ----->│              │  │
+ │  │  │          │  │ (lsu_iq) │  │(vec_iq)  │  │          │  │ MG / MS  │              │  │
  │  │  └────┬─────┘  └────┬─────┘  └────┬─────┘  └────┬─────┘  └────┬─────┘              │  │
  │  └────────┼─────────────┼─────────────┼─────────────┼──────────────┼────────────────────┘  │
  │           │             │             │             │              │                          │
@@ -902,6 +902,8 @@ The 7-bit opcode field encodes the instruction domain:
 - VEC-4K-v2 unit; 3R / 2W tile interface (unchanged).
 - Speculative Store Buffer (SSB, 24 entries) gates scalar stores by branch tag (unchanged).
 - Speculative Tile-Store Queue (STQ, 8 entries) gates TMA bulk stores by branch tag (unchanged).
+- **TMA request sources**: TLOAD / TSTORE arrive from the BCC LSU (contiguous block transfers);
+  MGATHER / MSCATTER arrive from the BCC BISQ (indexed gather/scatter).
 
 ---
 
@@ -2062,110 +2064,139 @@ The cube unit benefits indirectly from the TRegFile-4K `is_transpose` enhancemen
 
 ### 8.5 TMA Unit
 
-> **(v1 → v2: §8.5.A / §8.5.B / §8.5.C / §8.5.D 完整复制自 v1 §8.5.1 / §8.5.2 / §8.5.3 / §8.5.4 / §8.5.5。v2 增量集中在 §8.5.1 (TRANSPOSE 缩减) 与 §8.5.2 (STQ)。)**
+> **(v1 → v2: §8.5.A / §8.5.B / §8.5.C 从 TMA_spec.md 摘要重写。§8.5.D (TILE.GET/PUT) 与 §8.5.E (TILE.MOVE) 保留 v1 内容。§8.5.1 (TRANSPOSE 缩减) 保留。§8.5.2 STQ 与 §8.5.4 RS entry 暂删，后续包再议。)**
 
-The TMA unit is the **bridge between three domains**: memory ↔ TRegFile-4K (bulk tile transfers) and scalar GPR ↔ TRegFile-4K (single-element access via TILE.GET/TILE.PUT). All TMA instructions go through full **dual-RAT rename** at D2: scalar operands are renamed via the Scalar RAT, and tile operands are renamed via the Tile RAT. Instructions that produce a new tile (TILE.LD, TILE.ZERO, TILE.COPY, TILE.GATHER, TILE.PUT) allocate a fresh physical tile from the tile free list. TILE.GET produces a scalar GPR result and broadcasts on the CDB.
+The TMA unit is the **bridge between three domains**: memory ↔ TRegFile-4K (bulk tile transfers) and scalar GPR ↔ TRegFile-4K (single-element access via TILE.GET/TILE.PUT). TMA receives four types of requests from two distinct sources:
 
-#### 8.5.A Architecture (v1 §8.5.1, 未变更)
+| Source | Requests | Category |
+|--------|----------|----------|
+| **BCC LSU** (STQ/LDQ) | **TLOAD**, **TSTORE** | T requests |
+| **BCC BISQ** (via TCVT) | **MGATHER**, **MSCATTER** | M requests |
+| **VEC PE** (MPAR) | VGATHER, VSCATTER | M requests (VEC) |
+
+T requests are contiguous block transfers with optional fractal layout transforms; M requests are indexed gather/scatter operations driven by an offset tile. All TMA instructions undergo dual-RAT rename at D2: scalar operands (BaseAddr, Stride, Ridx) via the Scalar RAT, tile operands via the Tile RAT. Instructions that produce a new tile (TLOAD, TILE.ZERO, TILE.COPY, MGATHER, TILE.PUT) allocate a fresh physical tile from the tile free list. TILE.GET produces a scalar GPR result and broadcasts on the CDB.
+
+#### 8.5.A Microarchitecture
 
 ```
-  ┌──────────────────────────────────────────────────────────────────┐
-  │  Tile Memory Access (TMA) Unit                                  │
-  │                                                                  │
-  │  TMA RS (16 entries) ──┬──▶ Load Tile Pipeline                  │
-  │                        ├──▶ Store Tile Pipeline                 │
-  │                        ├──▶ Gather Pipeline                     │
-  │                        ├──▶ Scatter Pipeline                    │
-  │                        ├──▶ TILE.GET Pipeline (tile→GPR)        │
-  │                        └──▶ TILE.PUT Pipeline (GPR→tile, RMW)   │
-  │                                                                  │
-  │  ┌──────────────────────────────┐                                │
-  │  │ Outstanding Request Buffer   │  Tracks up to 32 in-flight    │
-  │  │ (32 entries)                 │  tile transfers for MLP        │
-  │  └──────────────┬───────────────┘                                │
-  │                 │                                                │
-  │  ┌──────────────▼───────────────┐  ┌─────────────────────────┐  │
-  │  │ Address Generation Unit      │  │ Data Assembly / Scatter  │  │
-  │  │ (contiguous, strided, index) │  │ (pack / unpack for G/S)  │  │
-  │  └──────────────┬───────────────┘  └──────────┬──────────────┘  │
-  │                 │                              │                 │
-  │                 ▼                              ▼                 │
-  │  ┌──────────────────────────────────────────────────┐           │
-  │  │  L2 / Memory Interface (high-bandwidth path)     │           │
-  │  │  64 B/cy (1 cache line/cy) sustained              │           │
-  │  └──────────────────────────────────────────────────┘           │
-  │                 │                              │                 │
-  │                 ▼                              ▼                 │
-  │  ┌──────────────────────────────────────────────────┐           │
-  │  │  TRegFile-4K Write Ports (W1–W7 for TILE.LD)    │           │
-  │  │  TRegFile-4K Read Ports (R5–R7 for TILE.ST)     │           │
-  │  └──────────────────────────────────────────────────┘           │
-  │                                                                  │
-  │  ┌──────────────────────────────────────────────────┐           │
-  │  │  Scalar GPR ↔ Tile Element Path                  │           │
-  │  │  TILE.GET: TRegFile read port → extract → CDB    │           │
-  │  │  TILE.PUT: CDB snoop → tile copy + insert → write│           │
-  │  └──────────────────────────────────────────────────┘           │
-  └──────────────────────────────────────────────────────────────────┘
+  ┌────────────────────────────────────────────────────────────────────────────┐
+  │  Tile Memory Access (TMA) Unit                                             │
+  │                                                                            │
+  │  BCC LSU ──┐                                                              │
+  │  (TLOAD/ST)├────────────────┐                                              │
+  │            │                ▼                                              │
+  │  BCC BIQ ──┘      ┌──────────────────┐  ┌─────────────────────────┐       │
+  │  (MG/MS)          │       BPQ        │  │   Tag Pipe              │       │
+  │                   │     32 entries   │  │  ┌────────────────┐     │       │
+  │  VEC PE ──────────┤  T: ≥16 sub-req  │───▶ │ Standard Tag   │     │       │
+  │  (VGATHER/        │  M: ≤64 lanes    │  │  │ (SRAM, set-   │     │       │
+  │   VSCATTER)       │  + Age Matrix    │  │  │  associative) │     │       │
+  │                   └──────────────────┘  │  ├────────────────┤     │       │
+  │                                          │  │ Tile Tag      │     │       │
+  │                                          │  │ (registers,   │     │       │
+  │                                          │  │  16-entry     │     │       │
+  │                                          │  │  packed)      │     │       │
+  │                                          └─────────┬───────┴─────┘       │
+  │                                                    │                      │
+  │                              ┌─────────────────────┴─────┐                │
+  │                              ▼                           ▼                │
+  │                      ┌──────────────┐           ┌──────────────┐          │
+  │                      │     CAQ       │           │     SRFB      │          │
+  │                      │ (BDB access)  │           │ (SoC read     │          │
+  │                      │ (hit path)    │           │  miss path)   │          │
+  │                      └──────┬───────┘           └──────┬───────┘          │
+  │                             │                         │                   │
+  │                             ▼                         │  ───▶  SoC       │
+  │               ┌────────────────────────┐              │       Memory      │
+  │               │   BDB (128 KB SRAM)    │◀─────────────┘                   │
+  │               │  T requests: buffer    │──SWCB─▶ SoC Memory               │
+  │               │  M requests: cache     │  (victim wb / TSTORE drain)      │
+  │               └───────────┬────────────┘                                  │
+  │                           │                                                │
+  │                           ▼                                                │
+  │                   ┌──────────────────┐                                    │
+  │                   │  Exchange Network│                                    │
+  │                   │  64×64 crossbar   │                                    │
+  │                   │  4B elem granular│                                    │
+  │                   └────────┬─────────┘                                    │
+  │                            │                                               │
+  │                   ┌────────▼─────────┐                                     │
+  │                   │  NWCB             │                                     │
+  │                   │  → Tile Reg via   │                                     │
+  │                   │  Ring (256 B/TX) │                                     │
+  │                   └──────────────────┘                                     │
+  └────────────────────────────────────────────────────────────────────────────┘
 ```
 
-#### 8.5.B Key Parameters (v1 §8.5.2, 未变更)
+##### Design Philosophy
+
+TMA serves a matrix-first memory pipeline. The inner-product matrix multiply (C = A × B) consumes **256 B × 2 per cycle** — A in NZ format, B in ZN format. TLOAD/TSTORE handle the fractal layout transforms that feed this pipeline; they are TMA's **primary investment target**. MGATHER/MSCATTER are secondary — they reuse resources already provisioned for T requests.
+
+Three design choices make this possible:
+
+1. **Dual Tag in parallel.** Standard Tag (SRAM, set-associative, cacheline-granularity) serves M-request point-lookups. Tile Tag (registers, fully readable, 16-entry packed, range-matching) serves T-request global-availability queries. Both are queried simultaneously; the Tag Pipe arbitrates. Merging them is prevented by **different physical media** — SRAM cannot be fully read in one cycle, registers cannot scale to cacheline-granularity capacity.
+
+2. **BDB dual-mode.** The same 128 KB SRAM operates as a **buffer** for T requests (tile-granularity sequential allocation and consumption) and as a **cache** for M requests (cacheline-granularity random access with Standard Tag hit/miss). Two Tag arrays manage disjoint address spaces; consistency checks keep them coherent.
+
+3. **Alloc-on-Miss.** Tag Pipe decides eviction at tag time, not after data returns. This eliminates the per-RFB return-data buffer (~256 B × 384 entries ≈ **96 KB** saved) at the cost of slightly reduced effective BDB capacity (some entries hold not-yet-ready data).
+
+> The result: T requests see a high-bandwidth streaming buffer; M requests see a conventional cache on the same silicon — no extra SRAM, no duplicated control.
+
+#### 8.5.B Key Parameters
 
 | Parameter | Value |
 |-----------|-------|
-| TILE.LD TRegFile write | **8 cycles** per write port (512 B/cy × 8 cy = 4 KB) |
-| TILE.LD total latency (L2 hit) | **72 cycles** (64 cy memory fetch + 8 cy TRegFile write epoch) |
-| TILE.ST TRegFile read | **8 cycles** per read port (512 B/cy × 8 cy = 4 KB) |
-| TILE.ST total latency (L2) | **72 cycles** (8 cy TRegFile read epoch + 64 cy memory write) |
-| Available write ports | W1–W7 (**7** ports, minus ports used by cube drain) |
-| Available read ports | R5–R7 (**3** ports, minus ports used by cube operands) |
-| Max concurrent TILE.LD | up to **7** (1 per write port), limited by memory BW |
-| Max concurrent TILE.ST | up to **3** (1 per read port) |
-| Outstanding request buffer | **32** entries (supports deep memory-level parallelism) |
-| Gather/scatter | Uses index tile (Tidx) for non-contiguous access patterns |
-| L2 → TMA bandwidth | **64 B/cy** (1 cache line/cy) → 1 tile in **64 cycles** from L2 |
-| TILE.COPY / TILE.TRANSPOSE latency | **16 cycles** (8 cy TRegFile read epoch + 8 cy write epoch) |
-| TILE.ZERO latency | **8 cycles** (1 write epoch, no read needed) |
-| **TILE.GET latency** | **9 cycles** (8 cy TRegFile read epoch + 1 cy element extract → CDB) |
-| **TILE.PUT latency** | **16 cycles** (8 cy read epoch + 8 cy write epoch); **8 cy** with copy elision |
-| TILE.GET throughput | **1 per 8 cycles** (read port occupied for full epoch even for single element) |
-| TILE.PUT throughput | **1 per 16 cycles** (read + write port, 2 epochs); **1 per 8 cy** with elision |
+| BDB capacity | **128 KB** (128 B × 1024 entries) |
+| BPQ entries | **32** (shared T + M) |
+| Tag Pipe throughput | **1 request/cy** (target) |
+| Standard Tag | SRAM, set-associative, cacheline granularity |
+| Tile Tag | Registers, fully readable, 16-entry packed |
+| Ring transaction width | **256 B** (TRegFile ↔ TMA data path) |
+| SoC memory interface | **64 B/cy** (1 cache line/cy) sustained |
+| Exchange network | **64 × 64** crossbar, **4 B** element granularity |
+| T request min split per BPQ entry | **≥16** sub-requests (one fractal = 16 rows × 32 B) |
+| M request max lanes per BPQ entry | **64** (after padding) |
+| Fractal size | **16 rows × 32 B** = **512 B** |
+| Tile size | **4 KB** (8 Ring transactions or 64 cache lines) |
+| Alloc-on-miss | Tag Pipe decides eviction at Tag time; BDB write on data return without re-tag |
+| Layout transform | Built into exchange network routing; no separate transpose buffer |
+| Per-RFB return data buffer saved | **~96 KB** (by alloc-on-miss vs alloc-on-fill) |
 
-#### 8.5.C TMA Rename → Issue → Execute Flow (Bulk Transfer) — (v1 §8.5.3, 未变更)
+#### 8.5.C TLOAD Lifecycle: from BPQ entry through Tag Pipe to Ring Transfer
 
 ```
   D2 (Rename):
-    TILE.LD T10, [X5]
-      Scalar RAT: X5 → P40 (physical scalar for base address)
-      Tile RAT:   T10 → PT200 (allocate new physical tile from tile free list)
+    TLOAD T10, [X5], Stride     // NORM, 4 KB contiguous with strided rows
+      Scalar RAT: X5 → P40 (base addr), X6 → P41 (stride)
+      Tile RAT:   T10 → PT200 (allocate new physical tile from free list)
                   old mapping PT10 marked orphan
       Tile RAT ready[PT200] ← 0
 
   DS (Dispatch):
-    TMA RS entry: {op=TILE.LD, pscalar=P40, srdy=<from Scalar RAT>, ptdst=PT200, ckpt=...}
+    BPQ entry allocated: {op=TLOAD, pscalar=[P40,P41], srdy, ptdst=PT200}
+    Instruction parameters (Layout, ValidCol, etc.) flow as immediates,
+    not through Scalar RAT.
 
-  IS (Issue):
-    Wait for pscalar P40 ready (CDB wakeup from scalar ALU)
-    → read base address from scalar physical RF
+  Tag Pipe (after scalar operands ready):
+    Compute tile address range: [base, base + Stride×(valid_rows-1) + valid_cols×elem_size)
+    Query Standard Tile Array:
+      ▸ Miss → allocate BDB + Tile Tag; split into 64 cacheline SRFB requests
+               → SoC memory read (≈64 cycles from L2)
+      ▸ Hit  → CAQ entry → read BDB continuously → exchange network
+               → NWCB → Tile Reg Ring (256 B/transaction)
 
-  EX (Execute — memory fetch + 1 TRegFile write epoch):
-    Memory phase (≈64 cycles from L2):
-        TMA Address Gen: compute contiguous address range from base address
-        TMA Data Path:   request 64 cache lines from L2 (64 B/cy)
-        MTE Buffer:      accumulate 4 KB in outstanding request buffer
-    TRegFile write epoch (8 cycles):
-        Reserve write port, program reg_idx = PT200
-        Write 512 B/cy × 8 cy = 4 KB to physical tile slot PT200
-    Total TILE.LD latency (L2 hit): 64 + 8 = **72 cycles**
+  Ring Transfer to Tile Reg (8 write epochs):
+    For each Ring transaction (2 per fractal = 16 transactions):
+      NWCB → RingTrans (256 B) → TRegFile write port
+    Total: 2 RingTX × 8 fractals = 16 × 256 B = 4 KB
 
   Complete:
     Tile RAT ready[PT200] ← 1
-    TCB broadcast: PT200
-    → wake dependent instructions in Vector RS, Cube RS, MTE RS
+    TCB broadcast: PT200 → wake dependents in Vector RS, Cube RS
     Decrement tile refcount for any source tiles
 ```
 
-MTE bulk operations incur both **memory latency** and **TRegFile epoch latency**. For TILE.LD, the MTE first fetches 4 KB from memory (64 cache lines at 64 B/cy = 64 cycles from L2), buffers the data, then writes to TRegFile-4K in one 8-cycle write epoch using the **physical tile index** (from Tile RAT) as the `reg_idx` address — total latency: **memory + 8 cycles**. For TILE.ST, the MTE first reads the tile from TRegFile in one 8-cycle read epoch, then writes the data to memory — total: **8 cycles + memory**. The MTE controller issues physical `reg_idx` addresses to port pending registers and sequences data transfer across each 8-cycle epoch.
+TMA bulk operations incur both **memory access latency** and **Ring transfer latency**. For fractal TLOAD, the TMA first fetches data from SoC memory (64 cache lines at 64 B/cy), buffers through BDB and the exchange network for layout transform, then transfers to TRegFile via Ring (256 B/transaction, 16 transactions per tile). For TSTORE, the TMA first reads the source tile from TRegFile via Ring, converts fractal→contiguous through the exchange network, and writes to SoC memory.
 
 #### 8.5.D TILE.GET / TILE.PUT Execution Flow (Element Access) — (v1 §8.5.4, 未变更)
 
@@ -2177,7 +2208,7 @@ MTE bulk operations incur both **memory latency** and **TRegFile epoch latency**
     Tile RAT:   Ts → PT180 (lookup source tile)
 
   DS (Dispatch):
-    MTE RS entry: {op=TILE.GET, pscalar=P50(Ridx), srdy, pdst=P60(Rd), ptsrc1=PT180(Ts), trdy}
+    TMA RS entry: {op=TILE.GET, pscalar=P50(Ridx), srdy, pdst=P60(Rd), ptsrc1=PT180(Ts), trdy}
 
   IS (Issue):
     Wait for P50 ready (CDB wakeup) AND PT180 ready (TCB wakeup)
@@ -2206,7 +2237,7 @@ MTE bulk operations incur both **memory latency** and **TRegFile epoch latency**
                 PT180 marked orphan; ready[PT210] ← 0
 
   DS (Dispatch):
-    MTE RS entry: {op=TILE.PUT, pscalar=P70(Rs), pscalar2=P71(Ridx),
+    TMA RS entry: {op=TILE.PUT, pscalar=P70(Rs), pscalar2=P71(Ridx),
                    ptsrc1=PT180(Td_old), ptdst=PT210(Td_new)}
 
   IS (Issue):
@@ -2216,7 +2247,7 @@ MTE bulk operations incur both **memory latency** and **TRegFile epoch latency**
     Read epoch (cycles 1–8):
         Reserve read port for physical tile PT180
         Read 512 B/cy × 8 cy = 4 KB (full source tile)
-        Buffer tile data in MTE internal SRAM; overwrite target element
+        Buffer tile data in TMA internal SRAM; overwrite target element
         at (row, col) derived from Ridx with scalar value from Rs
     Write epoch (cycles 9–16):
         Reserve write port for physical tile PT210
@@ -2258,59 +2289,17 @@ TILE.MOVE does not consume any execute-stage resources, TRegFile-4K ports, or me
 
 ---
 
-**v2 增量(下面 §8.5.1 / §8.5.2 / §8.5.3 / §8.5.4):**
+**v2 增量:**
 
 #### 8.5.1 `TILE.TRANSPOSE` — reduced footprint
 
-Because TRegFile-4K can deliver col-mode reads directly (§9.2), most "transpose then consume" patterns are subsumed by the consumer's `is_xpose` bit. The dedicated 4 KB MTE transpose buffer of v1 shrinks to a small **512 B element-level fixup buffer** used only for the non-aligned `W ∈ {128, 256, 1024, 2048, 4096}` regimes that [`tregfile4k.md`](tregfile4k.md) §7.5 leaves to downstream consumers. (For these regimes, the chunk-grid transpose at 64 B granularity is not element-level valid, and `TILE.TRANSPOSE` materializes an element-correct transpose in a new physical tile.)
+Because TRegFile-4K can deliver col-mode reads directly (§9.2), most "transpose then consume" patterns are subsumed by the consumer's `is_xpose` bit. The dedicated 4 KB TMA transpose buffer of v1 shrinks to a small **512 B element-level fixup buffer** used only for the non-aligned `W ∈ {128, 256, 1024, 2048, 4096}` regimes that [`tregfile4k.md`](tregfile4k.md) §7.5 leaves to downstream consumers. (For these regimes, the chunk-grid transpose at 64 B granularity is not element-level valid, and `TILE.TRANSPOSE` materializes an element-correct transpose in a new physical tile.)
 
-| MTE TILE.TRANSPOSE behaviour | v1 | v2 |
+| TILE.TRANSPOSE behaviour | v1 | v2 |
 |------------------------------|-----|-----|
 | 4 KB transpose buffer | required | replaced by 512 B fixup SRAM |
 | Latency | 16 cy | 16 cy (unchanged) |
 | Use case | universal | rare — only when materializing a transposed tile for reuse across many instructions that don't carry `is_xpose` |
-
-#### 8.5.2 Speculative Tile-Store Queue (STQ)
-
-`TILE.ST` and `TILE.SCATTER` allocate an STQ entry at dispatch (alongside the regular MTE RS entry):
-
-```
-  STQ entry (8 entries total):
-    valid (1b) | btag (3b) | base_addr (40b) | tile_phys_idx (8b) |
-    stride (40b) | scatter_idx_phys (8b) | size_log2 (3b) | drain_rdy (1b)
-    + meta_v (1b)
-```
-
-Total STQ size: 8 × ~110 b ≈ ~110 B. Drain logic mirrors the SSB:
-
-- **Tag clear** (branch resolves correctly): `btag` is updated; if it reaches `0xFF`, `drain_rdy` is set, and the STQ controller can issue the actual memory write.
-- **Mispredict**: STQ entries with `btag` younger or equal to the mispredicted tag are invalidated. The corresponding tile data — still resident in TRegFile-4K — is freed via the normal Tile RAT refcount path; no memory write was issued.
-- **Drain**: oldest `drain_rdy` entry begins streaming the tile from TRegFile through the MTE memory pipeline. Drain is overlapped with subsequent MTE operations.
-
-**Why only 8 entries?** Bulk tile stores are infrequent compared to scalar stores: a typical kernel issues 1 `TILE.ST` per ~10–50 scalar stores. The 8 entries provide ~64 cycles of buffering at peak issue (1 TILE.ST/4 cy), enough to absorb a burst at the end of a kernel without causing dispatch stall.
-
-**Why STQ is separate from SSB:** the TILE.ST data payload (4 KB) cannot reasonably be captured in the SSB's flip-flop register — it must remain resident in TRegFile-4K. The STQ stores only the *intent* (address + tile-pointer + branch_tag) and triggers the memory write on commit.
-
-#### 8.5.3 STQ area
-
-| Block | Area |
-|-------|------|
-| 8 × 110 b flip-flop array | ~10 K gate |
-| Branch-tag ancestry check (shared with SSB) | ~0 (reuses SSB's bitmap) |
-| Drain controller FSM | ~2 K gate |
-| **Total** | **~12 K gate** (~0.003 mm² @ 5 nm) |
-
-#### 8.5.4 MTE RS entry per instruction (v2 update)
-
-The `TILE.ST` and `TILE.SCATTER` entries gain a 4 b STQ index. Other MTE instructions are unaffected.
-
-| Instruction | STQ allocation | Notes |
-|-------------|----------------|-------|
-| TILE.LD, TILE.GATHER, TILE.ZERO | — | tile-write only, refcount-managed; no memory side effect, fully recoverable via Tile RAT |
-| TILE.ST, TILE.SCATTER | **STQ slot** | held in STQ until non-speculative |
-| TILE.COPY, TILE.MOVE, TILE.TRANSPOSE | — | tile-internal, fully recoverable |
-| TILE.GET | — | scalar GPR result; recoverable via Scalar RAT + ref-count |
-| TILE.PUT | — | tile-write (RMW); recoverable via Tile RAT |
 
 ---
 
