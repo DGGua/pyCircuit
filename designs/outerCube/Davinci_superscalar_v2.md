@@ -2736,7 +2736,7 @@ Detailed per-stage actions:
 | **Issue (P1)** | Ready Table bitmap query (O(1) per ptag); age-matrix cascaded pick selects oldest-ready per IQ |
 | **Issue (I1)** | Physical RF read-port arbitration across 7 issue slots |
 | **Issue (I2)** | Confirm IQ entry deallocation; confirm RF port occupancy |
-| **Execute (E1-EX_n)** | Compute result (variable latency). Scalar stores deposit into SSB; MTE bulk stores deposit into STQ. |
+| **Execute (E1-EX_n)** | Compute result (variable latency). Scalar stores deposit into SSB; TMA bulk stores deposit into STQ. |
 | **Writeback (W1)** | CDB/TCB broadcast; write to physical RF; Ready Table update (set ready bit); wakeup dependents; free orphans |### 10.3 Rename Register State (atag / ptag / SMAP / CMAP / MapQ)
 
 The BCC scalar pipeline replaces the Scalar RAT with a **three-table model**: CMAP (committed map), SMAP (speculative map), and MapQ (speculative rename increment log). The Tile RAT and Tile Metadata RAT are unchanged from v2.
@@ -3090,34 +3090,42 @@ Critically, **invalidated stores are silently discarded** — no memory write wa
 - **Sized for:** 8 tags × ~3 stores/tag = 24 entries, matching the v2 SSB capacity.
 - **Stall behavior:** if the SSB fills, dispatch stalls at the next store. This is rare in practice (97th-percentile occupancy is ~12 entries on typical kernels) but the mechanism is correct under any occupancy — the front-end simply waits for an SSB slot to drain.
 
-### 11.5 Speculative Tile-Store Queue (STQ) — MTE Memory Path
+### 11.5 Speculative Tile-Store Queue (STQ) — TMA Memory Path
 
-The STQ is the analogue of the SSB for **bulk tile stores** issued by the MTE unit (`TILE.ST`, `TILE.SCATTER`). Already introduced in §8.5.2; this subsection emphasizes the speculation-recovery semantics.
+The STQ is the analogue of the SSB for **bulk tile stores** issued by the TMA unit (`TSTORE`, `MSCATTER`). It gates TMA-side effects until the producing branch tag becomes non-speculative.
 
 Key differences from SSB:
 
-- **Data does not reside in the STQ.** The 4 KB tile payload stays in TRegFile-4K, referenced by `tile_phys_idx`. The STQ holds only the *intent* (address, source phys-tile, branch tag).
+- **Data does not reside in the STQ.** The 4 KB tile payload stays in TRegFile-4K, referenced by `tile_phys_idx`. The STQ holds only the *intent* (address, layout, source phys-tile, branch tag). The actual data transfer occurs when the STQ drains to TMA.
 - **Smaller capacity (8 entries).** Bulk tile stores are infrequent compared to scalar stores.
-- **Drain triggers a memory-bound transfer (8-cy TRegFile read epoch + ~64 cy memory write).** Unlike a single-cycle SSB drain, STQ drains take dozens of cycles and overlap with subsequent MTE operations.
+- **Drain triggers a memory-bound transfer through TMA.** Unlike a single-cycle SSB drain, STQ drains involve an 8-cy TRegFile read epoch, a Ring-transfer to TMA, and a ~64 cy memory write path, but these overlap with subsequent operations.
 
 #### 11.5.1 Allocation, drain, invalidation
 
-The flow mirrors §11.4.1–§11.4.4 with these adaptations:
+The flow mirrors §11.4.1–§11.4.4 with these TMA-specific adaptations:
 
 ```
-  Allocation: D2 of TILE.ST or TILE.SCATTER → STQ slot
-  Population: at MTE issue, fields {base_addr, tile_phys_idx, stride or scatter_idx_phys} fill in
-  Drain: when btag becomes 0xFF, drain_rdy ← 1; oldest drain_rdy entry begins
-         streaming the tile from TRegFile (8-cy read epoch) to memory (64-cy write)
-  Invalidation: on tag becoming wrong, matching STQ entries set valid ← 0
-                The source physical tile is freed via the normal Tile RAT refcount path
-                (the entry's allocation incremented refcount; invalidation decrements it)
+  Allocation:     D2 of TSTORE or MSCATTER → STQ slot
+  Population:     at TMA issue, fields {base_addr, layout, tile_phys_idx, branch_tag} fill in
+  Drain:          when btag becomes non-speculative, drain_rdy ← 1; oldest drain_rdy entry
+                  begins TRegFile read epoch → Ring transfer to TMA
+                  → TMA's BPQ splits into sub-requests → BDB buffers Tile Reg data
+                  → Exchange Network (fractal→contiguous transform) → SWCB → SoC memory
+                  → on memory completion, TMA notifies BROB and records the address
+                    in TSRQ (Tile Store Resolved Queue) for load conflict resolution
+  Invalidation:   on tag becoming wrong, matching STQ entries set valid ← 0
+                  The source physical tile is freed via the normal Tile RAT refcount path
+                  (the entry's allocation incremented refcount; invalidation decrements it)
+                  If data has already entered TMA (BDB), TMA detects the invalidation
+                  and aborts pending SWCB writes
 ```
+
+**TSRQ role:** After TSTORE data has been written through TMA to the memory subsystem, the address is recorded in the TSRQ. Later TLOAD instructions that encounter a conflicting address in TSRQ sleep in LDQ until the TSRQ entry dequeues (which happens when the TSTORE is fully ordered in memory). This is the only path by which TSTORE speculative ordering affects subsequent loads — the STQ itself only gates the *start* of the transfer.
 
 #### 11.5.2 Why 8 entries
 
 - **Min capacity:** 1 STQ entry per active speculation tag = 8.
-- **Worst case:** A kernel with 1 TILE.ST per ~10 instructions issues ~1 STQ entry per ~50 ns at 1.5 GHz; the drain rate is ~1 entry per ~72 cy = ~50 ns. The STQ stays at ~1–2 entries average.
+- **Worst case:** A kernel with 1 TSTORE per ~10 instructions issues ~1 STQ entry per ~50 ns at 1.5 GHz; the drain rate is ~1 entry per ~72 cy = ~50 ns. The STQ stays at ~1–2 entries average.
 - **Stall behavior:** STQ-full is rare; when it occurs, dispatch stalls at the next bulk tile store.
 
 ### 11.6 What about other externally-visible operations?
@@ -3616,12 +3624,12 @@ The L1-D's existing 8 MSHRs and 4-cy store pipeline are unchanged. The SSB inser
 | D-TLB | **64** | Fully assoc | 4 KB, 2 MB | L2 TLB lookup |
 | L2 TLB (unified) | **512** | 8-way | 4 KB, 2 MB, 1 GB | Page table walk |
 
-### 12.4 MTE Memory Path (v1 §11.4, 未变更)
+### 12.4 TMA Memory Path — BCC LSU & Tile Access Ordering
 
-The MTE unit has a **high-bandwidth path** to the L2 cache (and external memory) for tile data transfers, separate from the scalar LSU path through L1-D.
+The TMA unit has a **high-bandwidth path** to the L2 cache (and external memory) for tile data transfers, separate from the scalar LSU path through L1-D.
 
 ```
-  MTE ──▶ L2 Cache (512 KB) ──▶ External Memory
+  TMA ──▶ L2 Cache (512 KB) ──▶ External Memory
            64 B/cy sustained bandwidth
            1 cache line per cycle
            1 tile (4 KB) = 64 cache lines = 64 cycles from L2
@@ -3629,21 +3637,55 @@ The MTE unit has a **high-bandwidth path** to the L2 cache (and external memory)
 
 | Parameter | Value |
 |-----------|-------|
-| MTE → L2 bandwidth | **64 B/cycle** (1 cache line/cycle) |
+| TMA → L2 bandwidth | **64 B/cycle** (1 cache line/cycle) |
 | Tile load from L2 (hit) | **64 cycles** per tile (4 KB / 64 B) |
 | Tile load from external memory | **200–400 cycles** per tile (DRAM dependent) |
-| Outstanding MTE requests | **32** (deep buffer for memory-level parallelism) |
-| Prefetch support | MTE RS can issue TILE.LD early, buffering data in TRegFile |
+| Outstanding TMA requests | **32** (via BPQ + BDB) |
+| Prefetch support | BPQ can issue TLOAD early, buffering data in BDB |
 
-The MTE unit exploits the large TRegFile-4K (256 tiles, 1 MB) as a **software-managed scratchpad**. Programmers (or compiler) schedule TILE.LD instructions well ahead of CUBE.OPA to hide memory latency. The 32-entry outstanding request buffer allows many tile loads to be in flight simultaneously, maximizing bandwidth utilization.
+#### BCC LSU Integration
 
-**v2 增量:** `TILE.ST` and `TILE.SCATTER` traffic on this path is gated by the 8-entry STQ (§11.5).
+TLOAD / TSTORE / MGATHER / MSCATTER instructions share the **BCC LSU's LDQ and STQ** with scalar load/store instructions. All memory operations in the BCC channel receive unified load ID / store ID / loadstore ID encoding for ordering:
+
+| BCC LSU component | Used by | Purpose |
+|-------------------|---------|---------|
+| **LDQ** | scalar LD + TLOAD + MGATHER | Address conflict checking; holds all loads until resolve |
+| **STQ** | scalar ST + TSTORE + MSCATTER | Gates speculative stores; entry data = intent (addr, layout, phys-tile), not the 4 KB payload |
+| **LHQ** | scalar LD only | Dedicated resolve queue; no tile involvement |
+| **SCB** | scalar ST only | Store coalesce buffer; no tile involvement |
+| **TSRQ** (Tile Store Resolved Queue) | TSTORE / MSCATTER | Post-drain address tracking for load conflict resolution |
+
+**Key rule:** Tile data never enters L1-D. When tile data resides in L1-D, the TMA path bypasses L1-D entirely — the TMA issues cacheline-granularity reads/writes to L2. (Current CA model does not implement L2 snoop of L1-D.)
+
+**TLOAD path through BCC LSU:**
+1. BISQ dispatches TLOAD at E2; E3 queries STQ and SCB for older store conflicts
+2. If no conflict: enters LDQ **and** simultaneously enters TMA's BPQ
+3. TMA processes the request (Tag Pipe → BDB lookup → data fetch)
+4. On resolve: LSU deques the TLOAD from LDQ (shorter post-resolve lifecycle than scalar loads)
+5. Nuke flush: if the TLOAD is flushed, TMA's BPQ entry is cleared synchronously
+
+**TSTORE path through BCC LSU:**
+1. BISQ dispatches TSTORE; E3 queries STQ, SCB, and LDQ for conflicts
+2. If no younger LDQ conflict: enters STQ and immediately sends resolve to BROB
+3. STQ oldest entry (non-speculative) → drain: 8-cy TRegFile read epoch → Ring transfer to TMA
+4. TMA processes the store (Exchange Network fractal→contiguous → BDB → SWCB → SoC memory)
+5. After TMA completes the store → address recorded in **TSRQ** for subsequent load conflict detection
+6. TSRQ entry held until the store is fully ordered in memory; only then dequeued, waking any loads that slept on this address
+
+**Why L1-D bypass:**
+- Tile operations transfer 512 B to 4 KB at a time — too large for L1-D's 64 B line granularity
+- TMA's BDB (128 KB) serves as a dedicated tile-data buffer, avoiding L1-D pollution from bulk transfers
+- The BDB capacity (128 KB, 128 B × 1024 entries) is sized for tile working sets, not scalar random access
+
+The TMA unit exploits the large TRegFile-4K as a **software-managed scratchpad**. Programmers (or compiler) schedule TLOAD instructions well ahead of CUBE.OPA to hide memory latency. The BPQ (32 entries) allows many tile loads to be in flight simultaneously, maximizing bandwidth utilization.
+
+**v2 增量:** `TSTORE` and `MSCATTER` traffic on this path is gated by the 8-entry STQ (§11.5) and tracked by TSRQ for ordering.
 
 ### 12.5.1 VTG Vector Load/Store (v2.2)
 
 > **(Change Point #2 -- hardware-revised)**
 
-VTG vector memory operations load or store 256 B or 512 B VTG payloads under predicate control. VTG memory ops share the LSU pipeline with MTE. VTG loads perform a full-tile RMW on writeback (16 cy minimum, same as ALU ops).
+VTG vector memory operations load or store 256 B or 512 B VTG payloads under predicate control. VTG memory ops share the LSU pipeline with TMA. VTG loads perform a full-tile RMW on writeback (16 cy minimum, same as ALU ops).
 
 **Vector Load:**
 
