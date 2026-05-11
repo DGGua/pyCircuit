@@ -992,6 +992,8 @@ mlir = circ.emit_mlir()
 
 ### 命令行使用
 
+> **仓库位置**：Davinci `outerCube` 设计树（含 `davinci_top`）维护在独立仓库 [DavinciOO](https://github.com/hengliao1972/DavinciOO) 的 `outerCube/`，不再随 pyCircuit 发布。下列命令沿用 `python3 -m designs.outerCube.davinci.davinci_top` 时，请在 pyCircuit 根目录的 `designs/` 下提供被 `.gitignore` 忽略的 **`outerCube`** 包路径（例如将 DavinciOO 的 `outerCube` **符号链接**为 `designs/outerCube`），并把 `compiler/frontend` 加入 `PYTHONPATH`；详见 DavinciOO 内 `outerCube/davinci/README.md`。
+
 ```bash
 python -m designs.outerCube.davinci.davinci_top --hierarchical
 ```
@@ -1228,7 +1230,7 @@ build/bin/pycc davinci_top.mlir \
 
 ### 完整构建示例（Davinci OoO Core）
 
-下面以 Davinci 乱序处理器核为例，展示层次化和扁平化两条完整构建流水线。
+下面以 Davinci 乱序处理器核为例（源码见 [DavinciOO / `outerCube/davinci`](https://github.com/hengliao1972/DavinciOO/tree/main/outerCube/davinci)；需按上文准备 `designs/outerCube` 本地工作拷贝），展示层次化和扁平化两条完整构建流水线。
 
 #### 流水线 A：层次化 Verilog
 
@@ -1555,7 +1557,7 @@ if __name__ == "__main__":
 
 ### 范例4：Davinci OoO 处理器核（完整层次化）
 
-Davinci 核（`designs/outerCube/davinci/davinci_top.py`）展示了所有模式的大规模应用——27 个模块、1.5M+ 字符 MLIR：
+Davinci 核（[`DavinciOO` / `outerCube/davinci/davinci_top.py`](https://github.com/hengliao1972/DavinciOO/blob/main/outerCube/davinci/davinci_top.py)）展示了所有模式的大规模应用——27 个模块、1.5M+ 字符 MLIR：
 
 ```python
 def davinci_top(m, domain, *, inputs=None, prefix="dv") -> dict:

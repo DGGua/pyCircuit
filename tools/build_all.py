@@ -268,16 +268,6 @@ def all_designs() -> list[dict]:
             "hierarchical": xs_hier,
         })
 
-    # ── Davinci (hierarchical) ──
-    designs.append({
-        "name": "davinci_top",
-        "module": "designs.outerCube.davinci.davinci_top",
-        "fn": "davinci_top",
-        "kwargs": {},
-        "out_dir": "designs/outerCube/davinci/build",
-        "hierarchical": True,
-    })
-
     return designs
 
 

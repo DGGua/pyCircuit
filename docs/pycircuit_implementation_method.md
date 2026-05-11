@@ -76,14 +76,14 @@ Illustrations of **grammar and structure** are under **`designs/`** and subfolde
 
 | Area | Examples (non-exhaustive) |
 |------|---------------------------|
-| **V5 hierarchical composition** (full-scale, 27 modules, `domain.call()` + `submodule_input()` + `wire_of()`) | **`designs/outerCube/davinci/`** — Davinci OoO processor: `davinci_top.py`, `frontend/fetch/fetch.py`, `backend/scalar_exu/alu.py`, etc. Unit tests in `tests/unit/`, integration tests in `tests/integration/`. |
+| **V5 hierarchical composition** (full-scale, 27 modules, `domain.call()` + `submodule_input()` + `wire_of()`) | **[DavinciOO / `outerCube/davinci/`](https://github.com/hengliao1972/DavinciOO/tree/main/outerCube/davinci)** — Davinci OoO processor (`davinci_top.py`, `frontend/fetch/fetch.py`, `backend/scalar_exu/alu.py`, etc.; tests under `davinci/tests/`). *Not shipped in this repo;* optional local symlink `designs/outerCube` → that tree is gitignored. |
 | **V5 / cycle-aware style** (single-module) | `designs/BypassUnit/`, `designs/RegisterFile/`, `designs/IssueQueue/`, many `designs/examples/*/` |
 | **`@module` + JIT** | `designs/examples/counter/`, `designs/examples/jit_control_flow/`, `designs/examples/hier_modules/` |
-| **V5 testbench** (`CycleAwareTb`) | `designs/outerCube/davinci/tests/unit/test_alu.py`, `designs/outerCube/davinci/tests/unit/test_free_list.py` |
+| **V5 testbench** (`CycleAwareTb`) | DavinciOO: `outerCube/davinci/tests/unit/test_alu.py`, `outerCube/davinci/tests/unit/test_free_list.py` (same optional `designs/outerCube` symlink for in-tree paths) |
 | **Testbench layout** (low-level `Tb`) | `designs/examples/*/tb_*.py`, `designs/BypassUnit/tb_bypass_unit.py`, `designs/RegisterFile/tb_regfile.py` |
 | **Structured IO** | Designs using `spec` / bundles per `docs/SPEC_STRUCTURES.md` |
 
-Mirror the **directory layout** (design file + `tb_*.py` + optional `README.md`) of the example closest to your block's complexity. For **hierarchical multi-module designs**, use the Davinci project (`designs/outerCube/davinci/`) as the canonical reference.
+Mirror the **directory layout** (design file + `tb_*.py` + optional `README.md`) of the example closest to your block's complexity. For **hierarchical multi-module designs**, use the Davinci project in **[DavinciOO](https://github.com/hengliao1972/DavinciOO)** (`outerCube/davinci/`) as the canonical reference.
 
 ---
 
@@ -101,7 +101,7 @@ Mirror the **directory layout** (design file + `tb_*.py` + optional `README.md`)
    - **Simulation**: `CycleAwareTb` for cycle-aware testbenches.
 3. Read **`docs/FRONTEND_API.md`** and **`docs/TESTBENCH.md`** for `@module`, `Circuit`, and simulation contracts.
 4. Open **2–3 concrete examples** under `designs/` that match your intended style:
-   - **V5 hierarchical**: `designs/outerCube/davinci/` (full-scale: `davinci_top.py` → `fetch.py` → `alu.py`, with unit/integration tests).
+   - **V5 hierarchical**: [DavinciOO `outerCube/davinci/`](https://github.com/hengliao1972/DavinciOO/tree/main/outerCube/davinci) (full-scale: `davinci_top.py` → `fetch.py` → `alu.py`, with unit/integration tests).
    - **V5 single-module**: `designs/BypassUnit/`, `designs/RegisterFile/`.
    - **`@module`**: `designs/examples/counter/`, `designs/examples/hier_modules/`.
 5. Note **non-negotiables** from `AGENTS.md`: gate-first IR changes; no backend-only semantic fixes.
@@ -364,7 +364,7 @@ For complex blocks, mirror this repository's **10-step** narrative in **block-lo
 
 - For any block, block-specific specs live under `designs/<Block>/docs/`. Start Step 2 there after Step 1, **after** any **DOCX/PDF/XLSX → Markdown** conversion for files you will analyze in depth.
 - Existing completed blocks under `designs/` can serve as worked examples of the **From converted Markdown to feature list, step docs, and test plan** pipeline (including **heading checklist**, **`workflow_substeps.md`**, **`cycle_budget.md`**, and **`run_<block>_verification.py`**).
-- The **Davinci project** (`designs/outerCube/davinci/`) is the canonical reference for the V5 hierarchical composition workflow, demonstrating all patterns from Steps 1–10 at scale (27 modules, 1.5M+ chars MLIR, unit + integration tests).
+- The **Davinci project** ([DavinciOO `outerCube/davinci/`](https://github.com/hengliao1972/DavinciOO/tree/main/outerCube/davinci)) is the canonical reference for the V5 hierarchical composition workflow, demonstrating all patterns from Steps 1–10 at scale (27 modules, 1.5M+ chars MLIR, unit + integration tests).
 - For new blocks, substitute the appropriate `designs/<Block>/docs/` (or project doc root) and reuse the same artifact names where practical.
 
 ## Relationship to repository policy

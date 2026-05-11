@@ -245,3 +245,6 @@ designs/XiangShan-pyc/build_out_small/
 # External XiangShan repos (not part of pyCircuit)
 designs/XiangShan/
 designs/XiangShan-doc/
+
+# Davinci outerCube (canonical tree): https://github.com/hengliao1972/DavinciOO
+designs/outerCube/
