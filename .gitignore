@@ -246,5 +246,7 @@ designs/XiangShan-pyc/build_out_small/
 designs/XiangShan/
 designs/XiangShan-doc/
 
-# Davinci outerCube (canonical tree): https://github.com/hengliao1972/DavinciOO
+# DavinciOO canonical tree (https://github.com/hengliao1972/DavinciOO); optional local checkout
+designs/DavinciOO/
+# pyCircuit imports use package name outerCube — symlink only, never commit
 designs/outerCube/
