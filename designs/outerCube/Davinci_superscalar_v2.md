@@ -15,6 +15,13 @@ The Davinci-v2 core is a **single-threaded, 4-wide, out-of-order, speculatively-
    - **SRAM-based staging registers** (`SA`, `SB`, `SC`) decouple TRegFile fetch cadence from compute pipeline; per-beat microcode dispatches `{src, strip, tilelet_xpose}` per ALU operand.
    - **Restored narrow formats**: FP8 (E4M3/E5M2), FP4 (MXFP4/HiFP4) joining FP32, FP16, BF16.
    - **Three new PTO instructions** natively enabled by the v2 datapath: `TINV` (matrix inverse up to 128×128 FP32 / 16-tile range), `TROWRANGE_MUL` (column-wise product over a dynamic row sub-range), `TMRGSORT` (full-tile mergesort over any `N = 2^p` up to 8192 via a reconfigurable 256-lane shuffle + compare-swap primitive).
+
+k > t 
+k < t
+
+
+
+
 3. **Speculative out-of-order execution** with a **ROB-less recovery scheme** that nonetheless guarantees architectural state is never corrupted by a misspeculated path (§11). The mechanism extends the v1 RAT-checkpoint + reference-counting infrastructure with a **branch-tagged speculative store buffer** for scalar memory and a **speculative tile-store queue** for MTE memory writes — both of which gate visible side effects until the producing branch tag becomes non-speculative. Section 11 walks through why this is sufficient without a Reorder Buffer, what it costs in area / latency, and which workloads it can and cannot serve correctly.
 
 > **Design discipline:** The v2 core assumes **run-to-completion kernel execution** with **no OS-level interrupts** — the same envelope as v1. The new v2.3 **Block-ROB (BROB)** adds **block-granularity precise exception support**, enabling the core to identify the faulting instruction block and recover precisely when an exception (trap, page fault, illegal instruction) does occur. The new speculation-recovery mechanism handles **branch mispredictions** and **variable-latency tile ops**; Section 11.7 enumerates the remaining "non-recoverable" classes (asynchronous page faults, signaling NaNs, ECC errors observed mid-kernel) and the kernel-level conventions that bound them.

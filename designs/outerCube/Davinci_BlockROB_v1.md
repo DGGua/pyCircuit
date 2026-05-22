@@ -757,7 +757,7 @@ Block-ROB achieves ~75% of the precision of a flat ROB at ~75% of the gate cost.
 |-------------|---------|
 | §11.X BROB — Block Reorder Buffer | Full BROB specification |
 | §11.X Block SSB — In-Block Store Commit | Block SSB allocation, commit protocol |
-| §11.X Precise Exception Delivery | Exception flow, MapQ replay, OS entry |
+| §11.X Precise Exception Delivery | Exception flow, MapQ replay, OS entry |****
 
 ---
 

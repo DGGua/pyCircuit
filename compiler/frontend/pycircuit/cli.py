@@ -102,6 +102,32 @@ def _project_root(entry: Path, *, project_root_override: str | None = None) -> P
     return nearest_project_root(entry)
 
 
+def _is_cycle_aware_build(build: Any) -> bool:
+    """Detect a cycle-aware build entrypoint: ``def build(m, domain, ...)``.
+
+    These functions are intended for ``compile_cycle_aware``, which injects
+    ``domain = m.create_domain(...)`` and strips the ``domain`` parameter
+    before JIT compilation. The CLI must NOT require ``domain`` to have a
+    default and must route to ``compile_cycle_aware`` instead of ``compile``.
+    """
+    try:
+        sig = inspect.signature(build)
+    except (TypeError, ValueError):
+        return False
+    params = list(sig.parameters.values())
+    if len(params) < 2:
+        return False
+    second = params[1]
+    if second.name == "domain":
+        return True
+    ann = second.annotation
+    if isinstance(ann, str) and ann.endswith("CycleAwareDomain"):
+        return True
+    if getattr(ann, "__name__", "") == "CycleAwareDomain":
+        return True
+    return False
+
+
 def _collect_jit_params(build: Any, *, overrides: list[str]) -> dict[str, object]:
     if not callable(build):
         raise SystemExit("build must be a callable @module entrypoint: `def build(m: Circuit, ...)`")
@@ -112,10 +138,15 @@ def _collect_jit_params(build: Any, *, overrides: list[str]) -> dict[str, object
         raise SystemExit("build must use JIT entry semantics: `@module def build(m: Circuit, ...)`")
     value_param_names = set(value_params_of(build).keys())
 
-    # Collect JIT-time parameters from defaults.
+    # Skip the canonical first positional ``m`` (Circuit). For cycle-aware
+    # builds also skip ``domain`` (the second positional) since
+    # ``compile_cycle_aware`` materializes it from the circuit and removes it
+    # from the JIT signature; the CLI must not require it to have a default.
+    skip_count = 2 if _is_cycle_aware_build(build) else 1
+
     jit_params: dict[str, object] = {}
     missing: list[str] = []
-    for p in params[1:]:
+    for p in params[skip_count:]:
         if p.name in value_param_names:
             continue
         if p.default is inspect._empty:
@@ -1525,7 +1556,11 @@ def _cmd_build(args: argparse.Namespace) -> int:
 
     if not cache_hit:
         try:
-            design_obj = compile(build, name=top_name, **jit_params)
+            if _is_cycle_aware_build(build):
+                from .v5 import compile_cycle_aware
+                design_obj = compile_cycle_aware(build, name=top_name, **jit_params)
+            else:
+                design_obj = compile(build, name=top_name, **jit_params)
         except (DesignError, JitError) as e:
             raise SystemExit(f"design compile failed: {e}") from e
         if not isinstance(design_obj, Design):
@@ -1848,7 +1883,24 @@ def _cmd_build(args: argparse.Namespace) -> int:
                 "-Wno-DECLFILENAME",
                 "-Wno-UNUSEDSIGNAL",
                 "-Wno-WIDTHEXPAND",
-                "--quiet",
+                "-Wno-BLKLOOPINIT",
+                # CRITICAL: pyc_sync_mem.v has a per-byte write loop:
+                #     for (i = 0; i < STRB_WIDTH - 1; i = i + 1)
+                #         mem[wa][8*i +: 8] <= wdata[8*i +: 8];
+                # When STRB_WIDTH exceeds Verilator's default --unroll-count
+                # (64), the loop is NOT unrolled and the NBA-in-loop is
+                # silently dropped (only the last lane outside the loop
+                # gets written). This produces silent data corruption: the
+                # smoke testbench (P=4 → STRB_WIDTH=18) works fine; large
+                # builds (P=32, K_MAX=128 → STRB_WIDTH=176) lose all but
+                # the topmost byte of every SRAM word. Bump generously so
+                # production-size SRAM rows (up to ~4096 bits = 512 bytes)
+                # always get fully unrolled.
+                "--unroll-count",
+                "1024",
+                # NOTE: --quiet was added in Verilator 5.022; older Debian
+                # packages (e.g. 5.020 Debian) reject it. We omit it for
+                # compatibility — verbose output during build is fine.
                 # MSYS2/Windows Verilator wrapper does not support --quiet-build.
                 "--timing",
                 "--trace",

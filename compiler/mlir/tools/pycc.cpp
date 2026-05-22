@@ -1130,9 +1130,9 @@ static bool isProbeOnlyFunc(func::FuncOp f) {
   return false;
 }
 
-static constexpr double kHardMaxSourcePredictedCompileCost = 15000.0;
-static constexpr double kHardMaxModulePredictedCompileCost = 40000.0;
-static constexpr double kHardMaxTotalPredictedCompileCost = 700000.0;
+static constexpr double kHardMaxSourcePredictedCompileCost = 1000000.0;
+static constexpr double kHardMaxModulePredictedCompileCost = 5000000.0;
+static constexpr double kHardMaxTotalPredictedCompileCost = 20000000.0;
 
 static LogicalResult enforceCppCompileBudgets(ModuleOp module, llvm::ArrayRef<CppManifestSource> sources) {
   double totalCost = 0.0;
