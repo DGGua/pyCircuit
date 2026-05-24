@@ -9,22 +9,23 @@ Cycle plan (independent of input data, computed from the FSM in
     cycle 0           : drive in_req=1, cfg_topk
     cycle 1..8        : drive in_data beat 0..7 (in_req=0)
     cycle 9..16       : HIST round 0
-    cycle 17          : CUMSUM round 0
-    cycle 18..25      : MASK round 0
-    cycle 26..33      : HIST round 1
-    cycle 34          : CUMSUM round 1
-    cycle 35..42      : MASK round 1
-    cycle 43..50      : HIST round 2
-    cycle 51          : CUMSUM round 2
-    cycle 52..59      : MASK round 2
-    cycle 60..67      : HIST round 3
-    cycle 68          : CUMSUM round 3   (eq_keep latched into eq_remain)
-    cycle 69..(...)   : FILTER  (single pass, 1..8 cy, exits when wptr==K)
+    cycle 17..32      : CUMSUM round 0  (NUM_BINS / CUMSUM_BINS_PER_CY cycles)
+    cycle 33..40      : MASK round 0
+    cycle 41..48      : HIST round 1
+    cycle 49..64      : CUMSUM round 1
+    cycle 65..72      : MASK round 1
+    cycle 73..80      : HIST round 2
+    cycle 81..96      : CUMSUM round 2
+    cycle 97..104     : MASK round 2
+    cycle 105..112    : HIST round 3
+    cycle 113..128    : CUMSUM round 3   (eq_keep latched on last chunk)
+    cycle 129..(...)  : FILTER  (1..8 beats × FILTER_LANES chunks, exits when wptr==K)
     cycle X           : WAIT_OUT, out_req=1
     cycle X+1..X+8    : DRAIN (out_value, out_index_data per beat)
 
 For deterministic timing we use all-equal stimuli where gt_count=0, so
-FILTER takes exactly ceil(K / LANE_NUM) cycles (capped at BURST_LEN).
+FILTER takes exactly min(ceil(K / LANE_NUM), BURST_LEN) beats ×
+filter_lanes_per_beat() cycles per beat (default 8 chunks × 16 lanes).
 """
 from __future__ import annotations
 
@@ -42,15 +43,17 @@ from dataclasses import dataclass  # noqa: E402
 from typing import List  # noqa: E402
 
 from tool import float_to_fp32_bits, pack_lanes, split_into_beats  # noqa: E402
+from topk_histogram_config import cumsum_cycles, filter_lanes_per_beat  # noqa: E402
 from topk_histogram_model import SimResult, simulate_histogram_python  # noqa: E402
 
 
 # Cycle layout constants (must match topk_histogram.py FSM)
 LOAD_START_CY = 1                 # first LOAD cycle (in_req at cycle 0)
 LOAD_END_CY = LOAD_START_CY + 8 - 1   # 8 cycles → cycles 1..8
-RADIX_CY_PER_NONLAST_ROUND = 8 + 1 + 8    # HIST + CUMSUM + MASK
-RADIX_CY_LAST_ROUND = 8 + 1                # HIST + CUMSUM (no MASK)
-RADIX_TOTAL_CY = 3 * RADIX_CY_PER_NONLAST_ROUND + RADIX_CY_LAST_ROUND  # 60
+CUMSUM_CY = cumsum_cycles()
+RADIX_CY_PER_NONLAST_ROUND = 8 + CUMSUM_CY + 8    # HIST + CUMSUM + MASK
+RADIX_CY_LAST_ROUND = 8 + CUMSUM_CY                # HIST + CUMSUM (no MASK)
+RADIX_TOTAL_CY = 3 * RADIX_CY_PER_NONLAST_ROUND + RADIX_CY_LAST_ROUND
 LANE_NUM = 128
 BURST_LEN = 8
 
@@ -74,8 +77,8 @@ def gen_alleq_stimulus(*, K: int, value: float = 3.5) -> SmokeStimulus:
 
     With all-same input the FSM behaviour is fully predictable: gt_count = 0
     (no element is strictly greater than kth_key), so eq_keep = K and the
-    single-pass FILTER writes 128 elements per cycle until wptr reaches K.
-    Total FILTER cycles = min(ceil(K / LANE_NUM), BURST_LEN).
+    single-pass FILTER writes 128 elements per beat until wptr reaches K.
+    Total FILTER cycles = min(ceil(K / LANE_NUM), BURST_LEN) * filter_lanes_per_beat().
     """
     if K < 1 or K > 1024:
         raise ValueError(f"gen_alleq_stimulus requires 1 <= K <= 1024 (got {K})")
@@ -87,7 +90,8 @@ def gen_alleq_stimulus(*, K: int, value: float = 3.5) -> SmokeStimulus:
 
     # Single-pass FILTER: each cycle writes min(LANE_NUM, eq_remain) elements
     # until wptr_next reaches K (exits same cycle, no extra eq_done check).
-    filter_cy = min((K + LANE_NUM - 1) // LANE_NUM, BURST_LEN)
+    filter_beats = min((K + LANE_NUM - 1) // LANE_NUM, BURST_LEN)
+    filter_cy = filter_beats * filter_lanes_per_beat()
     return _assemble_stim(K=K, beats=beats, beat_buses=beat_buses,
                            golden=golden, filter_cy=filter_cy)
 

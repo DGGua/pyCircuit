@@ -17,9 +17,12 @@ DEFAULT_PARAMS: Dict[str, int] = {
     "K_MAX":         1024,    # maximum supported K
     "K_MAX_BITS":    11,      # ceil(log2(K_MAX + 1))
     "RADIX_BITS":    8,       # one byte per radix round → 4 rounds
+    "NUM_BINS":      256,     # 2 ** RADIX_BITS histogram bins per round
     "HIST_W":        11,      # ceil(log2(N + 1))
     "VAL_W":         32,      # fp32
     "ELEM_IDX_W":    10,      # ceil(log2(N))
+    "CUMSUM_BINS_PER_CY": 16,  # inclusive-prefix bins accumulated per PH_CUMSUM cycle
+    "FILTER_LANES_PER_CY": 16,  # GT/EQ + cap-prefix lanes evaluated per PH_FILTER cycle
 }
 
 
@@ -44,9 +47,12 @@ def validate_params(params: Dict[str, Any] | None = None) -> None:
     K_MAX = p["K_MAX"]
     K_MAX_BITS = p["K_MAX_BITS"]
     RADIX_BITS = p["RADIX_BITS"]
+    NUM_BINS = p["NUM_BINS"]
     HIST_W = p["HIST_W"]
     VAL_W = p["VAL_W"]
     ELEM_IDX_W = p["ELEM_IDX_W"]
+    CUMSUM_BINS_PER_CY = p["CUMSUM_BINS_PER_CY"]
+    FILTER_LANES_PER_CY = p["FILTER_LANES_PER_CY"]
 
     if N <= 0 or (N & (N - 1)) != 0:
         raise ValueError(f"N must be a positive power of 2 (got {N})")
@@ -68,6 +74,21 @@ def validate_params(params: Dict[str, Any] | None = None) -> None:
             )
     if RADIX_BITS != 8:
         raise ValueError(f"v1 only supports RADIX_BITS=8 (got {RADIX_BITS})")
+    if NUM_BINS != (1 << RADIX_BITS):
+        raise ValueError(
+            f"NUM_BINS must equal 2**RADIX_BITS "
+            f"(got NUM_BINS={NUM_BINS}, RADIX_BITS={RADIX_BITS})"
+        )
+    if CUMSUM_BINS_PER_CY <= 0 or NUM_BINS % CUMSUM_BINS_PER_CY != 0:
+        raise ValueError(
+            f"CUMSUM_BINS_PER_CY must divide NUM_BINS evenly "
+            f"(got CUMSUM_BINS_PER_CY={CUMSUM_BINS_PER_CY}, NUM_BINS={NUM_BINS})"
+        )
+    if FILTER_LANES_PER_CY <= 0 or LANE % FILTER_LANES_PER_CY != 0:
+        raise ValueError(
+            f"FILTER_LANES_PER_CY must divide LANE_NUM evenly "
+            f"(got FILTER_LANES_PER_CY={FILTER_LANES_PER_CY}, LANE_NUM={LANE})"
+        )
     if VAL_W != 32:
         raise ValueError(f"v1 only supports VAL_W=32 / fp32 (got {VAL_W})")
     if 32 % RADIX_BITS != 0:
@@ -83,6 +104,18 @@ def validate_params(params: Dict[str, Any] | None = None) -> None:
             f"ELEM_IDX_W={ELEM_IDX_W} too small for N={N} "
             f"(need {(N - 1).bit_length()})"
         )
+
+
+def cumsum_cycles(params: Dict[str, Any] | None = None) -> int:
+    """Number of PH_CUMSUM cycles per radix round (= NUM_BINS / CUMSUM_BINS_PER_CY)."""
+    p = dict(DEFAULT_PARAMS) if params is None else dict(params)
+    return p["NUM_BINS"] // p["CUMSUM_BINS_PER_CY"]
+
+
+def filter_lanes_per_beat(params: Dict[str, Any] | None = None) -> int:
+    """PH_FILTER cycles consumed per SRAM beat (= LANE_NUM / FILTER_LANES_PER_CY)."""
+    p = dict(DEFAULT_PARAMS) if params is None else dict(params)
+    return p["LANE_NUM"] // p["FILTER_LANES_PER_CY"]
 
 
 # Run validation on import so misconfiguration is caught early.

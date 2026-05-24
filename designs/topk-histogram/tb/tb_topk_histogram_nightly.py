@@ -6,8 +6,8 @@ Nightly preset (from topk_histogram_config.TB_PRESETS["nightly"]):
 For deterministic timing under the v1 pyCircuit JIT we use an all-same
 stimulus (value=3.5). With all-same input and K=900:
   - gt_count = 0 (no element is strictly greater than the only value)
-  - FILTER: 8 full cycles single pass (cy 7 writes the last 4 of 900),
-    exits on wptr_next == K AND at_beat_last simultaneously
+  - FILTER: 8 beats × 8 chunks (64 cy); beat 7 writes the last 4 of 900,
+    exits on wptr_next == K at the last chunk of the last beat
   - last beat's out_valid_mask = low 4 bits → exercises the partial-mask path
 
 Random-seed coverage stays in Layer A's `_selftest` (which uses seed=42

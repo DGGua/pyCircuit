@@ -257,9 +257,13 @@ def _argpartition_topk(bits: Sequence[int], K: int) -> set[int]:
     return set(sorted_indices[:K])
 
 
+def _beats_from_flat(bits: Sequence[int], *, N: int = 1024, LANE_NUM: int = 128) -> List[List[int]]:
+    return [list(bits[b * LANE_NUM : (b + 1) * LANE_NUM]) for b in range(N // LANE_NUM)]
+
+
 def _check_topk_set(bits: Sequence[int], K: int, *, N: int = 1024, LANE_NUM: int = 128) -> None:
     """Run the model on ``bits`` and assert its picked indices match argpartition."""
-    beats = [list(bits[b * LANE_NUM : (b + 1) * LANE_NUM]) for b in range(N // LANE_NUM)]
+    beats = _beats_from_flat(bits, N=N, LANE_NUM=LANE_NUM)
     res = simulate_histogram_python(beats, K=K, N=N, LANE_NUM=LANE_NUM)
     got = {idx for _, idx in res.output_pairs}
     K_eff = K if K > 0 else 1
@@ -281,6 +285,95 @@ def _check_topk_set(bits: Sequence[int], K: int, *, N: int = 1024, LANE_NUM: int
     assert ranks[K_eff - 1] == kth, (
         f"kth_key=0x{kth:08x} != true K-th largest key=0x{ranks[K_eff - 1]:08x}"
     )
+
+
+def _test_special_fp32_values() -> None:
+    """NaN / ±Inf / ±0 / subnormal coverage beyond random smoke.
+
+    RTL testbenches (smoke/nightly) still use all-same 3.5; these checks
+    exercise Layer A against the sortable-key ordering contract in arch.md.
+    """
+    from tool import (
+        FP32_NEG_INF,
+        FP32_POS_INF,
+        FP32_POS_ZERO,
+        FP32_NEG_ZERO,
+        FP32_QNAN_CANONICAL,
+        fp32_special_values,
+    )
+
+    one = _fp32_bits_of(1.0)
+
+    # --- NaN: must win top-K over +Inf and finite; outputs stay NaN ---
+    nan_variants = [
+        FP32_QNAN_CANONICAL,
+        0x7FC00001,
+        0xFFC00001,
+        0x7F800001,
+        0xFF800001,
+    ]
+    for nan_bits in nan_variants:
+        stream = [nan_bits] * 1024
+        res = simulate_histogram_python(_beats_from_flat(stream), K=16)
+        assert res.total_count == 16
+        for v, _ in res.output_pairs:
+            assert is_fp32_nan_bits(v), f"expected NaN out, got 0x{v:08x}"
+
+    # First 32 lanes NaN, remainder +Inf → scan-order top 32 are NaN
+    stream = [FP32_QNAN_CANONICAL] * 32 + [FP32_POS_INF] * (1024 - 32)
+    res = simulate_histogram_python(_beats_from_flat(stream), K=32)
+    assert all(is_fp32_nan_bits(v) for v, _ in res.output_pairs)
+
+    # --- +Inf: bit-exact on output when entire stream is +Inf ---
+    inf_stream = [FP32_POS_INF] * 1024
+    res = simulate_histogram_python(_beats_from_flat(inf_stream), K=64)
+    assert res.total_count == 64
+    for v, _ in res.output_pairs:
+        assert v == FP32_POS_INF, f"expected +Inf, got 0x{v:08x}"
+
+    # Last beat (+Inf) beats 1.0 elsewhere in key space
+    stream = [one] * (1024 - 128) + [FP32_POS_INF] * 128
+    _check_topk_set(stream, K=64)
+    res = simulate_histogram_python(_beats_from_flat(stream), K=64)
+    k_inf = fp_to_key_py(FP32_POS_INF)
+    for v, _ in res.output_pairs:
+        assert fp_to_key_py(v) >= k_inf, f"picked 0x{v:08x} below +Inf key"
+
+    # --- -Inf: all -Inf stream is self-consistent ---
+    neg_inf_stream = [FP32_NEG_INF] * 1024
+    _check_topk_set(neg_inf_stream, K=8)
+    res = simulate_histogram_python(_beats_from_flat(neg_inf_stream), K=8)
+    for v, _ in res.output_pairs:
+        assert v == FP32_NEG_INF
+
+    # Mostly finite positives; a few -Inf should not displace top-K of +1.0
+    stream = [one] * 1000 + [FP32_NEG_INF] * 24
+    _check_topk_set(stream, K=128)
+
+    # --- ±0: distinct keys; tie-breaking by scan order when all ±0 ---
+    stream = [FP32_POS_ZERO, FP32_NEG_ZERO] * 512
+    _check_topk_set(stream, K=16)
+    res = simulate_histogram_python(_beats_from_flat(stream), K=4)
+    # +0 key > -0 key in sortable space; top 4 in scan order are +0,+0,+0,+0
+    for v, _ in res.output_pairs:
+        assert v in (FP32_POS_ZERO, FP32_NEG_ZERO)
+
+    # --- Each tool.py special at index 0 must be pickable as K=1 top ---
+    for sp in fp32_special_values():
+        stream = [sp] + [one] * 1023
+        _check_topk_set(stream, K=1)
+
+    # --- NaN-heavy random (gen_random_fp32 front-loads specials) ---
+    from tool import gen_random_fp32
+    for seed in (0, 99, 12345):
+        bits = gen_random_fp32(1024, seed=seed, include_specials=True)
+        _check_topk_set(bits, K=128)
+        res = simulate_histogram_python(_beats_from_flat(bits), K=32)
+        for v, _ in res.output_pairs:
+            if is_fp32_nan_bits(v):
+                continue
+            # finite outputs must round-trip consistently
+            assert fp_to_key_py(key_to_fp_py(fp_to_key_py(v))) == fp_to_key_py(v)
 
 
 def _selftest() -> None:
@@ -418,6 +511,8 @@ def _selftest() -> None:
     _check_eq_keep_formula([_fp32_bits_of(3.5)] * 1024, K=4)
     _check_eq_keep_formula([_fp32_bits_of(3.5)] * 1024, K=900)
     _check_eq_keep_formula([_fp32_bits_of(3.5)] * 1024, K=1024)
+
+    _test_special_fp32_values()
 
     print("topk_histogram_model.py: selftest OK")
 

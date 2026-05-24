@@ -14,8 +14,8 @@ Layer C (Python replay against the software model):
 Smoke preset (from topk_histogram_config.TB_PRESETS["smoke"]):
     K=4, seed=0, deterministic all-same stimulus (value=3.5)
 
-With all-same input, the single-pass FILTER takes ceil(K/128) cycles:
-    K=4 → FILTER = 1 cy, out_req at cy 70.
+With all-same input, the single-pass FILTER takes ceil(K/128) beats × 8 chunks:
+    K=4 → FILTER = 8 cy, out_req at cy 137 (default CUMSUM/FILTER chunk = 16).
 """
 from __future__ import annotations
 
