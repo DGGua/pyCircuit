@@ -1555,6 +1555,8 @@ def _cmd_build(args: argparse.Namespace) -> int:
         "--inline-policy=off",
         "--hierarchy-policy=strict",
     ]
+    if args.cpp_localize_members:
+        pycc_hard_hierarchy_flags.append("--cpp-localize-members")
 
     build_flags = {
         "pycc": str(pycc.resolve()),
@@ -1563,6 +1565,7 @@ def _cmd_build(args: argparse.Namespace) -> int:
         "pycc_build_profile": pycc_build_profile,
         "inline_policy": "off",
         "hierarchy_policy": "strict",
+        "cpp_localize_members": bool(args.cpp_localize_members),
         "target": target,
         "frontend_contract": FRONTEND_CONTRACT,
     }
@@ -1978,6 +1981,11 @@ def main(argv: list[str] | None = None) -> int:
         help="Backend targets to generate/build",
     )
     build.add_argument("--logic-depth", type=int, default=32, help="Max combinational logic depth for pycc")
+    build.add_argument(
+        "--cpp-localize-members",
+        action="store_true",
+        help="Enable emitter-native comb wire localization (requires split C++ emit)",
+    )
     build.add_argument(
         "--trace-config",
         default=None,

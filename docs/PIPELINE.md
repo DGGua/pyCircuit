@@ -35,6 +35,15 @@ Default backend hierarchy policy:
 - `--inline-policy=off` for hierarchy-preserving module builds
 - strict mode fails compilation if frontend module symbol set changes after lowering passes
 
+### Optional C++ member placement
+
+For large split C++ builds, enable comb wire localization so single-method comb
+temporaries become function-local `Wire<>` instead of struct members:
+
+- MLIR: `pyc-cpp-placement` on every C++ emit (`--cpp-localize-members` enables member localization)
+- Requires `--cpp-split=module`
+- See [cpp_member_placement.md](cpp_member_placement.md)
+
 ## CLI entrypoints
 
 Emit a single `.pyc`:

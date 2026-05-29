@@ -1,4 +1,5 @@
 #include "pyc/Dialect/PYC/PYCDialect.h"
+#include "pyc/Emit/CppEmitter.h"
 #include "pyc/Transforms/Passes.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -23,6 +24,7 @@ static void forceLinkPycPasses() {
   (void)pyc::createLowerSCFToPYCStaticPass();
   (void)pyc::createCheckFlatTypesPass();
   (void)pyc::createPrunePortsPass();
+  (void)pyc::createCppPlacementPass(pyc::CppEmitterOptions::kDefaultCombChunkNodes, true);
 }
 
 int main(int argc, char **argv) {

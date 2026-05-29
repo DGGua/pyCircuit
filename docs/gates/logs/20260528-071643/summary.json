@@ -1,0 +1,16 @@
+{
+  "run_id": "20260528-071643",
+  "gates": {
+    "pyc_build": {
+      "status": "pass"
+    },
+    "cpp_member_placement_smoke": {
+      "status": "pass"
+    }
+  },
+  "decisions": [
+    "0141",
+    "0147"
+  ],
+  "feature": "cpp-localize-members"
+}

@@ -1,0 +1,118 @@
+[pyc] inferring LLVM_DIR/MLIR_DIR via /usr/bin/llvm-config-19
+[pyc] configure (/home/lidongzhe/pyCircuit/.pycircuit_out/toolchain/build)
+-- Could NOT find LibEdit (missing: LibEdit_INCLUDE_DIRS LibEdit_LIBRARIES) 
+-- Could NOT find LibEdit (missing: LibEdit_INCLUDE_DIRS LibEdit_LIBRARIES) 
+-- Using LLVMConfig.cmake in: /usr/lib/llvm-19/lib/cmake/llvm
+-- Using MLIRConfig.cmake in: /usr/lib/llvm-19/lib/cmake/mlir
+-- Building with -fPIC
+-- MLIRRegisterAllPasses not found; skipping pyc-opt (pycc only)
+-- Configuring done
+-- Generating done
+-- Build files have been written to: /home/lidongzhe/pyCircuit/.pycircuit_out/toolchain/build
+[pyc] build pycc + runtime (/home/lidongzhe/pyCircuit/.pycircuit_out/toolchain/build)
+ninja: Entering directory `/home/lidongzhe/pyCircuit/.pycircuit_out/toolchain/build'
+[1/31] Building include/pyc/Dialect/PYC/PYCTypes.cpp.inc...
+[2/31] Building include/pyc/Dialect/PYC/PYCTypes.h.inc...
+[3/29] Building include/pyc/Dialect/PYC/PYCOps.cpp.inc...
+[4/29] Building include/pyc/Dialect/PYC/PYCOps.h.inc...
+ninja: Entering directory `/home/lidongzhe/pyCircuit/.pycircuit_out/toolchain/build'
+-- Install configuration: "Release"
+-- Up-to-date: /home/lidongzhe/pyCircuit/.pycircuit_out/toolchain/install/bin/pycc
+-- Up-to-date: /home/lidongzhe/pyCircuit/.pycircuit_out/toolchain/install/include/cpp
+-- Up-to-date: /home/lidongzhe/pyCircuit/.pycircuit_out/toolchain/install/include/cpp/pyc_async_fifo.hpp
+-- Up-to-date: /home/lidongzhe/pyCircuit/.pycircuit_out/toolchain/install/include/cpp/pyc_bits.hpp
+-- Up-to-date: /home/lidongzhe/pyCircuit/.pycircuit_out/toolchain/install/include/cpp/pyc_byte_mem.hpp
+-- Up-to-date: /home/lidongzhe/pyCircuit/.pycircuit_out/toolchain/install/include/cpp/pyc_cdc_sync.hpp
+-- Up-to-date: /home/lidongzhe/pyCircuit/.pycircuit_out/toolchain/install/include/cpp/pyc_change_detect.hpp
+-- Up-to-date: /home/lidongzhe/pyCircuit/.pycircuit_out/toolchain/install/include/cpp/pyc_clock.hpp
+-- Up-to-date: /home/lidongzhe/pyCircuit/.pycircuit_out/toolchain/install/include/cpp/pyc_connector.hpp
+-- Up-to-date: /home/lidongzhe/pyCircuit/.pycircuit_out/toolchain/install/include/cpp/pyc_debug.hpp
+-- Up-to-date: /home/lidongzhe/pyCircuit/.pycircuit_out/toolchain/install/include/cpp/pyc_konata.hpp
+-- Up-to-date: /home/lidongzhe/pyCircuit/.pycircuit_out/toolchain/install/include/cpp/pyc_linxtrace.hpp
+-- Up-to-date: /home/lidongzhe/pyCircuit/.pycircuit_out/toolchain/install/include/cpp/pyc_ops.hpp
+-- Up-to-date: /home/lidongzhe/pyCircuit/.pycircuit_out/toolchain/install/include/cpp/pyc_primitives.hpp
+-- Up-to-date: /home/lidongzhe/pyCircuit/.pycircuit_out/toolchain/install/include/cpp/pyc_print.hpp
+-- Up-to-date: /home/lidongzhe/pyCircuit/.pycircuit_out/toolchain/install/include/cpp/pyc_probe_registry.hpp
+-- Up-to-date: /home/lidongzhe/pyCircuit/.pycircuit_out/toolchain/install/include/cpp/pyc_runtime.hpp
+-- Up-to-date: /home/lidongzhe/pyCircuit/.pycircuit_out/toolchain/install/include/cpp/pyc_sim.hpp
+-- Up-to-date: /home/lidongzhe/pyCircuit/.pycircuit_out/toolchain/install/include/cpp/pyc_sync_mem.hpp
+-- Up-to-date: /home/lidongzhe/pyCircuit/.pycircuit_out/toolchain/install/include/cpp/pyc_tb.hpp
+-- Up-to-date: /home/lidongzhe/pyCircuit/.pycircuit_out/toolchain/install/include/cpp/pyc_trace_bin.hpp
+-- Up-to-date: /home/lidongzhe/pyCircuit/.pycircuit_out/toolchain/install/include/cpp/pyc_vcd.hpp
+-- Up-to-date: /home/lidongzhe/pyCircuit/.pycircuit_out/toolchain/install/include/cpp/pyc_vec.hpp
+-- Up-to-date: /home/lidongzhe/pyCircuit/.pycircuit_out/toolchain/install/include/verilog
+-- Up-to-date: /home/lidongzhe/pyCircuit/.pycircuit_out/toolchain/install/include/verilog/pyc_add.v
+-- Up-to-date: /home/lidongzhe/pyCircuit/.pycircuit_out/toolchain/install/include/verilog/pyc_and.v
+-- Up-to-date: /home/lidongzhe/pyCircuit/.pycircuit_out/toolchain/install/include/verilog/pyc_async_fifo.v
+-- Up-to-date: /home/lidongzhe/pyCircuit/.pycircuit_out/toolchain/install/include/verilog/pyc_byte_mem.v
+-- Up-to-date: /home/lidongzhe/pyCircuit/.pycircuit_out/toolchain/install/include/verilog/pyc_cdc_sync.v
+-- Up-to-date: /home/lidongzhe/pyCircuit/.pycircuit_out/toolchain/install/include/verilog/pyc_fifo.v
+-- Up-to-date: /home/lidongzhe/pyCircuit/.pycircuit_out/toolchain/install/include/verilog/pyc_mux.v
+-- Up-to-date: /home/lidongzhe/pyCircuit/.pycircuit_out/toolchain/install/include/verilog/pyc_not.v
+-- Up-to-date: /home/lidongzhe/pyCircuit/.pycircuit_out/toolchain/install/include/verilog/pyc_or.v
+-- Up-to-date: /home/lidongzhe/pyCircuit/.pycircuit_out/toolchain/install/include/verilog/pyc_reg.v
+-- Up-to-date: /home/lidongzhe/pyCircuit/.pycircuit_out/toolchain/install/include/verilog/pyc_sync_mem.v
+-- Up-to-date: /home/lidongzhe/pyCircuit/.pycircuit_out/toolchain/install/include/verilog/pyc_sync_mem_dp.v
+-- Up-to-date: /home/lidongzhe/pyCircuit/.pycircuit_out/toolchain/install/include/verilog/pyc_xor.v
+-- Up-to-date: /home/lidongzhe/pyCircuit/.pycircuit_out/toolchain/install/lib/libpyc4_runtime.a
+-- Up-to-date: /home/lidongzhe/pyCircuit/.pycircuit_out/toolchain/install/share/pycircuit/python/pycircuit
+-- Up-to-date: /home/lidongzhe/pyCircuit/.pycircuit_out/toolchain/install/share/pycircuit/python/pycircuit/lib
+-- Up-to-date: /home/lidongzhe/pyCircuit/.pycircuit_out/toolchain/install/share/pycircuit/python/pycircuit/lib/__init__.py
+-- Up-to-date: /home/lidongzhe/pyCircuit/.pycircuit_out/toolchain/install/share/pycircuit/python/pycircuit/lib/cache.py
+-- Up-to-date: /home/lidongzhe/pyCircuit/.pycircuit_out/toolchain/install/share/pycircuit/python/pycircuit/lib/mem2port.py
+-- Up-to-date: /home/lidongzhe/pyCircuit/.pycircuit_out/toolchain/install/share/pycircuit/python/pycircuit/lib/picker.py
+-- Up-to-date: /home/lidongzhe/pyCircuit/.pycircuit_out/toolchain/install/share/pycircuit/python/pycircuit/lib/queue.py
+-- Up-to-date: /home/lidongzhe/pyCircuit/.pycircuit_out/toolchain/install/share/pycircuit/python/pycircuit/lib/regfile.py
+-- Up-to-date: /home/lidongzhe/pyCircuit/.pycircuit_out/toolchain/install/share/pycircuit/python/pycircuit/lib/sram.py
+-- Up-to-date: /home/lidongzhe/pyCircuit/.pycircuit_out/toolchain/install/share/pycircuit/python/pycircuit/lib/stream.py
+-- Up-to-date: /home/lidongzhe/pyCircuit/.pycircuit_out/toolchain/install/share/pycircuit/python/pycircuit/logic
+-- Up-to-date: /home/lidongzhe/pyCircuit/.pycircuit_out/toolchain/install/share/pycircuit/python/pycircuit/logic/__init__.py
+-- Up-to-date: /home/lidongzhe/pyCircuit/.pycircuit_out/toolchain/install/share/pycircuit/python/pycircuit/spec
+-- Up-to-date: /home/lidongzhe/pyCircuit/.pycircuit_out/toolchain/install/share/pycircuit/python/pycircuit/spec/__init__.py
+-- Up-to-date: /home/lidongzhe/pyCircuit/.pycircuit_out/toolchain/install/share/pycircuit/python/pycircuit/spec/builders.py
+-- Up-to-date: /home/lidongzhe/pyCircuit/.pycircuit_out/toolchain/install/share/pycircuit/python/pycircuit/spec/dse.py
+-- Up-to-date: /home/lidongzhe/pyCircuit/.pycircuit_out/toolchain/install/share/pycircuit/python/pycircuit/spec/types.py
+-- Up-to-date: /home/lidongzhe/pyCircuit/.pycircuit_out/toolchain/install/share/pycircuit/python/pycircuit/wiring
+-- Up-to-date: /home/lidongzhe/pyCircuit/.pycircuit_out/toolchain/install/share/pycircuit/python/pycircuit/wiring/__init__.py
+-- Up-to-date: /home/lidongzhe/pyCircuit/.pycircuit_out/toolchain/install/share/pycircuit/python/pycircuit/wiring/connect.py
+-- Up-to-date: /home/lidongzhe/pyCircuit/.pycircuit_out/toolchain/install/share/pycircuit/python/pycircuit/__init__.py
+-- Up-to-date: /home/lidongzhe/pyCircuit/.pycircuit_out/toolchain/install/share/pycircuit/python/pycircuit/api_contract.py
+-- Up-to-date: /home/lidongzhe/pyCircuit/.pycircuit_out/toolchain/install/share/pycircuit/python/pycircuit/connectors.py
+-- Up-to-date: /home/lidongzhe/pyCircuit/.pycircuit_out/toolchain/install/share/pycircuit/python/pycircuit/ct.py
+-- Up-to-date: /home/lidongzhe/pyCircuit/.pycircuit_out/toolchain/install/share/pycircuit/python/pycircuit/design.py
+-- Up-to-date: /home/lidongzhe/pyCircuit/.pycircuit_out/toolchain/install/share/pycircuit/python/pycircuit/diagnostics.py
+-- Up-to-date: /home/lidongzhe/pyCircuit/.pycircuit_out/toolchain/install/share/pycircuit/python/pycircuit/dsl.py
+-- Up-to-date: /home/lidongzhe/pyCircuit/.pycircuit_out/toolchain/install/share/pycircuit/python/pycircuit/hierarchical.py
+-- Up-to-date: /home/lidongzhe/pyCircuit/.pycircuit_out/toolchain/install/share/pycircuit/python/pycircuit/hw.py
+-- Up-to-date: /home/lidongzhe/pyCircuit/.pycircuit_out/toolchain/install/share/pycircuit/python/pycircuit/jit.py
+-- Up-to-date: /home/lidongzhe/pyCircuit/.pycircuit_out/toolchain/install/share/pycircuit/python/pycircuit/jit_cache.py
+-- Up-to-date: /home/lidongzhe/pyCircuit/.pycircuit_out/toolchain/install/share/pycircuit/python/pycircuit/literals.py
+-- Up-to-date: /home/lidongzhe/pyCircuit/.pycircuit_out/toolchain/install/share/pycircuit/python/pycircuit/packaged_toolchain.py
+-- Up-to-date: /home/lidongzhe/pyCircuit/.pycircuit_out/toolchain/install/share/pycircuit/python/pycircuit/path_shortening.py
+-- Up-to-date: /home/lidongzhe/pyCircuit/.pycircuit_out/toolchain/install/share/pycircuit/python/pycircuit/probe.py
+-- Up-to-date: /home/lidongzhe/pyCircuit/.pycircuit_out/toolchain/install/share/pycircuit/python/pycircuit/tb.py
+-- Up-to-date: /home/lidongzhe/pyCircuit/.pycircuit_out/toolchain/install/share/pycircuit/python/pycircuit/testbench.py
+-- Up-to-date: /home/lidongzhe/pyCircuit/.pycircuit_out/toolchain/install/share/pycircuit/python/pycircuit/trace_dsl.py
+-- Up-to-date: /home/lidongzhe/pyCircuit/.pycircuit_out/toolchain/install/share/pycircuit/python/pycircuit/v5.py
+-- Up-to-date: /home/lidongzhe/pyCircuit/.pycircuit_out/toolchain/install/share/pycircuit/python/pycircuit/cli.py
+-- Up-to-date: /home/lidongzhe/pyCircuit/.pycircuit_out/toolchain/install/share/pycircuit/pyproject.toml
+-- Up-to-date: /home/lidongzhe/pyCircuit/.pycircuit_out/toolchain/install/share/pycircuit/LICENSE
+-- Up-to-date: /home/lidongzhe/pyCircuit/.pycircuit_out/toolchain/install/share/pycircuit/README.md
+-- Up-to-date: /home/lidongzhe/pyCircuit/.pycircuit_out/toolchain/install/share/pycircuit/toolchain-metadata.json
+-- Up-to-date: /home/lidongzhe/pyCircuit/.pycircuit_out/toolchain/install/share/pycircuit/cmake/pycircuitTargets.cmake
+-- Up-to-date: /home/lidongzhe/pyCircuit/.pycircuit_out/toolchain/install/share/pycircuit/cmake/pycircuitTargets-release.cmake
+-- Up-to-date: /home/lidongzhe/pyCircuit/.pycircuit_out/toolchain/install/share/pycircuit/cmake/pycircuitConfig.cmake
+-- Up-to-date: /home/lidongzhe/pyCircuit/.pycircuit_out/toolchain/install/share/pycircuit/cmake/pycircuitConfigVersion.cmake
+-- Up-to-date: /home/lidongzhe/pyCircuit/.pycircuit_out/toolchain/install/lib/libbsd.so.0
+-- Up-to-date: /home/lidongzhe/pyCircuit/.pycircuit_out/toolchain/install/lib/libbsd.so.0.11.7
+-- Up-to-date: /home/lidongzhe/pyCircuit/.pycircuit_out/toolchain/install/lib/libicudata.so.72
+-- Up-to-date: /home/lidongzhe/pyCircuit/.pycircuit_out/toolchain/install/lib/libicudata.so.72.1
+-- Up-to-date: /home/lidongzhe/pyCircuit/.pycircuit_out/toolchain/install/lib/libicuuc.so.72
+-- Up-to-date: /home/lidongzhe/pyCircuit/.pycircuit_out/toolchain/install/lib/libicuuc.so.72.1
+-- Up-to-date: /home/lidongzhe/pyCircuit/.pycircuit_out/toolchain/install/lib/liblzma.so.5
+-- Up-to-date: /home/lidongzhe/pyCircuit/.pycircuit_out/toolchain/install/lib/liblzma.so.5.4.1
+-- Up-to-date: /home/lidongzhe/pyCircuit/.pycircuit_out/toolchain/install/lib/libmd.so.0
+-- Up-to-date: /home/lidongzhe/pyCircuit/.pycircuit_out/toolchain/install/lib/libmd.so.0.0.5
+-- Up-to-date: /home/lidongzhe/pyCircuit/.pycircuit_out/toolchain/install/lib/libtinfo.so.6
+-- Up-to-date: /home/lidongzhe/pyCircuit/.pycircuit_out/toolchain/install/lib/libtinfo.so.6.4
+[pyc] ok: /home/lidongzhe/pyCircuit/.pycircuit_out/toolchain/install/bin/pycc

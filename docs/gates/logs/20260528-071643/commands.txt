@@ -1,0 +1,2 @@
+bash flows/scripts/pyc build
+bash compiler/mlir/test/cpp_member_placement_smoke.sh

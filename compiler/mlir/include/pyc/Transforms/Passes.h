@@ -25,5 +25,7 @@ std::unique_ptr<::mlir::Pass> createSLPPackWiresPass();
 std::unique_ptr<::mlir::Pass> createCheckLogicDepthPass(unsigned logicDepth);
 std::unique_ptr<::mlir::Pass> createCollectCompileStatsPass();
 std::unique_ptr<::mlir::Pass> createFlattenInstancesPass();
+/// C++ emit prep: always sets module comb chunk size; \p localizeMembers runs member placement.
+std::unique_ptr<::mlir::Pass> createCppPlacementPass(unsigned combChunkNodes, bool localizeMembers);
 
 } // namespace pyc
