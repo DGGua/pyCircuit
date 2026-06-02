@@ -44,6 +44,15 @@ temporaries become function-local `Wire<>` instead of struct members:
 - Requires `--cpp-split=module`
 - See [cpp_member_placement.md](cpp_member_placement.md)
 
+### Optional C++ device hpp PCH
+
+For large split C++ builds, record device module headers for CMake
+precompiled headers (does not change emit):
+
+- pycc: `--cpp-pch` (requires `--cpp-split=module`)
+- CMake: `target_precompile_headers` via `gen_cmake_from_manifest.py`
+- See [cpp_device_pch.md](cpp_device_pch.md)
+
 ## CLI entrypoints
 
 Emit a single `.pyc`:
