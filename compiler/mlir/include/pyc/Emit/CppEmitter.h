@@ -1,5 +1,7 @@
 #pragma once
 
+#include "pyc/Emit/CppPlacement.h"
+
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/Support/LogicalResult.h"
@@ -15,15 +17,18 @@ struct CppEmitterOptions {
     Module,
   };
 
+  /// Default comb/eval chunk size (pycc placement pass and emitter both use this).
+  static constexpr unsigned kDefaultCombChunkNodes = 256;
+
   SplitMode splitMode = SplitMode::None;
   unsigned shardThresholdLines = 120000;
   unsigned shardThresholdBytes = 4 * 1024 * 1024;
   // Chunk full-topology eval bodies to avoid mega-functions that are expensive
   // for downstream C++ compilers.
-  unsigned evalTopoChunkNodes = 256;
+  unsigned evalTopoChunkNodes = kDefaultCombChunkNodes;
   // Chunk fused comb helpers to avoid single mega-functions that dominate
   // downstream C++ TU cost even after file sharding.
-  unsigned combChunkNodes = 256;
+  unsigned combChunkNodes = kDefaultCombChunkNodes;
   std::string probePlanPath{};
 };
 
