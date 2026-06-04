@@ -345,7 +345,10 @@ static void assignExpr(Value result, Type ty, llvm::raw_ostream &os, NameTable &
   std::string expr;
   llvm::raw_string_ostream ess(expr);
   buildExpr(ess);
-  ps->emitValueAssign(result, ty, nt.get(result), ess.str(), os);
+  if (ps)
+    ps->emitValueAssign(result, ty, nt.get(result), ess.str(), os);
+  else
+    os << "    " << nt.get(result) << " = " << ess.str() << ";\n";
 }
 
 static LogicalResult emitCombAssign(Operation &op, llvm::raw_ostream &os, NameTable &nt,
@@ -807,7 +810,7 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
   f.walk([&](Operation *op) {
     for (Value r : op->getResults()) {
       if (getValueCppStorage(r) == CppStorageKind::Local)
-        return;
+        continue;
       decls.push_back(Decl{nt.get(r), r.getType()});
     }
   });
@@ -876,9 +879,6 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
   std::sort(syncMemDPs.begin(), syncMemDPs.end(), [&](pyc::SyncMemDPOp a, pyc::SyncMemDPOp b) { return syncMemDPKey(a) < syncMemDPKey(b); });
   std::sort(asyncFifos.begin(), asyncFifos.end(), [&](pyc::AsyncFifoOp a, pyc::AsyncFifoOp b) { return asyncFifoKey(a) < asyncFifoKey(b); });
   std::sort(cdcSyncs.begin(), cdcSyncs.end(), [&](pyc::CdcSyncOp a, pyc::CdcSyncOp b) { return cdcKey(a) < cdcKey(b); });
-  auto combKey = [&](pyc::CombOp c) { return nt.get(c.getResult(0)); };
-  std::sort(combs.begin(), combs.end(), [&](pyc::CombOp a, pyc::CombOp b) { return combKey(a) < combKey(b); });
-
   auto instKey = [&](pyc::InstanceOp i) -> std::string {
     if (auto nameAttr = i->getAttrOfType<StringAttr>("name"))
       return sanitizeId(nameAttr.getValue());

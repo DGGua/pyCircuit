@@ -2849,9 +2849,15 @@ int main(int argc, char **argv) {
         manifestProfile["pycc_peak_rss_bytes"] = static_cast<int64_t>(getPeakRssBytes());
         manifestProfile["pass_time_ms"] = static_cast<int64_t>(passMs);
         auto toolchainRoot = findToolchainRoot(argv[0]);
+        llvm::SmallString<256> outDirAbs(outDir);
+        if (std::error_code ec = llvm::sys::fs::make_absolute(outDirAbs)) {
+          llvm::errs() << "error: cannot resolve absolute path for --out-dir " << outDir << ": "
+                       << ec.message() << "\n";
+          return 1;
+        }
         if (failed(writeCppCompileManifest(manifestPathStorage, top, cppManifestSources,
                                            includeDirs, compileDefines, toolchainRoot, topHeaderName,
-                                           std::string(outDir), cppPch.getValue(), manifestProfile)))
+                                           outDirAbs, cppPch.getValue(), manifestProfile)))
           return 1;
       }
 
