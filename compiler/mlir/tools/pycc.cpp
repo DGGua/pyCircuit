@@ -121,6 +121,11 @@ static llvm::cl::opt<std::string> cppSplitMode(
     llvm::cl::desc("C++ out-dir split mode: module|none"),
     llvm::cl::init("module"));
 
+static llvm::cl::opt<bool> cppPch(
+    "cpp-pch",
+    llvm::cl::desc("Record device module hpp for CMake precompiled headers (requires --cpp-split=module)"),
+    llvm::cl::init(false));
+
 static llvm::cl::opt<bool> cppCompileBudget(
     "cpp-compile-budget",
     llvm::cl::desc("Enforce predicted C++ compile cost budgets (PYC991-993)"),
@@ -1813,6 +1818,8 @@ static LogicalResult writeCppCompileManifest(llvm::StringRef path,
                                              llvm::ArrayRef<std::string> compileDefines,
                                              std::optional<std::string> toolchainRoot,
                                              llvm::StringRef topHeader,
+                                             llvm::StringRef outDirAbs,
+                                             bool enableDevicePch,
                                              const llvm::json::Object &profileSummary) {
   llvm::json::Object manifest;
   manifest["version"] = 3;
@@ -1890,6 +1897,17 @@ static LogicalResult writeCppCompileManifest(llvm::StringRef path,
   }
   manifest["top_header"] = topHeader.str();
   manifest["profile_summary"] = llvm::json::Object(profileSummary);
+  if (enableDevicePch) {
+    std::string expectedHeader = (targetName + ".hpp").str();
+    if (topHeader == expectedHeader) {
+      llvm::SmallString<256> headerAbs(outDirAbs);
+      llvm::sys::path::append(headerAbs, topHeader);
+      llvm::json::Array pchJson;
+      pchJson.push_back(headerAbs.str().str());
+      manifest["precompile_headers"] = std::move(pchJson);
+      manifest["precompile_headers_mode"] = "device_hpp";
+    }
+  }
 
   std::string hashInput;
   hashInput.reserve(256);
@@ -2362,6 +2380,7 @@ int main(int argc, char **argv) {
     obj["cpp_shard_threshold_lines"] = static_cast<int64_t>(cppShardThresholdLines);
     obj["cpp_shard_threshold_bytes"] = static_cast<int64_t>(cppShardThresholdBytes);
     obj["cpp_shard_max_ast_nodes"] = static_cast<int64_t>(cppShardMaxAstNodes);
+    obj["cpp_pch"] = cppPch.getValue();
     obj["profile_pass_timing"] = collectPassTiming;
     {
       llvm::json::Object placement;
@@ -2561,6 +2580,11 @@ int main(int argc, char **argv) {
         llvm::errs() << "error: unknown --cpp-split mode: " << cppSplitMode << " (expected: module|none)\n";
         return 1;
       }
+      if (cppPch && !splitModule) {
+        llvm::errs() << "error: --cpp-pch requires --cpp-split=module\n";
+        return 1;
+      }
+
       auto writeHeaderPreamble = [&](llvm::raw_ostream &os, llvm::StringRef moduleName) {
         (void)moduleName;
         os << "// pyCircuit C++ emission (split)\n";
@@ -2827,7 +2851,7 @@ int main(int argc, char **argv) {
         auto toolchainRoot = findToolchainRoot(argv[0]);
         if (failed(writeCppCompileManifest(manifestPathStorage, top, cppManifestSources,
                                            includeDirs, compileDefines, toolchainRoot, topHeaderName,
-                                           manifestProfile)))
+                                           std::string(outDir), cppPch.getValue(), manifestProfile)))
           return 1;
       }
 

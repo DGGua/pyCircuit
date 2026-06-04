@@ -1296,6 +1296,21 @@ def _gather_cpp_headers(cpp_root: Path) -> list[Path]:
     return out
 
 
+def _collect_pch_headers_from_device_cpp(device_cpp_root: Path) -> list[str]:
+    headers: list[str] = []
+    seen: set[str] = set()
+    for manifest_path in sorted(device_cpp_root.rglob("cpp_compile_manifest.json")):
+        data = json.loads(manifest_path.read_text(encoding="utf-8"))
+        profile = data.get("profile_summary") or {}
+        if not profile.get("cpp_pch"):
+            continue
+        for header in data.get("precompile_headers") or []:
+            if header not in seen:
+                seen.add(header)
+                headers.append(header)
+    return sorted(headers)
+
+
 def _module_hash(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
@@ -1555,6 +1570,8 @@ def _cmd_build(args: argparse.Namespace) -> int:
         "--inline-policy=off",
         "--hierarchy-policy=strict",
     ]
+    if args.cpp_pch:
+        pycc_hard_hierarchy_flags.append("--cpp-pch")
 
     build_flags = {
         "pycc": str(pycc.resolve()),
@@ -1563,6 +1580,7 @@ def _cmd_build(args: argparse.Namespace) -> int:
         "pycc_build_profile": pycc_build_profile,
         "inline_policy": "off",
         "hierarchy_policy": "strict",
+        "cpp_pch": bool(args.cpp_pch),
         "target": target,
         "frontend_contract": FRONTEND_CONTRACT,
     }
@@ -1746,6 +1764,15 @@ def _cmd_build(args: argparse.Namespace) -> int:
             "cxx_standard": "c++17",
             "profile": str(args.profile),
         }
+        if args.cpp_pch:
+            pch_headers = _collect_pch_headers_from_device_cpp(device_cpp_root)
+            if not pch_headers:
+                pch_script = _tool_script("cpp_pch_headers.py")
+                pch_mod = _load_py_file(pch_script)
+                pch_headers = pch_mod.select_device_hpp_headers(build_manifest["headers"])
+            if pch_headers:
+                build_manifest["precompile_headers"] = pch_headers
+                build_manifest["precompile_headers_mode"] = "device_hpp"
         cpp_manifest = out_dir / "cpp_project_manifest.json"
         _save_json(cpp_manifest, build_manifest)
 
@@ -1978,6 +2005,11 @@ def main(argv: list[str] | None = None) -> int:
         help="Backend targets to generate/build",
     )
     build.add_argument("--logic-depth", type=int, default=32, help="Max combinational logic depth for pycc")
+    build.add_argument(
+        "--cpp-pch",
+        action="store_true",
+        help="Precompile device module hpp headers in generated CMake build",
+    )
     build.add_argument(
         "--trace-config",
         default=None,
