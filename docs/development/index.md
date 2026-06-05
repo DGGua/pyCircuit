@@ -50,3 +50,11 @@ pyCircuit
 - GitHub Issues: Report bugs and request features
 - GitHub Discussions: Ask questions and share ideas
 - Discord: Join our community chat
+
+## Sidecar testbench schedule tests
+
+The sidecar schedule container is covered by:
+
+```bash
+PYTHONPATH=compiler/frontend:. python -m pytest tests/test_pycstb4_sections.py -q
+```

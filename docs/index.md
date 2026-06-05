@@ -47,3 +47,7 @@ def build(m: Circuit) -> None:
 - `designs/examples/README.md`
 - `docs/rfcs/pyc4.0-decisions.md` and `docs/updatePLAN.md` (contracts + execution plan)
 
+
+## Sidecar testbench schedule
+
+- [PYCSTB4 Sidecar Testbench Schedule](PYCSTB4_SIDECAR_SCHEDULE.md)
