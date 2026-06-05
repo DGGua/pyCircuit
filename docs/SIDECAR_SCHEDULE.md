@@ -1,4 +1,4 @@
-# PYCSTB4 Sidecar Testbench Schedule
+# Sidecar Testbench Schedule
 
 This document describes the PR scope for the sidecar testbench schedule path.
 It intentionally stays limited to the sidecar schedule path.
@@ -26,10 +26,10 @@ Use sidecar mode when the testbench schedule should be externalized:
 pycc <design.py> --tb-schedule-mode sidecar
 ```
 
-The sidecar mode can emit a PYCSTB4 binary schedule container.
+The sidecar mode can emit a sidecar binary schedule container.
 The generated C++ runner links against the sidecar support header and reads the sidecar schedule at process startup.
 
-## PYCSTB4 sections in this PR
+## Sidecar sections in this PR
 
 | Section | Purpose |
 | --- | --- |
@@ -43,7 +43,7 @@ The generated C++ runner links against the sidecar support header and reads the 
 
 Sidecar execution has three steps:
 
-1. Load the PYCSTB4 sidecar schedule.
+1. Load the sidecar schedule.
 2. Convert the sidecar sections into the generated runner schedule structure.
 3. Step the DUT cycle by cycle while applying drive frames, periodic drive patterns, and post-cycle checks.
 
@@ -52,6 +52,6 @@ Only the runner logic and the static port binding remain in generated code.
 
 ## PR boundary
 
-This PR only introduces the sidecar schedule path and the PYCSTB4 sections needed by that path.
+This PR only introduces the sidecar schedule path and the Sidecar sections needed by that path.
 It does not add higher-level workload APIs or scoreboard policies.
 Those are intentionally left out so the first upstream review can focus on the minimal mechanical split between generated C++ runner code and schedule data.

@@ -5,12 +5,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
-from .pycstb4_sections import (
+from .sidecar_sections import (
     PackedSection,
     SectionKind,
     SectionRegistry,
     default_section_registry,
-    verify_schedule_ir_for_pycstb4,
+    verify_schedule_ir_for_sidecar,
 )
 
 
@@ -178,7 +178,7 @@ def _detect_periodic_drive_patterns(
     return patterns
 
 
-def build_runtime_loop_schedule_ir(
+def build_sidecar_schedule_ir(
     *,
     top_symbol: str,
     schedule_path: Path,
@@ -210,7 +210,7 @@ def build_runtime_loop_schedule_ir(
         "max_cycle": int(timeout_cycles),
         "schedule_bytes": int(schedule_bytes),
         "generate_s": float(generate_s),
-        "legacy_pycstb3": {
+        "sidecar_source": {
             "drive_events": len(drive_events),
             "drive_frames": len(drive_frame_rows),
             "pre_expect_events": len(pre_expect_events),
@@ -223,10 +223,10 @@ def build_runtime_loop_schedule_ir(
         "version": {"major": 1, "minor": 0, "patch": 0},
         "metadata": {
             "case_name": f"tb_{top_symbol}",
-            "generator": "pycircuit.sidecar_schedule",
-            "generator_version": "prototype-pycstb3",
+            "generator": "pycircuit.sidecar",
+            "generator_version": "sidecar",
             "source": str(schedule_path),
-            "notes": "Generated alongside legacy PYCSTB3 sidecar schedule.",
+            "notes": "Generated for sidecar schedule execution.",
         },
         "timebase": {
             "unit": "cycle",
@@ -243,15 +243,15 @@ def build_runtime_loop_schedule_ir(
 
 
 
-_PYCSTB4_MAGIC = b"PYCSTB4\n"
-_PYCSTB4_HEADER_FMT = "<8sBHHHHQIIQII"
-_PYCSTB4_DIR_FMT = "<HHIQQQ"
-_PYCSTB4_PORT_FMT = "<IIBBHIII"
-_PYCSTB4_EVENT_PREFIX_FMT = "<QBBHIII"
-_PYCSTB4_FRAME_PREFIX_FMT = "<QBBHI"
-_PYCSTB4_FRAME_ITEM_PREFIX_FMT = "<IIII"
-_PYCSTB4_PATTERN_PREFIX_FMT = "<HHIQQQQQII"
-_PYCSTB4_NONE = 0xFFFFFFFF
+_SIDECAR_MAGIC = b"SIDECAR\n"
+_SIDECAR_HEADER_FMT = "<8sBHHHHQIIQII"
+_SIDECAR_DIR_FMT = "<HHIQQQ"
+_SIDECAR_PORT_FMT = "<IIBBHIII"
+_SIDECAR_EVENT_PREFIX_FMT = "<QBBHIII"
+_SIDECAR_FRAME_PREFIX_FMT = "<QBBHI"
+_SIDECAR_FRAME_ITEM_PREFIX_FMT = "<IIII"
+_SIDECAR_PATTERN_PREFIX_FMT = "<HHIQQQQQII"
+_SIDECAR_NONE = 0xFFFFFFFF
 
 _DIRECTION_ID = {"input": 0, "output": 1, "inout": 2}
 _ROLE_ID = {"unknown": 0, "data": 1, "valid": 2, "ready": 3, "tag": 4, "control": 5, "clock": 6, "reset": 7}
@@ -267,7 +267,7 @@ class _StringTable:
 
     def add(self, value: str | None) -> int:
         if value is None or value == "":
-            return _PYCSTB4_NONE
+            return _SIDECAR_NONE
         text = str(value)
         sid = self.ids.get(text)
         if sid is not None:
@@ -287,7 +287,7 @@ class _StringTable:
         return bytes(blob)
 
 
-def _collect_pycstb4_strings(schedule_ir: Mapping[str, Any]) -> _StringTable:
+def _collect_sidecar_strings(schedule_ir: Mapping[str, Any]) -> _StringTable:
     table = _StringTable()
     for port in schedule_ir.get("ports", []):
         if isinstance(port, Mapping):
@@ -319,7 +319,7 @@ def _nwords(value: int | None) -> int:
     return max(1, (int(value).bit_length() + 63) // 64)
 
 
-def _pycstb4_max_words(schedule_ir: Mapping[str, Any]) -> int:
+def _sidecar_max_words(schedule_ir: Mapping[str, Any]) -> int:
     max_words = 1
     for port in schedule_ir.get("ports", []):
         if isinstance(port, Mapping):
@@ -327,14 +327,14 @@ def _pycstb4_max_words(schedule_ir: Mapping[str, Any]) -> int:
     return max_words
 
 
-def _pack_pycstb4_ports(schedule_ir: Mapping[str, Any], strings: _StringTable) -> bytes:
+def _pack_sidecar_ports(schedule_ir: Mapping[str, Any], strings: _StringTable) -> bytes:
     blob = bytearray()
     for port in schedule_ir.get("ports", []):
         if not isinstance(port, Mapping):
             continue
         blob.extend(
             struct.pack(
-                _PYCSTB4_PORT_FMT,
+                _SIDECAR_PORT_FMT,
                 int(port["id"]),
                 strings.add(str(port["name"])),
                 _DIRECTION_ID.get(str(port.get("direction", "input")), 0),
@@ -348,17 +348,17 @@ def _pack_pycstb4_ports(schedule_ir: Mapping[str, Any], strings: _StringTable) -
     return bytes(blob)
 
 
-def _pack_pycstb4_events(schedule_ir: Mapping[str, Any], strings: _StringTable, max_words: int) -> bytes:
+def _pack_sidecar_events(schedule_ir: Mapping[str, Any], strings: _StringTable, max_words: int) -> bytes:
     blob = bytearray()
     for event in schedule_ir.get("events", []):
         if not isinstance(event, Mapping):
             continue
         value = _hex_to_int(event.get("value"))
         mask = _hex_to_int(event.get("mask"))
-        port = _PYCSTB4_NONE if event.get("port") is None else int(event["port"])
+        port = _SIDECAR_NONE if event.get("port") is None else int(event["port"])
         blob.extend(
             struct.pack(
-                _PYCSTB4_EVENT_PREFIX_FMT,
+                _SIDECAR_EVENT_PREFIX_FMT,
                 int(event["cycle"]),
                 _EVENT_KIND_ID.get(str(event.get("kind", "marker")), 3),
                 _PHASE_ID.get(str(event.get("phase", "post")), 1),
@@ -373,7 +373,7 @@ def _pack_pycstb4_events(schedule_ir: Mapping[str, Any], strings: _StringTable, 
     return bytes(blob)
 
 
-def _pack_pycstb4_frames(schedule_ir: Mapping[str, Any], strings: _StringTable, max_words: int) -> bytes:
+def _pack_sidecar_frames(schedule_ir: Mapping[str, Any], strings: _StringTable, max_words: int) -> bytes:
     blob = bytearray()
     covered: set[tuple[int, int]] = set()
     for pattern in schedule_ir.get("patterns", []):
@@ -394,13 +394,13 @@ def _pack_pycstb4_frames(schedule_ir: Mapping[str, Any], strings: _StringTable, 
         ]
         if not items:
             continue
-        blob.extend(struct.pack(_PYCSTB4_FRAME_PREFIX_FMT, cycle, _FRAME_KIND_ID.get(kind, 0), 0 if kind == "drive_frame" else 1, 0, len(items)))
+        blob.extend(struct.pack(_SIDECAR_FRAME_PREFIX_FMT, cycle, _FRAME_KIND_ID.get(kind, 0), 0 if kind == "drive_frame" else 1, 0, len(items)))
         for item in items:
             value = _hex_to_int(item.get("value"))
             mask = _hex_to_int(item.get("mask"))
             blob.extend(
                 struct.pack(
-                    _PYCSTB4_FRAME_ITEM_PREFIX_FMT,
+                    _SIDECAR_FRAME_ITEM_PREFIX_FMT,
                     int(item["port"]),
                     _nwords(value),
                     strings.add(None if item.get("message") is None else str(item.get("message"))),
@@ -412,7 +412,7 @@ def _pack_pycstb4_frames(schedule_ir: Mapping[str, Any], strings: _StringTable, 
     return bytes(blob)
 
 
-def _pack_pycstb4_patterns(schedule_ir: Mapping[str, Any], max_words: int) -> bytes:
+def _pack_sidecar_patterns(schedule_ir: Mapping[str, Any], max_words: int) -> bytes:
     blob = bytearray()
     for pattern in schedule_ir.get("patterns", []):
         if not isinstance(pattern, Mapping) or str(pattern.get("kind")) != "periodic_drive":
@@ -421,7 +421,7 @@ def _pack_pycstb4_patterns(schedule_ir: Mapping[str, Any], max_words: int) -> by
         default = _hex_to_int(pattern.get("default_value"))
         blob.extend(
             struct.pack(
-                _PYCSTB4_PATTERN_PREFIX_FMT,
+                _SIDECAR_PATTERN_PREFIX_FMT,
                 1,
                 0,
                 int(pattern["port"]),
@@ -439,11 +439,11 @@ def _pack_pycstb4_patterns(schedule_ir: Mapping[str, Any], max_words: int) -> by
     return bytes(blob)
 
 
-def _pycstb4_pattern_count(schedule_ir: Mapping[str, Any]) -> int:
+def _sidecar_pattern_count(schedule_ir: Mapping[str, Any]) -> int:
     return sum(1 for pattern in schedule_ir.get("patterns", []) if isinstance(pattern, Mapping) and str(pattern.get("kind")) == "periodic_drive")
 
 
-def _pycstb4_frame_count_after_pattern_compaction(schedule_ir: Mapping[str, Any]) -> int:
+def _sidecar_frame_count_after_pattern_compaction(schedule_ir: Mapping[str, Any]) -> int:
     frame_count = 0
     for frame in schedule_ir.get("frames", []):
         if not isinstance(frame, Mapping):
@@ -464,7 +464,7 @@ def _pycstb4_frame_count_after_pattern_compaction(schedule_ir: Mapping[str, Any]
 
 
 @dataclass(frozen=True)
-class _Pycstb4SectionBuildState:
+class _SidecarSectionBuildState:
     schedule_ir: Mapping[str, Any]
     strings: _StringTable
     max_words: int
@@ -474,43 +474,43 @@ class _Pycstb4SectionBuildState:
     frame_count: int
 
 
-_Pycstb4SectionEmitResult = tuple[bytes, int] | None
-_Pycstb4SectionEmitter = Callable[[_Pycstb4SectionBuildState], _Pycstb4SectionEmitResult]
+_SidecarSectionEmitResult = tuple[bytes, int] | None
+_SidecarSectionEmitter = Callable[[_SidecarSectionBuildState], _SidecarSectionEmitResult]
 
 
-def _build_pycstb4_section_state(schedule_ir: Mapping[str, Any], strings: _StringTable, max_words: int) -> _Pycstb4SectionBuildState:
-    return _Pycstb4SectionBuildState(
+def _build_sidecar_section_state(schedule_ir: Mapping[str, Any], strings: _StringTable, max_words: int) -> _SidecarSectionBuildState:
+    return _SidecarSectionBuildState(
         schedule_ir=schedule_ir,
         strings=strings,
         max_words=max_words,
-        pattern_blob=_pack_pycstb4_patterns(schedule_ir, max_words),
-        pattern_count=_pycstb4_pattern_count(schedule_ir),
-        frame_blob=_pack_pycstb4_frames(schedule_ir, strings, max_words),
-        frame_count=_pycstb4_frame_count_after_pattern_compaction(schedule_ir),
+        pattern_blob=_pack_sidecar_patterns(schedule_ir, max_words),
+        pattern_count=_sidecar_pattern_count(schedule_ir),
+        frame_blob=_pack_sidecar_frames(schedule_ir, strings, max_words),
+        frame_count=_sidecar_frame_count_after_pattern_compaction(schedule_ir),
     )
 
 
-def _emit_string_table_section(state: _Pycstb4SectionBuildState) -> _Pycstb4SectionEmitResult:
+def _emit_string_table_section(state: _SidecarSectionBuildState) -> _SidecarSectionEmitResult:
     return state.strings.to_bytes(), len(state.strings.items)
 
 
-def _emit_port_table_section(state: _Pycstb4SectionBuildState) -> _Pycstb4SectionEmitResult:
-    return _pack_pycstb4_ports(state.schedule_ir, state.strings), len(state.schedule_ir.get("ports", []))
+def _emit_port_table_section(state: _SidecarSectionBuildState) -> _SidecarSectionEmitResult:
+    return _pack_sidecar_ports(state.schedule_ir, state.strings), len(state.schedule_ir.get("ports", []))
 
 
-def _emit_event_table_section(state: _Pycstb4SectionBuildState) -> _Pycstb4SectionEmitResult:
-    return _pack_pycstb4_events(state.schedule_ir, state.strings, state.max_words), len(state.schedule_ir.get("events", []))
+def _emit_event_table_section(state: _SidecarSectionBuildState) -> _SidecarSectionEmitResult:
+    return _pack_sidecar_events(state.schedule_ir, state.strings, state.max_words), len(state.schedule_ir.get("events", []))
 
 
-def _emit_frame_table_section(state: _Pycstb4SectionBuildState) -> _Pycstb4SectionEmitResult:
+def _emit_frame_table_section(state: _SidecarSectionBuildState) -> _SidecarSectionEmitResult:
     return state.frame_blob, state.frame_count
 
 
-def _emit_pattern_table_section(state: _Pycstb4SectionBuildState) -> _Pycstb4SectionEmitResult:
+def _emit_pattern_table_section(state: _SidecarSectionBuildState) -> _SidecarSectionEmitResult:
     return (state.pattern_blob, state.pattern_count) if state.pattern_count else None
 
 
-_PYCSTB4_SECTION_EMITTERS: tuple[tuple[int, _Pycstb4SectionEmitter], ...] = (
+_SIDECAR_SECTION_EMITTERS: tuple[tuple[int, _SidecarSectionEmitter], ...] = (
     (int(SectionKind.STRING_TABLE), _emit_string_table_section),
     (int(SectionKind.PORT_TABLE), _emit_port_table_section),
     (int(SectionKind.EVENT_TABLE), _emit_event_table_section),
@@ -524,11 +524,11 @@ def _packed_section(registry: SectionRegistry, kind: SectionKind | int, data: by
     return PackedSection(kind=int(kind), data=data, count=int(count), flags=int(flags), name=descriptor.name if descriptor is not None else f"unknown_{int(kind)}")
 
 
-def build_pycstb4_section_plan(schedule_ir: Mapping[str, Any], strings: _StringTable, max_words: int) -> list[PackedSection]:
+def build_sidecar_section_plan(schedule_ir: Mapping[str, Any], strings: _StringTable, max_words: int) -> list[PackedSection]:
     registry = default_section_registry()
-    state = _build_pycstb4_section_state(schedule_ir, strings, max_words)
+    state = _build_sidecar_section_state(schedule_ir, strings, max_words)
     sections: list[PackedSection] = []
-    for kind, emitter in _PYCSTB4_SECTION_EMITTERS:
+    for kind, emitter in _SIDECAR_SECTION_EMITTERS:
         result = emitter(state)
         if result is None:
             continue
@@ -537,28 +537,28 @@ def build_pycstb4_section_plan(schedule_ir: Mapping[str, Any], strings: _StringT
     return sections
 
 
-def schedule_ir_to_pycstb4_bytes(schedule_ir: Mapping[str, Any]) -> bytes:
-    validation_errors = verify_schedule_ir_for_pycstb4(schedule_ir)
+def schedule_ir_to_sidecar_bytes(schedule_ir: Mapping[str, Any]) -> bytes:
+    validation_errors = verify_schedule_ir_for_sidecar(schedule_ir)
     if validation_errors:
         joined = "\n".join(f"- {item}" for item in validation_errors)
-        raise ValueError(f"invalid PYCSTB4 schedule IR:\n{joined}")
+        raise ValueError(f"invalid SIDECAR schedule IR:\n{joined}")
     version = schedule_ir.get("version", {})
     timebase = schedule_ir.get("timebase", {})
-    strings = _collect_pycstb4_strings(schedule_ir)
-    max_words = _pycstb4_max_words(schedule_ir)
-    sections = build_pycstb4_section_plan(schedule_ir, strings, max_words)
-    header_size = struct.calcsize(_PYCSTB4_HEADER_FMT)
-    dir_size = struct.calcsize(_PYCSTB4_DIR_FMT)
+    strings = _collect_sidecar_strings(schedule_ir)
+    max_words = _sidecar_max_words(schedule_ir)
+    sections = build_sidecar_section_plan(schedule_ir, strings, max_words)
+    header_size = struct.calcsize(_SIDECAR_HEADER_FMT)
+    dir_size = struct.calcsize(_SIDECAR_DIR_FMT)
     offset = header_size + len(sections) * dir_size
     directory = bytearray()
     payload = bytearray()
     for packed in sections:
-        directory.extend(struct.pack(_PYCSTB4_DIR_FMT, int(packed.kind), int(packed.flags), 0, int(offset), len(packed.data), int(packed.count)))
+        directory.extend(struct.pack(_SIDECAR_DIR_FMT, int(packed.kind), int(packed.flags), 0, int(offset), len(packed.data), int(packed.count)))
         payload.extend(packed.data)
         offset += len(packed.data)
     header = struct.pack(
-        _PYCSTB4_HEADER_FMT,
-        _PYCSTB4_MAGIC,
+        _SIDECAR_HEADER_FMT,
+        _SIDECAR_MAGIC,
         1,
         header_size,
         int(version.get("major", 1)),

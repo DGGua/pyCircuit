@@ -50,4 +50,4 @@ def build(m: Circuit) -> None:
 
 ## Sidecar testbench schedule
 
-- [PYCSTB4 Sidecar Testbench Schedule](PYCSTB4_SIDECAR_SCHEDULE.md)
+- [Sidecar Testbench Schedule](SIDECAR_SCHEDULE.md)

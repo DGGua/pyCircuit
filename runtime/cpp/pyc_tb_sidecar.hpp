@@ -11,18 +11,18 @@
 #include <utility>
 #include <vector>
 
-#include <cpp/pyc_tb_runtime_loop.hpp>
+#include <cpp/pyc_tb_sidecar_runtime.hpp>
 
 namespace pyc::cpp {
 
-constexpr std::uint16_t kPycstb4SectionStringTable = 1;
-constexpr std::uint16_t kPycstb4SectionPortTable = 2;
-constexpr std::uint16_t kPycstb4SectionEventTable = 3;
-constexpr std::uint16_t kPycstb4SectionFrameTable = 4;
-constexpr std::uint16_t kPycstb4SectionPatternTable = 5;
-constexpr std::uint32_t kPycstb4None = 0xffffffffu;
+constexpr std::uint16_t kSidecarSectionStringTable = 1;
+constexpr std::uint16_t kSidecarSectionPortTable = 2;
+constexpr std::uint16_t kSidecarSectionEventTable = 3;
+constexpr std::uint16_t kSidecarSectionFrameTable = 4;
+constexpr std::uint16_t kSidecarSectionPatternTable = 5;
+constexpr std::uint32_t kSidecarNone = 0xffffffffu;
 
-struct Pycstb4SectionInfo {
+struct SidecarSectionInfo {
   std::uint16_t kind = 0;
   std::uint16_t flags = 0;
   std::uint64_t offset = 0;
@@ -30,7 +30,7 @@ struct Pycstb4SectionInfo {
   std::uint64_t count = 0;
 };
 
-struct Pycstb4Port {
+struct SidecarPort {
   std::uint32_t id = 0;
   std::string name;
   std::uint8_t direction = 0;
@@ -40,32 +40,32 @@ struct Pycstb4Port {
   std::string protocol;
 };
 
-struct Pycstb4Event {
+struct SidecarFileEvent {
   std::uint64_t cycle = 0;
   std::uint8_t kind = 0;
   std::uint8_t phase = 0;
-  std::uint32_t port_id = kPycstb4None;
+  std::uint32_t port_id = kSidecarNone;
   std::uint32_t nwords = 0;
   std::vector<std::uint64_t> words;
   std::string msg;
 };
 
-struct Pycstb4FrameItem {
-  std::uint32_t port_id = kPycstb4None;
+struct SidecarFileFrameItem {
+  std::uint32_t port_id = kSidecarNone;
   std::uint32_t nwords = 0;
   std::vector<std::uint64_t> words;
   std::string msg;
 };
 
-struct Pycstb4Frame {
+struct SidecarFileFrame {
   std::uint64_t cycle = 0;
   std::uint8_t kind = 0;
   std::uint8_t phase = 0;
-  std::vector<Pycstb4FrameItem> items;
+  std::vector<SidecarFileFrameItem> items;
 };
 
-struct Pycstb4PeriodicDrive {
-  std::uint32_t port_id = kPycstb4None;
+struct SidecarPeriodicDrive {
+  std::uint32_t port_id = kSidecarNone;
   std::uint64_t start_cycle = 0;
   std::uint64_t end_cycle = 0;
   std::uint64_t period = 0;
@@ -82,19 +82,19 @@ struct Pycstb4PeriodicDrive {
   }
 };
 
-struct Pycstb4Schedule {
+struct SidecarSchedule {
   std::uint16_t major = 0;
   std::uint16_t minor = 0;
   std::uint16_t patch = 0;
   std::uint32_t max_words = 0;
   std::uint64_t max_cycle = 0;
   std::uint32_t reset_cycles = 0;
-  std::vector<Pycstb4SectionInfo> sections;
+  std::vector<SidecarSectionInfo> sections;
   std::vector<std::string> strings;
-  std::vector<Pycstb4Port> ports;
-  std::vector<Pycstb4Event> events;
-  std::vector<Pycstb4Frame> frames;
-  std::vector<Pycstb4PeriodicDrive> periodic_drives;
+  std::vector<SidecarPort> ports;
+  std::vector<SidecarFileEvent> events;
+  std::vector<SidecarFileFrame> frames;
+  std::vector<SidecarPeriodicDrive> periodic_drives;
 };
 
 namespace detail {
@@ -106,7 +106,7 @@ inline bool fail(std::string* error, const std::string& msg) {
 
 inline bool checkRange(std::size_t size, std::size_t offset, std::size_t bytes, std::string* error, const char* what) {
   if (offset > size || bytes > size - offset) {
-    return fail(error, std::string("truncated PYCSTB4 ") + what);
+    return fail(error, std::string("truncated sidecar ") + what);
   }
   return true;
 }
@@ -144,24 +144,24 @@ inline bool readU64(const std::vector<std::uint8_t>& data, std::size_t offset, s
 
 inline bool readFile(const std::filesystem::path& path, std::vector<std::uint8_t>* out, std::string* error) {
   std::ifstream stream(path, std::ios::binary);
-  if (!stream.is_open()) return fail(error, "failed to open PYCSTB4 file: " + path.string());
+  if (!stream.is_open()) return fail(error, "failed to open sidecar file: " + path.string());
   out->assign(std::istreambuf_iterator<char>(stream), std::istreambuf_iterator<char>());
   return true;
 }
 
-inline const Pycstb4SectionInfo* findSection(const Pycstb4Schedule& schedule, std::uint16_t kind) {
+inline const SidecarSectionInfo* findSection(const SidecarSchedule& schedule, std::uint16_t kind) {
   for (const auto& section : schedule.sections) {
     if (section.kind == kind) return &section;
   }
   return nullptr;
 }
 
-inline bool stringRef(const Pycstb4Schedule& schedule, std::uint32_t sid, std::string* out, std::string* error) {
-  if (sid == kPycstb4None) {
+inline bool stringRef(const SidecarSchedule& schedule, std::uint32_t sid, std::string* out, std::string* error) {
+  if (sid == kSidecarNone) {
     out->clear();
     return true;
   }
-  if (sid >= schedule.strings.size()) return fail(error, "PYCSTB4 string reference out of range");
+  if (sid >= schedule.strings.size()) return fail(error, "sidecar string reference out of range");
   *out = schedule.strings[sid];
   return true;
 }
@@ -186,8 +186,8 @@ inline bool readWords(const std::vector<std::uint8_t>& data,
 }
 
 inline bool decodeStringTable(const std::vector<std::uint8_t>& data,
-                              const Pycstb4SectionInfo& section,
-                              Pycstb4Schedule* schedule,
+                              const SidecarSectionInfo& section,
+                              SidecarSchedule* schedule,
                               std::string* error) {
   std::size_t cursor = static_cast<std::size_t>(section.offset);
   const std::size_t end = static_cast<std::size_t>(section.offset + section.size);
@@ -200,7 +200,7 @@ inline bool decodeStringTable(const std::vector<std::uint8_t>& data,
     std::uint32_t length = 0;
     if (!readU32(data, cursor, &length, error, "string length")) return false;
     cursor += 4;
-    if (cursor > end || length > end - cursor) return fail(error, "PYCSTB4 string table entry exceeds section");
+    if (cursor > end || length > end - cursor) return fail(error, "sidecar string table entry exceeds section");
     schedule->strings.emplace_back(reinterpret_cast<const char*>(data.data() + cursor), length);
     cursor += length;
   }
@@ -208,18 +208,18 @@ inline bool decodeStringTable(const std::vector<std::uint8_t>& data,
 }
 
 inline bool decodePortTable(const std::vector<std::uint8_t>& data,
-                            const Pycstb4SectionInfo& section,
-                            Pycstb4Schedule* schedule,
+                            const SidecarSectionInfo& section,
+                            SidecarSchedule* schedule,
                             std::string* error) {
   constexpr std::size_t kRecordSize = 24;
-  if (section.size < section.count * kRecordSize) return fail(error, "PYCSTB4 port_table size/count mismatch");
+  if (section.size < section.count * kRecordSize) return fail(error, "sidecar port_table size/count mismatch");
   schedule->ports.clear();
   schedule->ports.reserve(static_cast<std::size_t>(section.count));
   for (std::uint64_t idx = 0; idx < section.count; ++idx) {
     const std::size_t cursor = static_cast<std::size_t>(section.offset) + static_cast<std::size_t>(idx) * kRecordSize;
-    Pycstb4Port port;
-    std::uint32_t name_sid = kPycstb4None;
-    std::uint32_t protocol_sid = kPycstb4None;
+    SidecarPort port;
+    std::uint32_t name_sid = kSidecarNone;
+    std::uint32_t protocol_sid = kSidecarNone;
     std::uint16_t reserved = 0;
     if (!readU32(data, cursor + 0, &port.id, error, "port id") ||
         !readU32(data, cursor + 4, &name_sid, error, "port name") ||
@@ -238,18 +238,18 @@ inline bool decodePortTable(const std::vector<std::uint8_t>& data,
 }
 
 inline bool decodeEventTable(const std::vector<std::uint8_t>& data,
-                             const Pycstb4SectionInfo& section,
-                             Pycstb4Schedule* schedule,
+                             const SidecarSectionInfo& section,
+                             SidecarSchedule* schedule,
                              std::string* error) {
   const std::size_t record_size = 24u + static_cast<std::size_t>(schedule->max_words) * 16u;
-  if (section.size < section.count * record_size) return fail(error, "PYCSTB4 event_table size/count mismatch");
+  if (section.size < section.count * record_size) return fail(error, "sidecar event_table size/count mismatch");
   schedule->events.clear();
   schedule->events.reserve(static_cast<std::size_t>(section.count));
   for (std::uint64_t idx = 0; idx < section.count; ++idx) {
     const std::size_t cursor = static_cast<std::size_t>(section.offset) + static_cast<std::size_t>(idx) * record_size;
-    Pycstb4Event event;
+    SidecarFileEvent event;
     std::uint16_t reserved = 0;
-    std::uint32_t msg_sid = kPycstb4None;
+    std::uint32_t msg_sid = kSidecarNone;
     if (!readU64(data, cursor + 0, &event.cycle, error, "event cycle") ||
         !readU8(data, cursor + 8, &event.kind, error, "event kind") ||
         !readU8(data, cursor + 9, &event.phase, error, "event phase") ||
@@ -267,8 +267,8 @@ inline bool decodeEventTable(const std::vector<std::uint8_t>& data,
 }
 
 inline bool decodeFrameTable(const std::vector<std::uint8_t>& data,
-                             const Pycstb4SectionInfo& section,
-                             Pycstb4Schedule* schedule,
+                             const SidecarSectionInfo& section,
+                             SidecarSchedule* schedule,
                              std::string* error) {
   std::size_t cursor = static_cast<std::size_t>(section.offset);
   const std::size_t end = static_cast<std::size_t>(section.offset + section.size);
@@ -276,7 +276,7 @@ inline bool decodeFrameTable(const std::vector<std::uint8_t>& data,
   schedule->frames.reserve(static_cast<std::size_t>(section.count));
   for (std::uint64_t idx = 0; idx < section.count; ++idx) {
     if (!checkRange(end, cursor, 16, error, "frame prefix")) return false;
-    Pycstb4Frame frame;
+    SidecarFileFrame frame;
     std::uint16_t reserved = 0;
     std::uint32_t item_count = 0;
     if (!readU64(data, cursor + 0, &frame.cycle, error, "frame cycle") ||
@@ -290,9 +290,9 @@ inline bool decodeFrameTable(const std::vector<std::uint8_t>& data,
     frame.items.reserve(item_count);
     for (std::uint32_t item_idx = 0; item_idx < item_count; ++item_idx) {
       const std::size_t item_size = 16u + static_cast<std::size_t>(schedule->max_words) * 16u;
-      if (cursor > end || item_size > end - cursor) return fail(error, "PYCSTB4 frame item exceeds section");
-      Pycstb4FrameItem item;
-      std::uint32_t msg_sid = kPycstb4None;
+      if (cursor > end || item_size > end - cursor) return fail(error, "sidecar frame item exceeds section");
+      SidecarFileFrameItem item;
+      std::uint32_t msg_sid = kSidecarNone;
       std::uint32_t item_reserved = 0;
       if (!readU32(data, cursor + 0, &item.port_id, error, "frame item port") ||
           !readU32(data, cursor + 4, &item.nwords, error, "frame item nwords") ||
@@ -311,18 +311,18 @@ inline bool decodeFrameTable(const std::vector<std::uint8_t>& data,
 }
 
 inline bool decodePatternTable(const std::vector<std::uint8_t>& data,
-                               const Pycstb4SectionInfo& section,
-                               Pycstb4Schedule* schedule,
+                               const SidecarSectionInfo& section,
+                               SidecarSchedule* schedule,
                                std::string* error) {
   const std::size_t record_size = 56u + static_cast<std::size_t>(schedule->max_words) * 16u;
-  if (section.size < section.count * record_size) return fail(error, "PYCSTB4 pattern_table size/count mismatch");
+  if (section.size < section.count * record_size) return fail(error, "sidecar pattern_table size/count mismatch");
   schedule->periodic_drives.clear();
   schedule->periodic_drives.reserve(static_cast<std::size_t>(section.count));
   for (std::uint64_t idx = 0; idx < section.count; ++idx) {
     const std::size_t cursor = static_cast<std::size_t>(section.offset) + static_cast<std::size_t>(idx) * record_size;
     std::uint16_t kind = 0;
     std::uint16_t reserved = 0;
-    Pycstb4PeriodicDrive pattern;
+    SidecarPeriodicDrive pattern;
     if (!readU16(data, cursor + 0, &kind, error, "pattern kind") ||
         !readU16(data, cursor + 2, &reserved, error, "pattern reserved") ||
         !readU32(data, cursor + 4, &pattern.port_id, error, "pattern port") ||
@@ -357,13 +357,13 @@ inline int findDriveIndex(const std::vector<std::uint32_t>& drive_port_ids, std:
 
 }  // namespace detail
 
-inline bool loadPycstb4Schedule(const std::filesystem::path& path, Pycstb4Schedule* schedule, std::string* error) {
-  if (schedule == nullptr) return detail::fail(error, "null PYCSTB4 schedule output");
+inline bool loadSidecarSchedule(const std::filesystem::path& path, SidecarSchedule* schedule, std::string* error) {
+  if (schedule == nullptr) return detail::fail(error, "null sidecar schedule output");
   std::vector<std::uint8_t> data;
   if (!detail::readFile(path, &data, error)) return false;
-  if (data.size() < 49) return detail::fail(error, "PYCSTB4 file too small");
-  static constexpr char kMagic[8] = {'P', 'Y', 'C', 'S', 'T', 'B', '4', '\n'};
-  if (std::memcmp(data.data(), kMagic, 8) != 0) return detail::fail(error, "invalid PYCSTB4 magic");
+  if (data.size() < 49) return detail::fail(error, "sidecar file too small");
+  static constexpr char kMagic[8] = {'S', 'I', 'D', 'E', 'C', 'A', 'R', '\n'};
+  if (std::memcmp(data.data(), kMagic, 8) != 0) return detail::fail(error, "invalid sidecar magic");
 
   std::uint8_t endian = 0;
   std::uint16_t header_size = 0;
@@ -383,17 +383,17 @@ inline bool loadPycstb4Schedule(const std::filesystem::path& path, Pycstb4Schedu
       !detail::readU32(data, 45, &reserved32, error, "header reserved")) {
     return false;
   }
-  if (endian != 1) return detail::fail(error, "unsupported PYCSTB4 endian marker");
-  if (header_size < 49) return detail::fail(error, "invalid PYCSTB4 header size");
+  if (endian != 1) return detail::fail(error, "unsupported sidecar endian marker");
+  if (header_size < 49) return detail::fail(error, "invalid sidecar header size");
   const std::size_t directory_offset = header_size;
   const std::size_t directory_size = static_cast<std::size_t>(section_count) * 32u;
   if (!detail::checkRange(data.size(), directory_offset, directory_size, error, "section directory")) return false;
 
-  *schedule = Pycstb4Schedule{schedule->major, schedule->minor, schedule->patch, schedule->max_words, schedule->max_cycle, schedule->reset_cycles};
+  *schedule = SidecarSchedule{schedule->major, schedule->minor, schedule->patch, schedule->max_words, schedule->max_cycle, schedule->reset_cycles};
   schedule->sections.reserve(section_count);
   for (std::uint32_t idx = 0; idx < section_count; ++idx) {
     const std::size_t cursor = directory_offset + static_cast<std::size_t>(idx) * 32u;
-    Pycstb4SectionInfo section;
+    SidecarSectionInfo section;
     std::uint32_t reserved = 0;
     if (!detail::readU16(data, cursor + 0, &section.kind, error, "section kind") ||
         !detail::readU16(data, cursor + 2, &section.flags, error, "section flags") ||
@@ -404,18 +404,18 @@ inline bool loadPycstb4Schedule(const std::filesystem::path& path, Pycstb4Schedu
       return false;
     }
     if (section.offset > data.size() || section.size > data.size() - section.offset) {
-      return detail::fail(error, "PYCSTB4 section extends beyond file");
+      return detail::fail(error, "sidecar section extends beyond file");
     }
     schedule->sections.push_back(section);
   }
 
-  const auto* string_section = detail::findSection(*schedule, kPycstb4SectionStringTable);
-  const auto* port_section = detail::findSection(*schedule, kPycstb4SectionPortTable);
-  const auto* event_section = detail::findSection(*schedule, kPycstb4SectionEventTable);
-  const auto* frame_section = detail::findSection(*schedule, kPycstb4SectionFrameTable);
-  const auto* pattern_section = detail::findSection(*schedule, kPycstb4SectionPatternTable);
+  const auto* string_section = detail::findSection(*schedule, kSidecarSectionStringTable);
+  const auto* port_section = detail::findSection(*schedule, kSidecarSectionPortTable);
+  const auto* event_section = detail::findSection(*schedule, kSidecarSectionEventTable);
+  const auto* frame_section = detail::findSection(*schedule, kSidecarSectionFrameTable);
+  const auto* pattern_section = detail::findSection(*schedule, kSidecarSectionPatternTable);
   if (string_section == nullptr || port_section == nullptr || event_section == nullptr || frame_section == nullptr) {
-    return detail::fail(error, "PYCSTB4 sidecar file is missing a required section");
+    return detail::fail(error, "sidecar file is missing a required section");
   }
   if (!detail::decodeStringTable(data, *string_section, schedule, error) ||
       !detail::decodePortTable(data, *port_section, schedule, error) ||
@@ -428,12 +428,12 @@ inline bool loadPycstb4Schedule(const std::filesystem::path& path, Pycstb4Schedu
 }
 
 template <std::size_t MaxWords, std::size_t MaxDrivePorts>
-bool convertPycstb4ToRuntimeLoopSchedule(const Pycstb4Schedule& src,
+bool convertSidecarToRunnerSchedule(const SidecarSchedule& src,
                                           const std::array<std::uint32_t, MaxDrivePorts>& drive_port_ids,
-                                          RuntimeLoopSchedule<MaxWords, MaxDrivePorts>* out,
+                                          SidecarRunnerSchedule<MaxWords, MaxDrivePorts>* out,
                                           std::string* error) {
   if (out == nullptr) return detail::fail(error, "null sidecar schedule output");
-  if (src.max_words > MaxWords) return detail::fail(error, "PYCSTB4 max_words exceeds generated sidecar capacity");
+  if (src.max_words > MaxWords) return detail::fail(error, "sidecar max_words exceeds generated sidecar capacity");
 
   std::vector<std::uint32_t> drive_ids(drive_port_ids.begin(), drive_port_ids.end());
   out->drive_frames.clear();
@@ -442,7 +442,7 @@ bool convertPycstb4ToRuntimeLoopSchedule(const Pycstb4Schedule& src,
 
   for (const auto& frame : src.frames) {
     if (frame.kind != 0) continue;
-    RuntimeLoopDriveFrame<MaxWords, MaxDrivePorts> dst;
+    SidecarDriveFrame<MaxWords, MaxDrivePorts> dst;
     dst.cycle = frame.cycle;
     for (auto& mask_word : dst.port_mask) mask_word = 0;
     for (auto& port_words : dst.words) {
@@ -450,8 +450,8 @@ bool convertPycstb4ToRuntimeLoopSchedule(const Pycstb4Schedule& src,
     }
     for (const auto& item : frame.items) {
       const int slot = detail::findDriveIndex(drive_ids, item.port_id);
-      if (slot < 0) return detail::fail(error, "PYCSTB4 frame targets a non-drive port");
-      if (item.nwords > MaxWords) return detail::fail(error, "PYCSTB4 frame item nwords exceeds generated capacity");
+      if (slot < 0) return detail::fail(error, "sidecar frame targets a non-drive port");
+      if (item.nwords > MaxWords) return detail::fail(error, "sidecar frame item nwords exceeds generated capacity");
       dst.port_mask[static_cast<std::size_t>(slot) / 64u] |= (std::uint64_t{1} << (static_cast<std::size_t>(slot) % 64u));
       for (std::uint32_t word = 0; word < item.nwords; ++word) {
         dst.words[static_cast<std::size_t>(slot)][word] = item.words[word];
@@ -462,8 +462,8 @@ bool convertPycstb4ToRuntimeLoopSchedule(const Pycstb4Schedule& src,
 
   for (const auto& event : src.events) {
     if (event.kind != 1) continue;
-    if (event.nwords > MaxWords) return detail::fail(error, "PYCSTB4 event nwords exceeds generated capacity");
-    RuntimeLoopEvent<MaxWords> dst;
+    if (event.nwords > MaxWords) return detail::fail(error, "sidecar event nwords exceeds generated capacity");
+    SidecarEvent<MaxWords> dst;
     dst.cycle = event.cycle;
     dst.port_id = event.port_id;
     dst.nwords = event.nwords;
@@ -477,16 +477,16 @@ bool convertPycstb4ToRuntimeLoopSchedule(const Pycstb4Schedule& src,
     } else if (event.phase == 1) {
       out->post_expect_events.push_back(std::move(dst));
     } else {
-      return detail::fail(error, "PYCSTB4 expect event has unsupported phase");
+      return detail::fail(error, "sidecar expect event has unsupported phase");
     }
   }
 
   for (const auto& pattern : src.periodic_drives) {
     if (pattern.active_nwords > MaxWords || pattern.default_nwords > MaxWords) {
-      return detail::fail(error, "PYCSTB4 pattern nwords exceeds generated capacity");
+      return detail::fail(error, "sidecar pattern nwords exceeds generated capacity");
     }
     if (detail::findDriveIndex(drive_ids, pattern.port_id) < 0) {
-      return detail::fail(error, "PYCSTB4 pattern targets a non-drive port");
+      return detail::fail(error, "sidecar pattern targets a non-drive port");
     }
   }
   return true;

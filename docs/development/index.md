@@ -56,5 +56,5 @@ pyCircuit
 The sidecar schedule container is covered by:
 
 ```bash
-PYTHONPATH=compiler/frontend:. python -m pytest tests/test_pycstb4_sections.py -q
+PYTHONPATH=compiler/frontend:. python -m pytest tests/test_sidecar_sections.py -q
 ```

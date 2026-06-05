@@ -30,9 +30,9 @@ from .probe import (
     load_probe_catalog,
     resolve_probe_function,
 )
-from .pycstb4_sections import (
-    inspect_pycstb4_file,
-    render_pycstb4_inspect_text,
+from .sidecar_sections import (
+    inspect_sidecar_file,
+    render_sidecar_inspect_text,
 )
 from .tb import Tb, TbError, _sanitize_id
 from .testbench import emit_testbench_pyc, testbench_payload_from_tb
@@ -439,13 +439,12 @@ def _module_paths_from_manifest(manifest: Mapping[str, Any], *, out_dir: Path) -
     return out
 
 
-def _render_tb_cpp_runtime_loop(
+def _render_tb_cpp_sidecar(
     iface: _TopIface,
     t: Tb,
     *,
     trace_plan: TracePlan | None = None,
     schedule_path: Path | None = None,
-    schedule_format: str = "pycstb3",
 ) -> str:
     has_clocks = bool(t.clocks)
     has_reset = t.reset_spec is not None
@@ -455,14 +454,11 @@ def _render_tb_cpp_runtime_loop(
         raise SystemExit("sidecar C++ TB currently does not support trace-config binary traces; use --tb-schedule-mode=inline")
     if schedule_path is None:
         raise SystemExit("sidecar C++ TB requires an external schedule path")
-    fmt = str(schedule_format).strip().lower()
-    if fmt not in {"pycstb3", "pycstb4"}:
-        raise SystemExit(f"unsupported sidecar schedule format: {schedule_format!r}")
     from .schedule_ir import (
-        build_runtime_loop_schedule_ir,
+        build_sidecar_schedule_ir,
         infer_port_protocol,
         infer_port_role,
-        schedule_ir_to_pycstb4_bytes,
+        schedule_ir_to_sidecar_bytes,
     )
 
     top = _sanitize_id(iface.sym)
@@ -651,54 +647,16 @@ def _render_tb_cpp_runtime_loop(
         return out
 
     schedule_t0 = time.perf_counter()
-
-    def append_schedule_event(blob: bytearray, row: tuple[int, int, str, int, list[int]] | tuple[int, int, str, int, list[int], str]) -> None:
-        cyc = int(row[0])
-        pid = int(row[1])
-        words = list(row[4])
-        msg = str(row[5]).encode("utf-8") if len(row) >= 6 else b""
-        blob.extend(cyc.to_bytes(8, "little", signed=False))
-        blob.extend(pid.to_bytes(4, "little", signed=False))
-        blob.extend(len(words).to_bytes(4, "little", signed=False))
-        blob.extend(len(msg).to_bytes(4, "little", signed=False))
-        for i in range(max_words):
-            word = int(words[i]) if i < len(words) else 0
-            blob.extend((word & ((1 << 64) - 1)).to_bytes(8, "little", signed=False))
-        blob.extend(msg)
-
-    def append_drive_frame(blob: bytearray, frame: tuple[int, list[int], list[list[int]]]) -> None:
-        cyc, masks, values = frame
-        blob.extend(int(cyc).to_bytes(8, "little", signed=False))
-        for mask in masks:
-            blob.extend((int(mask) & ((1 << 64) - 1)).to_bytes(8, "little", signed=False))
-        for port_words in values:
-            for word in port_words[:max_words]:
-                blob.extend((int(word) & ((1 << 64) - 1)).to_bytes(8, "little", signed=False))
-
-    schedule_blob = bytearray()
-    schedule_blob.extend(b"PYCSTB3\n")
-    schedule_blob.extend(int(max_words).to_bytes(4, "little", signed=False))
-    schedule_blob.extend(len(drive_ports).to_bytes(4, "little", signed=False))
-    schedule_blob.extend(len(drive_frame_rows).to_bytes(8, "little", signed=False))
-    schedule_blob.extend(len(pre_expect_events).to_bytes(8, "little", signed=False))
-    schedule_blob.extend(len(post_expect_events).to_bytes(8, "little", signed=False))
-    for frame in drive_frame_rows:
-        append_drive_frame(schedule_blob, frame)
-    for row in pre_expect_events:
-        append_schedule_event(schedule_blob, row)
-    for row in post_expect_events:
-        append_schedule_event(schedule_blob, row)
     schedule_path.parent.mkdir(parents=True, exist_ok=True)
-    schedule_path.write_bytes(bytes(schedule_blob))
-    schedule_generate_s = time.perf_counter() - schedule_t0
-    schedule_ir = build_runtime_loop_schedule_ir(
+    schedule_generate_s = 0.0
+    schedule_ir = build_sidecar_schedule_ir(
         top_symbol=iface.sym,
         schedule_path=schedule_path,
         ports=port_meta_by_sn.values(),
         timeout_cycles=int(t.timeout_cycles),
         reset_cycles=int(ca + cd) if has_reset else 0,
         clocking="single_clock" if has_clocks else "none",
-        schedule_bytes=len(schedule_blob),
+        schedule_bytes=0,
         max_event_words=int(max_words),
         drive_events=drive_events,
         drive_ports=drive_ports,
@@ -707,8 +665,9 @@ def _render_tb_cpp_runtime_loop(
         post_expect_events=post_expect_events,
         generate_s=schedule_generate_s,
     )
-    schedule_pycstb4_blob = schedule_ir_to_pycstb4_bytes(schedule_ir)
-    schedule_path.with_suffix(".pycstb4").write_bytes(schedule_pycstb4_blob)
+    schedule_sidecar_blob = schedule_ir_to_sidecar_bytes(schedule_ir)
+    schedule_path.write_bytes(schedule_sidecar_blob)
+    schedule_generate_s = time.perf_counter() - schedule_t0
     drive_port_ids_literal = "{" + ", ".join(f"{int(pid)}u" for pid, _sn, _w in drive_ports) + "}"
 
     lines: list[str] = []
@@ -721,8 +680,8 @@ def _render_tb_cpp_runtime_loop(
     lines.append("#include <optional>\n")
     lines.append("#include <string>\n\n")
     lines.append("#include <cpp/pyc_tb.hpp>\n\n")
-    lines.append("#include <cpp/pyc_tb_runtime_loop.hpp>\n\n")
-    lines.append("#include <cpp/pyc_tb_pycstb4.hpp>\n\n")
+    lines.append("#include <cpp/pyc_tb_sidecar_runtime.hpp>\n\n")
+    lines.append("#include <cpp/pyc_tb_sidecar.hpp>\n\n")
     lines.append(f"#include \"{hdr}\"\n\n")
     lines.append("using pyc::cpp::Testbench;\n\n")
     lines.append("namespace {\n\n")
@@ -730,11 +689,11 @@ def _render_tb_cpp_runtime_loop(
     lines.append(f"static constexpr std::uint32_t kDrivePortCount = {len(drive_ports)}u;\n")
     lines.append(f"static constexpr std::array<std::uint32_t, kDrivePortCount> kDrivePortIds = {drive_port_ids_literal};\n")
     lines.append(f"static constexpr const char *kScheduleFormat = {json.dumps(fmt)};\n")
-    lines.append("using RuntimeLoopEvent = pyc::cpp::RuntimeLoopEvent<kMaxEventWords>;\n")
-    lines.append("using RuntimeLoopDriveFrame = pyc::cpp::RuntimeLoopDriveFrame<kMaxEventWords, kDrivePortCount>;\n\n")
+    lines.append("using SidecarEvent = pyc::cpp::SidecarEvent<kMaxEventWords>;\n")
+    lines.append("using SidecarDriveFrame = pyc::cpp::SidecarDriveFrame<kMaxEventWords, kDrivePortCount>;\n\n")
 
     lines.append("template <typename Dut>\n")
-    lines.append("void applyDriveFrame(Dut &dut, const RuntimeLoopDriveFrame &frame) {\n")
+    lines.append("void applyDriveFrame(Dut &dut, const SidecarDriveFrame &frame) {\n")
     lines.append("  auto hasDrive = [&](std::uint32_t slot) -> bool {\n")
     lines.append("    return ((frame.port_mask[slot / 64u] >> (slot % 64u)) & 1ull) != 0ull;\n")
     lines.append("  };\n")
@@ -743,7 +702,7 @@ def _render_tb_cpp_runtime_loop(
     lines.append("}\n\n")
 
     lines.append("template <typename Dut>\n")
-    lines.append("void applyPeriodicDrive(Dut &dut, const pyc::cpp::Pycstb4PeriodicDrive &pattern, std::uint64_t cyc) {\n")
+    lines.append("void applyPeriodicDrive(Dut &dut, const pyc::cpp::SidecarPeriodicDrive &pattern, std::uint64_t cyc) {\n")
     lines.append("  const auto &words = pattern.activeAt(cyc) ? pattern.active_words : pattern.default_words;\n")
     lines.append("  switch (pattern.port_id) {\n")
     for pid, sn, w in drive_ports:
@@ -764,7 +723,7 @@ def _render_tb_cpp_runtime_loop(
     lines.append("}\n\n")
 
     lines.append("template <typename Dut>\n")
-    lines.append("bool checkExpect(Dut &dut, const RuntimeLoopEvent &ev, const char *phase) {\n")
+    lines.append("bool checkExpect(Dut &dut, const SidecarEvent &ev, const char *phase) {\n")
     lines.append("  switch (ev.port_id) {\n")
     for pid, sn, w in expect_ports:
         exp_expr = wire_from_event_expr(w)
@@ -797,43 +756,16 @@ def _render_tb_cpp_runtime_loop(
     lines.append(
         f"  const std::filesystem::path schedule_path = schedule_env != nullptr && schedule_env[0] != '\\0' ? std::filesystem::path(schedule_env) : std::filesystem::path({json.dumps(str(schedule_path))});\n"
     )
-    lines.append("  pyc::cpp::RuntimeLoopSchedule<kMaxEventWords, kDrivePortCount> schedule;\n")
-    lines.append("  pyc::cpp::Pycstb4Schedule pycstb4_schedule;\n")
-    lines.append("  const bool using_pycstb4 = std::string(kScheduleFormat) == \"pycstb4\";\n")
-    lines.append("  if (using_pycstb4) {\n")
-    lines.append("    std::filesystem::path pycstb4_path = schedule_path;\n")
-    lines.append("    pycstb4_path.replace_extension(\".pycstb4\");\n")
-    lines.append("    std::string pycstb4_error;\n")
-    lines.append("    if (!pyc::cpp::loadPycstb4Schedule(pycstb4_path, &pycstb4_schedule, &pycstb4_error)) {\n")
-    lines.append("      std::cerr << \"ERROR: failed to load PYCSTB4 schedule: \" << pycstb4_error << \"\\n\";\n")
-    lines.append("      return 1;\n")
-    lines.append("    }\n")
-    lines.append("    if (!pyc::cpp::convertPycstb4ToRuntimeLoopSchedule(pycstb4_schedule, kDrivePortIds, &schedule, &pycstb4_error)) {\n")
-    lines.append("      std::cerr << \"ERROR: failed to convert PYCSTB4 schedule: \" << pycstb4_error << \"\\n\";\n")
-    lines.append("      return 1;\n")
-    lines.append("    }\n")
-    lines.append("  } else {\n")
-    lines.append("    if (!pyc::cpp::loadRuntimeLoopSchedule(schedule_path, schedule)) return 1;\n")
-    lines.append("  }\n\n")
-    lines.append("  const char *pycstb4_check_env = std::getenv(\"PYC_TB_PYCSTB4_CHECK\");\n")
-    lines.append("  if (pycstb4_check_env != nullptr && pycstb4_check_env[0] != '\\0') {\n")
-    lines.append("    std::filesystem::path pycstb4_path = schedule_path;\n")
-    lines.append("    pycstb4_path.replace_extension(\".pycstb4\");\n")
-    lines.append("    pyc::cpp::Pycstb4Schedule pycstb4_schedule;\n")
-    lines.append("    std::string pycstb4_error;\n")
-    lines.append("    if (!pyc::cpp::loadPycstb4Schedule(pycstb4_path, &pycstb4_schedule, &pycstb4_error)) {\n")
-    lines.append("      std::cerr << \"ERROR: failed to load PYCSTB4 sidecar: \" << pycstb4_error << \"\\n\";\n")
-    lines.append("      return 1;\n")
-    lines.append("    }\n")
-    lines.append("    const std::size_t pycstb4_expect_events = pycstb4_schedule.events.size();\n")
-    lines.append("    const std::size_t pycstb3_expect_events = schedule.pre_expect_events.size() + schedule.post_expect_events.size();\n")
-    lines.append("    if (pycstb4_schedule.frames.size() > schedule.drive_frames.size() || pycstb4_expect_events != pycstb3_expect_events) {\n")
-    lines.append("      std::cerr << \"ERROR: PYCSTB4 sidecar shape mismatch: frames=\" << pycstb4_schedule.frames.size()\n")
-    lines.append("                << \" max_expected_frames=\" << schedule.drive_frames.size()\n")
-    lines.append("                << \" events=\" << pycstb4_expect_events\n")
-    lines.append("                << \" expected_events=\" << pycstb3_expect_events << \"\\n\";\n")
-    lines.append("      return 1;\n")
-    lines.append("    }\n")
+    lines.append("  pyc::cpp::SidecarRunnerSchedule<kMaxEventWords, kDrivePortCount> schedule;\n")
+    lines.append("  pyc::cpp::SidecarSchedule sidecar_schedule;\n")
+    lines.append("  std::string sidecar_error;\n")
+    lines.append("  if (!pyc::cpp::loadSidecarSchedule(schedule_path, &sidecar_schedule, &sidecar_error)) {\n")
+    lines.append("    std::cerr << \"ERROR: failed to load sidecar schedule: \" << sidecar_error << \"\\n\";\n")
+    lines.append("    return 1;\n")
+    lines.append("  }\n")
+    lines.append("  if (!pyc::cpp::convertSidecarToRunnerSchedule(sidecar_schedule, kDrivePortIds, &schedule, &sidecar_error)) {\n")
+    lines.append("    std::cerr << \"ERROR: failed to convert sidecar schedule: \" << sidecar_error << \"\\n\";\n")
+    lines.append("    return 1;\n")
     lines.append("  }\n\n")
     if rand_specs:
         lines.append("  // Random streams (deterministic).\n")
@@ -883,10 +815,8 @@ def _render_tb_cpp_runtime_loop(
             )
         lines.append("\n")
 
-    lines.append("    if (using_pycstb4) {\n")
-    lines.append("      for (const auto &pattern : pycstb4_schedule.periodic_drives) {\n")
-    lines.append("        if (cyc >= pattern.start_cycle && cyc < pattern.end_cycle) applyPeriodicDrive(dut, pattern, cyc);\n")
-    lines.append("      }\n")
+    lines.append("    for (const auto &pattern : sidecar_schedule.periodic_drives) {\n")
+    lines.append("      if (cyc >= pattern.start_cycle && cyc < pattern.end_cycle) applyPeriodicDrive(dut, pattern, cyc);\n")
     lines.append("    }\n")
     lines.append("    while (drive_frame_idx < schedule.drive_frames.size() && schedule.drive_frames[drive_frame_idx].cycle == cyc) {\n")
     lines.append("      applyDriveFrame(dut, schedule.drive_frames[drive_frame_idx]);\n")
@@ -959,16 +889,14 @@ def _render_tb_cpp(
     trace_plan: TracePlan | None = None,
     schedule_mode: str = "inline",
     schedule_path: Path | None = None,
-    schedule_format: str = "pycstb3",
 ) -> str:
     mode = str(schedule_mode).strip().lower()
     if mode == "sidecar":
-        return _render_tb_cpp_runtime_loop(
+        return _render_tb_cpp_sidecar(
             iface,
             t,
             trace_plan=trace_plan,
             schedule_path=schedule_path,
-            schedule_format=schedule_format,
         )
     if mode != "inline":
         raise SystemExit(f"unsupported C++ TB schedule mode: {schedule_mode!r}")
@@ -1763,7 +1691,6 @@ def _collect_testbench_payload(
     trace_plan: TracePlan | None = None,
     tb_probes: TbProbes | None = None,
     tb_schedule_mode: str = "inline",
-    tb_schedule_format: str = "pycstb3",
     tb_schedule_dir: Path | None = None,
 ) -> tuple[str, str]:
     if not hasattr(mod, "tb") or not callable(getattr(mod, "tb")):
@@ -1798,14 +1725,12 @@ def _collect_testbench_payload(
     payload = payload_obj.as_dict()
     payload["tb_name"] = str(tb_name)
     payload["tb_schedule_mode"] = str(tb_schedule_mode)
-    payload["tb_schedule_format"] = str(tb_schedule_format)
     tb_runtime_schedule_path: Path | None = None
     if str(tb_schedule_mode).strip().lower() == "sidecar":
         if tb_schedule_dir is None:
             raise SystemExit("sidecar TB requires a schedule output directory")
         tb_runtime_schedule_path = tb_schedule_dir / f"{tb_name}.schedule.bin"
         payload["tb_schedule"] = str(tb_runtime_schedule_path)
-        payload["tb_schedule_pycstb4"] = str(tb_runtime_schedule_path.with_suffix(".pycstb4"))
     if trace_plan is not None:
         payload["trace_plan"] = trace_plan.as_dict()
     payload["cpp_text"] = _render_tb_cpp(
@@ -1814,7 +1739,6 @@ def _collect_testbench_payload(
         trace_plan=trace_plan,
         schedule_mode=tb_schedule_mode,
         schedule_path=tb_runtime_schedule_path,
-        schedule_format=tb_schedule_format,
     )
     payload["sv_text"] = _render_tb_sv(iface, t, trace_plan=trace_plan)
     return (str(tb_name), json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False))
@@ -2195,7 +2119,6 @@ def _cmd_build(args: argparse.Namespace) -> int:
         trace_plan=trace_plan,
         tb_probes=tb_probes,
         tb_schedule_mode=str(args.tb_schedule_mode),
-        tb_schedule_format=str(args.tb_schedule_format),
         tb_schedule_dir=out_dir / "tb",
     )
     tb_pyc_path = _emit_testbench_pyc_file(out_dir=out_dir, tb_name=tb_name, payload_json=tb_payload_json)
@@ -2458,14 +2381,14 @@ def _cmd_build(args: argparse.Namespace) -> int:
     return 0
 
 
-def _cmd_pycstb4_inspect(args: argparse.Namespace) -> int:
-    report = inspect_pycstb4_file(Path(args.file))
-    sys.stdout.write(render_pycstb4_inspect_text(report))
+def _cmd_sidecar_inspect(args: argparse.Namespace) -> int:
+    report = inspect_sidecar_file(Path(args.file))
+    sys.stdout.write(render_sidecar_inspect_text(report))
     return 1 if bool(report.get("errors")) and bool(getattr(args, "strict", False)) else 0
 
 
-def _cmd_pycstb4_verify(args: argparse.Namespace) -> int:
-    report = inspect_pycstb4_file(Path(args.file))
+def _cmd_sidecar_verify(args: argparse.Namespace) -> int:
+    report = inspect_sidecar_file(Path(args.file))
     if report.get("errors"):
         for item in report["errors"]:
             print(f"ERROR: {item}", file=sys.stderr)
@@ -2473,9 +2396,9 @@ def _cmd_pycstb4_verify(args: argparse.Namespace) -> int:
         for item in report["warnings"]:
             print(f"WARNING: {item}", file=sys.stderr)
     if report.get("valid"):
-        print("PYCSTB4 verify: ok")
+        print("sidecar verify: ok")
         return 0
-    print("PYCSTB4 verify: failed", file=sys.stderr)
+    print("sidecar verify: failed", file=sys.stderr)
     return 1
 
 
@@ -2577,13 +2500,7 @@ def main(argv: list[str] | None = None) -> int:
         "--tb-schedule-mode",
         choices=["inline", "sidecar"],
         default="inline",
-        help="C++ testbench schedule rendering mode: inline preserves legacy per-cycle emission; sidecar emits a stable runner plus external schedule sidecar data.",
-    )
-    build.add_argument(
-        "--tb-schedule-format",
-        choices=["pycstb3", "pycstb4"],
-        default="pycstb3",
-        help="Sidecar schedule execution format. pycstb3 is the legacy default; pycstb4 is experimental.",
+        help="C++ testbench schedule rendering mode: inline preserves existing per-cycle emission; sidecar emits a stable runner plus external schedule sidecar data.",
     )
     build.add_argument(
         "--run-verilator",
@@ -2598,17 +2515,17 @@ def main(argv: list[str] | None = None) -> int:
     )
     build.set_defaults(fn=_cmd_build)
 
-    pycstb4 = sub.add_parser("pycstb4", help="Inspect and verify PYCSTB4 container files.")
-    pycstb4_sub = pycstb4.add_subparsers(dest="pycstb4_cmd", required=True)
+    sidecar = sub.add_parser("sidecar", help="Inspect and verify sidecar schedule files.")
+    sidecar_sub = sidecar.add_subparsers(dest="sidecar_cmd", required=True)
 
-    pycstb4_inspect = pycstb4_sub.add_parser("inspect", help="Print a human-readable PYCSTB4 section summary.")
-    pycstb4_inspect.add_argument("file", help="PYCSTB4 file path")
-    pycstb4_inspect.add_argument("--strict", action="store_true", help="Return non-zero if framework-level errors exist.")
-    pycstb4_inspect.set_defaults(fn=_cmd_pycstb4_inspect)
+    sidecar_inspect = sidecar_sub.add_parser("inspect", help="Print a human-readable sidecar section summary.")
+    sidecar_inspect.add_argument("file", help="sidecar file path")
+    sidecar_inspect.add_argument("--strict", action="store_true", help="Return non-zero if framework-level errors exist.")
+    sidecar_inspect.set_defaults(fn=_cmd_sidecar_inspect)
 
-    pycstb4_verify = pycstb4_sub.add_parser("verify", help="Verify PYCSTB4 container and section-directory consistency.")
-    pycstb4_verify.add_argument("file", help="PYCSTB4 file path")
-    pycstb4_verify.set_defaults(fn=_cmd_pycstb4_verify)
+    sidecar_verify = sidecar_sub.add_parser("verify", help="Verify sidecar container and section-directory consistency.")
+    sidecar_verify.add_argument("file", help="sidecar file path")
+    sidecar_verify.set_defaults(fn=_cmd_sidecar_verify)
 
     ns = p.parse_args(argv)
     return int(ns.fn(ns))

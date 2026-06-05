@@ -1,13 +1,13 @@
 from __future__ import annotations
 
-from pycircuit.pycstb4_sections import (
+from pycircuit.sidecar_sections import (
     SectionKind,
     default_section_registry,
-    inspect_pycstb4_file,
-    render_pycstb4_inspect_text,
-    verify_schedule_ir_for_pycstb4,
+    inspect_sidecar_file,
+    render_sidecar_inspect_text,
+    verify_schedule_ir_for_sidecar,
 )
-from pycircuit.schedule_ir import schedule_ir_to_pycstb4_bytes
+from pycircuit.schedule_ir import schedule_ir_to_sidecar_bytes
 
 
 def _sidecar_schedule_ir() -> dict:
@@ -142,15 +142,15 @@ def test_sidecar_registry_has_only_sidecar_sections() -> None:
     }
 
 
-def test_pycstb4_sidecar_round_trip(tmp_path) -> None:
+def test_sidecar_sidecar_round_trip(tmp_path) -> None:
     schedule_ir = _sidecar_schedule_ir()
-    errors = verify_schedule_ir_for_pycstb4(schedule_ir)
+    errors = verify_schedule_ir_for_sidecar(schedule_ir)
     assert errors == []
 
-    schedule_path = tmp_path / "schedule.pycstb4.bin"
-    schedule_path.write_bytes(schedule_ir_to_pycstb4_bytes(schedule_ir))
+    schedule_path = tmp_path / "schedule.sidecar.bin"
+    schedule_path.write_bytes(schedule_ir_to_sidecar_bytes(schedule_ir))
 
-    inspected = inspect_pycstb4_file(schedule_path)
+    inspected = inspect_sidecar_file(schedule_path)
     assert inspected["header"]["major"] == 1
     assert inspected["header"]["minor"] == 0
     assert inspected["header"]["max_cycle"] == 8
@@ -166,15 +166,15 @@ def test_pycstb4_sidecar_round_trip(tmp_path) -> None:
     assert decoded["frames"][0]["items"][1]["message"] == "cmd_data"
     assert decoded["patterns"][0]["kind"] == "periodic_drive"
 
-    rendered = render_pycstb4_inspect_text(inspected)
-    assert "PYCSTB4 file" in rendered
+    rendered = render_sidecar_inspect_text(inspected)
+    assert "SIDECAR file" in rendered
     assert "pattern_table" in rendered
 
 
 
-def test_pycstb4_verifier_rejects_unknown_port_reference() -> None:
+def test_sidecar_verifier_rejects_unknown_port_reference() -> None:
     schedule_ir = _sidecar_schedule_ir()
     schedule_ir["events"][0]["port"] = 99
 
-    errors = verify_schedule_ir_for_pycstb4(schedule_ir)
+    errors = verify_schedule_ir_for_sidecar(schedule_ir)
     assert any("references missing port id: 99" in error for error in errors)

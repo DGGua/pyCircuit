@@ -7,17 +7,17 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping
 
 
-PYCSTB4_MAGIC = b"PYCSTB4\n"
-PYCSTB4_HEADER_FMT = "<8sBHHHHQIIQII"
-PYCSTB4_DIR_FMT = "<HHIQQQ"
-PYCSTB4_PORT_FMT = "<IIBBHIII"
-PYCSTB4_EVENT_PREFIX_FMT = "<QBBHIII"
-PYCSTB4_FRAME_PREFIX_FMT = "<QBBHI"
-PYCSTB4_FRAME_ITEM_PREFIX_FMT = "<IIII"
-PYCSTB4_PATTERN_PREFIX_FMT = "<HHIQQQQQII"
-PYCSTB4_HEADER_SIZE = struct.calcsize(PYCSTB4_HEADER_FMT)
-PYCSTB4_DIR_SIZE = struct.calcsize(PYCSTB4_DIR_FMT)
-PYCSTB4_NONE = 0xFFFFFFFF
+SIDECAR_MAGIC = b"SIDECAR\n"
+SIDECAR_HEADER_FMT = "<8sBHHHHQIIQII"
+SIDECAR_DIR_FMT = "<HHIQQQ"
+SIDECAR_PORT_FMT = "<IIBBHIII"
+SIDECAR_EVENT_PREFIX_FMT = "<QBBHIII"
+SIDECAR_FRAME_PREFIX_FMT = "<QBBHI"
+SIDECAR_FRAME_ITEM_PREFIX_FMT = "<IIII"
+SIDECAR_PATTERN_PREFIX_FMT = "<HHIQQQQQII"
+SIDECAR_HEADER_SIZE = struct.calcsize(SIDECAR_HEADER_FMT)
+SIDECAR_DIR_SIZE = struct.calcsize(SIDECAR_DIR_FMT)
+SIDECAR_NONE = 0xFFFFFFFF
 
 _DIRECTION_NAME = {0: "input", 1: "output", 2: "inout"}
 _ROLE_NAME = {0: "unknown", 1: "data", 2: "valid", 3: "ready", 4: "tag", 5: "control", 6: "clock", 7: "reset"}
@@ -42,8 +42,6 @@ class SectionDescriptor:
     major: int = 0
     minor: int = 1
     required: bool = False
-    experimental: bool = False
-    deprecated: bool = False
     dependencies: tuple[int, ...] = ()
     runtime_tags: tuple[str, ...] = ()
     summary: str = ""
@@ -59,12 +57,10 @@ class SectionDirectoryEntry:
     name: str
     known: bool
     required: bool
-    experimental: bool
-    deprecated: bool
 
 
 @dataclass(frozen=True)
-class Pycstb4Header:
+class SidecarHeader:
     endian: int
     header_size: int
     major: int
@@ -98,9 +94,9 @@ class SectionRegistry:
         kind = int(descriptor.kind)
         name = str(descriptor.name)
         if kind in self._by_kind:
-            raise ValueError(f"duplicate PYCSTB4 section kind: {kind}")
+            raise ValueError(f"duplicate SIDECAR section kind: {kind}")
         if name in self._by_name:
-            raise ValueError(f"duplicate PYCSTB4 section name: {name}")
+            raise ValueError(f"duplicate SIDECAR section name: {name}")
         self._by_kind[kind] = descriptor
         self._by_name[name] = descriptor
 
@@ -166,15 +162,15 @@ def default_section_registry() -> SectionRegistry:
     )
 
 
-def _read_exact_header(data: bytes) -> tuple[Pycstb4Header | None, list[str]]:
-    if len(data) < PYCSTB4_HEADER_SIZE:
-        return None, [f"file too small for PYCSTB4 header: {len(data)} bytes"]
-    unpacked = struct.unpack_from(PYCSTB4_HEADER_FMT, data, 0)
+def _read_exact_header(data: bytes) -> tuple[SidecarHeader | None, list[str]]:
+    if len(data) < SIDECAR_HEADER_SIZE:
+        return None, [f"file too small for SIDECAR header: {len(data)} bytes"]
+    unpacked = struct.unpack_from(SIDECAR_HEADER_FMT, data, 0)
     errors: list[str] = []
-    if unpacked[0] != PYCSTB4_MAGIC:
-        errors.append("invalid PYCSTB4 magic")
+    if unpacked[0] != SIDECAR_MAGIC:
+        errors.append("invalid SIDECAR magic")
     return (
-        Pycstb4Header(
+        SidecarHeader(
             endian=int(unpacked[1]),
             header_size=int(unpacked[2]),
             major=int(unpacked[3]),
@@ -196,7 +192,7 @@ def _slice_section(data: bytes, section: SectionDirectoryEntry) -> bytes:
 
 
 def _decode_string_ref(strings: list[str], sid: int) -> str | None:
-    if sid == PYCSTB4_NONE:
+    if sid == SIDECAR_NONE:
         return None
     if 0 <= sid < len(strings):
         return strings[sid]
@@ -233,7 +229,7 @@ def _value_from_words(words: list[int]) -> str:
 
 def _decode_ports(blob: bytes, count: int, strings: list[str]) -> tuple[list[dict[str, Any]], list[str]]:
     errors: list[str] = []
-    record_size = struct.calcsize(PYCSTB4_PORT_FMT)
+    record_size = struct.calcsize(SIDECAR_PORT_FMT)
     out: list[dict[str, Any]] = []
     for idx in range(count):
         pos = idx * record_size
@@ -241,7 +237,7 @@ def _decode_ports(blob: bytes, count: int, strings: list[str]) -> tuple[list[dic
             errors.append(f"port_table truncated at record {idx}")
             break
         port_id, name_sid, direction, role, _reserved, bit_width, word_count, protocol_sid = struct.unpack_from(
-            PYCSTB4_PORT_FMT, blob, pos
+            SIDECAR_PORT_FMT, blob, pos
         )
         out.append(
             {
@@ -259,7 +255,7 @@ def _decode_ports(blob: bytes, count: int, strings: list[str]) -> tuple[list[dic
 
 def _decode_events(blob: bytes, count: int, strings: list[str], max_words: int) -> tuple[list[dict[str, Any]], list[str]]:
     errors: list[str] = []
-    prefix_size = struct.calcsize(PYCSTB4_EVENT_PREFIX_FMT)
+    prefix_size = struct.calcsize(SIDECAR_EVENT_PREFIX_FMT)
     record_size = prefix_size + max_words * 16
     out: list[dict[str, Any]] = []
     for idx in range(count):
@@ -267,7 +263,7 @@ def _decode_events(blob: bytes, count: int, strings: list[str], max_words: int) 
         if pos + record_size > len(blob):
             errors.append(f"event_table truncated at record {idx}")
             break
-        cycle, kind, phase, _reserved, port, nwords, msg_sid = struct.unpack_from(PYCSTB4_EVENT_PREFIX_FMT, blob, pos)
+        cycle, kind, phase, _reserved, port, nwords, msg_sid = struct.unpack_from(SIDECAR_EVENT_PREFIX_FMT, blob, pos)
         pos += prefix_size
         words = [int.from_bytes(blob[pos + i * 8 : pos + i * 8 + 8], "little", signed=False) for i in range(max_words)]
         pos += max_words * 8
@@ -277,7 +273,7 @@ def _decode_events(blob: bytes, count: int, strings: list[str], max_words: int) 
                 "cycle": int(cycle),
                 "kind": _EVENT_KIND_NAME.get(int(kind), f"unknown_{int(kind)}"),
                 "phase": _PHASE_NAME.get(int(phase), f"unknown_{int(phase)}"),
-                "port": None if int(port) == PYCSTB4_NONE else int(port),
+                "port": None if int(port) == SIDECAR_NONE else int(port),
                 "nwords": int(nwords),
                 "value": _value_from_words(words[: int(nwords)]),
                 "mask": _value_from_words(masks),
@@ -291,20 +287,20 @@ def _decode_frames(blob: bytes, count: int, strings: list[str], max_words: int) 
     errors: list[str] = []
     pos = 0
     out: list[dict[str, Any]] = []
-    prefix_size = struct.calcsize(PYCSTB4_FRAME_PREFIX_FMT)
-    item_prefix_size = struct.calcsize(PYCSTB4_FRAME_ITEM_PREFIX_FMT)
+    prefix_size = struct.calcsize(SIDECAR_FRAME_PREFIX_FMT)
+    item_prefix_size = struct.calcsize(SIDECAR_FRAME_ITEM_PREFIX_FMT)
     for idx in range(count):
         if pos + prefix_size > len(blob):
             errors.append(f"frame_table truncated before frame {idx}")
             break
-        cycle, kind, phase, _reserved, item_count = struct.unpack_from(PYCSTB4_FRAME_PREFIX_FMT, blob, pos)
+        cycle, kind, phase, _reserved, item_count = struct.unpack_from(SIDECAR_FRAME_PREFIX_FMT, blob, pos)
         pos += prefix_size
         items: list[dict[str, Any]] = []
         for item_index in range(int(item_count)):
             if pos + item_prefix_size + max_words * 16 > len(blob):
                 errors.append(f"frame_table truncated at frame={idx} item={item_index}")
                 break
-            port, nwords, msg_sid, _item_reserved = struct.unpack_from(PYCSTB4_FRAME_ITEM_PREFIX_FMT, blob, pos)
+            port, nwords, msg_sid, _item_reserved = struct.unpack_from(SIDECAR_FRAME_ITEM_PREFIX_FMT, blob, pos)
             pos += item_prefix_size
             words = [int.from_bytes(blob[pos + i * 8 : pos + i * 8 + 8], "little", signed=False) for i in range(max_words)]
             pos += max_words * 8
@@ -334,13 +330,13 @@ def _decode_patterns(blob: bytes, count: int, max_words: int) -> tuple[list[dict
     errors: list[str] = []
     pos = 0
     out: list[dict[str, Any]] = []
-    prefix_size = struct.calcsize(PYCSTB4_PATTERN_PREFIX_FMT)
+    prefix_size = struct.calcsize(SIDECAR_PATTERN_PREFIX_FMT)
     for idx in range(count):
         if pos + prefix_size + max_words * 16 > len(blob):
             errors.append(f"pattern_table truncated at record {idx}")
             break
         kind, _reserved, port, start, end, period, active_cycles, phase_cycle, active_nwords, default_nwords = struct.unpack_from(
-            PYCSTB4_PATTERN_PREFIX_FMT, blob, pos
+            SIDECAR_PATTERN_PREFIX_FMT, blob, pos
         )
         pos += prefix_size
         active_words = [int.from_bytes(blob[pos + i * 8 : pos + i * 8 + 8], "little", signed=False) for i in range(max_words)]
@@ -363,7 +359,7 @@ def _decode_patterns(blob: bytes, count: int, max_words: int) -> tuple[list[dict
     return out, errors
 
 
-def inspect_pycstb4_file(path: str | Path, *, registry: SectionRegistry | None = None) -> dict[str, Any]:
+def inspect_sidecar_file(path: str | Path, *, registry: SectionRegistry | None = None) -> dict[str, Any]:
     registry = default_section_registry() if registry is None else registry
     p = Path(path)
     data = p.read_bytes()
@@ -374,18 +370,18 @@ def inspect_pycstb4_file(path: str | Path, *, registry: SectionRegistry | None =
         return {"path": str(p), "size_bytes": len(data), "valid": False, "errors": errors, "warnings": warnings, "header": None, "sections": [], "summary": {}}
     if header.endian != 1:
         errors.append(f"unsupported endian marker: {header.endian}")
-    if header.header_size < PYCSTB4_HEADER_SIZE:
+    if header.header_size < SIDECAR_HEADER_SIZE:
         errors.append(f"header_size too small: {header.header_size}")
     directory_start = header.header_size
-    directory_end = directory_start + header.section_count * PYCSTB4_DIR_SIZE
+    directory_end = directory_start + header.section_count * SIDECAR_DIR_SIZE
     if directory_end > len(data):
         errors.append(f"section directory extends past end of file: end={directory_end} file_size={len(data)}")
     else:
         seen_kinds: set[int] = set()
         ranges: list[tuple[int, int, int]] = []
         for idx in range(header.section_count):
-            pos = directory_start + idx * PYCSTB4_DIR_SIZE
-            kind, flags, _reserved, offset, size, count = struct.unpack_from(PYCSTB4_DIR_FMT, data, pos)
+            pos = directory_start + idx * SIDECAR_DIR_SIZE
+            kind, flags, _reserved, offset, size, count = struct.unpack_from(SIDECAR_DIR_FMT, data, pos)
             descriptor = registry.by_kind(kind)
             if kind in seen_kinds:
                 errors.append(f"duplicate section kind: {kind}")
@@ -406,8 +402,6 @@ def inspect_pycstb4_file(path: str | Path, *, registry: SectionRegistry | None =
                     name=descriptor.name if descriptor is not None else f"unknown_{int(kind)}",
                     known=descriptor is not None,
                     required=bool(descriptor.required) if descriptor is not None else False,
-                    experimental=bool(descriptor.experimental) if descriptor is not None else False,
-                    deprecated=bool(descriptor.deprecated) if descriptor is not None else False,
                 )
             )
         for prev, cur in zip(sorted(ranges), sorted(ranges)[1:]):
@@ -468,8 +462,6 @@ def inspect_pycstb4_file(path: str | Path, *, registry: SectionRegistry | None =
             "count": section.count,
             "known": section.known,
             "required": section.required,
-            "experimental": section.experimental,
-            "deprecated": section.deprecated,
         }
         for section in sections
     ]
@@ -477,7 +469,6 @@ def inspect_pycstb4_file(path: str | Path, *, registry: SectionRegistry | None =
         "section_count": len(sections),
         "known_section_count": sum(1 for section in sections if section.known),
         "unknown_section_count": sum(1 for section in sections if not section.known),
-        "experimental_section_count": sum(1 for section in sections if section.experimental),
         "total_section_payload_bytes": sum(section.size for section in sections),
         "sections_by_name": {section.name: {"kind": section.kind, "count": section.count, "size": section.size} for section in sections},
     }
@@ -506,9 +497,9 @@ def inspect_pycstb4_file(path: str | Path, *, registry: SectionRegistry | None =
     }
 
 
-def render_pycstb4_inspect_text(report: dict[str, Any]) -> str:
+def render_sidecar_inspect_text(report: dict[str, Any]) -> str:
     lines: list[str] = []
-    lines.append(f"PYCSTB4 file: {report.get('path')}")
+    lines.append(f"SIDECAR file: {report.get('path')}")
     lines.append(f"valid: {bool(report.get('valid'))}")
     lines.append(f"size_bytes: {int(report.get('size_bytes', 0))}")
     header = report.get("header")
@@ -537,10 +528,6 @@ def render_pycstb4_inspect_text(report: dict[str, Any]) -> str:
         status: list[str] = []
         if section.get("required"):
             status.append("required")
-        if section.get("experimental"):
-            status.append("experimental")
-        if section.get("deprecated"):
-            status.append("deprecated")
         if not section.get("known"):
             status.append("unknown")
         status_text = ",".join(status) if status else "optional"
@@ -596,7 +583,7 @@ def _mapping_items(value: Any) -> list[Mapping[str, Any]]:
     return [item for item in value if isinstance(item, Mapping)]
 
 
-def verify_schedule_ir_for_pycstb4(schedule_ir: Mapping[str, Any]) -> list[str]:
+def verify_schedule_ir_for_sidecar(schedule_ir: Mapping[str, Any]) -> list[str]:
     errors: list[str] = []
     ports = _mapping_items(schedule_ir.get("ports"))
     port_ids: set[int] = set()
