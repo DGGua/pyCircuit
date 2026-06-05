@@ -688,7 +688,6 @@ def _render_tb_cpp_sidecar(
     lines.append(f"static constexpr std::uint32_t kMaxEventWords = {int(max_words)}u;\n\n")
     lines.append(f"static constexpr std::uint32_t kDrivePortCount = {len(drive_ports)}u;\n")
     lines.append(f"static constexpr std::array<std::uint32_t, kDrivePortCount> kDrivePortIds = {drive_port_ids_literal};\n")
-    lines.append(f"static constexpr const char *kScheduleFormat = {json.dumps(fmt)};\n")
     lines.append("using SidecarEvent = pyc::cpp::SidecarEvent<kMaxEventWords>;\n")
     lines.append("using SidecarDriveFrame = pyc::cpp::SidecarDriveFrame<kMaxEventWords, kDrivePortCount>;\n\n")
 
