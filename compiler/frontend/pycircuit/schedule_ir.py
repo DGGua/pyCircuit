@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import struct
 from dataclasses import dataclass
 from pathlib import Path
@@ -210,7 +209,6 @@ def build_runtime_loop_schedule_ir(
         "port_count": len(port_list),
         "max_cycle": int(timeout_cycles),
         "schedule_bytes": int(schedule_bytes),
-        "json_bytes": 0,
         "generate_s": float(generate_s),
         "legacy_pycstb3": {
             "drive_events": len(drive_events),
@@ -243,15 +241,6 @@ def build_runtime_loop_schedule_ir(
         "stats": stats,
     }
 
-
-def render_schedule_ir_json(schedule_ir: dict[str, Any]) -> str:
-    for _ in range(4):
-        text = json.dumps(schedule_ir, sort_keys=True, indent=2) + "\n"
-        json_bytes = len(text.encode("utf-8"))
-        if int(schedule_ir["stats"]["json_bytes"]) == json_bytes:
-            return text
-        schedule_ir["stats"]["json_bytes"] = json_bytes
-    return json.dumps(schedule_ir, sort_keys=True, indent=2) + "\n"
 
 
 _PYCSTB4_MAGIC = b"PYCSTB4\n"

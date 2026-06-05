@@ -1,12 +1,9 @@
 from __future__ import annotations
 
-import json
-
 from pycircuit.pycstb4_sections import (
     SectionKind,
     default_section_registry,
     inspect_pycstb4_file,
-    pycstb4_report_json,
     render_pycstb4_inspect_text,
     verify_schedule_ir_for_pycstb4,
 )
@@ -173,8 +170,6 @@ def test_pycstb4_sidecar_round_trip(tmp_path) -> None:
     assert "PYCSTB4 file" in rendered
     assert "pattern_table" in rendered
 
-    report = json.loads(pycstb4_report_json(inspected))
-    assert report["summary"]["sections_by_name"]["event_table"]["count"] == 2
 
 
 def test_pycstb4_verifier_rejects_unknown_port_reference() -> None:

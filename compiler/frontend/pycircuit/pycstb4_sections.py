@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import hashlib
-import json
 import struct
 from dataclasses import dataclass
 from enum import IntEnum
@@ -166,33 +164,6 @@ def default_section_registry() -> SectionRegistry:
             ),
         ]
     )
-
-
-def section_registry_manifest(registry: SectionRegistry | None = None) -> dict[str, Any]:
-    registry = default_section_registry() if registry is None else registry
-    sections = [
-        {
-            "kind": int(descriptor.kind),
-            "name": descriptor.name,
-            "major": int(descriptor.major),
-            "minor": int(descriptor.minor),
-            "required": bool(descriptor.required),
-            "experimental": bool(descriptor.experimental),
-            "deprecated": bool(descriptor.deprecated),
-            "dependencies": [int(dep) for dep in descriptor.dependencies],
-            "runtime_tags": list(descriptor.runtime_tags),
-            "summary": descriptor.summary,
-        }
-        for descriptor in registry.descriptors()
-    ]
-    payload = json.dumps(sections, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    return {
-        "schema": "pycircuit.pycstb4.section_registry",
-        "schema_version": {"major": 0, "minor": 1},
-        "section_count": len(sections),
-        "sha256": hashlib.sha256(payload).hexdigest(),
-        "sections": sections,
-    }
 
 
 def _read_exact_header(data: bytes) -> tuple[Pycstb4Header | None, list[str]]:
@@ -606,8 +577,6 @@ def render_pycstb4_inspect_text(report: dict[str, Any]) -> str:
     return "\n".join(lines) + "\n"
 
 
-def pycstb4_report_json(report: dict[str, Any]) -> str:
-    return json.dumps(report, sort_keys=True, indent=2) + "\n"
 
 
 def _int_or_none(value: Any) -> int | None:

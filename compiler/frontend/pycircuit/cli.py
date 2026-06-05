@@ -31,11 +31,8 @@ from .probe import (
     resolve_probe_function,
 )
 from .pycstb4_sections import (
-    default_section_registry,
     inspect_pycstb4_file,
-    pycstb4_report_json,
     render_pycstb4_inspect_text,
-    section_registry_manifest,
 )
 from .tb import Tb, TbError, _sanitize_id
 from .testbench import emit_testbench_pyc, testbench_payload_from_tb
@@ -465,7 +462,6 @@ def _render_tb_cpp_runtime_loop(
         build_runtime_loop_schedule_ir,
         infer_port_protocol,
         infer_port_role,
-        render_schedule_ir_json,
         schedule_ir_to_pycstb4_bytes,
     )
 
@@ -695,21 +691,6 @@ def _render_tb_cpp_runtime_loop(
     schedule_path.parent.mkdir(parents=True, exist_ok=True)
     schedule_path.write_bytes(bytes(schedule_blob))
     schedule_generate_s = time.perf_counter() - schedule_t0
-    schedule_stats = {
-        "version": 3,
-        "format": "PYCSTB3",
-        "schedule": str(schedule_path),
-        "schedule_bytes": len(schedule_blob),
-        "schedule_json": str(schedule_path.with_suffix(".json")),
-        "max_event_words": int(max_words),
-        "drive_frames": len(drive_frame_rows),
-        "drive_ports": len(drive_ports),
-        "drive_events": len(drive_events),
-        "pre_expect_events": len(pre_expect_events),
-        "post_expect_events": len(post_expect_events),
-        "total_events": len(drive_events) + len(pre_expect_events) + len(post_expect_events),
-        "generate_s": schedule_generate_s,
-    }
     schedule_ir = build_runtime_loop_schedule_ir(
         top_symbol=iface.sym,
         schedule_path=schedule_path,
@@ -727,14 +708,7 @@ def _render_tb_cpp_runtime_loop(
         generate_s=schedule_generate_s,
     )
     schedule_pycstb4_blob = schedule_ir_to_pycstb4_bytes(schedule_ir)
-    schedule_ir["stats"]["pycstb4_bytes"] = len(schedule_pycstb4_blob)
-    schedule_json_text = render_schedule_ir_json(schedule_ir)
-    schedule_path.with_suffix(".json").write_text(schedule_json_text, encoding="utf-8")
     schedule_path.with_suffix(".pycstb4").write_bytes(schedule_pycstb4_blob)
-    schedule_stats["schedule_json_bytes"] = len(schedule_json_text.encode("utf-8"))
-    schedule_stats["schedule_pycstb4"] = str(schedule_path.with_suffix(".pycstb4"))
-    schedule_stats["schedule_pycstb4_bytes"] = len(schedule_pycstb4_blob)
-    schedule_path.with_suffix(".stats.json").write_text(json.dumps(schedule_stats, sort_keys=True, indent=2) + "\n", encoding="utf-8")
     drive_port_ids_literal = "{" + ", ".join(f"{int(pid)}u" for pid, _sn, _w in drive_ports) + "}"
 
     lines: list[str] = []
@@ -1831,7 +1805,6 @@ def _collect_testbench_payload(
             raise SystemExit("sidecar TB requires a schedule output directory")
         tb_runtime_schedule_path = tb_schedule_dir / f"{tb_name}.schedule.bin"
         payload["tb_schedule"] = str(tb_runtime_schedule_path)
-        payload["tb_schedule_json"] = str(tb_runtime_schedule_path.with_suffix(".json"))
         payload["tb_schedule_pycstb4"] = str(tb_runtime_schedule_path.with_suffix(".pycstb4"))
     if trace_plan is not None:
         payload["trace_plan"] = trace_plan.as_dict()
@@ -2491,12 +2464,6 @@ def _cmd_pycstb4_inspect(args: argparse.Namespace) -> int:
     return 1 if bool(report.get("errors")) and bool(getattr(args, "strict", False)) else 0
 
 
-def _cmd_pycstb4_dump_json(args: argparse.Namespace) -> int:
-    report = inspect_pycstb4_file(Path(args.file))
-    sys.stdout.write(pycstb4_report_json(report))
-    return 1 if bool(report.get("errors")) and bool(getattr(args, "strict", False)) else 0
-
-
 def _cmd_pycstb4_verify(args: argparse.Namespace) -> int:
     report = inspect_pycstb4_file(Path(args.file))
     if report.get("errors"):
@@ -2510,38 +2477,6 @@ def _cmd_pycstb4_verify(args: argparse.Namespace) -> int:
         return 0
     print("PYCSTB4 verify: failed", file=sys.stderr)
     return 1
-
-
-def _cmd_pycstb4_stats(args: argparse.Namespace) -> int:
-    report = inspect_pycstb4_file(Path(args.file))
-    sys.stdout.write(json.dumps(report.get("summary", {}), sort_keys=True, indent=2) + "\n")
-    return 1 if bool(report.get("errors")) and bool(getattr(args, "strict", False)) else 0
-
-
-def _cmd_pycstb4_registry(args: argparse.Namespace) -> int:
-    registry = default_section_registry()
-    manifest = section_registry_manifest(registry)
-    rows = list(manifest["sections"])
-    if bool(getattr(args, "json", False)):
-        sys.stdout.write(json.dumps(manifest, sort_keys=True, indent=2) + "\n")
-        return 0
-    print(f"schema: {manifest['schema']} v{manifest['schema_version']['major']}.{manifest['schema_version']['minor']}")
-    print(f"section_count: {manifest['section_count']}")
-    print(f"sha256: {manifest['sha256']}")
-    print("")
-    print("kind  name                         req  exp  deps        runtime_tags")
-    for row in rows:
-        deps = ",".join(str(dep) for dep in row["dependencies"]) or "-"
-        tags = ",".join(str(tag) for tag in row["runtime_tags"]) or "-"
-        print(
-            f"{int(row['kind']):>4}  "
-            f"{str(row['name']):<28} "
-            f"{'yes' if row['required'] else 'no ':<3}  "
-            f"{'yes' if row['experimental'] else 'no ':<3}  "
-            f"{deps:<10}  "
-            f"{tags}"
-        )
-    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -2663,7 +2598,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     build.set_defaults(fn=_cmd_build)
 
-    pycstb4 = sub.add_parser("pycstb4", help="Inspect, dump, and verify PYCSTB4 container files.")
+    pycstb4 = sub.add_parser("pycstb4", help="Inspect and verify PYCSTB4 container files.")
     pycstb4_sub = pycstb4.add_subparsers(dest="pycstb4_cmd", required=True)
 
     pycstb4_inspect = pycstb4_sub.add_parser("inspect", help="Print a human-readable PYCSTB4 section summary.")
@@ -2671,23 +2606,9 @@ def main(argv: list[str] | None = None) -> int:
     pycstb4_inspect.add_argument("--strict", action="store_true", help="Return non-zero if framework-level errors exist.")
     pycstb4_inspect.set_defaults(fn=_cmd_pycstb4_inspect)
 
-    pycstb4_dump_json = pycstb4_sub.add_parser("dump-json", help="Dump PYCSTB4 header and section metadata as JSON.")
-    pycstb4_dump_json.add_argument("file", help="PYCSTB4 file path")
-    pycstb4_dump_json.add_argument("--strict", action="store_true", help="Return non-zero if framework-level errors exist.")
-    pycstb4_dump_json.set_defaults(fn=_cmd_pycstb4_dump_json)
-
     pycstb4_verify = pycstb4_sub.add_parser("verify", help="Verify PYCSTB4 container and section-directory consistency.")
     pycstb4_verify.add_argument("file", help="PYCSTB4 file path")
     pycstb4_verify.set_defaults(fn=_cmd_pycstb4_verify)
-
-    pycstb4_stats = pycstb4_sub.add_parser("stats", help="Print PYCSTB4 section summary stats as JSON.")
-    pycstb4_stats.add_argument("file", help="PYCSTB4 file path")
-    pycstb4_stats.add_argument("--strict", action="store_true", help="Return non-zero if framework-level errors exist.")
-    pycstb4_stats.set_defaults(fn=_cmd_pycstb4_stats)
-
-    pycstb4_registry = pycstb4_sub.add_parser("registry", help="List registered PYCSTB4 section descriptors.")
-    pycstb4_registry.add_argument("--json", action="store_true", help="Output registry as JSON.")
-    pycstb4_registry.set_defaults(fn=_cmd_pycstb4_registry)
 
     ns = p.parse_args(argv)
     return int(ns.fn(ns))
