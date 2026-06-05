@@ -1,5 +1,7 @@
 # Sidecar Testbench Schedule
 
+Author: haochongyu@member of Zhangcheng and Xiekunpeng team
+
 This document describes the PR scope for the sidecar testbench schedule path.
 It intentionally stays limited to the sidecar schedule path.
 
