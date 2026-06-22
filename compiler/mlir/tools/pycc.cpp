@@ -175,7 +175,7 @@ static llvm::cl::opt<bool> cppOnlyPreserveOps(
 
 static llvm::cl::opt<bool> unrollVector(
     "unroll-vector",
-    llvm::cl::desc("Fully unroll vector types into individual scalar wires (no unpacked arrays)"),
+    llvm::cl::desc("Unroll vector operations to scalars at IR level before optimization passes"),
     llvm::cl::init(false));
 
 static llvm::cl::opt<bool> noInline(
@@ -2269,8 +2269,11 @@ int main(int argc, char **argv) {
   pm.addNestedPass<func::FuncOp>(pyc::createLowerSCFToPYCStaticPass());
   pm.addNestedPass<func::FuncOp>(pyc::createEliminateWiresPass());
   pm.addNestedPass<func::FuncOp>(pyc::createEliminateDeadStatePass());
+  if (unrollVector)
+    pm.addNestedPass<func::FuncOp>(pyc::createVectorUnrollPass());
+  if (!unrollVector)
+    pm.addNestedPass<func::FuncOp>(pyc::createSLPPackWiresPass());
   pm.addNestedPass<func::FuncOp>(pyc::createCombCanonicalizePass());
-  pm.addNestedPass<func::FuncOp>(pyc::createSLPPackWiresPass());
   pm.addPass(pyc::createCheckCombCyclesPass());
   pm.addPass(pyc::createCheckClockDomainsPass());
   pm.addNestedPass<func::FuncOp>(pyc::createPackI1RegsPass());
@@ -2459,7 +2462,6 @@ int main(int argc, char **argv) {
       pyc::VerilogEmitterOptions opts;
       opts.includePrimitives = false; // out-dir mode uses pyc_primitives.v (or expects external primitives)
       opts.targetFpga = targetFpga;
-      opts.unrollVectors = unrollVector;
 
       for (auto f : module->getOps<func::FuncOp>()) {
         if (f.isDeclaration())
@@ -2522,7 +2524,6 @@ int main(int argc, char **argv) {
         cppEmitOpts.combChunkNodes = cppShardMaxAstNodes;
       }
       cppEmitOpts.probePlanPath = probePlanPath;
-      cppEmitOpts.unrollVectors = unrollVector;
 
       // Collect direct dependencies per module for header includes.
       llvm::StringMap<llvm::SmallVector<std::string>> deps;
@@ -2851,7 +2852,6 @@ int main(int argc, char **argv) {
     }
     pyc::VerilogEmitterOptions opts;
     opts.includePrimitives = includePrims;
-    opts.unrollVectors = unrollVector;
     if (targetKind == "fpga")
       opts.targetFpga = true;
     else if (targetKind != "default") {
@@ -2874,7 +2874,6 @@ int main(int argc, char **argv) {
       cppEmitOpts.combChunkNodes = cppShardMaxAstNodes;
     }
     cppEmitOpts.probePlanPath = probePlanPath;
-    cppEmitOpts.unrollVectors = unrollVector;
     if (failed(pyc::emitCpp(*module, os, cppEmitOpts)))
       return 1;
     if (failed(writeSingleOutputStats()))
