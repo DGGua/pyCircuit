@@ -51,6 +51,10 @@ Signed div/rem run as C++ backend cases only by default because the generated
 Verilator behavior currently disagrees with the bit-accurate signed oracle. The
 case remains in the matrix so the gap is visible.
 
+Scalar-arm Vec select cases (`select_vs` and `select_sv`) are full backend
+cases. They guard the broadcast-to-vector fast path used by issue-queue style
+masked muxes.
+
 Vector-shaped IO and 2D dim-reduce have standalone emit+pycc checks. Ordinary
 JIT `Circuit.instance` still does not accept `Vec` as an instance port binding;
 hierarchical Vec IO should be covered through the cycle-aware `domain.call`

@@ -16,6 +16,7 @@
 
 #include <algorithm>
 #include <optional>
+#include <functional>
 #include <vector>
 
 using namespace mlir;
@@ -398,15 +399,10 @@ static std::optional<LogicalResult> emitScalarOpAssign(Operation &op, raw_ostrea
       return {vb.emitError("verilog emitter expects vector result for pyc.v_broadcast")};
     if (vt.getRank() != 1)
       return {vb.emitError("verilog emitter currently supports rank-1 pyc.v_broadcast")};
-    std::string g = sanitizeId(nt.get(vb.getResult()));
-    std::string gv = "__pyc_vb_" + g;
-    os << "genvar " << gv << ";\n";
-    os << "generate\n";
-    os << "  for (" << gv << " = 0; " << gv << " < " << vt.getShape()[0] << "; " << gv << " = " << gv
-       << " + 1) begin : __pyc_vb_g_" << g << "\n";
-    os << "    assign " << nt.get(vb.getResult()) << "[" << gv << "] = " << nt.get(vb.getScalar()) << ";\n";
-    os << "  end\n";
-    os << "endgenerate\n";
+    std::string dst = nt.get(vb.getResult());
+    std::string src = nt.get(vb.getScalar());
+    for (int64_t i = 0; i < vt.getShape()[0]; ++i)
+      os << "assign " << dst << "[" << i << "] = " << src << ";\n";
     return success();
   }
   auto emitVectorReduce = [&](auto vr, const char *opName, const std::string &opToken) -> LogicalResult {
@@ -479,61 +475,46 @@ static std::optional<LogicalResult> emitScalarOpAssign(Operation &op, raw_ostrea
   return std::nullopt;
 }
 
-// Expand an element-wise op with a vector result into SystemVerilog generate
-// loops, indexing the result and every same-shape vector operand so that each
-// lane reduces to the scalar emission above. Scalar operands broadcast.
+// Unroll element-wise vector ops into per-lane scalar assigns.
 static LogicalResult emitVectorElementwise(Operation &op, VectorType vt, raw_ostream &os, NameTable &nt) {
   ArrayRef<int64_t> shape = vt.getShape();
   unsigned rank = static_cast<unsigned>(shape.size());
   Value res = op.getResult(0);
-  std::string g = sanitizeId(nt.get(res));
 
-  std::string suffix;
-  std::vector<std::string> gvars;
-  gvars.reserve(rank);
-  for (unsigned d = 0; d < rank; ++d) {
-    std::string gv = "__pyc_gv_" + g + "_" + std::to_string(d);
-    gvars.push_back(gv);
-    suffix += "[" + gv + "]";
-  }
-
-  // Temporarily rebind names to indexed forms, restoring afterwards.
+  std::function<LogicalResult(unsigned, std::string &)> walk;
   std::vector<std::pair<Value, std::string>> saved;
-  auto rebind = [&](Value v) {
-    std::string base = nt.get(v);
-    saved.emplace_back(v, base);
-    nt.names[v] = base + suffix;
+  walk = [&](unsigned depth, std::string &idx) -> LogicalResult {
+    if (depth == rank) {
+      saved.clear();
+      auto rebind = [&](Value v) {
+        std::string base = nt.get(v);
+        saved.emplace_back(v, base);
+        nt.names[v] = base + idx;
+      };
+      rebind(res);
+      for (Value operand : op.getOperands()) {
+        if (auto ovt = dyn_cast<VectorType>(operand.getType()))
+          if (ovt.getShape() == shape)
+            rebind(operand);
+      }
+      auto handled = emitScalarOpAssign(op, os, nt);
+      for (auto &s : saved)
+        nt.names[s.first] = s.second;
+      if (!handled)
+        return op.emitError("verilog emitter: unsupported vector op for element-wise emission");
+      return *handled;
+    }
+    for (int64_t i = 0; i < shape[depth]; ++i) {
+      size_t old = idx.size();
+      idx += "[" + std::to_string(i) + "]";
+      if (failed(walk(depth + 1, idx)))
+        return failure();
+      idx.resize(old);
+    }
+    return success();
   };
-  rebind(res);
-  for (Value operand : op.getOperands()) {
-    if (auto ovt = dyn_cast<VectorType>(operand.getType()))
-      if (ovt.getShape() == shape)
-        rebind(operand);
-  }
-
-  os << "genvar";
-  for (unsigned d = 0; d < rank; ++d)
-    os << (d ? ", " : " ") << gvars[d];
-  os << ";\n";
-  os << "generate\n";
-  for (unsigned d = 0; d < rank; ++d)
-    os << std::string(2 * (d + 1), ' ') << "for (" << gvars[d] << " = 0; " << gvars[d] << " < " << shape[d] << "; "
-       << gvars[d] << " = " << gvars[d] << " + 1) begin : __pyc_gb_" << g << "_" << d << "\n";
-  std::string body;
-  llvm::raw_string_ostream bodyOs(body);
-  std::optional<LogicalResult> handled = emitScalarOpAssign(op, bodyOs, nt);
-  bodyOs.flush();
-  os << std::string(2 * (rank + 1), ' ') << body;
-  for (unsigned d = rank; d > 0; --d)
-    os << std::string(2 * d, ' ') << "end\n";
-  os << "endgenerate\n";
-
-  for (auto &s : saved)
-    nt.names[s.first] = s.second;
-
-  if (!handled)
-    return op.emitError("verilog emitter: unsupported vector op for element-wise emission");
-  return *handled;
+  std::string idx;
+  return walk(0, idx);
 }
 
 // Emit a netlist op, expanding vector results element-wise when needed.
@@ -562,28 +543,16 @@ static void emitConnectAssign(llvm::StringRef lhs, llvm::StringRef rhs, Type ty,
     return;
   }
   ArrayRef<int64_t> shape = vt.getShape();
-  unsigned rank = static_cast<unsigned>(shape.size());
-  std::string g = sanitizeId(lhs);
-  std::string suffix;
-  std::vector<std::string> gvars;
-  gvars.reserve(rank);
-  for (unsigned d = 0; d < rank; ++d) {
-    std::string gv = "__pyc_cv_" + g + "_" + std::to_string(d);
-    gvars.push_back(gv);
-    suffix += "[" + gv + "]";
+  if (shape.size() == 1) {
+    for (int64_t i = 0; i < shape[0]; ++i)
+      os << "assign " << lhs << "[" << i << "] = " << rhs << "[" << i << "];\n";
+  } else {
+    for (int64_t i = 0; i < shape[0]; ++i) {
+      std::string is = "[" + std::to_string(i) + "]";
+      for (int64_t j = 0; j < shape[1]; ++j)
+        os << "assign " << lhs << is << "[" << j << "] = " << rhs << is << "[" << j << "];\n";
+    }
   }
-  os << "genvar";
-  for (unsigned d = 0; d < rank; ++d)
-    os << (d ? ", " : " ") << gvars[d];
-  os << ";\n";
-  os << "generate\n";
-  for (unsigned d = 0; d < rank; ++d)
-    os << std::string(2 * (d + 1), ' ') << "for (" << gvars[d] << " = 0; " << gvars[d] << " < " << shape[d] << "; "
-       << gvars[d] << " = " << gvars[d] << " + 1) begin : __pyc_cb_" << g << "_" << d << "\n";
-  os << std::string(2 * (rank + 1), ' ') << "assign " << lhs << suffix << " = " << rhs << suffix << ";\n";
-  for (unsigned d = rank; d > 0; --d)
-    os << std::string(2 * d, ' ') << "end\n";
-  os << "endgenerate\n";
 }
 
 static LogicalResult emitComb(pyc::CombOp comb, raw_ostream &os, NameTable &nt) {

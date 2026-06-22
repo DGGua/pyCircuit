@@ -70,28 +70,28 @@ def _case_expr(case: VecCase) -> tuple[list[str], str, bool]:
             _vec_input("cond", 1, n),
             _vec_input("a", w, n),
             _vec_input("b", w, n),
-        ], "cond.select(a, b)", True
+        ], "(a if cond else b)", True
 
     if case.kind == "select_vs":
         return [
             _vec_input("cond", 1, n),
             _vec_input("a", w, n),
             f'scalar = m.input("scalar", width={w})',
-        ], "cond.select(a, scalar)", True
+        ], "(a if cond else scalar)", True
 
     if case.kind == "select_sv":
         return [
             _vec_input("cond", 1, n),
             _vec_input("a", w, n),
             f'scalar = m.input("scalar", width={w})',
-        ], "cond.select(scalar, a)", True
+        ], "(scalar if cond else a)", True
 
     if case.kind in {"zext", "sext", "trunc", "slice", "shl_imm", "lshr_imm", "ashr_imm"}:
         lines = [_vec_input("a", w, n, signed=signed)]
         exprs = {
             "zext": "a.zext(width=6)",
             "sext": "a.sext(width=6)",
-            "trunc": "a.trunc(width=3)",
+            "trunc": "a.slice(lsb=0, width=3)",
             "slice": "a.slice(lsb=1, width=2)",
             "shl_imm": "a << 1",
             "lshr_imm": "a >> 1",

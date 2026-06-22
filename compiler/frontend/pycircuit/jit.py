@@ -1101,8 +1101,12 @@ class _Compiler:
             cond_v = self.eval_expr(node.test)
             if isinstance(cond_v, LiteralValue):
                 return self.eval_expr(node.body if bool(int(cond_v.value)) else node.orelse)
-            if not isinstance(cond_v, (Wire, Reg)) and isinstance(cond_v, (bool, int)):
+            if not isinstance(cond_v, (Wire, Reg, Vec)) and isinstance(cond_v, (bool, int)):
                 return self.eval_expr(node.body if bool(cond_v) else node.orelse)
+            if isinstance(cond_v, Vec):
+                true_v = self.eval_expr(node.body)
+                false_v = self.eval_expr(node.orelse)
+                return cond_v.select(true_v, false_v)
 
             cond = _expect_wire(cond_v, ctx="if-expression condition")
             true_v = self.eval_expr(node.body)

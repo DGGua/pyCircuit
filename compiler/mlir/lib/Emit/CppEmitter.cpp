@@ -432,10 +432,15 @@ static LogicalResult emitCombAssign(Operation &op, llvm::raw_ostream &os, NameTa
     unsigned w = bitWidth(m.getResult().getType());
     if (w == 0)
       return m.emitError("invalid mux width");
+    bool selIsVec = isa<VectorType>(m.getSel().getType());
     assignExpr(m.getResult(), m.getType(), os, nt,
                [&](llvm::raw_ostream &e) {
-                 e << "pyc::cpp::mux<" << w << ">(" << nt.get(m.getSel()) << ", " << nt.get(m.getA()) << ", "
-                   << nt.get(m.getB()) << ")";
+                 if (selIsVec)
+                   e << "pyc::cpp::mux_vec<" << w << ">(" << nt.get(m.getSel()) << ", " << nt.get(m.getA()) << ", "
+                     << nt.get(m.getB()) << ")";
+                 else
+                   e << "pyc::cpp::mux<" << w << ">(" << nt.get(m.getSel()) << ", " << nt.get(m.getA()) << ", "
+                     << nt.get(m.getB()) << ")";
                });
     return success();
   }
@@ -497,8 +502,12 @@ static LogicalResult emitCombAssign(Operation &op, llvm::raw_ostream &os, NameTa
     unsigned ow = bitWidth(t.getResult().getType());
     if (iw == 0 || ow == 0)
       return t.emitError("invalid trunc width");
-    os << "    " << nt.get(t.getResult()) << " = pyc::cpp::trunc<" << ow << ", " << iw << ">(" << nt.get(t.getIn())
-       << ");\n";
+    bool inIsVec = isa<VectorType>(t.getIn().getType());
+    assignExpr(t.getResult(), t.getType(), os, nt,
+               [&](llvm::raw_ostream &e) {
+                 e << "pyc::cpp::" << (inIsVec ? "trunc_vec<" : "trunc<")
+                   << ow << ", " << iw << ">(" << nt.get(t.getIn()) << ")";
+               });
     return success();
   }
   if (auto z = dyn_cast<pyc::ZextOp>(op)) {
@@ -506,8 +515,12 @@ static LogicalResult emitCombAssign(Operation &op, llvm::raw_ostream &os, NameTa
     unsigned ow = bitWidth(z.getResult().getType());
     if (iw == 0 || ow == 0)
       return z.emitError("invalid zext width");
-    os << "    " << nt.get(z.getResult()) << " = pyc::cpp::zext<" << ow << ", " << iw << ">(" << nt.get(z.getIn())
-       << ");\n";
+    bool inIsVec = isa<VectorType>(z.getIn().getType());
+    assignExpr(z.getResult(), z.getType(), os, nt,
+               [&](llvm::raw_ostream &e) {
+                 e << "pyc::cpp::" << (inIsVec ? "zext_vec<" : "zext<")
+                   << ow << ", " << iw << ">(" << nt.get(z.getIn()) << ")";
+               });
     return success();
   }
   if (auto s = dyn_cast<pyc::SextOp>(op)) {
@@ -515,8 +528,12 @@ static LogicalResult emitCombAssign(Operation &op, llvm::raw_ostream &os, NameTa
     unsigned ow = bitWidth(s.getResult().getType());
     if (iw == 0 || ow == 0)
       return s.emitError("invalid sext width");
-    os << "    " << nt.get(s.getResult()) << " = pyc::cpp::sext<" << ow << ", " << iw << ">(" << nt.get(s.getIn())
-       << ");\n";
+    bool inIsVec = isa<VectorType>(s.getIn().getType());
+    assignExpr(s.getResult(), s.getType(), os, nt,
+               [&](llvm::raw_ostream &e) {
+                 e << "pyc::cpp::" << (inIsVec ? "sext_vec<" : "sext<")
+                   << ow << ", " << iw << ">(" << nt.get(s.getIn()) << ")";
+               });
     return success();
   }
   if (auto ex = dyn_cast<pyc::ExtractOp>(op)) {
@@ -610,7 +627,7 @@ static LogicalResult emitCombAssign(Operation &op, llvm::raw_ostream &os, NameTa
                    e << nt.get(v);
                  }
                  e << "}}";
-               },
+               }
                );
     return success();
   }
@@ -627,7 +644,7 @@ static LogicalResult emitCombAssign(Operation &op, llvm::raw_ostream &os, NameTa
                    e << nt.get(vb.getScalar());
                  }
                  e << "}}";
-               },
+               }
                );
     return success();
   }
@@ -658,7 +675,7 @@ static LogicalResult emitCombAssign(Operation &op, llvm::raw_ostream &os, NameTa
                      e << nt.get(vr.getVec()) << "[" << i << "]";
                    }
                    e << ")";
-                 },
+                 }
                  );
       return success();
     }
@@ -687,7 +704,7 @@ static LogicalResult emitCombAssign(Operation &op, llvm::raw_ostream &os, NameTa
                    e << ")";
                  }
                  e << "}}";
-               },
+               }
                );
     return success();
   };

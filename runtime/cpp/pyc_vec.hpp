@@ -172,6 +172,31 @@ PYC_VEC_SHIFT(ashr)
 PYC_VEC_WIDTH_UNFN(trunc)
 PYC_VEC_WIDTH_UNFN(zext)
 PYC_VEC_WIDTH_UNFN(sext)
+
+// Disambiguated vector-only aliases so the emitter can call zext_vec<OW,IW>(vec)
+// without the scalar overload stealing the explicit template arguments.
+// Inline element-wise loop instead of delegating to avoid the same ambiguity.
+template <unsigned OutW, unsigned InW, typename T, std::size_t N>
+constexpr auto trunc_vec(const Vec<T, N> &a) {
+  using Elem = decltype(trunc<OutW, InW>(a[0]));
+  Vec<Elem, N> out{};
+  for (std::size_t i = 0; i < N; ++i) out[i] = trunc<OutW, InW>(a[i]);
+  return out;
+}
+template <unsigned OutW, unsigned InW, typename T, std::size_t N>
+constexpr auto zext_vec(const Vec<T, N> &a) {
+  using Elem = decltype(zext<OutW, InW>(a[0]));
+  Vec<Elem, N> out{};
+  for (std::size_t i = 0; i < N; ++i) out[i] = zext<OutW, InW>(a[i]);
+  return out;
+}
+template <unsigned OutW, unsigned InW, typename T, std::size_t N>
+constexpr auto sext_vec(const Vec<T, N> &a) {
+  using Elem = decltype(sext<OutW, InW>(a[0]));
+  Vec<Elem, N> out{};
+  for (std::size_t i = 0; i < N; ++i) out[i] = sext<OutW, InW>(a[i]);
+  return out;
+}
 #undef PYC_VEC_WIDTH_UNFN
 
 // slt needs special bool→Wire<1> conversion; kept manual (not macro-generated).
@@ -265,6 +290,30 @@ constexpr Vec<T, N> mux(const Vec<S, N> &sel, const Vec<T, N> &a, Wire<W> b) {
 
 template <unsigned W, typename S, typename T, std::size_t N>
 constexpr Vec<T, N> mux(const Vec<S, N> &sel, Wire<W> a, const Vec<T, N> &b) {
+  Vec<T, N> out{};
+  for (std::size_t i = 0; i < N; ++i)
+    out[i] = mux<W>(sel[i], a, b[i]);
+  return out;
+}
+
+// Disambiguated vector-only mux aliases so the emitter can provide the
+// data-width W explicitly without the scalar Wire overload stealing the call.
+template <unsigned W, typename S, typename T, std::size_t N>
+constexpr Vec<T, N> mux_vec(const Vec<S, N> &sel, const Vec<T, N> &a, const Vec<T, N> &b) {
+  Vec<T, N> out{};
+  for (std::size_t i = 0; i < N; ++i)
+    out[i] = mux<W>(sel[i], a[i], b[i]);
+  return out;
+}
+template <unsigned W, typename S, typename T, std::size_t N>
+constexpr Vec<T, N> mux_vec(const Vec<S, N> &sel, const Vec<T, N> &a, Wire<W> b) {
+  Vec<T, N> out{};
+  for (std::size_t i = 0; i < N; ++i)
+    out[i] = mux<W>(sel[i], a[i], b);
+  return out;
+}
+template <unsigned W, typename S, typename T, std::size_t N>
+constexpr Vec<T, N> mux_vec(const Vec<S, N> &sel, Wire<W> a, const Vec<T, N> &b) {
   Vec<T, N> out{};
   for (std::size_t i = 0; i < N; ++i)
     out[i] = mux<W>(sel[i], a, b[i]);
