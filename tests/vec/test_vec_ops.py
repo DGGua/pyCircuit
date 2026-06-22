@@ -86,6 +86,7 @@ def test_true_division_is_rejected(repo_root: Path) -> None:
         out = lhs / rhs
         m.output("out0", out[0])
 
+    build.__globals__["Vec"] = Vec
     with pytest.raises(Exception, match="use `//`"):
         compile(build, name="vec_true_division_jit_rejected")
 
