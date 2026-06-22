@@ -10,6 +10,7 @@ namespace pyc {
 struct VerilogEmitterOptions {
   bool includePrimitives = true;
   bool targetFpga = false;
+  bool unrollVectors = false;
 };
 
 ::mlir::LogicalResult emitVerilog(::mlir::ModuleOp module, ::llvm::raw_ostream &os,

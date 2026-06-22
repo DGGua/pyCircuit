@@ -47,6 +47,20 @@ static std::string vRange(Type ty) {
   return "[" + std::to_string(intTy.getWidth() - 1) + ":0]";
 }
 
+/// Build a lane-indexed name. When `unroll` is true, uses flat suffix `_0`,
+/// `_1`, ...; otherwise uses unpacked-array indexing `[0]`, `[1]`, ...
+static std::string laneName(llvm::StringRef base, int64_t idx, bool unroll) {
+  if (unroll)
+    return (base + "_" + std::to_string(idx)).str();
+  return (base + "[" + std::to_string(idx) + "]").str();
+}
+
+static std::string laneName(llvm::StringRef base, int64_t idx0, int64_t idx1, bool unroll) {
+  if (unroll)
+    return (base + "_" + std::to_string(idx0) + "_" + std::to_string(idx1)).str();
+  return (base + "[" + std::to_string(idx0) + "][" + std::to_string(idx1) + "]").str();
+}
+
 /// Return the unpacked array dimensions for a VectorType, e.g. " [0:3][0:7]".
 /// Returns empty string for non-VectorType.
 static std::string vUnpacked(Type ty) {
@@ -180,8 +194,8 @@ static void computeUniquePortNames(func::FuncOp f, std::vector<std::string> &inN
 // set shared by the pyc.comb region path and the top-level netlist path.
 // Returns std::nullopt when `op` is not one of these ops (the caller handles
 // container-specific ops such as pyc.assert / pyc.assign / pyc.comb).
-static void emitConnectAssign(llvm::StringRef lhs, llvm::StringRef rhs, Type ty, raw_ostream &os);
-static std::optional<LogicalResult> emitScalarOpAssign(Operation &op, raw_ostream &os, NameTable &nt) {
+static void emitConnectAssign(llvm::StringRef lhs, llvm::StringRef rhs, Type ty, raw_ostream &os, bool unroll);
+static std::optional<LogicalResult> emitScalarOpAssign(Operation &op, raw_ostream &os, NameTable &nt, bool unroll) {
   if (auto c = dyn_cast<pyc::ConstantOp>(op)) {
     os << "assign " << nt.get(c.getResult()) << " = " << vLiteral(c.getValueAttr(), c.getType()) << ";\n";
     return success();
@@ -370,11 +384,8 @@ static std::optional<LogicalResult> emitScalarOpAssign(Operation &op, raw_ostrea
     std::int64_t idx = vg.getIndexAttr().getInt();
     if (idx < 0 || idx >= vt.getShape()[0])
       return {vg.emitError("pyc.v_get index out of range for verilog emission")};
-    emitConnectAssign(
-        nt.get(vg.getResult()),
-        nt.get(vg.getVec()) + "[" + std::to_string(static_cast<long long>(idx)) + "]",
-        vg.getResult().getType(),
-        os);
+    std::string rhs = laneName(nt.get(vg.getVec()), idx, unroll);
+    emitConnectAssign(nt.get(vg.getResult()), rhs, vg.getResult().getType(), os, unroll);
     return success();
   }
   if (auto vc = dyn_cast<pyc::VCreateOp>(op)) {
@@ -385,11 +396,8 @@ static std::optional<LogicalResult> emitScalarOpAssign(Operation &op, raw_ostrea
       return {vc.emitError("pyc.v_create element count mismatch for verilog emission")};
     std::string dstBase = nt.get(vc.getResult());
     for (auto [i, e] : llvm::enumerate(vc.getElements())) {
-      emitConnectAssign(
-          dstBase + "[" + std::to_string(static_cast<unsigned>(i)) + "]",
-          nt.get(e),
-          e.getType(),
-          os);
+      std::string dstLane = laneName(dstBase, static_cast<int64_t>(i), unroll);
+      emitConnectAssign(dstLane, nt.get(e), e.getType(), os, unroll);
     }
     return success();
   }
@@ -402,7 +410,7 @@ static std::optional<LogicalResult> emitScalarOpAssign(Operation &op, raw_ostrea
     std::string dst = nt.get(vb.getResult());
     std::string src = nt.get(vb.getScalar());
     for (int64_t i = 0; i < vt.getShape()[0]; ++i)
-      os << "assign " << dst << "[" << i << "] = " << src << ";\n";
+      os << "assign " << laneName(dst, i, unroll) << " = " << src << ";\n";
     return success();
   }
   auto emitVectorReduce = [&](auto vr, const char *opName, const std::string &opToken) -> LogicalResult {
@@ -427,13 +435,10 @@ static std::optional<LogicalResult> emitScalarOpAssign(Operation &op, raw_ostrea
       for (std::int64_t i = 0; i < lanes; ++i) {
         if (i)
           expr += " " + opToken + " ";
-        expr += nt.get(vr.getVec());
-        expr += "[";
-        expr += std::to_string(static_cast<long long>(i));
-        expr += "]";
+        expr += laneName(nt.get(vr.getVec()), i, unroll);
       }
       expr += ")";
-      emitConnectAssign(nt.get(vr.getResult()), expr, vr.getResult().getType(), os);
+      emitConnectAssign(nt.get(vr.getResult()), expr, vr.getResult().getType(), os, unroll);
       return success();
     }
 
@@ -446,20 +451,14 @@ static std::optional<LogicalResult> emitScalarOpAssign(Operation &op, raw_ostrea
       for (std::int64_t j = 0; j < reduceLanes; ++j) {
         if (j)
           expr += " " + opToken + " ";
-        expr += nt.get(vr.getVec());
         if (dim == 0)
-          expr += "[" + std::to_string(static_cast<long long>(j)) + "][" +
-                  std::to_string(static_cast<long long>(i)) + "]";
+          expr += laneName(nt.get(vr.getVec()), j, i, unroll);
         else
-          expr += "[" + std::to_string(static_cast<long long>(i)) + "][" +
-                  std::to_string(static_cast<long long>(j)) + "]";
+          expr += laneName(nt.get(vr.getVec()), i, j, unroll);
       }
       expr += ")";
-      emitConnectAssign(
-          nt.get(vr.getResult()) + "[" + std::to_string(static_cast<long long>(i)) + "]",
-          expr,
-          vt.getElementType(),
-          os);
+      std::string dstLane = laneName(nt.get(vr.getResult()), i, unroll);
+      emitConnectAssign(dstLane, expr, vt.getElementType(), os, unroll);
     }
     return success();
   };
@@ -476,7 +475,8 @@ static std::optional<LogicalResult> emitScalarOpAssign(Operation &op, raw_ostrea
 }
 
 // Unroll element-wise vector ops into per-lane scalar assigns.
-static LogicalResult emitVectorElementwise(Operation &op, VectorType vt, raw_ostream &os, NameTable &nt) {
+static LogicalResult emitVectorElementwise(Operation &op, VectorType vt, raw_ostream &os, NameTable &nt,
+                                           bool unroll) {
   ArrayRef<int64_t> shape = vt.getShape();
   unsigned rank = static_cast<unsigned>(shape.size());
   Value res = op.getResult(0);
@@ -497,7 +497,7 @@ static LogicalResult emitVectorElementwise(Operation &op, VectorType vt, raw_ost
           if (ovt.getShape() == shape)
             rebind(operand);
       }
-      auto handled = emitScalarOpAssign(op, os, nt);
+      auto handled = emitScalarOpAssign(op, os, nt, unroll);
       for (auto &s : saved)
         nt.names[s.first] = s.second;
       if (!handled)
@@ -506,7 +506,16 @@ static LogicalResult emitVectorElementwise(Operation &op, VectorType vt, raw_ost
     }
     for (int64_t i = 0; i < shape[depth]; ++i) {
       size_t old = idx.size();
-      idx += "[" + std::to_string(i) + "]";
+      if (unroll) {
+        if (depth == 0 && rank == 1)
+          idx += "_" + std::to_string(i);
+        else if (depth == 0)
+          idx += "_" + std::to_string(i);
+        else
+          idx += "_" + std::to_string(i);
+      } else {
+        idx += "[" + std::to_string(i) + "]";
+      }
       if (failed(walk(depth + 1, idx)))
         return failure();
       idx.resize(old);
@@ -518,7 +527,7 @@ static LogicalResult emitVectorElementwise(Operation &op, VectorType vt, raw_ost
 }
 
 // Emit a netlist op, expanding vector results element-wise when needed.
-static LogicalResult emitNetlistOp(Operation &op, raw_ostream &os, NameTable &nt) {
+static LogicalResult emitNetlistOp(Operation &op, raw_ostream &os, NameTable &nt, bool unroll) {
   if (op.getNumResults() == 1)
     if (auto vt = dyn_cast<VectorType>(op.getResult(0).getType()))
       if (!isa<pyc::VGetOp,
@@ -527,8 +536,8 @@ static LogicalResult emitNetlistOp(Operation &op, raw_ostream &os, NameTable &nt
                pyc::VOrReduceOp,
                pyc::VAndReduceOp,
                pyc::VAddReduceOp>(op))
-        return emitVectorElementwise(op, vt, os, nt);
-  std::optional<LogicalResult> handled = emitScalarOpAssign(op, os, nt);
+        return emitVectorElementwise(op, vt, os, nt, unroll);
+  std::optional<LogicalResult> handled = emitScalarOpAssign(op, os, nt, unroll);
   if (!handled)
     return op.emitError("internal error: missing verilog emission handler");
   return *handled;
@@ -536,7 +545,7 @@ static LogicalResult emitNetlistOp(Operation &op, raw_ostream &os, NameTable &nt
 
 // Emit a continuous connection `lhs = rhs`, expanding unpacked vector arrays
 // element-wise (whole-array continuous assignment is not portable).
-static void emitConnectAssign(llvm::StringRef lhs, llvm::StringRef rhs, Type ty, raw_ostream &os) {
+static void emitConnectAssign(llvm::StringRef lhs, llvm::StringRef rhs, Type ty, raw_ostream &os, bool unroll) {
   auto vt = dyn_cast<VectorType>(ty);
   if (!vt) {
     os << "assign " << lhs << " = " << rhs << ";\n";
@@ -545,17 +554,16 @@ static void emitConnectAssign(llvm::StringRef lhs, llvm::StringRef rhs, Type ty,
   ArrayRef<int64_t> shape = vt.getShape();
   if (shape.size() == 1) {
     for (int64_t i = 0; i < shape[0]; ++i)
-      os << "assign " << lhs << "[" << i << "] = " << rhs << "[" << i << "];\n";
+      os << "assign " << laneName(lhs, i, unroll) << " = " << laneName(rhs, i, unroll) << ";\n";
   } else {
     for (int64_t i = 0; i < shape[0]; ++i) {
-      std::string is = "[" + std::to_string(i) + "]";
       for (int64_t j = 0; j < shape[1]; ++j)
-        os << "assign " << lhs << is << "[" << j << "] = " << rhs << is << "[" << j << "];\n";
+        os << "assign " << laneName(lhs, i, j, unroll) << " = " << laneName(rhs, i, j, unroll) << ";\n";
     }
   }
 }
 
-static LogicalResult emitComb(pyc::CombOp comb, raw_ostream &os, NameTable &nt) {
+static LogicalResult emitComb(pyc::CombOp comb, raw_ostream &os, NameTable &nt, bool unroll) {
   if (comb.getBody().empty())
     return comb.emitError("pyc.comb must have a non-empty region");
   Block &b = comb.getBody().front();
@@ -568,7 +576,7 @@ static LogicalResult emitComb(pyc::CombOp comb, raw_ostream &os, NameTable &nt) 
   for (Operation &op : b) {
     if (isa<pyc::YieldOp>(op))
       break;
-    if (failed(emitNetlistOp(op, os, nt)))
+    if (failed(emitNetlistOp(op, os, nt, unroll)))
       return failure();
   }
 
@@ -579,7 +587,7 @@ static LogicalResult emitComb(pyc::CombOp comb, raw_ostream &os, NameTable &nt) 
     return comb.emitError("pyc.yield operand count must match pyc.comb results");
 
   for (auto [i, v] : llvm::enumerate(yield.getOperands()))
-    emitConnectAssign(nt.get(comb.getResult(i)), nt.get(v), comb.getResult(i).getType(), os);
+    emitConnectAssign(nt.get(comb.getResult(i)), nt.get(v), comb.getResult(i).getType(), os, unroll);
 
   return success();
 }
@@ -714,7 +722,7 @@ static bool topoSortCombOps(ArrayRef<Operation *> ops, NameTable &nt, llvm::Smal
 }
 
 static LogicalResult emitFunc(func::FuncOp f, raw_ostream &os, const VerilogEmitterOptions &opts) {
-  (void)opts;
+  bool unroll = opts.unrollVectors;
   NameTable nt;
   std::vector<std::string> outNames;
   outNames.reserve(f.getNumResults());
@@ -767,6 +775,29 @@ static LogicalResult emitFunc(func::FuncOp f, raw_ostream &os, const VerilogEmit
   for (const NetDecl &d : decls) {
     std::string range = vRange(d.ty);
     std::string unpacked = vUnpacked(d.ty);
+    if (unroll && !unpacked.empty()) {
+      // Emit individual scalar wires for each vector lane.
+      if (auto vt = dyn_cast<VectorType>(d.ty)) {
+        auto shape = vt.getShape();
+        std::function<void(unsigned, const std::string &)> emitLanes;
+        emitLanes = [&](unsigned depth, const std::string &suffix) {
+          if (depth == static_cast<unsigned>(shape.size())) {
+            os << "wire ";
+            if (!range.empty())
+              os << range << " ";
+            os << d.name << suffix << ";";
+            if (!d.comment.empty())
+              os << " // " << d.comment;
+            os << "\n";
+            return;
+          }
+          for (int64_t i = 0; i < shape[depth]; ++i)
+            emitLanes(depth + 1, suffix + "_" + std::to_string(i));
+        };
+        emitLanes(0, "");
+        continue;
+      }
+    }
     os << "wire ";
     if (!range.empty())
       os << range << " ";
@@ -878,15 +909,15 @@ static LogicalResult emitFunc(func::FuncOp f, raw_ostream &os, const VerilogEmit
         continue;
       }
       if (auto a = dyn_cast<pyc::AssignOp>(op)) {
-        emitConnectAssign(nt.get(a.getDst()), nt.get(a.getSrc()), a.getDst().getType(), os);
+        emitConnectAssign(nt.get(a.getDst()), nt.get(a.getSrc()), a.getDst().getType(), os, unroll);
         continue;
       }
       if (auto comb = dyn_cast<pyc::CombOp>(op)) {
-        if (failed(emitComb(comb, os, nt)))
+        if (failed(emitComb(comb, os, nt, unroll)))
           return failure();
         continue;
       }
-      if (failed(emitNetlistOp(*op, os, nt)))
+      if (failed(emitNetlistOp(*op, os, nt, unroll)))
         return failure();
     }
     os << "\n";
@@ -947,10 +978,46 @@ static LogicalResult emitFunc(func::FuncOp f, raw_ostream &os, const VerilogEmit
     os << "// --- Sequential primitives\n";
     for (Operation *op : seqInstOps) {
       if (auto r = dyn_cast<pyc::RegOp>(op)) {
-        auto qTy = dyn_cast<IntegerType>(r.getQ().getType());
-        if (!qTy)
+        auto qTy = r.getQ().getType();
+        if (auto vecTy = dyn_cast<VectorType>(qTy)) {
+          if (!unroll)
+            return r.emitError("verilog emitter supports vector reg only with --unroll-vector");
+          auto leafTy = leafIntType(vecTy);
+          if (!leafTy)
+            return r.emitError("verilog emitter only supports integer reg element type");
+          unsigned w = leafTy.getWidth();
+          auto shape = vecTy.getShape();
+          std::string qBase = nt.get(r.getQ());
+          std::string nextBase = nt.get(r.getNext());
+          std::string initBase = nt.get(r.getInit());
+          std::string clkName = nt.get(r.getClk());
+          std::string rstName = nt.get(r.getRst());
+          std::string enName = nt.get(r.getEn());
+          // Emit one scalar reg per vector lane.
+          std::function<void(unsigned, const std::string &)> emitRegLanes;
+          emitRegLanes = [&](unsigned depth, const std::string &suffix) {
+            if (depth == static_cast<unsigned>(shape.size())) {
+              std::string instName = nt.unique(qBase + suffix + "_inst");
+              os << "pyc_reg #(.WIDTH(" << w << ")) " << instName << " (\n";
+              os << "  .clk(" << clkName << "),\n";
+              os << "  .rst(" << rstName << "),\n";
+              os << "  .en(" << enName << "),\n";
+              os << "  .d(" << nextBase << suffix << "),\n";
+              os << "  .init(" << initBase << suffix << "),\n";
+              os << "  .q(" << qBase << suffix << ")\n";
+              os << ");\n";
+              return;
+            }
+            for (int64_t i = 0; i < shape[depth]; ++i)
+              emitRegLanes(depth + 1, suffix + "_" + std::to_string(i));
+          };
+          emitRegLanes(0, "");
+          continue;
+        }
+        auto intQTy = dyn_cast<IntegerType>(qTy);
+        if (!intQTy)
           return r.emitError("verilog emitter only supports integer reg data type");
-        os << "pyc_reg #(.WIDTH(" << qTy.getWidth() << ")) " << nt.get(r.getQ()) << "_inst (\n";
+        os << "pyc_reg #(.WIDTH(" << intQTy.getWidth() << ")) " << nt.get(r.getQ()) << "_inst (\n";
         os << "  .clk(" << nt.get(r.getClk()) << "),\n";
         os << "  .rst(" << nt.get(r.getRst()) << "),\n";
         os << "  .en(" << nt.get(r.getEn()) << "),\n";
@@ -1115,7 +1182,7 @@ static LogicalResult emitFunc(func::FuncOp f, raw_ostream &os, const VerilogEmit
   for (auto [i, v] : llvm::enumerate(ret.getOperands())) {
     if (nt.get(v) == outNames[i])
       continue;
-    emitConnectAssign(outNames[i], nt.get(v), f.getResultTypes()[i], os);
+    emitConnectAssign(outNames[i], nt.get(v), f.getResultTypes()[i], os, unroll);
   }
 
   os << "\nendmodule\n\n";

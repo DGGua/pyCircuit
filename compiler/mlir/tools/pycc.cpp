@@ -173,6 +173,11 @@ static llvm::cl::opt<bool> cppOnlyPreserveOps(
     llvm::cl::desc("Preserve operation-granular C++ scheduling in --sim-mode=cpp-only (disables comb fusion)"),
     llvm::cl::init(false));
 
+static llvm::cl::opt<bool> unrollVector(
+    "unroll-vector",
+    llvm::cl::desc("Fully unroll vector types into individual scalar wires (no unpacked arrays)"),
+    llvm::cl::init(false));
+
 static llvm::cl::opt<bool> noInline(
     "noinline",
     llvm::cl::desc("Disable MLIR inliner to preserve module boundaries (prevents merge/flatten)"),
@@ -2454,6 +2459,7 @@ int main(int argc, char **argv) {
       pyc::VerilogEmitterOptions opts;
       opts.includePrimitives = false; // out-dir mode uses pyc_primitives.v (or expects external primitives)
       opts.targetFpga = targetFpga;
+      opts.unrollVectors = unrollVector;
 
       for (auto f : module->getOps<func::FuncOp>()) {
         if (f.isDeclaration())
@@ -2516,6 +2522,7 @@ int main(int argc, char **argv) {
         cppEmitOpts.combChunkNodes = cppShardMaxAstNodes;
       }
       cppEmitOpts.probePlanPath = probePlanPath;
+      cppEmitOpts.unrollVectors = unrollVector;
 
       // Collect direct dependencies per module for header includes.
       llvm::StringMap<llvm::SmallVector<std::string>> deps;
@@ -2844,6 +2851,7 @@ int main(int argc, char **argv) {
     }
     pyc::VerilogEmitterOptions opts;
     opts.includePrimitives = includePrims;
+    opts.unrollVectors = unrollVector;
     if (targetKind == "fpga")
       opts.targetFpga = true;
     else if (targetKind != "default") {
@@ -2866,6 +2874,7 @@ int main(int argc, char **argv) {
       cppEmitOpts.combChunkNodes = cppShardMaxAstNodes;
     }
     cppEmitOpts.probePlanPath = probePlanPath;
+    cppEmitOpts.unrollVectors = unrollVector;
     if (failed(pyc::emitCpp(*module, os, cppEmitOpts)))
       return 1;
     if (failed(writeSingleOutputStats()))

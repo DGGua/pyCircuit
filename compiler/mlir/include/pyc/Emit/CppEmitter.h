@@ -25,6 +25,7 @@ struct CppEmitterOptions {
   // downstream C++ TU cost even after file sharding.
   unsigned combChunkNodes = 256;
   std::string probePlanPath{};
+  bool unrollVectors = false;
 };
 
 ::mlir::LogicalResult emitCpp(::mlir::ModuleOp module, ::llvm::raw_ostream &os,

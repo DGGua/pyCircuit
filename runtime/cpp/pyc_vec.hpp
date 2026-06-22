@@ -110,10 +110,11 @@ constexpr bool operator!=(const Vec<T, N> &a, const Vec<T, N> &b) {
 // Each overload recurses until it reaches the Wire<W> leaf functions in pyc_bits.
 #define PYC_VEC_WIDTH_BINFN(FN)                                                        \
   template <unsigned W, typename T, std::size_t N>                                     \
-  constexpr Vec<T, N> FN(const Vec<T, N> &a, const Vec<T, N> &b) {                      \
-    Vec<T, N> out{};                                                                   \
+  constexpr auto FN(const Vec<T, N> &a, const Vec<T, N> &b) {                          \
+    using Elem = decltype(FN<W>(a[0], b[0]));                                          \
+    Vec<Elem, N> out{};                                                                \
     for (std::size_t i = 0; i < N; ++i)                                                \
-      out[i] = FN<W>(a[i], b[i]);                                                       \
+      out[i] = FN<W>(a[i], b[i]);                                                      \
     return out;                                                                        \
   }                                                                                    \
   template <unsigned W, typename T, std::size_t N, typename S,                         \
