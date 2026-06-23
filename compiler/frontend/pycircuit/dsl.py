@@ -441,6 +441,22 @@ class Module:
         self._emit(f"{tmp} = pyc.v_broadcast {scalar.ref} to {lanes} : {scalar.ty} -> {out_ty}")
         return Signal(ref=tmp, ty=out_ty)
 
+    def v_broadcast_dim(self, vec: Signal, *, size: int, dim: int) -> Signal:
+        """Broadcast a vector by repeating along a new dimension."""
+        lanes = int(size)
+        d = int(dim)
+        if lanes <= 0:
+            raise ValueError("v_broadcast_dim size must be > 0")
+        shape, elem_ty = _vector_shape_elem_type(vec.ty)
+        if d < 0 or d > len(shape):
+            raise ValueError(f"v_broadcast_dim dim out of range: {d} for {vec.ty}")
+        new_shape = list(shape)
+        new_shape.insert(d, lanes)
+        out_ty = _format_vector_type(new_shape, elem_ty)
+        tmp = self._tmp()
+        self._emit(f"{tmp} = pyc.v_broadcast_dim {vec.ref} to {lanes}, {d} : {vec.ty} -> {out_ty}")
+        return Signal(ref=tmp, ty=out_ty)
+
     def v_get(self, vec: Signal, *, index: int) -> Signal:
         lanes, elem_ty = _vector_elem_type(vec.ty)
         idx = int(index)

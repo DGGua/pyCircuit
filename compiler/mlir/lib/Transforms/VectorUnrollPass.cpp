@@ -173,6 +173,29 @@ static Value unrollBroadcast(pyc::VBroadcastOp op, OpBuilder &builder) {
   return builder.create<pyc::VCreateOp>(op.getLoc(), vt, elements);
 }
 
+// Unroll v_broadcast_dim: walk result lanes, mapping each to source lane.
+static Value unrollBroadcastDim(pyc::VBroadcastDimOp op, OpBuilder &builder) {
+  auto srcVT = cast<VectorType>(op.getVec().getType());
+  auto dstVT = cast<VectorType>(op.getResult().getType());
+  int64_t dim = op.getDimAttr().getInt();
+  ArrayRef<int64_t> dstShape = dstVT.getShape();
+
+  llvm::SmallVector<Value> lanes;
+  llvm::SmallVector<int64_t> indices;
+  walkShape(dstShape, 0, indices, [&](const llvm::SmallVectorImpl<int64_t> &dstIdx) {
+    // Build source index by dropping the broadcast dimension.
+    llvm::SmallVector<int64_t> srcIdx;
+    for (unsigned d = 0; d < dstShape.size(); ++d)
+      if (static_cast<int64_t>(d) != dim)
+        srcIdx.push_back(dstIdx[d]);
+    lanes.push_back(extractLane(builder, op.getLoc(), op.getVec(), srcIdx));
+  });
+
+  if (dstShape.size() == 1)
+    return builder.create<pyc::VCreateOp>(op.getLoc(), dstVT, lanes);
+  return createVector(builder, op.getLoc(), dstVT, lanes, dstShape, 0);
+}
+
 // Unroll WireOp: split into N scalar wires, rebuild with v_create.
 static void unrollWire(pyc::WireOp op, OpBuilder &builder) {
   auto vt = cast<VectorType>(op.getResult().getType());
@@ -228,7 +251,7 @@ static void unrollReg(pyc::RegOp op, OpBuilder &builder) {
 static bool isElementWiseVectorOp(Operation &op) {
   if (op.getNumResults() != 1) return false;
   if (!isa<VectorType>(op.getResult(0).getType())) return false;
-  if (isa<pyc::VGetOp, pyc::VCreateOp, pyc::VBroadcastOp,
+  if (isa<pyc::VGetOp, pyc::VCreateOp, pyc::VBroadcastOp, pyc::VBroadcastDimOp,
           pyc::VOrReduceOp, pyc::VAndReduceOp, pyc::VAddReduceOp,
           pyc::WireOp, pyc::AssignOp, pyc::RegOp>(op))
     return false;
@@ -259,7 +282,7 @@ struct VectorUnrollPass : public PassWrapper<VectorUnrollPass, OperationPass<fun
     OpBuilder builder(f.getContext());
 
     // Collect all vector ops in the function body and CombOp regions.
-    llvm::SmallVector<Operation *> vgetOps, reduceOps, broadcastOps;
+    llvm::SmallVector<Operation *> vgetOps, reduceOps, broadcastOps, broadcastDimOps;
     llvm::SmallVector<Operation *> wireOps, assignOps, regOps, elemOps;
 
     std::function<void(Operation &)> collect;
@@ -270,6 +293,8 @@ struct VectorUnrollPass : public PassWrapper<VectorUnrollPass, OperationPass<fun
         vgetOps.push_back(&op);
       else if (isa<pyc::VBroadcastOp>(op))
         broadcastOps.push_back(&op);
+      else if (isa<pyc::VBroadcastDimOp>(op))
+        broadcastDimOps.push_back(&op);
       else if (isa<pyc::WireOp>(op) && isa<VectorType>(op.getResult(0).getType()))
         wireOps.push_back(&op);
       else if (isa<pyc::AssignOp>(op) && isa<VectorType>(op.getOperand(0).getType()))
@@ -307,6 +332,12 @@ struct VectorUnrollPass : public PassWrapper<VectorUnrollPass, OperationPass<fun
       builder.setInsertionPoint(op);
       auto vb = cast<pyc::VBroadcastOp>(op);
       Value r = unrollBroadcast(vb, builder);
+      op->getResult(0).replaceAllUsesWith(r); op->erase();
+    }
+    for (auto *op : broadcastDimOps) {
+      builder.setInsertionPoint(op);
+      auto vbd = cast<pyc::VBroadcastDimOp>(op);
+      Value r = unrollBroadcastDim(vbd, builder);
       op->getResult(0).replaceAllUsesWith(r); op->erase();
     }
     for (auto *op : wireOps) {

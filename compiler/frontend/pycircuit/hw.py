@@ -3117,6 +3117,33 @@ class Vec:
             vls = Vec(new_vls)
         return sels[0].select(vls[0], zero)
 
+    def broadcast(self, *, dim: int, size: int) -> "Vec":
+        """Broadcast this Vec by repeating along a new dimension.
+
+        ``broadcast(dim=0, size=6)`` on a ``Vec<8, T>`` → ``Vec<6, Vec<8, T>>``
+        (6 outer copies, each an independent copy of the original 8-element vector).
+
+        ``broadcast(dim=1, size=6)`` on a ``Vec<8, T>`` → ``Vec<8, Vec<6, T>>``
+        (each of the 8 lanes becomes a 6-element sub-vector of copies).
+        """
+        info = self._as_vector_signal()
+        if info is None:
+            raise ValueError("broadcast requires a vector-backed Vec")
+        m, sig, signs = info
+        from pycircuit.dsl import _vector_shape_elem_type, _format_vector_type
+        shape, elem_ty = _vector_shape_elem_type(sig.ty)
+        d = int(dim)
+        if d < 0 or d > len(shape):
+            raise ValueError(f"broadcast dim {d} out of range for shape {shape}")
+        new_sig = m.v_broadcast_dim(sig, size=int(size), dim=d)
+        new_shape = list(shape)
+        new_shape.insert(d, int(size))
+        # Adjust signs for the new outer dimension count.
+        if d == 0:
+            signs = [signs[0]] * int(size)
+        # dim > 0: outer dim unchanged, signs stay the same
+        return Vec._from_vector_signal(m, new_sig, signs=signs)
+
     # -- width transforms -------------------------------------------------------
 
     def trunc(self, *, width: int) -> "Vec":

@@ -648,6 +648,41 @@ static LogicalResult emitCombAssign(Operation &op, llvm::raw_ostream &os, NameTa
                );
     return success();
   }
+  if (auto vbd = dyn_cast<pyc::VBroadcastDimOp>(op)) {
+    auto srcVT = dyn_cast<VectorType>(vbd.getVec().getType());
+    auto dstVT = dyn_cast<VectorType>(vbd.getResult().getType());
+    if (!srcVT || !dstVT)
+      return vbd.emitError("C++ emitter expects vector types for v_broadcast_dim");
+    std::int64_t dim = vbd.getDimAttr().getInt();
+    assignExpr(vbd.getResult(), vbd.getType(), os, nt,
+               [&](llvm::raw_ostream &e) {
+                 e << cppType(dstVT) << "{{";
+                 // Walk all result lanes, mapping to source.
+                 std::function<void(unsigned, std::vector<int64_t> &)> walk;
+                 walk = [&](unsigned depth, std::vector<int64_t> &idx) {
+                   if (depth == static_cast<unsigned>(dstVT.getRank())) {
+                     if (!idx.empty() && (idx[0] > 0 || depth > 1))
+                       e << ", ";
+                     // Build source index by dropping the broadcast dim.
+                     std::string srcIdx;
+                     for (unsigned d = 0; d < dstVT.getRank(); ++d)
+                       if (static_cast<int64_t>(d) != dim)
+                         srcIdx += "[" + std::to_string(idx[d]) + "]";
+                     e << nt.get(vbd.getVec()) << srcIdx;
+                     return;
+                   }
+                   for (int64_t i = 0; i < dstVT.getDimSize(depth); ++i) {
+                     idx.push_back(i);
+                     walk(depth + 1, idx);
+                     idx.pop_back();
+                   }
+                 };
+                 std::vector<int64_t> idx;
+                 walk(0, idx);
+                 e << "}}";
+               });
+    return success();
+  }
   auto emitVectorReduce = [&](auto vr, const char *opName, const char *opToken) -> LogicalResult {
     auto vt = dyn_cast<VectorType>(vr.getVec().getType());
     if (!vt)
@@ -1716,6 +1751,7 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
             pyc::VGetOp,
             pyc::VCreateOp,
             pyc::VBroadcastOp,
+            pyc::VBroadcastDimOp,
             pyc::VOrReduceOp,
             pyc::VAndReduceOp,
             pyc::VAddReduceOp,
@@ -2137,6 +2173,7 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
             pyc::VGetOp,
             pyc::VCreateOp,
             pyc::VBroadcastOp,
+            pyc::VBroadcastDimOp,
             pyc::VOrReduceOp,
             pyc::VAndReduceOp,
             pyc::VAddReduceOp,

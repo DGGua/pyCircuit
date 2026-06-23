@@ -422,6 +422,40 @@ static std::optional<LogicalResult> emitScalarOpAssign(Operation &op, raw_ostrea
       os << "assign " << dst << "[" << i << "] = " << src << ";\n";
     return success();
   }
+  if (auto vbd = dyn_cast<pyc::VBroadcastDimOp>(op)) {
+    auto srcVT = dyn_cast<VectorType>(vbd.getVec().getType());
+    auto dstVT = dyn_cast<VectorType>(vbd.getResult().getType());
+    if (!srcVT || !dstVT)
+      return {vbd.emitError("verilog emitter expects vector types for v_broadcast_dim")};
+    int64_t dim = vbd.getDimAttr().getInt();
+    std::string dstBase = nt.get(vbd.getResult());
+    std::string srcBase = nt.get(vbd.getVec());
+    // Walk all result lanes, mapping each to the appropriate source lane.
+    std::function<void(unsigned, std::string &, std::string &)> walkDst;
+    walkDst = [&](unsigned depth, std::string &dstIdx, std::string &srcIdx) -> void {
+      if (depth == static_cast<unsigned>(dstVT.getRank())) {
+        os << "assign " << dstBase << dstIdx << " = " << srcBase << srcIdx << ";\n";
+        return;
+      }
+      for (int64_t i = 0; i < dstVT.getDimSize(depth); ++i) {
+        std::string d = "[" + std::to_string(i) + "]";
+        size_t dOld = dstIdx.size();
+        dstIdx += d;
+        if (static_cast<int64_t>(depth) != dim) {
+          size_t sOld = srcIdx.size();
+          srcIdx += d;
+          walkDst(depth + 1, dstIdx, srcIdx);
+          srcIdx.resize(sOld);
+        } else {
+          walkDst(depth + 1, dstIdx, srcIdx);
+        }
+        dstIdx.resize(dOld);
+      }
+    };
+    std::string dstIdx, srcIdx;
+    walkDst(0, dstIdx, srcIdx);
+    return success();
+  }
   auto emitVectorReduce = [&](auto vr, const char *opName, const std::string &opToken) -> LogicalResult {
     auto vt = dyn_cast<VectorType>(vr.getVec().getType());
     if (!vt)
@@ -536,6 +570,7 @@ static LogicalResult emitNetlistOp(Operation &op, raw_ostream &os, NameTable &nt
       if (!isa<pyc::VGetOp,
                pyc::VCreateOp,
                pyc::VBroadcastOp,
+               pyc::VBroadcastDimOp,
                pyc::VOrReduceOp,
                pyc::VAndReduceOp,
                pyc::VAddReduceOp>(op))
@@ -837,6 +872,7 @@ static LogicalResult emitFunc(func::FuncOp f, raw_ostream &os, const VerilogEmit
               pyc::VGetOp,
               pyc::VCreateOp,
               pyc::VBroadcastOp,
+              pyc::VBroadcastDimOp,
               pyc::VOrReduceOp,
               pyc::VAndReduceOp,
               pyc::VAddReduceOp>(op)) {

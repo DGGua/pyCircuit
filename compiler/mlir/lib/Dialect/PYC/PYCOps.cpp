@@ -1317,6 +1317,33 @@ LogicalResult VBroadcastOp::verify() {
   return success();
 }
 
+LogicalResult VBroadcastDimOp::verify() {
+  auto srcVT = dyn_cast<VectorType>(getVec().getType());
+  if (!srcVT || srcVT.getRank() < 1)
+    return emitOpError("vec operand must have a vector type");
+  auto resultVT = dyn_cast<VectorType>(getResult().getType());
+  if (!resultVT)
+    return emitOpError("result type must be a vector type");
+  int64_t size = getSizeAttr().getInt();
+  int64_t dim = getDimAttr().getInt();
+  if (dim < 0 || dim > srcVT.getRank())
+    return emitOpError("dim out of range: ") << dim << " (src rank=" << srcVT.getRank() << ")";
+  if (size <= 0)
+    return emitOpError("size must be positive");
+  if (resultVT.getRank() != srcVT.getRank() + 1)
+    return emitOpError("result rank must be src rank + 1");
+  for (int64_t s = 0; s < srcVT.getRank(); ++s) {
+    int64_t rd = s < dim ? s : s + 1;
+    if (resultVT.getDimSize(rd) != srcVT.getDimSize(s))
+      return emitOpError("result dim ") << rd << " must match src dim " << s;
+  }
+  if (resultVT.getDimSize(dim) != size)
+    return emitOpError("result dim ") << dim << " size must be " << size;
+  if (resultVT.getElementType() != srcVT.getElementType())
+    return emitOpError("result element type must match src element type");
+  return success();
+}
+
 static LogicalResult verifyVectorReduce(Operation *op, Value vec, std::optional<int64_t> dimAttr, Type resultTy) {
   auto vecTy = dyn_cast<VectorType>(vec.getType());
   if (!vecTy)

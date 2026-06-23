@@ -433,6 +433,14 @@ def PYC_VBroadcastOp : PYC_Op<"v_broadcast", [Pure]> {
   let assemblyFormat = "$scalar `to` $size attr-dict `:` type($scalar) `->` type($result)";
 }
 
+def PYC_VBroadcastDimOp : PYC_Op<"v_broadcast_dim", [Pure]> {
+  let summary = "Broadcast a vector by repeating along a new dimension";
+  let arguments = (ins AnyIntegerOrV:$vec, I64Attr:$size, I64Attr:$dim);
+  let results = (outs AnyIntegerOrV:$result);
+  let hasVerifier = 1;
+  let assemblyFormat = "$vec `to` $size `,` $dim attr-dict `:` type($vec) `->` type($result)";
+}
+
 // Reduce a vector with bitwise OR over a selected dimension.
 // v_or_reduce vector<16xi1> -> i1
 // v_or_reduce vector<2x16xi1> {dim = 0} -> vector<16xi1>
