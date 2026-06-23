@@ -3085,14 +3085,37 @@ class Vec:
             ])
         return Vec([self._wire_of(e).select(a, b) for e in self])
 
-    def masked_or(self, vals: Any, *, zero: Any = 0) -> Wire:
-        """Select ``vals`` where this mask is true, then OR-reduce the lanes."""
-        values = vals if isinstance(vals, Vec) else Vec(list(vals))
-        return self.select(values, zero).or_reduce()
+    def priority_mux(self, vals: Any, *, zero: Any = 0) -> Wire:
+        """Balanced binary-tree priority mux with left-to-right precedence.
 
-    def onehot_mux(self, vals: Any, *, zero: Any = 0) -> Wire:
-        """One-hot mux implemented as masked OR over a Vec of candidate values."""
-        return self.masked_or(vals, zero=zero)
+        Builds a tree of 2:1 muxes (``val_a if sel_a else val_b``) paired
+        with OR-reduced selects.  When the select mask is one-hot this
+        recovers the exact candidate value; when multiple bits are set the
+        leftmost candidate wins, making the result well-defined even for
+        non-onehot masks.
+        """
+        values = vals if isinstance(vals, Vec) else Vec(list(vals))
+        n = len(self)
+        if n == 0:
+            return zero
+        sels = self
+        vls = values
+        # ceil(log2(n)) tree levels.
+        while n > 1:
+            n = (n + 1) // 2
+            m = len(sels)
+            new_sels = []
+            new_vls = []
+            for i in range(0, m, 2):
+                if i + 1 < m:
+                    new_sels.append(sels[i] | sels[i + 1])
+                    new_vls.append(sels[i].select(vls[i], vls[i + 1]))
+                else:
+                    new_sels.append(sels[i])
+                    new_vls.append(vls[i])
+            sels = Vec(new_sels)
+            vls = Vec(new_vls)
+        return sels[0].select(vls[0], zero)
 
     # -- width transforms -------------------------------------------------------
 
