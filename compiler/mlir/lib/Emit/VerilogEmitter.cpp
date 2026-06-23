@@ -59,6 +59,23 @@ static std::string vUnpacked(Type ty) {
   return "";
 }
 
+/// Build a balanced binary-tree expression from a list of term strings.
+/// e.g. {"v[0]","v[1]","v[2]","v[3]"} with "|" → "((v[0] | v[1]) | (v[2] | v[3]))"
+static std::string treeReduceExpr(llvm::SmallVectorImpl<std::string> &terms,
+                                  const std::string &op) {
+  while (terms.size() > 1) {
+    llvm::SmallVector<std::string> next;
+    for (size_t i = 0; i < terms.size(); i += 2) {
+      if (i + 1 < terms.size())
+        next.push_back("(" + terms[i] + " " + op + " " + terms[i + 1] + ")");
+      else
+        next.push_back(terms[i]);
+    }
+    terms = std::move(next);
+  }
+  return terms.empty() ? "" : terms[0];
+}
+
 static std::string vLiteral(IntegerAttr a, Type dstTy) {
   auto intTy = dyn_cast<IntegerType>(dstTy);
   if (!intTy)
@@ -423,16 +440,12 @@ static std::optional<LogicalResult> emitScalarOpAssign(Operation &op, raw_ostrea
 
     if (vt.getRank() == 1) {
       std::int64_t lanes = vt.getShape()[0];
-      std::string expr = "(";
+      llvm::SmallVector<std::string> terms;
       for (std::int64_t i = 0; i < lanes; ++i) {
-        if (i)
-          expr += " " + opToken + " ";
-        expr += nt.get(vr.getVec());
-        expr += "[";
-        expr += std::to_string(static_cast<long long>(i));
-        expr += "]";
+        terms.push_back(nt.get(vr.getVec()) + "[" +
+                        std::to_string(static_cast<long long>(i)) + "]");
       }
-      expr += ")";
+      std::string expr = treeReduceExpr(terms, opToken);
       emitConnectAssign(nt.get(vr.getResult()), expr, vr.getResult().getType(), os);
       return success();
     }
@@ -442,19 +455,18 @@ static std::optional<LogicalResult> emitScalarOpAssign(Operation &op, raw_ostrea
     std::int64_t outLanes = (dim == 0) ? cols : rows;
     std::int64_t reduceLanes = (dim == 0) ? rows : cols;
     for (std::int64_t i = 0; i < outLanes; ++i) {
-      std::string expr = "(";
+      llvm::SmallVector<std::string> terms;
       for (std::int64_t j = 0; j < reduceLanes; ++j) {
-        if (j)
-          expr += " " + opToken + " ";
-        expr += nt.get(vr.getVec());
         if (dim == 0)
-          expr += "[" + std::to_string(static_cast<long long>(j)) + "][" +
-                  std::to_string(static_cast<long long>(i)) + "]";
+          terms.push_back(nt.get(vr.getVec()) + "[" +
+                          std::to_string(static_cast<long long>(j)) + "][" +
+                          std::to_string(static_cast<long long>(i)) + "]");
         else
-          expr += "[" + std::to_string(static_cast<long long>(i)) + "][" +
-                  std::to_string(static_cast<long long>(j)) + "]";
+          terms.push_back(nt.get(vr.getVec()) + "[" +
+                          std::to_string(static_cast<long long>(i)) + "][" +
+                          std::to_string(static_cast<long long>(j)) + "]");
       }
-      expr += ")";
+      std::string expr = treeReduceExpr(terms, opToken);
       emitConnectAssign(
           nt.get(vr.getResult()) + "[" + std::to_string(static_cast<long long>(i)) + "]",
           expr,
