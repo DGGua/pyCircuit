@@ -173,6 +173,11 @@ static llvm::cl::opt<bool> cppOnlyPreserveOps(
     llvm::cl::desc("Preserve operation-granular C++ scheduling in --sim-mode=cpp-only (disables comb fusion)"),
     llvm::cl::init(false));
 
+static llvm::cl::opt<bool> unrollVector(
+    "unroll-vector",
+    llvm::cl::desc("Unroll vector operations to scalars at IR level before optimization passes"),
+    llvm::cl::init(false));
+
 static llvm::cl::opt<bool> noInline(
     "noinline",
     llvm::cl::desc("Disable MLIR inliner to preserve module boundaries (prevents merge/flatten)"),
@@ -1130,7 +1135,7 @@ static bool isProbeOnlyFunc(func::FuncOp f) {
   return false;
 }
 
-static constexpr double kHardMaxSourcePredictedCompileCost = 15000.0;
+static constexpr double kHardMaxSourcePredictedCompileCost = 40000.0;
 static constexpr double kHardMaxModulePredictedCompileCost = 40000.0;
 static constexpr double kHardMaxTotalPredictedCompileCost = 700000.0;
 
@@ -2264,8 +2269,11 @@ int main(int argc, char **argv) {
   pm.addNestedPass<func::FuncOp>(pyc::createLowerSCFToPYCStaticPass());
   pm.addNestedPass<func::FuncOp>(pyc::createEliminateWiresPass());
   pm.addNestedPass<func::FuncOp>(pyc::createEliminateDeadStatePass());
+  if (unrollVector)
+    pm.addNestedPass<func::FuncOp>(pyc::createVectorUnrollPass());
+  if (!unrollVector)
+    pm.addNestedPass<func::FuncOp>(pyc::createSLPPackWiresPass());
   pm.addNestedPass<func::FuncOp>(pyc::createCombCanonicalizePass());
-  pm.addNestedPass<func::FuncOp>(pyc::createSLPPackWiresPass());
   pm.addPass(pyc::createCheckCombCyclesPass());
   pm.addPass(pyc::createCheckClockDomainsPass());
   pm.addNestedPass<func::FuncOp>(pyc::createPackI1RegsPass());
