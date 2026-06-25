@@ -55,10 +55,8 @@ Scalar-arm Vec select cases (`select_vs` and `select_sv`) are full backend
 cases. They guard the broadcast-to-vector fast path used by issue-queue style
 masked muxes.
 
-Vector-shaped IO and 2D dim-reduce have standalone emit+pycc checks. Ordinary
-JIT `Circuit.instance` still does not accept `Vec` as an instance port binding;
-hierarchical Vec IO should be covered through the cycle-aware `domain.call`
-path or after `Circuit.instance` grows equivalent vector-port support.
+Vector-shaped IO, ordinary JIT `Circuit.instance` Vec port binding, and 2D
+dim-reduce have standalone emit+pycc checks.
 
 ## Add A Case
 

@@ -194,6 +194,61 @@ def test_eager_vec_broadcast_emit_and_pycc(
 
 
 @pytest.mark.vec
+def test_jit_instance_vec_port_emit_and_pycc(
+    *,
+    repo_root: Path,
+    vec_test_root: Path,
+    pyc_pythonpath: str,
+    pycc: Path,
+) -> None:
+    case_root = vec_test_root / "jit_instance_vec_port"
+    src_dir = case_root / "src"
+    out_dir = case_root / "build"
+    src_dir.mkdir(parents=True, exist_ok=True)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    src = src_dir / "jit_instance_vec_port.py"
+    src.write_text(
+        "\n".join(
+            [
+                "from __future__ import annotations",
+                "",
+                "from pycircuit import Circuit, Vec, module",
+                "",
+                "",
+                "@module",
+                "def child(m: Circuit, a):",
+                "    return a + a",
+                "",
+                "",
+                "@module",
+                "def build(m: Circuit) -> None:",
+                '    a = Vec([m.input(f"a{i}", width=4) for i in range(4)])',
+                '    y = m.instance(child, name="u_child", a=a).read()',
+                '    m.output("out", y)',
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    env = merged_env(pythonpath=pyc_pythonpath, pycc=pycc)
+    pyc = out_dir / "jit_instance_vec_port.pyc"
+    run_cmd(["python3", "-m", "pycircuit.cli", "emit", str(src), "-o", str(pyc)], cwd=repo_root, env=env)
+    mlir = pyc.read_text(encoding="utf-8")
+    check_ir(
+        VecCase("jit_instance_vec_port", "jit_instance_vec_port", ir_tokens=("pyc.instance", "vector<4xi4>", "pyc.v_create")),
+        mlir,
+    )
+    cpp_dir = out_dir / "cpp"
+    run_cmd(
+        [str(pycc), str(pyc), "--emit=cpp", "--cpp-split=module", "--out-dir", str(cpp_dir), "--build-profile=dev-fast"],
+        cwd=repo_root,
+        env=env,
+    )
+    run_cmd([str(pycc), str(pyc), "--emit=verilog", "-o", str(out_dir / "jit_instance_vec_port.v"), "--build-profile=dev-fast"], cwd=repo_root, env=env)
+    check_cpp_manifest_syntax(out_dir, repo_root=repo_root)
+
+
+@pytest.mark.vec
 def test_eager_vec_caches_sig(repo_root: Path) -> None:
     import sys
 

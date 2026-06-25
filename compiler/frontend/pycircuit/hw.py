@@ -15,6 +15,7 @@ from .connectors import (
     ModuleCollectionHandle,
     ModuleInstanceHandle,
     RegConnector,
+    VecConnector,
     WireConnector,
     is_connector,
     is_connector_bundle,
@@ -1183,7 +1184,7 @@ class Circuit(Module):
 
     def as_connector(
         self,
-        value: Union[Connector, Wire, Reg, Signal, LiteralValue, int],
+        value: Union[Connector, Wire, Reg, Signal, LiteralValue, int, "Vec"],
         *,
         name: str | None = None,
     ) -> Connector:
@@ -1199,6 +1200,14 @@ class Circuit(Module):
             if value.m is not self:
                 raise ConnectorError("wire belongs to a different Circuit")
             return WireConnector(owner=self, name=str(name or value.ref), wire=value)
+        if isinstance(value, Vec):
+            info = value._as_vector_signal()
+            if info is None:
+                raise ConnectorError("Vec cannot be converted to a vector signal")
+            vec_m, _vec_sig, _vec_signs = info
+            if vec_m is not self:
+                raise ConnectorError("Vec belongs to a different Circuit")
+            return VecConnector(owner=self, name=str(name or "vec"), vec=value)
         if isinstance(value, Signal):
             return WireConnector(owner=self, name=str(name or value.ref), wire=value)
         if isinstance(value, LiteralValue):
@@ -1209,7 +1218,7 @@ class Circuit(Module):
             ww = infer_literal_width(int(value), signed=(int(value) < 0))
             w = self.const(int(value), width=ww)
             return WireConnector(owner=self, name=str(name or f"lit_{int(value)}"), wire=w)
-        raise ConnectorError(f"expected Connector/Wire/Reg/Signal/int/literal, got {type(value).__name__}")
+        raise ConnectorError(f"expected Connector/Wire/Reg/Vec/Signal/int/literal, got {type(value).__name__}")
 
     def input_connector(self, name: str, *, width: int, signed: bool = False) -> WireConnector:
         w = self.input(str(name), width=width, signed=signed)
@@ -1651,7 +1660,7 @@ class Circuit(Module):
         except Exception as e:  # noqa: BLE001
             raise DesignError(
                 f"instance port {port!r}: unsupported value {type(v).__name__}; "
-                "expected Connector/Wire/Reg/Signal/int/literal"
+                "expected Connector/Wire/Reg/Vec/Signal/int/literal"
             ) from e
 
     def instance_handle(
@@ -1713,6 +1722,19 @@ class Circuit(Module):
 
             c = normalized_ports[pname]
             rv = c.read()
+            if isinstance(rv, Vec):
+                info = rv._as_vector_signal()
+                if info is None:
+                    raise DesignError(f"instance port {pname!r}: Vec cannot be converted to a vector signal")
+                rv_m, rv_sig, rv_signs = info
+                if rv_m is not self:
+                    raise DesignError(f"instance port {pname!r}: cannot connect a Vec from a different module")
+                sig_port_specs[pname] = {
+                    "kind": "vec",
+                    "ty": rv_sig.ty,
+                    "signed": [bool(s) for s in rv_signs],
+                }
+                continue
             if isinstance(rv, Wire):
                 if rv.m is not self:
                     raise DesignError(f"instance port {pname!r}: cannot connect a wire from a different module")
@@ -1751,7 +1773,15 @@ class Circuit(Module):
 
         def coerce_to_sig(c: Connector, *, expected_ty: str, port: str) -> Signal:
             rv = c.read()
-            if isinstance(rv, Wire):
+            if isinstance(rv, Vec):
+                info = rv._as_vector_signal()
+                if info is None:
+                    raise DesignError(f"instance port {port!r}: Vec cannot be converted to a vector signal")
+                rv_m, sig, _rv_signs = info
+                if rv_m is not self:
+                    raise DesignError(f"instance port {port!r}: cannot connect a Vec from a different module")
+                src_signed = False
+            elif isinstance(rv, Wire):
                 if rv.m is not self:
                     raise DesignError(f"instance port {port!r}: cannot connect a wire from a different module")
                 sig = rv.sig
@@ -1793,7 +1823,12 @@ class Circuit(Module):
         self._record_struct_instance()
         out_fields: dict[str, Connector] = {}
         for oname, sig in zip(cm.result_names, outs):
-            out_fields[oname] = WireConnector(owner=self, name=oname, wire=Wire(self, sig))
+            if sig.ty.startswith("vector<"):
+                shape, _elem_ty = Vec._vector_shape_elem_type(sig.ty)
+                vec = Vec._from_vector_signal(self, sig, signs=[False for _ in range(shape[0])])
+                out_fields[oname] = VecConnector(owner=self, name=oname, vec=vec)
+            else:
+                out_fields[oname] = WireConnector(owner=self, name=oname, wire=Wire(self, sig))
         force_bundle = False
         try:
             ann = inspect.signature(cm.fn).return_annotation
