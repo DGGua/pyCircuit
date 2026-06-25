@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import cast
+
 from pycircuit import (
     CycleAwareCircuit,
     CycleAwareDomain,
@@ -98,6 +100,10 @@ def build(
     # Pre-compute constants for the vectorised bypass search.
     # Use m.const: u() returns LiteralValue which Vec cannot ingest.
     lane_nums = Vec([m.const(j, width=lane_w) for j in range(int(lanes_n))])
+    zero_hit = m.const(0, width=1)
+    one_hit = m.const(1, width=1)
+    zero_stage = m.const(0, width=2)
+    stage_consts = {prio: m.const(prio, width=2) for prio in (1, 2, 3)}
     zero_lane = m.const(0, width=lane_w)
     zero_data = m.const(0, width=data_w)
 
@@ -107,22 +113,22 @@ def build(
     w_ptype: dict[str, Vec] = {}
     w_data: dict[str, Vec] = {}
     for stage in ("w1", "w2", "w3"):
-        w_valid[stage] = Vec([m.input(f"{stage}{k}_valid", width=1) for k in range(lanes_n)])
-        w_ptag[stage] = Vec([m.input(f"{stage}{k}_ptag", width=ptag_w) for k in range(lanes_n)])
-        w_ptype[stage] = Vec([m.input(f"{stage}{k}_ptype", width=ptype_w) for k in range(lanes_n)])
-        w_data[stage] = Vec([m.input(f"{stage}{k}_data", width=data_w) for k in range(lanes_n)])
+        w_valid[stage] = cast(Vec, m.input(f"{stage}_valid", width=1, shape=lanes_n))
+        w_ptag[stage] = cast(Vec, m.input(f"{stage}_ptag", width=ptag_w, shape=lanes_n))
+        w_ptype[stage] = cast(Vec, m.input(f"{stage}_ptype", width=ptype_w, shape=lanes_n))
+        w_data[stage] = cast(Vec, m.input(f"{stage}_data", width=data_w, shape=lanes_n))
 
     for src in ("srcL", "srcR"):
         # Collect all N sources of this type into Vecs.
-        src_valid_v = Vec([m.input(f"i2{i}_{src}_valid", width=1) for i in range(lanes_n)])
-        src_ptag_v  = Vec([m.input(f"i2{i}_{src}_ptag", width=ptag_w) for i in range(lanes_n)])
-        src_ptype_v = Vec([m.input(f"i2{i}_{src}_ptype", width=ptype_w) for i in range(lanes_n)])
-        src_rfdata_v = Vec([m.input(f"i2{i}_{src}_rf_data", width=data_w) for i in range(lanes_n)])
+        src_valid_v = cast(Vec, m.input(f"i2_{src}_valid", width=1, shape=lanes_n))
+        src_ptag_v  = cast(Vec, m.input(f"i2_{src}_ptag", width=ptag_w, shape=lanes_n))
+        src_ptype_v = cast(Vec, m.input(f"i2_{src}_ptype", width=ptype_w, shape=lanes_n))
+        src_rfdata_v = cast(Vec, m.input(f"i2_{src}_rf_data", width=data_w, shape=lanes_n))
 
         sel_data  = src_rfdata_v
-        sel_hit   = Vec([m.const(0, width=1) for _ in range(lanes_n)])
-        sel_stage = Vec([m.const(0, width=2) for _ in range(lanes_n)])
-        sel_lane  = Vec([m.const(0, width=lane_w) for _ in range(lanes_n)])
+        sel_hit   = Vec([zero_hit for _ in range(lanes_n)])
+        sel_stage = Vec([zero_stage for _ in range(lanes_n)])
+        sel_lane  = Vec([zero_lane for _ in range(lanes_n)])
 
         # Priority: w3 > w2 > w1.
         for stage, prio in [("w3", 3), ("w2", 2), ("w1", 1)]:
@@ -136,15 +142,14 @@ def build(
             )
 
             sel_data  = mux(has, data_sel, sel_data)
-            sel_hit   = mux(has, m.const(1, width=1), sel_hit)
-            sel_stage = mux(has, m.const(prio, width=2), sel_stage)
+            sel_hit   = mux(has, one_hit, sel_hit)
+            sel_stage = mux(has, stage_consts[prio], sel_stage)
             sel_lane  = mux(has, lane_sel, sel_lane)
 
-        for i in range(lanes_n):
-            m.output(f"i2{i}_{src}_data", sel_data[i])
-            m.output(f"i2{i}_{src}_hit", sel_hit[i])
-            m.output(f"i2{i}_{src}_sel_stage", sel_stage[i])
-            m.output(f"i2{i}_{src}_sel_lane", sel_lane[i])
+        m.output(f"i2_{src}_data", cast(Vec, sel_data))
+        m.output(f"i2_{src}_hit", cast(Vec, sel_hit))
+        m.output(f"i2_{src}_sel_stage", cast(Vec, sel_stage))
+        m.output(f"i2_{src}_sel_lane", cast(Vec, sel_lane))
 
 
 build.__pycircuit_name__ = "bypass_unit"
