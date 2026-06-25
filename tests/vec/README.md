@@ -49,9 +49,9 @@ Vector cast cases (`zext`, `sext`, `trunc`) use the contract-approved
 function-style API (`zext(a, width=...)`, etc.) and run as full backend cases.
 Method-style calls such as `a.zext(width=...)` remain rejected by `PYC415`.
 
-Signed div/rem run as C++ backend cases only by default because the generated
-Verilator behavior currently disagrees with the bit-accurate signed oracle. The
-case remains in the matrix so the gap is visible.
+Signed div/rem are full backend cases. The Verilog emitter keeps the divide/rem
+ternary signed by casting the zero branch, avoiding Verilator treating the
+protected expression as unsigned.
 
 Scalar-arm Vec select cases (`select_vs` and `select_sv`) are full backend
 cases. They guard the broadcast-to-vector fast path used by issue-queue style

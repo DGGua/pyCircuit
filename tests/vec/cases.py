@@ -175,8 +175,8 @@ BINARY_SPECS: tuple[BinarySpec, ...] = (
     BinarySpec("slt", ("vector<", "pyc.slt"), _samples({"a": SIGNED_A, "b": SIGNED_B}, {"a": SIGNED_A, "scalar": 0b1110}, {"a": SIGNED_A, "scalar": 0b1110}), oracle_op="lt", signed=True, out_width=1),
     BinarySpec("udiv", ("vector<", "pyc.udiv"), _samples({"a": DIV_A, "b": DIV_B}, {"a": DIV_A, "scalar": 3}, {"a": DIV_B, "scalar": 15}), oracle_op="div"),
     BinarySpec("urem", ("vector<", "pyc.urem"), _samples({"a": DIV_A, "b": DIV_B}, {"a": DIV_A, "scalar": 3}, {"a": DIV_B, "scalar": 15}), oracle_op="rem"),
-    BinarySpec("sdiv", ("vector<", "pyc.sdiv"), _samples({"a": SDIV_A, "b": SDIV_B}, {"a": SDIV_A, "scalar": 0b1110}, {"a": SDIV_B, "scalar": 0b0110}), oracle_op="div", signed=True, verilator=False),
-    BinarySpec("srem", ("vector<", "pyc.srem"), _samples({"a": SDIV_A, "b": SDIV_B}, {"a": SDIV_A, "scalar": 0b1110}, {"a": SDIV_B, "scalar": 0b0110}), oracle_op="rem", signed=True, verilator=False),
+    BinarySpec("sdiv", ("vector<", "pyc.sdiv"), _samples({"a": SDIV_A, "b": SDIV_B}, {"a": SDIV_A, "scalar": 0b1110}, {"a": SDIV_B, "scalar": 0b0110}), oracle_op="div", signed=True),
+    BinarySpec("srem", ("vector<", "pyc.srem"), _samples({"a": SDIV_A, "b": SDIV_B}, {"a": SDIV_A, "scalar": 0b1110}, {"a": SDIV_B, "scalar": 0b0110}), oracle_op="rem", signed=True),
 )
 
 

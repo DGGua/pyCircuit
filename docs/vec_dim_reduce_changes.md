@@ -35,6 +35,8 @@ w1_ptag: vector<lanesxiN>
 
 `Vec` 现在采用 Wire 风格命名的双层表示：`elems` 始终保留 Python lane list，`sig` 保存可安全向量化时对应的底层 MLIR vector `Signal`。普通 `Vec([wire0, wire1, ...])` 构造时会生成一次 `pyc.v_create` 并保存到 `sig`，后续 `_as_vector_signal()`、element-wise op、reduce 和 broadcast 复用同一个 vector signal，不再重复合成。来自 vector op 的结果会用 `pyc.v_get` 构造 Python lane list 视图，同时原始 vector op result 保存在 `Vec.sig`。
 
+`Vec` 也可以接受 cycle-aware lane wrapper（例如 `cas(domain, wire, cycle=N)`、`ForwardSignal`/`StateSignal` 委托出的当前 CAS 视图），但仅作为构造入口兼容：构造时检查所有 cycle-aware lane 的 cycle 必须完全一致，然后解包为底层 `Wire` 并继续走普通 vector IR。为了避免裸 `Wire` 缺少 logical cycle provenance，`Vec([...])` 不允许混用 cycle-aware lane 和 raw `Wire`/`Reg`/`Vec` lane；需要用户先统一包装或先显式对齐。
+
 ### Element-Wise Vector Ops
 
 `Vec` 已覆盖主要逐 lane 运算：
@@ -160,6 +162,8 @@ Verilog backend 直接发射 unpacked vector lanes，并支持：
 
 balanced reduce 对 dim-reduce 很重要：它降低组合深度，避免 `or_reduce` / `and_reduce` / `add_reduce` 在 lane 很多时成为一条长路径。
 
+signed div/rem 的 Verilog 除零保护已和 bit-accurate oracle 对齐。此前表达式形如 `rhs == 0 ? 0 : $signed(lhs) / $signed(rhs)`，Verilator 会因为 unsigned zero 分支把整个三元表达式按 unsigned divide/rem 处理；现在 zero 分支显式 `$signed(...)`，相关 Vec `sdiv`/`srem` case 已恢复 Verilator 覆盖。
+
 ### Vector Unroll Pass
 
 `pyc-unroll-vector` 是 IR-level pass，不是 backend-only fallback。它覆盖：
@@ -255,7 +259,7 @@ lane i -> bits [i * lane_width +: lane_width]
 - `cases.py` 定义算术、位运算、比较、shift、select、reduce 等 case。
 - `generate.py` 生成临时 DUT/testbench。
 - `runner.py` 负责 build、检查 IR token、运行 C++ binary，并在有 Verilator 时检查 Verilog。
-- `test_vec_ops.py` 额外覆盖 vector-shaped IO 和 2-D dim reduce emit+pycc。
+- `test_vec_ops.py` 额外覆盖 vector-shaped IO、ordinary JIT `Circuit.instance` Vec port binding、function-style cast API、cycle-aware lane 构造规则和 2-D dim reduce emit+pycc。
 
 推荐 gate：
 
@@ -272,7 +276,7 @@ make vec-smoke
 PYTHONPATH=compiler/frontend .venv/bin/python -m pytest tests/vec -m vec -q
 ```
 
-结果：`70 passed in 107.75s`。
+结果：`77 passed in 115.18s`。
 
 dim-reduce standalone gate 会生成：
 
@@ -293,7 +297,7 @@ m.output("sum1", a.reduce_sum(dim=1))
 - MLIR verifier/emitter 当前只承诺 rank-1/rank-2 reduce；更高维 reduce 需要继续扩展 verifier、emitter 和 tests。
 - `dim=None` 只允许 rank-1；rank>1 必须显式传 `dim`。
 - `Vec.broadcast()` 要求输入是可向量化 `Vec`；普通 eager `Vec([wire...])` 会在构造时缓存 vector signal，因此可以直接 broadcast。非矩形、跨 module 或混合 leaf 类型的 irregular Vec 仍会拒绝。
-- signed div/rem 的 Verilator 行为仍和 bit-accurate oracle 有差异，因此相关 case 默认只跑 C++ backend。
+- cycle-aware lane 只在 `Vec` 构造入口做同 cycle 检查和解包；`Vec` 本身还不是 `CycleAwareVec`，不会自动插入 delay 或保留后续 cycle provenance。
 
 ## 10. 结论
 

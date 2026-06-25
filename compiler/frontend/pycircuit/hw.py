@@ -2145,20 +2145,25 @@ class Vec:
     signed: list[bool] | None = None
 
     @staticmethod
-    def _normalize_init_elem(e: Any) -> Union[Wire, Reg, "Vec"]:
-        if isinstance(e, (Wire, Reg, Vec)):
-            return e
-
-        # Accept cycle-aware wrappers only when they denote the current-cycle
-        # value.  Reg is intentionally left untouched; Vec([reg]) should still
-        # expose Reg elements rather than silently rewriting them to reg.q.
+    def _cycle_aware_init_elem(e: Any) -> tuple[Wire, int] | None:
         cas = getattr(e, "_cas", e)
         w = getattr(cas, "_w", None)
         cycle = getattr(cas, "_cycle", None)
         if isinstance(w, Wire) and cycle is not None:
-            if int(cycle) != 0:
-                raise ValueError(f"Vec only accepts cycle-aware signals at cycle=0, got cycle={int(cycle)}")
-            return w
+            return w, int(cycle)
+        return None
+
+    @staticmethod
+    def _normalize_init_elem(e: Any) -> Union[Wire, Reg, "Vec"]:
+        if isinstance(e, (Wire, Reg, Vec)):
+            return e
+
+        # Accept cycle-aware wrappers as lane values. Reg is intentionally left
+        # untouched; Vec([reg]) should still expose Reg elements rather than
+        # silently rewriting them to reg.q.
+        cycle_aware = Vec._cycle_aware_init_elem(e)
+        if cycle_aware is not None:
+            return cycle_aware[0]
 
         return e
 
@@ -2168,6 +2173,19 @@ class Vec:
                 object.__setattr__(self, "elems", list(self.elems))
             except TypeError as e:
                 raise TypeError("Vec expects an iterable of elements") from e
+        cycles: list[int] = []
+        raw_cycleless = 0
+        for e in self.elems:
+            info = self._cycle_aware_init_elem(e)
+            if info is not None:
+                _w, cycle = info
+                cycles.append(cycle)
+            elif isinstance(e, (Wire, Reg, Vec)):
+                raw_cycleless += 1
+        if cycles and raw_cycleless:
+            raise ValueError("Vec cannot mix cycle-aware elements with raw Wire/Reg/Vec elements")
+        if cycles and any(cycle != cycles[0] for cycle in cycles[1:]):
+            raise ValueError(f"Vec cycle-aware elements must have the same cycle, got cycles={cycles}")
         object.__setattr__(self, "elems", [self._normalize_init_elem(e) for e in self.elems])
 
         if self.sig is not None:

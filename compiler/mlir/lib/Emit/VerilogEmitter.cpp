@@ -237,13 +237,13 @@ static std::optional<LogicalResult> emitScalarOpAssign(Operation &op, raw_ostrea
   }
   if (auto d = dyn_cast<pyc::SdivOp>(op)) {
     os << "assign " << nt.get(d.getResult()) << " = (" << nt.get(d.getRhs()) << " == " << vZero(d.getRhs().getType())
-       << " ? " << vZero(d.getResult().getType()) << " : ($signed(" << nt.get(d.getLhs()) << ") / $signed("
+       << " ? $signed(" << vZero(d.getResult().getType()) << ") : ($signed(" << nt.get(d.getLhs()) << ") / $signed("
        << nt.get(d.getRhs()) << ")));\n";
     return success();
   }
   if (auto r = dyn_cast<pyc::SremOp>(op)) {
     os << "assign " << nt.get(r.getResult()) << " = (" << nt.get(r.getRhs()) << " == " << vZero(r.getRhs().getType())
-       << " ? " << vZero(r.getResult().getType()) << " : ($signed(" << nt.get(r.getLhs()) << ") % $signed("
+       << " ? $signed(" << vZero(r.getResult().getType()) << ") : ($signed(" << nt.get(r.getLhs()) << ") % $signed("
        << nt.get(r.getRhs()) << ")));\n";
     return success();
   }

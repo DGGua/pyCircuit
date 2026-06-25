@@ -273,6 +273,40 @@ def test_eager_vec_caches_sig(repo_root: Path) -> None:
 
 
 @pytest.mark.vec
+def test_vec_cycle_aware_lanes_require_matching_cycle(repo_root: Path) -> None:
+    import sys
+
+    frontend = repo_root / "compiler" / "frontend"
+    if str(frontend) not in sys.path:
+        sys.path.insert(0, str(frontend))
+
+    from pycircuit import CycleAwareCircuit, Vec, cas
+
+    m = CycleAwareCircuit("vec_cas_cycles")
+    domain = m.create_domain("main")
+    same_cycle = Vec([cas(domain, m.input(f"a{i}", width=4), cycle=2) for i in range(2)])
+
+    assert same_cycle.sig is not None
+    assert same_cycle.sig.ty == "vector<2xi4>"
+
+    with pytest.raises(ValueError, match="same cycle"):
+        Vec(
+            [
+                cas(domain, m.input("b0", width=4), cycle=1),
+                cas(domain, m.input("b1", width=4), cycle=2),
+            ]
+        )
+
+    with pytest.raises(ValueError, match="cannot mix cycle-aware"):
+        Vec(
+            [
+                cas(domain, m.input("c0", width=4), cycle=2),
+                m.input("c1", width=4),
+            ]
+        )
+
+
+@pytest.mark.vec
 def test_vector_op_result_reuses_vec_sig(repo_root: Path) -> None:
     import sys
 
