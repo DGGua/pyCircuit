@@ -659,10 +659,12 @@ static LogicalResult emitCombAssign(Operation &op, llvm::raw_ostream &os, NameTa
                  e << cppType(dstVT) << "{{";
                  // Walk all result lanes, mapping to source.
                  std::function<void(unsigned, std::vector<int64_t> &)> walk;
+                 bool emittedAny = false;
                  walk = [&](unsigned depth, std::vector<int64_t> &idx) {
                    if (depth == static_cast<unsigned>(dstVT.getRank())) {
-                     if (!idx.empty() && (idx[0] > 0 || depth > 1))
+                     if (emittedAny)
                        e << ", ";
+                     emittedAny = true;
                      // Build source index by dropping the broadcast dim.
                      std::string srcIdx;
                      for (unsigned d = 0; d < dstVT.getRank(); ++d)

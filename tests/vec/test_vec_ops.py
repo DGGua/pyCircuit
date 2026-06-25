@@ -147,6 +147,126 @@ def test_vector_io_emit_and_pycc(
 
 
 @pytest.mark.vec
+def test_eager_vec_broadcast_emit_and_pycc(
+    *,
+    repo_root: Path,
+    vec_test_root: Path,
+    pyc_pythonpath: str,
+    pycc: Path,
+) -> None:
+    case_root = vec_test_root / "eager_broadcast"
+    src_dir = case_root / "src"
+    out_dir = case_root / "build"
+    src_dir.mkdir(parents=True, exist_ok=True)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    src = src_dir / "eager_broadcast.py"
+    src.write_text(
+        "\n".join(
+            [
+                "from __future__ import annotations",
+                "",
+                "from pycircuit import Circuit, Vec, module",
+                "",
+                "",
+                "@module",
+                "def build(m: Circuit) -> None:",
+                '    a = Vec([m.input(f"a{i}", width=4) for i in range(4)])',
+                "    out = a.broadcast(dim=1, size=2)",
+                '    m.output("out", out)',
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    env = merged_env(pythonpath=pyc_pythonpath, pycc=pycc)
+    pyc = out_dir / "eager_broadcast.pyc"
+    run_cmd(["python3", "-m", "pycircuit.cli", "emit", str(src), "-o", str(pyc)], cwd=repo_root, env=env)
+    mlir = pyc.read_text(encoding="utf-8")
+    check_ir(VecCase("eager_broadcast", "eager_broadcast", ir_tokens=("vector<", "pyc.v_create", "pyc.v_broadcast_dim")), mlir)
+    cpp_dir = out_dir / "cpp"
+    run_cmd(
+        [str(pycc), str(pyc), "--emit=cpp", "--cpp-split=module", "--out-dir", str(cpp_dir), "--build-profile=dev-fast"],
+        cwd=repo_root,
+        env=env,
+    )
+    run_cmd([str(pycc), str(pyc), "--emit=verilog", "-o", str(out_dir / "eager_broadcast.v"), "--build-profile=dev-fast"], cwd=repo_root, env=env)
+    check_cpp_manifest_syntax(out_dir, repo_root=repo_root)
+
+
+@pytest.mark.vec
+def test_eager_vec_caches_sig(repo_root: Path) -> None:
+    import sys
+
+    frontend = repo_root / "compiler" / "frontend"
+    if str(frontend) not in sys.path:
+        sys.path.insert(0, str(frontend))
+
+    from pycircuit import Circuit, Vec
+
+    m = Circuit("vec_cached_signal")
+    a = Vec([m.input(f"a{i}", width=4) for i in range(4)])
+    first = a._as_vector_signal()
+    second = a._as_vector_signal()
+
+    assert first is not None
+    assert second is not None
+    assert a.sig is not None
+    assert first[1].ref == second[1].ref
+    assert first[1].ref == a.sig.ref
+    assert len(a.elems) == 4
+    assert m.emit_mlir().count("pyc.v_create") == 1
+
+
+@pytest.mark.vec
+def test_vector_op_result_reuses_vec_sig(repo_root: Path) -> None:
+    import sys
+
+    frontend = repo_root / "compiler" / "frontend"
+    if str(frontend) not in sys.path:
+        sys.path.insert(0, str(frontend))
+
+    from pycircuit import Circuit, Vec
+
+    m = Circuit("vec_result_reuses_sig")
+    a = Vec([m.input(f"a{i}", width=4) for i in range(4)])
+    b = a + a
+    c = b & b
+
+    assert b.sig is not None
+    assert c.sig is not None
+    assert len(b.elems) == 4
+    assert m.emit_mlir().count("pyc.v_create") == 1
+
+
+@pytest.mark.vec
+def test_vec_reg_lane_view_uses_reg_q_for_sig(repo_root: Path) -> None:
+    import sys
+
+    frontend = repo_root / "compiler" / "frontend"
+    if str(frontend) not in sys.path:
+        sys.path.insert(0, str(frontend))
+
+    from pycircuit import Circuit, Reg, Vec
+
+    m = Circuit("vec_reg_lane_view")
+    domain = m.domain("main")
+    en = m.const(1, width=1)
+    regs = [
+        m.reg_domain(domain, en, m.input(f"d{i}", width=4), init=0)
+        for i in range(2)
+    ]
+    v = Vec(regs)
+    info = v._as_vector_signal()
+
+    assert isinstance(v[0], Reg)
+    assert info is not None
+    assert v.sig is not None
+    assert info[1].ty == "vector<2xi4>"
+    assert v.sig.ty == "vector<2xi4>"
+    assert "pyc.v_create" in m.emit_mlir()
+
+
+@pytest.mark.vec
 def test_dim_reduce_emit_and_pycc(
     *,
     repo_root: Path,

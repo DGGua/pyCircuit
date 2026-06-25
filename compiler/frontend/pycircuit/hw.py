@@ -2105,10 +2105,9 @@ class Vec:
     """A small fixed-length container of wires/regs for building pipelines."""
 
     elems: list[Union[Wire, Reg, "Vec"]]
-    _vector_module: Module | None = None
-    _vector_sig: Signal | None = None
-    _vector_signs: list[bool] | None = None
-    _lane_cache: dict[int, Union[Wire, "Vec"]] = field(default_factory=dict, compare=False)
+    m: Module | None = None
+    sig: Signal | None = None
+    signed: list[bool] | None = None
 
     @staticmethod
     def _normalize_init_elem(e: Any) -> Union[Wire, Reg, "Vec"]:
@@ -2136,30 +2135,48 @@ class Vec:
                 raise TypeError("Vec expects an iterable of elements") from e
         object.__setattr__(self, "elems", [self._normalize_init_elem(e) for e in self.elems])
 
-        if self._vector_sig is not None:
-            if self._vector_module is None:
-                raise ValueError("vector-backed Vec requires a module")
-            if self._vector_signs is None:
-                raise ValueError("vector-backed Vec requires lane signedness")
-            shape, _ = self._vector_shape_elem_type(self._vector_sig.ty)
-            if shape[0] != len(self._vector_signs):
-                raise ValueError("vector-backed Vec lane count must match vector type")
-            if self.elems:
-                raise ValueError("vector-backed Vec must not also store eager elements")
+        if self.sig is not None:
+            if self.m is None:
+                raise ValueError("Vec with sig requires a module")
+            if self.signed is None:
+                raise ValueError("Vec with sig requires lane signedness")
+            shape, _ = self._vector_shape_elem_type(self.sig.ty)
+            if shape[0] != len(self.signed):
+                raise ValueError("Vec lane count must match vector type")
+            if not self.elems:
+                object.__setattr__(
+                    self,
+                    "elems",
+                    self._elems_from_vector_signal(
+                        self.m,
+                        self.sig,
+                        signs=list(self.signed),
+                    ),
+                )
+            elif len(self.elems) != shape[0]:
+                raise ValueError("Vec elems length must match vector outer dimension")
+            for e in self.elems:
+                if self._module_of(e) is not self.m:
+                    raise ValueError("Vec elems module must match sig module")
             return
 
         if not self.elems:
             raise ValueError("Vec cannot be empty")
 
-        first = self.elems[0]
-        if isinstance(first, Vec):
-            return  # nested Vec — defer module check to innermost Vec
-        m0 = self._module_of(first)
+        m0 = self._module_of(self.elems[0])
         for e in self.elems[1:]:
-            if isinstance(e, Vec):
-                continue
             if self._module_of(e) is not m0:
                 raise ValueError("Vec elements must belong to the same Circuit/Module")
+        if self.m is None:
+            object.__setattr__(self, "m", m0)
+        elif self.m is not m0:
+            raise ValueError("Vec module must match element module")
+        info = self._try_build_vector_sig_from_elems()
+        if info is not None:
+            m, sig, signs = info
+            object.__setattr__(self, "m", m)
+            object.__setattr__(self, "sig", sig)
+            object.__setattr__(self, "signed", signs)
 
     @staticmethod
     def _module_of(e: Union[Wire, Reg, "Vec"]) -> Module:
@@ -2167,22 +2184,14 @@ class Vec:
             return e.m
         if isinstance(e, Reg):
             return e.q.m
-        return e.m  # fallback (Vec or other with .m)
-
-    @property
-    def m(self) -> Module:
-        if self._vector_module is not None:
-            return self._vector_module
-        return self._module_of(self.elems[0])
+        if e.m is None:
+            return e._module_of(e.elems[0])
+        return e.m
 
     def __len__(self) -> int:
-        if self._vector_sig is not None:
-            return len(self._vector_signs or [])
         return len(self.elems)
 
-    def __iter__(self) -> Iterator[Union[Wire, Reg]]:
-        if self._vector_sig is not None:
-            return iter([self[i] for i in range(len(self))])
+    def __iter__(self) -> Iterator[Union[Wire, Reg, Vec]]:
         return iter(self.elems)
 
     @overload
@@ -2195,12 +2204,24 @@ class Vec:
     def __getitem__(self, idx: tuple[int | slice, ...]) -> Union[Wire, Reg, "Vec"]: ...
 
     def __getitem__(self, idx: int | slice | tuple[int | slice, ...]) -> Union[Wire, Reg, "Vec"]:
-        if self._vector_sig is not None:
+        if self.elems:
             if isinstance(idx, tuple):
                 if len(idx) == 0:
                     return self
                 head, *tail = idx
-                elem = self[head]
+                if isinstance(head, slice):
+                    selected = self.elems[head]
+                    if not tail:
+                        return Vec(selected)
+                    rest: int | slice | tuple[int | slice, ...]
+                    rest = tuple(tail) if len(tail) > 1 else tail[0]
+                    out: list[Union[Wire, Reg, Vec]] = []
+                    for e in selected:
+                        if not isinstance(e, Vec):
+                            raise TypeError("tuple indexing into nested dimensions requires Vec elements")
+                        out.append(e[rest])
+                    return Vec(out)
+                elem = self.elems[int(head)]
                 if not tail:
                     return elem
                 if not isinstance(elem, Vec):
@@ -2208,54 +2229,10 @@ class Vec:
                 rest = tuple(tail) if len(tail) > 1 else tail[0]
                 return elem[rest]
             if isinstance(idx, slice):
-                return Vec([self[i] for i in range(len(self))[idx]])
-            lane = int(idx)
-            if lane < 0:
-                lane += len(self)
-            if lane < 0 or lane >= len(self):
-                raise IndexError("Vec index out of range")
-            cached = self._lane_cache.get(lane)
-            if cached is not None:
-                return cached
-            assert self._vector_sig is not None
-            assert self._vector_signs is not None
-            lane_sig = self.m.v_get(self._vector_sig, index=lane)
-            if lane_sig.ty.startswith("vector<"):
-                shape, _elem_ty = self._vector_shape_elem_type(lane_sig.ty)
-                sub_signs = [bool(self._vector_signs[lane]) for _ in range(shape[0])]
-                sub_vec = self._from_vector_signal(self.m, lane_sig, signs=sub_signs)
-                self._lane_cache[lane] = sub_vec
-                return sub_vec
-            wire = Wire(self.m, lane_sig, signed=bool(self._vector_signs[lane]))
-            self._lane_cache[lane] = wire
-            return wire
+                return Vec(self.elems[idx])
+            return self.elems[int(idx)]
 
-        if isinstance(idx, tuple):
-            if len(idx) == 0:
-                return self
-            head, *tail = idx
-            if isinstance(head, slice):
-                selected = self.elems[head]
-                if not tail:
-                    return Vec(selected)
-                rest: int | slice | tuple[int | slice, ...]
-                rest = tuple(tail) if len(tail) > 1 else tail[0]
-                out: list[Union[Wire, Reg, Vec]] = []
-                for e in selected:
-                    if not isinstance(e, Vec):
-                        raise TypeError("tuple indexing into nested dimensions requires Vec elements")
-                    out.append(e[rest])
-                return Vec(out)
-            elem = self.elems[int(head)]
-            if not tail:
-                return elem
-            if not isinstance(elem, Vec):
-                raise TypeError("tuple indexing into nested dimensions requires Vec elements")
-            rest = tuple(tail) if len(tail) > 1 else tail[0]
-            return elem[rest]
-        if isinstance(idx, slice):
-            return Vec(self.elems[idx])
-        return self.elems[int(idx)]
+        raise IndexError("Vec index out of range")
 
     # -- internal helpers -------------------------------------------------------
 
@@ -2284,8 +2261,27 @@ class Vec:
 
     @classmethod
     def _from_vector_signal(cls, m: Module, sig: Signal, *, signs: list[bool]) -> "Vec":
-        """从底层向量 Signal 构造惰性 Vec（elems 为空，按需提取 lane）。"""
-        return cls([], _vector_module=m, _vector_sig=sig, _vector_signs=list(signs))
+        """从底层向量 Signal 构造 Vec，同时保留 Python lane-list 视图。"""
+        lane_signs = list(signs)
+        elems = cls._elems_from_vector_signal(m, sig, signs=lane_signs)
+        return cls(elems, m=m, sig=sig, signed=lane_signs)
+
+    @classmethod
+    def _elems_from_vector_signal(cls, m: Module, sig: Signal, *, signs: list[bool]) -> list[Union[Wire, "Vec"]]:
+        shape, _elem_ty = cls._vector_shape_elem_type(sig.ty)
+        if shape[0] != len(signs):
+            raise ValueError("vector lane signs must match outer dimension")
+        elems: list[Union[Wire, Vec]] = []
+        for lane in range(shape[0]):
+            lane_sig = m.v_get(sig, index=lane)
+            if lane_sig.ty.startswith("vector<"):
+                sub_shape, _ = cls._vector_shape_elem_type(lane_sig.ty)
+                sub_signs = [bool(signs[lane]) for _ in range(sub_shape[0])]
+                sub_elems = cls._elems_from_vector_signal(m, lane_sig, signs=sub_signs)
+                elems.append(cls(sub_elems, m=m, sig=lane_sig, signed=sub_signs))
+            else:
+                elems.append(Wire(m, lane_sig, signed=bool(signs[lane])))
+        return elems
 
     @staticmethod
     def _wire_of(e: Union[Wire, Reg, "Vec"]) -> Wire:
@@ -2313,8 +2309,6 @@ class Vec:
 
     def _leaf_wires(self) -> list[Wire] | None:
         """若为 1-D 叶子 Vec，返回所有 Wire 列表；含嵌套 Vec 或空则返回 None。"""
-        if self._vector_sig is not None:
-            return [self[i] for i in range(len(self))]
         if not self.elems or any(isinstance(e, Vec) for e in self.elems):
             return None
         out = [self._wire_of(e) for e in self.elems]
@@ -2327,8 +2321,8 @@ class Vec:
         return out
     def _any_lane_signed(self) -> bool:
         """判断是否存在任何 lane 为有符号类型。"""
-        if self._vector_signs is not None:
-            return any(self._vector_signs)
+        if self.signed is not None:
+            return any(self.signed)
         ws = self._leaf_wires()
         if ws is not None:
             return any(w.signed for w in ws)
@@ -2336,14 +2330,25 @@ class Vec:
 
     def _as_vector_signal(self) -> tuple[Module, Signal, list[bool]] | None:
         """尝试将 Vec 提升为单一向量 Signal。
-        1) 已为 vector-backed → 直接返回；
+        1) 已有关联 sig → 直接返回；
         2) 所有元素为同构子 Vec → v_create 合并成高维向量；
         3) 叶子 Wire → v_create 构造 1-D 向量，或识别 v_get 链路反推原始向量。
         提升失败返回 None，调用方回退到逐元素映射路径。
         """
-        if self._vector_sig is not None:
-            assert self._vector_signs is not None
-            return self.m, self._vector_sig, list(self._vector_signs)
+        if self.sig is not None:
+            assert self.m is not None
+            assert self.signed is not None
+            return self.m, self.sig, list(self.signed)
+        info = self._try_build_vector_sig_from_elems()
+        if info is not None:
+            m, sig, signs = info
+            object.__setattr__(self, "m", m)
+            object.__setattr__(self, "sig", sig)
+            object.__setattr__(self, "signed", signs)
+            return m, sig, list(signs)
+        return None
+
+    def _try_build_vector_sig_from_elems(self) -> tuple[Module, Signal, list[bool]] | None:
         if self.elems and all(isinstance(e, Vec) for e in self.elems):
             row_infos = [e._as_vector_signal() for e in self.elems]
             if all(info is not None for info in row_infos):
@@ -2659,8 +2664,8 @@ class Vec:
 
     def _is_leaf_1d(self) -> bool:
         """判断是否为 1-D 叶子 Vec（所有元素为 Wire/Reg，无嵌套 Vec）。"""
-        if self._vector_sig is not None:
-            shape, _ = self._vector_shape_elem_type(self._vector_sig.ty)
+        if self.sig is not None:
+            shape, _ = self._vector_shape_elem_type(self.sig.ty)
             return len(shape) == 1
         return all(not isinstance(e, Vec) for e in self.elems)
 
@@ -2670,7 +2675,7 @@ class Vec:
         out_shape = [d for i, d in enumerate(in_shape) if i != dim]
         if not out_shape:
             return []
-        # `_vector_signs` tracks the outer visible lane signs. After reducing
+        # `signed` tracks the outer visible lane signs. After reducing
         # away that axis, use a conservative sign for each new outer lane.
         if dim == 0:
             return [any(in_signs) for _ in range(out_shape[0])]
@@ -2680,27 +2685,28 @@ class Vec:
 
     def _reduce_vector_backed(self, dim: int | None, *, is_or: bool) -> Union[Wire, "Vec"] | None:
         """用原生向量归约指令（v_or_reduce / v_and_reduce）。dim=None 归约到 Wire。"""
-        if self._vector_sig is None:
+        if self.sig is None:
             return None
-        assert self._vector_signs is not None
-        shape, _elem_ty = self._vector_shape_elem_type(self._vector_sig.ty)
+        assert self.m is not None
+        assert self.signed is not None
+        shape, _elem_ty = self._vector_shape_elem_type(self.sig.ty)
         if dim is None:
             if len(shape) != 1:
                 raise ValueError("reduce(dim=None) requires a 1-D Vec (leaf elements are Wire/Reg)")
-            red_sig = self.m.v_or_reduce(self._vector_sig) if is_or else self.m.v_and_reduce(self._vector_sig)
-            return Wire(self.m, red_sig, signed=any(self._vector_signs))
+            red_sig = self.m.v_or_reduce(self.sig) if is_or else self.m.v_and_reduce(self.sig)
+            return Wire(self.m, red_sig, signed=any(self.signed))
 
         reduce_dim = int(dim)
         if reduce_dim < 0 or reduce_dim >= len(shape):
             raise ValueError(f"reduce dim out of range: {reduce_dim} for Vec rank {len(shape)}")
         red_sig = (
-            self.m.v_or_reduce(self._vector_sig, dim=reduce_dim)
+            self.m.v_or_reduce(self.sig, dim=reduce_dim)
             if is_or
-            else self.m.v_and_reduce(self._vector_sig, dim=reduce_dim)
+            else self.m.v_and_reduce(self.sig, dim=reduce_dim)
         )
-        out_signs = self._reduced_vector_signs(shape, list(self._vector_signs), dim=reduce_dim)
+        out_signs = self._reduced_vector_signs(shape, list(self.signed), dim=reduce_dim)
         if not out_signs:
-            return Wire(self.m, red_sig, signed=any(self._vector_signs))
+            return Wire(self.m, red_sig, signed=any(self.signed))
         return self._from_vector_signal(self.m, red_sig, signs=out_signs)
 
     def _reduce_1d(self, *, is_or: bool) -> Wire:
@@ -2850,7 +2856,7 @@ class Vec:
                 return Vec([self._sum_1d(width=width, signed=bool(signed))])
 
             children = self._as_children_vecs()
-            # Try vector-backed path: promote children to rank-2 signal → v_add_reduce
+            # Try vector path: promote children to rank-2 signal → v_add_reduce
             infos = [child._as_vector_signal() for child in children]
             if all(info is not None for info in infos):
                 row_infos = [info for info in infos if info is not None]
@@ -3128,7 +3134,7 @@ class Vec:
         """
         info = self._as_vector_signal()
         if info is None:
-            raise ValueError("broadcast requires a vector-backed Vec")
+            raise ValueError("broadcast requires a vectorizable Vec")
         m, sig, signs = info
         from pycircuit.dsl import _vector_shape_elem_type, _format_vector_type
         shape, elem_ty = _vector_shape_elem_type(sig.ty)
