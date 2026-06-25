@@ -294,6 +294,33 @@ def test_vector_op_result_reuses_vec_sig(repo_root: Path) -> None:
 
 
 @pytest.mark.vec
+def test_function_style_casts_cover_wire_reg_and_vec(repo_root: Path) -> None:
+    import sys
+
+    frontend = repo_root / "compiler" / "frontend"
+    if str(frontend) not in sys.path:
+        sys.path.insert(0, str(frontend))
+
+    from pycircuit import Circuit, Reg, Vec, sext, trunc, zext
+
+    m = Circuit("function_style_casts")
+    domain = m.domain("main")
+    en = m.const(1, width=1)
+    w = m.input("w", width=4)
+    r = m.reg_domain(domain, en, w, init=0)
+    v = Vec([m.input(f"a{i}", width=4) for i in range(4)])
+
+    assert zext(w, width=6).ty == "i6"
+    assert sext(r, width=6).ty == "i6"
+    tv = trunc(v, width=3)
+
+    assert isinstance(r, Reg)
+    assert isinstance(tv, Vec)
+    assert tv.sig is not None
+    assert tv.sig.ty == "vector<4xi3>"
+
+
+@pytest.mark.vec
 def test_vec_reg_lane_view_uses_reg_q_for_sig(repo_root: Path) -> None:
     import sys
 

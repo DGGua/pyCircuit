@@ -3467,6 +3467,43 @@ def cat(*elems: Union[Wire, Reg, int, LiteralValue]) -> Wire:
     return Vec(ws).pack()
 
 
+def _cast_value(value: Any, *, width: int, op: str) -> Wire | Vec:
+    if isinstance(value, Connector):
+        value = value.read()
+    if isinstance(value, Reg):
+        value = value.q
+    if isinstance(value, Wire):
+        if op == "zext":
+            return value._zext(width=int(width))
+        if op == "sext":
+            return value._sext(width=int(width))
+        if op == "trunc":
+            return value._trunc(width=int(width))
+    if isinstance(value, Vec):
+        if op == "zext":
+            return value.zext(width=int(width))
+        if op == "sext":
+            return value.sext(width=int(width))
+        if op == "trunc":
+            return value.trunc(width=int(width))
+    raise TypeError(f"{op}() expects Wire/Reg/Vec/Connector, got {type(value).__name__}")
+
+
+def zext(value: Any, *, width: int) -> Wire | Vec:
+    """Zero-extend a Wire/Reg/Vec using the canonical function-style API."""
+    return _cast_value(value, width=int(width), op="zext")
+
+
+def sext(value: Any, *, width: int) -> Wire | Vec:
+    """Sign-extend a Wire/Reg/Vec using the canonical function-style API."""
+    return _cast_value(value, width=int(width), op="sext")
+
+
+def trunc(value: Any, *, width: int) -> Wire | Vec:
+    """Truncate a Wire/Reg/Vec using the canonical function-style API."""
+    return _cast_value(value, width=int(width), op="trunc")
+
+
 
 
 def mux(*_args: Any, **_kwargs: Any) -> Wire:

@@ -13,7 +13,7 @@ from .connectors import (
     WireConnector,
 )
 from .design import const, function, module, probe as _probe_decorator, testbench as _testbench_decorator
-from .hw import Bundle, Circuit, ClockDomain, Pop, Reg, Vec, Wire, cat, unsigned
+from .hw import Bundle, Circuit, ClockDomain, Pop, Reg, Vec, Wire, cat, sext, trunc, unsigned, zext
 from .jit import JitError, compile
 from .literals import LiteralValue, S, U, s, u
 from .v5 import (
@@ -100,7 +100,10 @@ __all__ = [
     "testbench",
     "wiring",
     "s",
+    "sext",
     "sva",
+    "trunc",
     "u",
     "unsigned",
+    "zext",
 ]

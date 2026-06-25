@@ -42,10 +42,12 @@ Some cases are intentionally frontend-only in the default matrix:
 
 - `select_vv`: current JIT supports scalar conditional expressions, but does
   not yet have a contract-approved Vec condition select syntax.
-- `zext`, `sext`, `trunc`: the methods still exist on `Vec`, but current API
-  contract blocks method-style cast calls in canonical build inputs.
 - `slice`: currently scalarizes to per-lane `pyc.extract`; it remains tracked
   as an optimization target rather than a vector-IR gate.
+
+Vector cast cases (`zext`, `sext`, `trunc`) use the contract-approved
+function-style API (`zext(a, width=...)`, etc.) and run as full backend cases.
+Method-style calls such as `a.zext(width=...)` remain rejected by `PYC415`.
 
 Signed div/rem run as C++ backend cases only by default because the generated
 Verilator behavior currently disagrees with the bit-accurate signed oracle. The
