@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 import hashlib
 import inspect
 import json
-from typing import Any, Iterable, Iterator, Mapping, Union, overload
+from typing import Any, Iterable, Iterator, Mapping, Protocol, Union, overload
 
 from .connectors import (
     Connector,
@@ -2135,6 +2135,11 @@ def _shift_amount_wire(m: Module, amount: Any) -> Wire | None:
 
 
 
+class _CycleAwareDomainLike(Protocol):
+    def delay_to(self, w: Wire, *, from_cycle: int, to_cycle: int, width: int) -> Wire:
+        ...
+
+
 @dataclass(frozen=True)
 class Vec:
     """A small fixed-length container of wires/regs for building pipelines."""
@@ -2143,14 +2148,17 @@ class Vec:
     m: Module | None = None
     sig: Signal | None = None
     signed: list[bool] | None = None
+    domain: _CycleAwareDomainLike | None = None
+    cycle: int | None = None
 
     @staticmethod
-    def _cycle_aware_init_elem(e: Any) -> tuple[Wire, int] | None:
+    def _cycle_aware_init_elem(e: Any) -> tuple[Wire, _CycleAwareDomainLike, int] | None:
         cas = getattr(e, "_cas", e)
         w = getattr(cas, "_w", None)
+        domain = getattr(cas, "_domain", None)
         cycle = getattr(cas, "_cycle", None)
-        if isinstance(w, Wire) and cycle is not None:
-            return w, int(cycle)
+        if isinstance(w, Wire) and domain is not None and cycle is not None:
+            return w, domain, int(cycle)
         return None
 
     @staticmethod
@@ -2174,18 +2182,36 @@ class Vec:
             except TypeError as e:
                 raise TypeError("Vec expects an iterable of elements") from e
         cycles: list[int] = []
+        domains: list[_CycleAwareDomainLike] = []
         raw_cycleless = 0
         for e in self.elems:
             info = self._cycle_aware_init_elem(e)
             if info is not None:
-                _w, cycle = info
+                _w, domain, cycle = info
+                domains.append(domain)
                 cycles.append(cycle)
+            elif isinstance(e, Vec) and e._is_cycle_aware():
+                domains.append(e.domain)
+                cycles.append(int(e.cycle))
             elif isinstance(e, (Wire, Reg, Vec)):
                 raw_cycleless += 1
+        if (self.domain is None) != (self.cycle is None):
+            raise ValueError("Vec cycle metadata requires both domain and cycle")
         if cycles and raw_cycleless:
             raise ValueError("Vec cannot mix cycle-aware elements with raw Wire/Reg/Vec elements")
         if cycles and any(cycle != cycles[0] for cycle in cycles[1:]):
             raise ValueError(f"Vec cycle-aware elements must have the same cycle, got cycles={cycles}")
+        if domains and any(domain is not domains[0] for domain in domains[1:]):
+            raise ValueError("Vec cycle-aware elements must belong to the same domain")
+        if cycles:
+            if self.domain is not None and self.domain is not domains[0]:
+                raise ValueError("Vec explicit domain must match cycle-aware elements")
+            if self.cycle is not None and int(self.cycle) != cycles[0]:
+                raise ValueError("Vec explicit cycle must match cycle-aware elements")
+            object.__setattr__(self, "domain", domains[0])
+            object.__setattr__(self, "cycle", cycles[0])
+        elif self.cycle is not None:
+            object.__setattr__(self, "cycle", int(self.cycle))
         object.__setattr__(self, "elems", [self._normalize_init_elem(e) for e in self.elems])
 
         if self.sig is not None:
@@ -2204,6 +2230,8 @@ class Vec:
                         self.m,
                         self.sig,
                         signs=list(self.signed),
+                        domain=self.domain,
+                        cycle=self.cycle,
                     ),
                 )
             elif len(self.elems) != shape[0]:
@@ -2265,7 +2293,7 @@ class Vec:
                 if isinstance(head, slice):
                     selected = self.elems[head]
                     if not tail:
-                        return Vec(selected)
+                        return Vec(selected, domain=self.domain, cycle=self.cycle)
                     rest: int | slice | tuple[int | slice, ...]
                     rest = tuple(tail) if len(tail) > 1 else tail[0]
                     out: list[Union[Wire, Reg, Vec]] = []
@@ -2273,7 +2301,7 @@ class Vec:
                         if not isinstance(e, Vec):
                             raise TypeError("tuple indexing into nested dimensions requires Vec elements")
                         out.append(e[rest])
-                    return Vec(out)
+                    return Vec(out, domain=self.domain, cycle=self.cycle)
                 elem = self.elems[int(head)]
                 if not tail:
                     return elem
@@ -2282,7 +2310,7 @@ class Vec:
                 rest = tuple(tail) if len(tail) > 1 else tail[0]
                 return elem[rest]
             if isinstance(idx, slice):
-                return Vec(self.elems[idx])
+                return Vec(self.elems[idx], domain=self.domain, cycle=self.cycle)
             return self.elems[int(idx)]
 
         raise IndexError("Vec index out of range")
@@ -2313,14 +2341,30 @@ class Vec:
         return dims, "x".join(parts[i:])
 
     @classmethod
-    def _from_vector_signal(cls, m: Module, sig: Signal, *, signs: list[bool]) -> "Vec":
+    def _from_vector_signal(
+        cls,
+        m: Module,
+        sig: Signal,
+        *,
+        signs: list[bool],
+        domain: _CycleAwareDomainLike | None = None,
+        cycle: int | None = None,
+    ) -> "Vec":
         """从底层向量 Signal 构造 Vec，同时保留 Python lane-list 视图。"""
         lane_signs = list(signs)
-        elems = cls._elems_from_vector_signal(m, sig, signs=lane_signs)
-        return cls(elems, m=m, sig=sig, signed=lane_signs)
+        elems = cls._elems_from_vector_signal(m, sig, signs=lane_signs, domain=domain, cycle=cycle)
+        return cls(elems, m=m, sig=sig, signed=lane_signs, domain=domain, cycle=cycle)
 
     @classmethod
-    def _elems_from_vector_signal(cls, m: Module, sig: Signal, *, signs: list[bool]) -> list[Union[Wire, "Vec"]]:
+    def _elems_from_vector_signal(
+        cls,
+        m: Module,
+        sig: Signal,
+        *,
+        signs: list[bool],
+        domain: _CycleAwareDomainLike | None = None,
+        cycle: int | None = None,
+    ) -> list[Union[Wire, "Vec"]]:
         shape, _elem_ty = cls._vector_shape_elem_type(sig.ty)
         if shape[0] != len(signs):
             raise ValueError("vector lane signs must match outer dimension")
@@ -2330,8 +2374,14 @@ class Vec:
             if lane_sig.ty.startswith("vector<"):
                 sub_shape, _ = cls._vector_shape_elem_type(lane_sig.ty)
                 sub_signs = [bool(signs[lane]) for _ in range(sub_shape[0])]
-                sub_elems = cls._elems_from_vector_signal(m, lane_sig, signs=sub_signs)
-                elems.append(cls(sub_elems, m=m, sig=lane_sig, signed=sub_signs))
+                sub_elems = cls._elems_from_vector_signal(
+                    m,
+                    lane_sig,
+                    signs=sub_signs,
+                    domain=domain,
+                    cycle=cycle,
+                )
+                elems.append(cls(sub_elems, m=m, sig=lane_sig, signed=sub_signs, domain=domain, cycle=cycle))
             else:
                 elems.append(Wire(m, lane_sig, signed=bool(signs[lane])))
         return elems
@@ -2347,18 +2397,83 @@ class Vec:
 
     def _map1(self, fn: Callable[[Wire], Wire]) -> "Vec":
         """逐元素一元运算。元素可以是 Wire/Reg/Vec（嵌套递归）。"""
-        return Vec([fn(e) for e in self])
+        return Vec([fn(e) for e in self], domain=self.domain, cycle=self.cycle)
 
     def _map2(self, other: Any, fn: Callable[[Any, Any], Any]) -> "Vec":
         """逐元素二元运算。fn 直接作用于元素，Python 运算符分发自动处理嵌套 Vec。"""
+        lhs, rhs, meta = self._align_cycle_with(other)
         if isinstance(other, Vec):
-            if len(other) != len(self):
-                raise ValueError(f"Vec size mismatch: {len(self)} vs {len(other)}")
-            return Vec([fn(e1, e2) for e1, e2 in zip(self, other)])
+            assert isinstance(rhs, Vec)
+            if len(rhs) != len(lhs):
+                raise ValueError(f"Vec size mismatch: {len(lhs)} vs {len(rhs)}")
+            return Vec([fn(e1, e2) for e1, e2 in zip(lhs, rhs)], domain=meta[0], cycle=meta[1])
         if isinstance(other, (Wire, Reg, int)):
-            scalar = other if isinstance(other, Wire) else (other.q if isinstance(other, Reg) else other)
-            return Vec([fn(e, scalar) for e in self])
+            scalar = rhs if isinstance(rhs, Wire) else (rhs.q if isinstance(rhs, Reg) else rhs)
+            return Vec([fn(e, scalar) for e in lhs], domain=meta[0], cycle=meta[1])
         return NotImplemented
+
+    def _is_cycle_aware(self) -> bool:
+        return self.domain is not None and self.cycle is not None
+
+    def _delay_to_cycle(self, cycle: int) -> "Vec":
+        if not self._is_cycle_aware():
+            return self
+        assert self.domain is not None
+        assert self.cycle is not None
+        target = int(cycle)
+        source = int(self.cycle)
+        if target < source:
+            raise ValueError(f"cannot align Vec backward from cycle {source} to {target}")
+        if target == source:
+            return self
+
+        def delay_elem(e: Union[Wire, Reg, Vec]) -> Union[Wire, Vec]:
+            if isinstance(e, Vec):
+                if e._is_cycle_aware():
+                    return e._delay_to_cycle(target)
+                return Vec([delay_elem(child) for child in e], domain=self.domain, cycle=target)
+            w = self._wire_of(e)
+            delayed = self.domain.delay_to(w, from_cycle=source, to_cycle=target, width=w.width)
+            return Wire(delayed.m, delayed.sig, signed=w.signed)
+
+        return Vec(
+            [delay_elem(e) for e in self],
+            domain=self.domain,
+            cycle=target,
+        )
+
+    @staticmethod
+    def _cycle_meta_from_values(*values: Any) -> tuple[_CycleAwareDomainLike | None, int | None]:
+        domain: _CycleAwareDomainLike | None = None
+        cycle: int | None = None
+        for value in values:
+            if not isinstance(value, Vec) or not value._is_cycle_aware():
+                continue
+            if domain is None:
+                domain = value.domain
+                cycle = int(value.cycle)
+                continue
+            if value.domain is not domain:
+                raise ValueError("cycle-aware Vec operands must belong to the same domain")
+            assert cycle is not None
+            cycle = max(cycle, int(value.cycle))
+        return domain, cycle
+
+    @staticmethod
+    def _delay_value_to_cycle(value: Any, *, domain: _CycleAwareDomainLike | None, cycle: int | None) -> Any:
+        if isinstance(value, Vec) and value._is_cycle_aware():
+            if value.domain is not domain:
+                raise ValueError("cycle-aware Vec operands must belong to the same domain")
+            assert cycle is not None
+            return value._delay_to_cycle(cycle)
+        return value
+
+    def _align_cycle_with(self, other: Any) -> tuple["Vec", Any, tuple[_CycleAwareDomainLike | None, int | None]]:
+        domain, cycle = self._cycle_meta_from_values(self, other)
+        lhs = self._delay_value_to_cycle(self, domain=domain, cycle=cycle)
+        rhs = self._delay_value_to_cycle(other, domain=domain, cycle=cycle)
+        assert isinstance(lhs, Vec)
+        return lhs, rhs, (domain, cycle)
 
     def _leaf_wires(self) -> list[Wire] | None:
         """若为 1-D 叶子 Vec，返回所有 Wire 列表；含嵌套 Vec 或空则返回 None。"""
@@ -2480,14 +2595,15 @@ class Vec:
         m, in_sig, signs = info
         if op == "not":
             out_sig = m.not_(in_sig)
-            return self._from_vector_signal(m, out_sig, signs=signs)
+            return self._from_vector_signal(m, out_sig, signs=signs, domain=self.domain, cycle=self.cycle)
         return None
 
     def _try_vector_binary(self, other: Any, op: str, *, reverse: bool = False) -> "Vec | None":
         """尝试用原生向量指令做二元运算（add/sub/mul/and/or/xor 等）。
         成功返回新的惰性 Vec；失败返回 None，调用方回退到逐元素 ``_map2`` 路径。
         """
-        lhs_info = self._as_vector_signal()
+        lhs, rhs, meta = self._align_cycle_with(other)
+        lhs_info = lhs._as_vector_signal()
         method_name = _VEC_BINARY_METHODS.get(op)
         if lhs_info is None or method_name is None:
             return None
@@ -2495,8 +2611,8 @@ class Vec:
         shape, elem_ty = self._vector_shape_elem_type(lhs_sig.ty)
         width = _int_width(elem_ty)
 
-        rhs_info = self._vector_operand_info(
-            other,
+        rhs_info = lhs._vector_operand_info(
+            rhs,
             module=m,
             width=width,
             shape=shape,
@@ -2513,7 +2629,7 @@ class Vec:
             return None
         out_sig = builder(a_sig, b_sig)
         out_signs = [False for _ in lhs_signs] if op in _VEC_COMPARE_OPS else [ls or rs for ls, rs in zip(lhs_signs, rhs_signs)]
-        return self._from_vector_signal(m, out_sig, signs=out_signs)
+        return lhs._from_vector_signal(m, out_sig, signs=out_signs, domain=meta[0], cycle=meta[1])
 
     def _try_vector_signed_binary(
         self,
@@ -2554,7 +2670,13 @@ class Vec:
         ``sel`` 必须为 i1 向量。a/b 可以是同模同型 Vec，也可以是
         与另一侧 Vec leaf width 匹配的标量；标量 arm 会广播到 Vec shape。
         """
-        sel_info = self._as_vector_signal()
+        domain, cycle = self._cycle_meta_from_values(self, a, b)
+        sel = self._delay_value_to_cycle(self, domain=domain, cycle=cycle)
+        a = self._delay_value_to_cycle(a, domain=domain, cycle=cycle)
+        b = self._delay_value_to_cycle(b, domain=domain, cycle=cycle)
+        assert isinstance(sel, Vec)
+
+        sel_info = sel._as_vector_signal()
         if sel_info is None:
             return None
         m, sel_sig, _sel_signs = sel_info
@@ -2594,7 +2716,13 @@ class Vec:
         a_sig, a_signs = a_arm
         b_sig, b_signs = b_arm
         out_sig = m.mux(sel_sig, a_sig, b_sig)
-        return self._from_vector_signal(m, out_sig, signs=[as_ or bs for as_, bs in zip(a_signs, b_signs)])
+        return sel._from_vector_signal(
+            m,
+            out_sig,
+            signs=[as_ or bs for as_, bs in zip(a_signs, b_signs)],
+            domain=domain,
+            cycle=cycle,
+        )
 
     @staticmethod
     def _broadcast_scalar_signal(m: Module, scalar: Signal, *, shape: list[int]) -> Signal:
@@ -2621,7 +2749,7 @@ class Vec:
             out_signs = [True for _ in signs]
         else:
             out_signs = signs
-        return self._from_vector_signal(m, out_sig, signs=out_signs)
+        return self._from_vector_signal(m, out_sig, signs=out_signs, domain=self.domain, cycle=self.cycle)
 
     def _try_vector_shift(self, op: str, amount: Any) -> "Vec | None":
         """尝试用向量指令做移位。立即数用 shli/lshri/ashri，动态移位量用 shl/lshr/ashr。
@@ -2650,7 +2778,7 @@ class Vec:
                 return None
             out_sig = builder(in_sig, amount_wire.sig)
         out_signs = [False for _ in signs] if op == "lshr" else signs
-        return self._from_vector_signal(m, out_sig, signs=out_signs)
+        return self._from_vector_signal(m, out_sig, signs=out_signs, domain=self.domain, cycle=self.cycle)
 
     @staticmethod
     def _tree_reduce_wires_1d(ws: list[Wire], *, is_or: bool) -> Wire:
@@ -2760,7 +2888,13 @@ class Vec:
         out_signs = self._reduced_vector_signs(shape, list(self.signed), dim=reduce_dim)
         if not out_signs:
             return Wire(self.m, red_sig, signed=any(self.signed))
-        return self._from_vector_signal(self.m, red_sig, signs=out_signs)
+        return self._from_vector_signal(
+            self.m,
+            red_sig,
+            signs=out_signs,
+            domain=self.domain,
+            cycle=self.cycle,
+        )
 
     def _reduce_1d(self, *, is_or: bool) -> Wire:
         """1-D 归约到单个 Wire。优先用向量指令，否则树状归约。"""
@@ -2811,7 +2945,7 @@ class Vec:
         if not out_shape:
             return Wire(m, red_sig, signed=bool(signed))
         out_signs = self._reduced_vector_signs(shape, [bool(signed) for _ in signs], dim=reduce_dim)
-        return self._from_vector_signal(m, red_sig, signs=out_signs)
+        return self._from_vector_signal(m, red_sig, signs=out_signs, domain=self.domain, cycle=self.cycle)
 
     def _as_children_vecs(self) -> list["Vec"]:
         """将嵌套 Vec 的子 Vec 展开为列表，同时校验矩形维度（所有子 Vec 等长）。"""
@@ -2845,7 +2979,7 @@ class Vec:
             if self._is_leaf_1d():
                 # dim-specified reductions return Vec; reducing a leaf row gives a
                 # singleton Vec containing the reduced wire.
-                return Vec([self._reduce_1d(is_or=is_or)])
+                return Vec([self._reduce_1d(is_or=is_or)], domain=self.domain, cycle=self.cycle)
 
             children = self._as_children_vecs()
             infos = [child._as_vector_signal() for child in children]
@@ -2862,7 +2996,13 @@ class Vec:
                         any(row_signs[i] for _row_m, _row_sig, row_signs in row_infos)
                         for i in range(len(first_signs))
                     ]
-                    return self._from_vector_signal(m, red_sig, signs=out_signs)
+                    return self._from_vector_signal(
+                        m,
+                        red_sig,
+                        signs=out_signs,
+                        domain=self.domain,
+                        cycle=self.cycle,
+                    )
 
             width = len(children[0])
             out: list[Union[Wire, Reg, Vec]] = []
@@ -2870,7 +3010,7 @@ class Vec:
                 col = Vec([child[j] for child in children])
                 # Reduce this column to a single wire so dim=0 lowers rank by one.
                 out.append(col._reduce_1d(is_or=is_or))
-            return Vec(out)
+            return Vec(out, domain=self.domain, cycle=self.cycle)
 
         children = self._as_children_vecs()
         if dim == 1:
@@ -2888,10 +3028,12 @@ class Vec:
                         m,
                         red_sig,
                         signs=[any(row_signs) for _row_m, _row_sig, row_signs in row_infos],
+                        domain=self.domain,
+                        cycle=self.cycle,
                     )
         if dim == 1 and all(child._is_leaf_1d() for child in children):
-            return Vec([child._reduce_1d(is_or=is_or) for child in children])
-        return Vec([child._reduce_dim(dim - 1, is_or=is_or) for child in children])
+            return Vec([child._reduce_1d(is_or=is_or) for child in children], domain=self.domain, cycle=self.cycle)
+        return Vec([child._reduce_dim(dim - 1, is_or=is_or) for child in children], domain=self.domain, cycle=self.cycle)
 
     def _sum_dim(self, dim: int, *, width: int | None = None, signed: bool = False) -> Union[Wire, "Vec"]:
         """沿指定轴做求和归约。优先用向量指令，否则递归降维。
@@ -2906,7 +3048,7 @@ class Vec:
 
         if dim == 0:
             if self._is_leaf_1d():
-                return Vec([self._sum_1d(width=width, signed=bool(signed))])
+                return Vec([self._sum_1d(width=width, signed=bool(signed))], domain=self.domain, cycle=self.cycle)
 
             children = self._as_children_vecs()
             # Try vector path: promote children to rank-2 signal → v_add_reduce
@@ -2923,21 +3065,42 @@ class Vec:
                         any(row_signs[i] for _row_m, _row_sig, row_signs in row_infos)
                         for i in range(len(first_signs))
                     ]
-                    tmp = Vec._from_vector_signal(m, rank2_sig, signs=outer_signs)
+                    tmp = Vec._from_vector_signal(
+                        m,
+                        rank2_sig,
+                        signs=outer_signs,
+                        domain=self.domain,
+                        cycle=self.cycle,
+                    )
                     reduced = tmp._sum_vector_backed(0, width=width, signed=bool(signed))
                     if reduced is not None:
                         return reduced
 
             col_count = len(children[0])
-            return Vec([
-                Vec([child[j] for child in children])._sum_1d(width=width, signed=bool(signed))
-                for j in range(col_count)
-            ])
+            return Vec(
+                [
+                    Vec([child[j] for child in children], domain=self.domain, cycle=self.cycle)._sum_1d(
+                        width=width,
+                        signed=bool(signed),
+                    )
+                    for j in range(col_count)
+                ],
+                domain=self.domain,
+                cycle=self.cycle,
+            )
 
         children = self._as_children_vecs()
         if dim == 1 and all(child._is_leaf_1d() for child in children):
-            return Vec([child._sum_1d(width=width, signed=bool(signed)) for child in children])
-        return Vec([child._sum_dim(dim - 1, width=width, signed=bool(signed)) for child in children])
+            return Vec(
+                [child._sum_1d(width=width, signed=bool(signed)) for child in children],
+                domain=self.domain,
+                cycle=self.cycle,
+            )
+        return Vec(
+            [child._sum_dim(dim - 1, width=width, signed=bool(signed)) for child in children],
+            domain=self.domain,
+            cycle=self.cycle,
+        )
 
     def or_reduce(self, dim: int | None = None) -> Union[Wire, "Vec"]:
         """Bitwise OR reduction.
@@ -3135,14 +3298,19 @@ class Vec:
         v = self._try_vector_select(a, b)
         if v is not None:
             return v
+        domain, cycle = self._cycle_meta_from_values(self, a, b)
+        sel = self._delay_value_to_cycle(self, domain=domain, cycle=cycle)
+        a = self._delay_value_to_cycle(a, domain=domain, cycle=cycle)
+        b = self._delay_value_to_cycle(b, domain=domain, cycle=cycle)
+        assert isinstance(sel, Vec)
         if isinstance(a, Vec) and isinstance(b, Vec):
-            if len(a) != len(self) or len(b) != len(self):
+            if len(a) != len(sel) or len(b) != len(sel):
                 raise ValueError("Vec size mismatch in select")
             return Vec([
-                self._wire_of(s).select(va, vb)
-                for s, va, vb in zip(self, a, b)
-            ])
-        return Vec([self._wire_of(e).select(a, b) for e in self])
+                sel._wire_of(s).select(va, vb)
+                for s, va, vb in zip(sel, a, b)
+            ], domain=domain, cycle=cycle)
+        return Vec([sel._wire_of(e).select(a, b) for e in sel], domain=domain, cycle=cycle)
 
     def priority_mux(self, vals: Any, *, zero: Any = 0) -> Wire:
         """Balanced binary-tree priority mux with left-to-right precedence.
@@ -3189,19 +3357,16 @@ class Vec:
         if info is None:
             raise ValueError("broadcast requires a vectorizable Vec")
         m, sig, signs = info
-        from pycircuit.dsl import _vector_shape_elem_type, _format_vector_type
-        shape, elem_ty = _vector_shape_elem_type(sig.ty)
+        shape, _elem_ty = self._vector_shape_elem_type(sig.ty)
         d = int(dim)
         if d < 0 or d > len(shape):
             raise ValueError(f"broadcast dim {d} out of range for shape {shape}")
         new_sig = m.v_broadcast_dim(sig, size=int(size), dim=d)
-        new_shape = list(shape)
-        new_shape.insert(d, int(size))
         # Adjust signs for the new outer dimension count.
         if d == 0:
             signs = [signs[0]] * int(size)
         # dim > 0: outer dim unchanged, signs stay the same
-        return Vec._from_vector_signal(m, new_sig, signs=signs)
+        return Vec._from_vector_signal(m, new_sig, signs=signs, domain=self.domain, cycle=self.cycle)
 
     # -- width transforms -------------------------------------------------------
 

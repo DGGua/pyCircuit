@@ -6,7 +6,7 @@ import pytest
 
 from .cases import FRONTEND_ONLY_CASES, FULL_BACKEND_CASES, VEC_CASES, VecCase
 from .generate import render_case_source
-from .runner import check_cpp_manifest_syntax, check_ir, merged_env, run_cmd, run_vec_case
+from .runner import assert_verilator_ran, check_cpp_manifest_syntax, check_ir, merged_env, run_cmd, run_cpp_binary, run_vec_case
 
 
 @pytest.mark.vec
@@ -144,6 +144,97 @@ def test_vector_io_emit_and_pycc(
     )
     run_cmd([str(pycc), str(pyc), "--emit=verilog", "-o", str(out_dir / "vector_io.v"), "--build-profile=dev-fast"], cwd=repo_root, env=env)
     check_cpp_manifest_syntax(out_dir, repo_root=repo_root)
+
+
+@pytest.mark.vec
+def test_vector_port_cli_build_runs_tb(
+    *,
+    repo_root: Path,
+    vec_test_root: Path,
+    pyc_pythonpath: str,
+    pycc: Path,
+    verilator: str | None,
+) -> None:
+    case_root = vec_test_root / "vector_port_tb"
+    src_dir = case_root / "src"
+    out_dir = case_root / "build"
+    src_dir.mkdir(parents=True, exist_ok=True)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    src = src_dir / "vector_port_tb.py"
+    src.write_text(
+        "\n".join(
+            [
+                "from __future__ import annotations",
+                "",
+                "from pycircuit import Circuit, Tb, module, testbench",
+                "",
+                "",
+                "@module",
+                "def build(m: Circuit) -> None:",
+                '    a = m.input("a", width=4, shape=4)',
+                "    out = a + 1",
+                '    m.output("out", out)',
+                "",
+                "",
+                "@testbench",
+                "def tb(t: Tb) -> None:",
+                "    t.timeout(1)",
+                '    t.drive("a", 0x4321, at=0)',
+                '    t.expect("out", 0x5432, at=0, msg="vector out")',
+                "    t.finish(at=0)",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    env = merged_env(pythonpath=pyc_pythonpath, pycc=pycc)
+    run_cmd(
+        [
+            "python3",
+            "-m",
+            "pycircuit.cli",
+            "build",
+            str(src),
+            "--out-dir",
+            str(out_dir),
+            "--target",
+            "cpp",
+            "--jobs",
+            "2",
+            "--logic-depth",
+            "64",
+            "--profile",
+            "dev",
+        ],
+        cwd=repo_root,
+        env=env,
+    )
+    run_cpp_binary(out_dir)
+    if verilator:
+        verilator_out = case_root / "build_verilator"
+        run_cmd(
+            [
+                "python3",
+                "-m",
+                "pycircuit.cli",
+                "build",
+                str(src),
+                "--out-dir",
+                str(verilator_out),
+                "--target",
+                "both",
+                "--jobs",
+                "2",
+                "--logic-depth",
+                "64",
+                "--profile",
+                "dev",
+                "--run-verilator",
+            ],
+            cwd=repo_root,
+            env=env,
+        )
+        assert_verilator_ran(verilator_out)
 
 
 @pytest.mark.vec
@@ -288,6 +379,8 @@ def test_vec_cycle_aware_lanes_require_matching_cycle(repo_root: Path) -> None:
 
     assert same_cycle.sig is not None
     assert same_cycle.sig.ty == "vector<2xi4>"
+    assert same_cycle.domain is domain
+    assert same_cycle.cycle == 2
 
     with pytest.raises(ValueError, match="same cycle"):
         Vec(
@@ -304,6 +397,51 @@ def test_vec_cycle_aware_lanes_require_matching_cycle(repo_root: Path) -> None:
                 m.input("c1", width=4),
             ]
         )
+
+
+@pytest.mark.vec
+def test_cycle_aware_vec_binary_ops_align_to_latest_cycle(repo_root: Path) -> None:
+    import sys
+
+    frontend = repo_root / "compiler" / "frontend"
+    if str(frontend) not in sys.path:
+        sys.path.insert(0, str(frontend))
+
+    from pycircuit import CycleAwareCircuit, Vec, cas
+
+    m = CycleAwareCircuit("vec_cas_binary_align")
+    domain = m.create_domain("main")
+    a = Vec([cas(domain, m.input(f"a{i}", width=4), cycle=0) for i in range(2)])
+    b = Vec([cas(domain, m.input(f"b{i}", width=4), cycle=2) for i in range(2)])
+
+    out = a + b
+
+    assert out.domain is domain
+    assert out.cycle == 2
+    assert "_v5_bal_" in m.emit_mlir()
+
+
+@pytest.mark.vec
+def test_cycle_aware_vec_select_aligns_selector_and_arms(repo_root: Path) -> None:
+    import sys
+
+    frontend = repo_root / "compiler" / "frontend"
+    if str(frontend) not in sys.path:
+        sys.path.insert(0, str(frontend))
+
+    from pycircuit import CycleAwareCircuit, Vec, cas
+
+    m = CycleAwareCircuit("vec_cas_select_align")
+    domain = m.create_domain("main")
+    sel = Vec([cas(domain, m.input(f"sel{i}", width=1), cycle=1) for i in range(2)])
+    a = Vec([cas(domain, m.input(f"a{i}", width=4), cycle=0) for i in range(2)])
+    b = Vec([cas(domain, m.input(f"b{i}", width=4), cycle=2) for i in range(2)])
+
+    out = sel.select(a, b)
+
+    assert out.domain is domain
+    assert out.cycle == 2
+    assert "_v5_bal_" in m.emit_mlir()
 
 
 @pytest.mark.vec
