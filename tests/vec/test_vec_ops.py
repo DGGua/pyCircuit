@@ -445,6 +445,32 @@ def test_cycle_aware_vec_select_aligns_selector_and_arms(repo_root: Path) -> Non
 
 
 @pytest.mark.vec
+def test_cycle_aware_vec_assign_lanes(repo_root: Path) -> None:
+    import sys
+
+    frontend = repo_root / "compiler" / "frontend"
+    if str(frontend) not in sys.path:
+        sys.path.insert(0, str(frontend))
+
+    from pycircuit import CycleAwareCircuit, Vec, cas, wire_of
+
+    m = CycleAwareCircuit("vec_assign_lanes")
+    domain = m.create_domain("main")
+    states = Vec([domain.signal(width=4, reset_value=0, name=f"q{i}") for i in range(2)])
+    data = Vec([cas(domain, m.input(f"d{i}", width=4), cycle=0) for i in range(2)])
+    mask = Vec([cas(domain, m.input(f"en{i}", width=1), cycle=0) for i in range(2)])
+
+    m.output("q0", wire_of(states[0]))
+    m.output("q1", wire_of(states[1]))
+    domain.next()
+    states.assign(data, when=mask)
+
+    mlir = m.emit_mlir()
+    assert "q0" in mlir
+    assert "q1" in mlir
+
+
+@pytest.mark.vec
 def test_vector_op_result_reuses_vec_sig(repo_root: Path) -> None:
     import sys
 

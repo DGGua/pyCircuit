@@ -2150,6 +2150,7 @@ class Vec:
     signed: list[bool] | None = None
     domain: _CycleAwareDomainLike | None = None
     cycle: int | None = None
+    _assign_elems: list[Any] | None = field(default=None, repr=False, compare=False)
 
     @staticmethod
     def _cycle_aware_init_elem(e: Any) -> tuple[Wire, _CycleAwareDomainLike, int] | None:
@@ -2181,6 +2182,8 @@ class Vec:
                 object.__setattr__(self, "elems", list(self.elems))
             except TypeError as e:
                 raise TypeError("Vec expects an iterable of elements") from e
+        if self._assign_elems is None:
+            object.__setattr__(self, "_assign_elems", list(self.elems))
         cycles: list[int] = []
         domains: list[_CycleAwareDomainLike] = []
         raw_cycleless = 0
@@ -2314,6 +2317,54 @@ class Vec:
             return self.elems[int(idx)]
 
         raise IndexError("Vec index out of range")
+
+    def _broadcast_assign_arg(self, value: Any, *, arg_name: str) -> list[Any]:
+        if isinstance(value, Vec):
+            if len(value) != len(self):
+                raise ValueError(f"Vec.assign {arg_name} length mismatch: {len(value)} != {len(self)}")
+            return list(value)
+        if isinstance(value, (list, tuple)):
+            if len(value) != len(self):
+                raise ValueError(f"Vec.assign {arg_name} length mismatch: {len(value)} != {len(self)}")
+            return list(value)
+        return [value for _ in range(len(self))]
+
+    @staticmethod
+    def _assign_one(dst: Any, src: Any, when: Any | None) -> None:
+        if isinstance(dst, Vec):
+            dst.assign(src, when=when)
+            return
+        if hasattr(dst, "assign"):
+            if when is None:
+                dst.assign(src)
+            else:
+                dst.assign(src, when=when)
+            return
+        if hasattr(dst, "set"):
+            if when is None:
+                dst.set(src)
+            else:
+                dst.set(src, when=when)
+            return
+        raise TypeError(f"Vec.assign target lane is not assignable: {type(dst).__name__}")
+
+    def assign(self, value: Any, *, when: Any | None = None) -> "Vec":
+        """Lane-wise assignment into a list-backed Vec of assignable lanes.
+
+        ``dst.assign(src, when=mask)`` is equivalent to assigning each lane:
+        ``dst[i].assign(src[i], when=mask[i])``.  ``src`` and ``when`` may be
+        Vec/list values of matching length or scalars broadcast to all lanes.
+        Vector-backed expression Vecs are read-only and fail per lane because
+        their lanes are plain ``Wire`` read views.
+        """
+        targets = self._assign_elems
+        if targets is None or len(targets) != len(self):
+            raise TypeError("Vec.assign requires a list-backed Vec")
+        values = self._broadcast_assign_arg(value, arg_name="value")
+        whens = [None for _ in range(len(self))] if when is None else self._broadcast_assign_arg(when, arg_name="when")
+        for dst, src, cond in zip(targets, values, whens):
+            self._assign_one(dst, src, cond)
+        return self
 
     # -- internal helpers -------------------------------------------------------
 
