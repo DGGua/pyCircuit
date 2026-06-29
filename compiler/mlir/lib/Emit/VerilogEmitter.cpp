@@ -9,6 +9,7 @@
 #include "mlir/IR/Operation.h"
 #include "mlir/IR/Value.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/SmallSet.h"
 #include "llvm/ADT/StringMap.h"
@@ -36,7 +37,7 @@ static std::string vRange(Type ty) {
   // Clocks/resets are treated as 1-bit scalar ports/nets in Verilog.
   if (isa<pyc::ClockType>(ty) || isa<pyc::ResetType>(ty))
     return "";
-  // VectorType uses element packed width; unpacked dims are handled by caller.
+  // VectorType uses element packed width for internal unpacked-array views.
   if (auto vt = dyn_cast<VectorType>(ty))
     return vRange(vt.getElementType());
   auto intTy = dyn_cast<IntegerType>(ty);
@@ -45,6 +46,38 @@ static std::string vRange(Type ty) {
   if (intTy.getWidth() <= 1)
     return "";
   return "[" + std::to_string(intTy.getWidth() - 1) + ":0]";
+}
+
+static std::optional<unsigned> leafWidth(Type ty) {
+  auto intTy = leafIntType(ty);
+  if (!intTy)
+    return std::nullopt;
+  return intTy.getWidth();
+}
+
+static int64_t vectorLaneCount(ArrayRef<int64_t> shape) {
+  int64_t lanes = 1;
+  for (int64_t d : shape)
+    lanes *= d;
+  return lanes;
+}
+
+static std::optional<int64_t> flatBitWidth(Type ty) {
+  auto width = leafWidth(ty);
+  if (!width)
+    return std::nullopt;
+  if (auto vt = dyn_cast<VectorType>(ty))
+    return vectorLaneCount(vt.getShape()) * static_cast<int64_t>(*width);
+  return static_cast<int64_t>(*width);
+}
+
+/// Packed range for module boundary ports.  Vector ports are flattened into a
+/// single packed bus so Yosys does not have to parse unpacked array ports.
+static std::string vPortRange(Type ty) {
+  auto bits = flatBitWidth(ty);
+  if (!bits || *bits <= 1)
+    return "";
+  return "[" + std::to_string(*bits - 1) + ":0]";
 }
 
 /// Return the unpacked array dimensions for a VectorType, e.g. " [0:3][0:7]".
@@ -57,6 +90,77 @@ static std::string vUnpacked(Type ty) {
     return dims;
   }
   return "";
+}
+
+static std::string indexSuffix(ArrayRef<int64_t> indices) {
+  std::string out;
+  for (int64_t i : indices)
+    out += "[" + std::to_string(i) + "]";
+  return out;
+}
+
+static int64_t flatLaneIndex(ArrayRef<int64_t> shape, ArrayRef<int64_t> indices) {
+  int64_t flat = 0;
+  for (size_t i = 0; i < indices.size(); ++i)
+    flat = flat * shape[i] + indices[i];
+  return flat;
+}
+
+static std::string packedSlice(llvm::StringRef base, ArrayRef<int64_t> shape, ArrayRef<int64_t> indices, unsigned width) {
+  int64_t lane = flatLaneIndex(shape, indices);
+  int64_t lsb = lane * static_cast<int64_t>(width);
+  if (width == 1)
+    return base.str() + "[" + std::to_string(lsb) + "]";
+  return base.str() + "[" + std::to_string(lsb + static_cast<int64_t>(width) - 1) + ":" + std::to_string(lsb) + "]";
+}
+
+static void walkVectorIndices(ArrayRef<int64_t> shape,
+                              const std::function<void(ArrayRef<int64_t>)> &emit) {
+  llvm::SmallVector<int64_t> indices;
+  std::function<void(unsigned)> walk = [&](unsigned depth) {
+    if (depth == shape.size()) {
+      emit(indices);
+      return;
+    }
+    for (int64_t i = 0; i < shape[depth]; ++i) {
+      indices.push_back(i);
+      walk(depth + 1);
+      indices.pop_back();
+    }
+  };
+  walk(0);
+}
+
+static void emitUnpackFromPacked(llvm::StringRef arrayBase, llvm::StringRef packedBase, Type ty, raw_ostream &os) {
+  auto vt = dyn_cast<VectorType>(ty);
+  if (!vt) {
+    os << "assign " << arrayBase << " = " << packedBase << ";\n";
+    return;
+  }
+  auto width = leafWidth(ty);
+  if (!width)
+    return;
+  ArrayRef<int64_t> shape = vt.getShape();
+  walkVectorIndices(shape, [&](ArrayRef<int64_t> indices) {
+    os << "assign " << arrayBase << indexSuffix(indices) << " = "
+       << packedSlice(packedBase, shape, indices, *width) << ";\n";
+  });
+}
+
+static void emitPackToPacked(llvm::StringRef packedBase, llvm::StringRef arrayBase, Type ty, raw_ostream &os) {
+  auto vt = dyn_cast<VectorType>(ty);
+  if (!vt) {
+    os << "assign " << packedBase << " = " << arrayBase << ";\n";
+    return;
+  }
+  auto width = leafWidth(ty);
+  if (!width)
+    return;
+  ArrayRef<int64_t> shape = vt.getShape();
+  walkVectorIndices(shape, [&](ArrayRef<int64_t> indices) {
+    os << "assign " << packedSlice(packedBase, shape, indices, *width)
+       << " = " << arrayBase << indexSuffix(indices) << ";\n";
+  });
 }
 
 /// Build a balanced binary-tree expression from a list of term strings.
@@ -529,10 +633,14 @@ static LogicalResult emitVectorElementwise(Operation &op, VectorType vt, raw_ost
 
   std::function<LogicalResult(unsigned, std::string &)> walk;
   std::vector<std::pair<Value, std::string>> saved;
+  llvm::SmallDenseSet<Value, 8> rebound;
   walk = [&](unsigned depth, std::string &idx) -> LogicalResult {
     if (depth == rank) {
       saved.clear();
+      rebound.clear();
       auto rebind = [&](Value v) {
+        if (!rebound.insert(v).second)
+          return;
         std::string base = nt.get(v);
         saved.emplace_back(v, base);
         nt.names[v] = base + idx;
@@ -765,6 +873,12 @@ static LogicalResult emitFunc(func::FuncOp f, raw_ostream &os, const VerilogEmit
   NameTable nt;
   std::vector<std::string> outNames;
   outNames.reserve(f.getNumResults());
+  struct VectorInputAlias {
+    std::string alias;
+    std::string port;
+    Type ty;
+  };
+  std::vector<VectorInputAlias> vectorInputAliases;
 
   os << "// Generated by pycc (pyCircuit)\n";
   os << "// Module: " << f.getSymName() << "\n\n";
@@ -773,27 +887,42 @@ static LogicalResult emitFunc(func::FuncOp f, raw_ostream &os, const VerilogEmit
   os << "module " << f.getSymName() << " (\n";
   for (auto [i, arg] : llvm::enumerate(f.getArguments())) {
     std::string portName = nt.unique(getPortName(f, i, /*isResult=*/false));
-    std::string range = vRange(arg.getType());
-    std::string unpacked = vUnpacked(arg.getType());
+    std::string range = vPortRange(arg.getType());
     os << "  input ";
     if (!range.empty())
       os << range << " ";
-    os << portName << unpacked;
+    os << portName;
     os << ((i + 1 == f.getNumArguments() && f.getNumResults() == 0) ? "\n" : ",\n");
-    nt.names.try_emplace(arg, portName);
+    if (isa<VectorType>(arg.getType())) {
+      std::string alias = nt.unique(portName + "__vec");
+      nt.names.try_emplace(arg, alias);
+      vectorInputAliases.push_back({alias, portName, arg.getType()});
+    } else {
+      nt.names.try_emplace(arg, portName);
+    }
   }
   for (unsigned i = 0; i < f.getNumResults(); ++i) {
     std::string portName = nt.unique(getPortName(f, i, /*isResult=*/true));
     outNames.push_back(portName);
-    std::string range = vRange(f.getResultTypes()[i]);
-    std::string unpacked = vUnpacked(f.getResultTypes()[i]);
+    std::string range = vPortRange(f.getResultTypes()[i]);
     os << "  output ";
     if (!range.empty())
       os << range << " ";
-    os << portName << unpacked;
+    os << portName;
     os << ((i + 1 == f.getNumResults()) ? "\n" : ",\n");
   }
   os << ");\n\n";
+
+  for (auto &aliasInfo : vectorInputAliases) {
+    std::string range = vRange(aliasInfo.ty);
+    os << "wire ";
+    if (!range.empty())
+      os << range << " ";
+    os << aliasInfo.alias << vUnpacked(aliasInfo.ty) << "; // port=" << aliasInfo.port << "\n";
+    emitUnpackFromPacked(aliasInfo.alias, aliasInfo.port, aliasInfo.ty, os);
+  }
+  if (!vectorInputAliases.empty())
+    os << "\n";
 
   // Declare internal nets for op results (including results inside pyc.comb regions).
   std::vector<NetDecl> decls;
@@ -972,21 +1101,61 @@ static LogicalResult emitFunc(func::FuncOp f, raw_ostream &os, const VerilogEmit
         instName = sanitizeId(shortAttr.getValue());
       instName = nt.unique(instName);
 
+      std::vector<std::string> inConn;
+      std::vector<std::string> outConn;
+      inConn.reserve(inPorts.size());
+      outConn.reserve(outPorts.size());
+
+      for (unsigned i = 0; i < inPorts.size(); ++i) {
+        Value operand = inst.getOperand(i);
+        if (isa<VectorType>(operand.getType())) {
+          std::string bridge = nt.unique(instName + "_" + inPorts[i] + "__flat");
+          std::string range = vPortRange(operand.getType());
+          os << "wire ";
+          if (!range.empty())
+            os << range << " ";
+          os << bridge << ";\n";
+          emitPackToPacked(bridge, nt.get(operand), operand.getType(), os);
+          inConn.push_back(bridge);
+        } else {
+          inConn.push_back(nt.get(operand));
+        }
+      }
+      for (unsigned i = 0; i < outPorts.size(); ++i) {
+        Value result = inst.getResult(i);
+        if (isa<VectorType>(result.getType())) {
+          std::string bridge = nt.unique(instName + "_" + outPorts[i] + "__flat");
+          std::string range = vPortRange(result.getType());
+          os << "wire ";
+          if (!range.empty())
+            os << range << " ";
+          os << bridge << ";\n";
+          outConn.push_back(bridge);
+        } else {
+          outConn.push_back(nt.get(result));
+        }
+      }
+
       os << callee.getSymName() << " " << instName << " (\n";
       unsigned totalPorts = static_cast<unsigned>(inPorts.size() + outPorts.size());
       unsigned emitted = 0;
 
       for (unsigned i = 0; i < inPorts.size(); ++i) {
-        os << "  ." << inPorts[i] << "(" << nt.get(inst.getOperand(i)) << ")";
+        os << "  ." << inPorts[i] << "(" << inConn[i] << ")";
         emitted++;
         os << ((emitted == totalPorts) ? "\n" : ",\n");
       }
       for (unsigned i = 0; i < outPorts.size(); ++i) {
-        os << "  ." << outPorts[i] << "(" << nt.get(inst.getResult(i)) << ")";
+        os << "  ." << outPorts[i] << "(" << outConn[i] << ")";
         emitted++;
         os << ((emitted == totalPorts) ? "\n" : ",\n");
       }
       os << ");\n";
+      for (unsigned i = 0; i < outPorts.size(); ++i) {
+        Value result = inst.getResult(i);
+        if (isa<VectorType>(result.getType()))
+          emitUnpackFromPacked(nt.get(result), outConn[i], result.getType(), os);
+      }
     }
     os << "\n";
   }
@@ -1161,9 +1330,12 @@ static LogicalResult emitFunc(func::FuncOp f, raw_ostream &os, const VerilogEmit
   if (!ret)
     return f.emitError("missing return");
   for (auto [i, v] : llvm::enumerate(ret.getOperands())) {
-    if (nt.get(v) == outNames[i])
+    if (!isa<VectorType>(f.getResultTypes()[i]) && nt.get(v) == outNames[i])
       continue;
-    emitConnectAssign(outNames[i], nt.get(v), f.getResultTypes()[i], os);
+    if (isa<VectorType>(f.getResultTypes()[i]))
+      emitPackToPacked(outNames[i], nt.get(v), f.getResultTypes()[i], os);
+    else
+      emitConnectAssign(outNames[i], nt.get(v), f.getResultTypes()[i], os);
   }
 
   os << "\nendmodule\n\n";

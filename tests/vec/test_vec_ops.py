@@ -9,6 +9,29 @@ from .generate import render_case_source
 from .runner import assert_verilator_ran, check_cpp_manifest_syntax, check_ir, merged_env, run_cmd, run_cpp_binary, run_vec_case
 
 
+def _run_yosys_smoke(verilog: Path, *, top: str, repo_root: Path) -> None:
+    import shutil
+
+    yosys = shutil.which("yosys")
+    if yosys is None:
+        pytest.skip("yosys not found")
+    script = verilog.with_suffix(".ys")
+    script.write_text(
+        "\n".join(
+            [
+                f"read_verilog -I{repo_root / 'runtime' / 'verilog'} {verilog}",
+                f"hierarchy -top {top}",
+                "proc",
+                "opt",
+                "stat",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    run_cmd([yosys, "-q", "-s", str(script)], cwd=repo_root)
+
+
 @pytest.mark.vec
 @pytest.mark.slow
 @pytest.mark.parametrize("case", FULL_BACKEND_CASES, ids=[case.name for case in FULL_BACKEND_CASES])
@@ -142,8 +165,59 @@ def test_vector_io_emit_and_pycc(
         cwd=repo_root,
         env=env,
     )
-    run_cmd([str(pycc), str(pyc), "--emit=verilog", "-o", str(out_dir / "vector_io.v"), "--build-profile=dev-fast"], cwd=repo_root, env=env)
+    verilog = out_dir / "vector_io.v"
+    run_cmd([str(pycc), str(pyc), "--emit=verilog", "-o", str(verilog), "--build-profile=dev-fast"], cwd=repo_root, env=env)
+    verilog_text = verilog.read_text(encoding="utf-8")
+    assert "input [15:0] a" in verilog_text
+    assert "output [15:0] out" in verilog_text
+    assert "input [3:0] a [0:3]" not in verilog_text
+    assert "output [3:0] out [0:3]" not in verilog_text
     check_cpp_manifest_syntax(out_dir, repo_root=repo_root)
+
+
+@pytest.mark.vec
+def test_rank2_vector_io_verilog_uses_packed_ports_and_yosys(
+    *,
+    repo_root: Path,
+    vec_test_root: Path,
+    pyc_pythonpath: str,
+    pycc: Path,
+) -> None:
+    case_root = vec_test_root / "rank2_vector_io"
+    src_dir = case_root / "src"
+    out_dir = case_root / "build"
+    src_dir.mkdir(parents=True, exist_ok=True)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    src = src_dir / "rank2_vector_io.py"
+    src.write_text(
+        "\n".join(
+            [
+                "from __future__ import annotations",
+                "",
+                "from pycircuit import Circuit, module",
+                "",
+                "",
+                "@module",
+                "def build(m: Circuit) -> None:",
+                '    a = m.input("a", width=2, shape=(2, 3))',
+                "    out = a + a",
+                '    m.output("out", out)',
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    env = merged_env(pythonpath=pyc_pythonpath, pycc=pycc)
+    pyc = out_dir / "rank2_vector_io.pyc"
+    run_cmd(["python3", "-m", "pycircuit.cli", "emit", str(src), "-o", str(pyc)], cwd=repo_root, env=env)
+    verilog = out_dir / "rank2_vector_io.v"
+    run_cmd([str(pycc), str(pyc), "--emit=verilog", "-o", str(verilog), "--build-profile=dev-fast"], cwd=repo_root, env=env)
+    verilog_text = verilog.read_text(encoding="utf-8")
+    assert "input [11:0] a" in verilog_text
+    assert "output [11:0] out" in verilog_text
+    assert "input [1:0] a [0:1][0:2]" not in verilog_text
+    assert "output [1:0] out [0:1][0:2]" not in verilog_text
+    _run_yosys_smoke(verilog, top="Rank2VectorIo", repo_root=repo_root)
 
 
 @pytest.mark.vec
@@ -335,7 +409,13 @@ def test_jit_instance_vec_port_emit_and_pycc(
         cwd=repo_root,
         env=env,
     )
-    run_cmd([str(pycc), str(pyc), "--emit=verilog", "-o", str(out_dir / "jit_instance_vec_port.v"), "--build-profile=dev-fast"], cwd=repo_root, env=env)
+    verilog = out_dir / "jit_instance_vec_port.v"
+    run_cmd([str(pycc), str(pyc), "--emit=verilog", "-o", str(verilog), "--build-profile=dev-fast"], cwd=repo_root, env=env)
+    verilog_text = verilog.read_text(encoding="utf-8")
+    assert "input [15:0] a" in verilog_text
+    assert "__flat" in verilog_text
+    assert "input [3:0] a [0:3]" not in verilog_text
+    _run_yosys_smoke(verilog, top="JitInstanceVecPort", repo_root=repo_root)
     check_cpp_manifest_syntax(out_dir, repo_root=repo_root)
 
 
