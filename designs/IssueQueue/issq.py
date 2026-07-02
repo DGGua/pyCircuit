@@ -60,7 +60,7 @@ def _wake_hit_vec(m: Circuit, wake_valid_v: Vec, wake_ptag_v: Vec, ptag_wire):
 def _alloc_field_vec(m: Circuit, enq_uops: list, alloc_lane: list[Vec], slot: int, path: str, width: int, enq_ports: int):
     sels = Vec([alloc_lane[k][int(slot)] for k in range(int(enq_ports))])
     vals = Vec([enq_uops[k][path].read() for k in range(int(enq_ports))])
-    return sels.priority_mux(vals, zero=u(int(width), 0))
+    return sels.priority_mux(vals, zero=u(int(width), 0), assume_onehot=True)
 
 
 @function
@@ -143,16 +143,16 @@ def _emit_issue_ports_vec(
     for k in range(int(issue_ports)):
         sel = issue_sel[k]
         vals = {
-            "src0.valid": sel.priority_mux(fields["src0.valid"], zero=u(1, 0)),
-            "src0.ptag": sel.priority_mux(fields["src0.ptag"], zero=u(int(ptag_width), 0)),
-            "src0.ready": sel.priority_mux(fields["src0.ready"], zero=u(1, 0)),
-            "src1.valid": sel.priority_mux(fields["src1.valid"], zero=u(1, 0)),
-            "src1.ptag": sel.priority_mux(fields["src1.ptag"], zero=u(int(ptag_width), 0)),
-            "src1.ready": sel.priority_mux(fields["src1.ready"], zero=u(1, 0)),
-            "dst.valid": sel.priority_mux(fields["dst.valid"], zero=u(1, 0)),
-            "dst.ptag": sel.priority_mux(fields["dst.ptag"], zero=u(int(ptag_width), 0)),
-            "dst.ready": sel.priority_mux(fields["dst.ready"], zero=u(1, 0)),
-            "payload": sel.priority_mux(fields["payload"], zero=u(int(payload_width), 0)),
+            "src0.valid": sel.priority_mux(fields["src0.valid"], zero=u(1, 0), assume_onehot=True),
+            "src0.ptag": sel.priority_mux(fields["src0.ptag"], zero=u(int(ptag_width), 0), assume_onehot=True),
+            "src0.ready": sel.priority_mux(fields["src0.ready"], zero=u(1, 0), assume_onehot=True),
+            "src1.valid": sel.priority_mux(fields["src1.valid"], zero=u(1, 0), assume_onehot=True),
+            "src1.ptag": sel.priority_mux(fields["src1.ptag"], zero=u(int(ptag_width), 0), assume_onehot=True),
+            "src1.ready": sel.priority_mux(fields["src1.ready"], zero=u(1, 0), assume_onehot=True),
+            "dst.valid": sel.priority_mux(fields["dst.valid"], zero=u(1, 0), assume_onehot=True),
+            "dst.ptag": sel.priority_mux(fields["dst.ptag"], zero=u(int(ptag_width), 0), assume_onehot=True),
+            "dst.ready": sel.priority_mux(fields["dst.ready"], zero=u(1, 0), assume_onehot=True),
+            "payload": sel.priority_mux(fields["payload"], zero=u(int(payload_width), 0), assume_onehot=True),
         }
         issue_uops.append(vals)
         m.output(f"iss{k}_valid", issue_valid[k])

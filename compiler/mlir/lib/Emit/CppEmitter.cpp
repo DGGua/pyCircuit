@@ -154,6 +154,37 @@ struct NameTable {
   }
 };
 
+static std::string treeReduceExpr(llvm::SmallVectorImpl<std::string> &terms,
+                                  llvm::StringRef op) {
+  while (terms.size() > 1) {
+    llvm::SmallVector<std::string> next;
+    for (size_t i = 0; i < terms.size(); i += 2) {
+      if (i + 1 < terms.size())
+        next.push_back("(" + terms[i] + " " + op.str() + " " + terms[i + 1] + ")");
+      else
+        next.push_back(terms[i]);
+    }
+    terms = std::move(next);
+  }
+  return terms.empty() ? "" : terms[0];
+}
+
+static std::string chainReduceExpr(llvm::SmallVectorImpl<std::string> &terms,
+                                   llvm::StringRef op) {
+  if (terms.empty())
+    return "";
+  std::string out = terms[0];
+  for (size_t i = 1; i < terms.size(); ++i)
+    out = "(" + out + " " + op.str() + " " + terms[i] + ")";
+  return out;
+}
+
+static bool isTreeReduceMode(Operation *op) {
+  if (auto mode = op->getAttrOfType<StringAttr>("mode"))
+    return mode.getValue() == "tree";
+  return false;
+}
+
 static std::string getPortName(func::FuncOp f, unsigned idx, bool isResult) {
   if (!isResult) {
     if (auto names = f->getAttrOfType<ArrayAttr>("arg_names")) {
@@ -700,18 +731,18 @@ static LogicalResult emitCombAssign(Operation &op, llvm::raw_ostream &os, NameTa
       return vr.emitError("pyc.") << opName << " dim out of range";
     if (!vr.getDim() && vt.getRank() != 1)
       return vr.emitError("pyc.") << opName << " requires explicit dim for rank > 1";
+    bool useTree = isTreeReduceMode(vr.getOperation());
 
     std::int64_t lanes = vt.getShape()[0];
     if (vt.getRank() == 1) {
       assignExpr(vr.getResult(), vr.getType(), os, nt,
                  [&](llvm::raw_ostream &e) {
-                   e << "(";
+                   llvm::SmallVector<std::string> terms;
                    for (std::int64_t i = 0; i < lanes; ++i) {
-                     if (i)
-                       e << " " << opToken << " ";
-                     e << nt.get(vr.getVec()) << "[" << i << "]";
+                     terms.push_back(nt.get(vr.getVec()) + "[" +
+                                     std::to_string(static_cast<long long>(i)) + "]");
                    }
-                   e << ")";
+                   e << (useTree ? treeReduceExpr(terms, opToken) : chainReduceExpr(terms, opToken));
                  }
                  );
       return success();
@@ -729,16 +760,18 @@ static LogicalResult emitCombAssign(Operation &op, llvm::raw_ostream &os, NameTa
                  for (std::int64_t i = 0; i < outLanes; ++i) {
                    if (i)
                      e << ", ";
-                   e << "(";
+                   llvm::SmallVector<std::string> terms;
                    for (std::int64_t j = 0; j < reduceLanes; ++j) {
-                     if (j)
-                       e << " " << opToken << " ";
                      if (dim == 0)
-                       e << nt.get(vr.getVec()) << "[" << j << "][" << i << "]";
+                       terms.push_back(nt.get(vr.getVec()) + "[" +
+                                       std::to_string(static_cast<long long>(j)) + "][" +
+                                       std::to_string(static_cast<long long>(i)) + "]");
                      else
-                       e << nt.get(vr.getVec()) << "[" << i << "][" << j << "]";
+                       terms.push_back(nt.get(vr.getVec()) + "[" +
+                                       std::to_string(static_cast<long long>(i)) + "][" +
+                                       std::to_string(static_cast<long long>(j)) + "]");
                    }
-                   e << ")";
+                   e << (useTree ? treeReduceExpr(terms, opToken) : chainReduceExpr(terms, opToken));
                  }
                  e << "}}";
                }

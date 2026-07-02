@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 import hashlib
 import inspect
 import json
-from typing import Any, Iterable, Iterator, Mapping, Protocol, Union, overload
+from typing import Any, Iterable, Iterator, Literal, Mapping, Protocol, Union, overload
 
 from .connectors import (
     Connector,
@@ -42,6 +42,13 @@ _VEC_BINARY_METHODS: dict[str, str] = {
     "slt": "slt",
 }
 _VEC_COMPARE_OPS = {"eq", "ult", "slt"}
+_ReduceMode = Literal["chain", "tree"]
+
+
+def _normalize_reduce_mode(mode: str) -> _ReduceMode:
+    if mode not in ("chain", "tree"):
+        raise ValueError(f"reduce mode must be 'chain' or 'tree', got {mode!r}")
+    return mode
 
 
 def _int_width(ty: str) -> int:
@@ -2832,21 +2839,28 @@ class Vec:
         return self._from_vector_signal(m, out_sig, signs=out_signs, domain=self.domain, cycle=self.cycle)
 
     @staticmethod
+    def _linear_reduce_wires_1d(ws: list[Wire], *, is_or: bool) -> Wire:
+        """1-D linear reduction using source order."""
+        if not ws:
+            raise ValueError("reduce requires at least one element")
+        out = ws[0]
+        for w in ws[1:]:
+            out = (out | w) if is_or else (out & w)
+        return out
+
+    @staticmethod
     def _tree_reduce_wires_1d(ws: list[Wire], *, is_or: bool) -> Wire:
-        """1-D 树状归约：逐对 | (OR) 或 & (AND) 直到剩一个 Wire。"""
+        """1-D balanced tree reduction using source order within pairs."""
         if not ws:
             raise ValueError("reduce requires at least one element")
         cur = list(ws)
         while len(cur) > 1:
             nxt: list[Wire] = []
-            i = 0
-            while i < len(cur):
+            for i in range(0, len(cur), 2):
                 if i + 1 < len(cur):
                     nxt.append((cur[i] | cur[i + 1]) if is_or else (cur[i] & cur[i + 1]))
-                    i += 2
                 else:
                     nxt.append(cur[i])
-                    i += 1
             cur = nxt
         return cur[0]
 
@@ -2877,20 +2891,27 @@ class Vec:
         return Wire(w.m, w.sig, signed=bool(signed))
 
     @classmethod
+    def _linear_sum_wires_1d(cls, ws: list[Wire], *, width: int | None = None, signed: bool = False) -> Wire:
+        """1-D linear sum reduction after lane extension."""
+        out_width = cls._sum_output_width(ws, len(ws), width)
+        cur = [cls._extend_sum_lane(w, width=out_width, signed=bool(signed)) for w in ws]
+        out = cur[0]
+        for w in cur[1:]:
+            out = out + w
+        return out
+
+    @classmethod
     def _tree_sum_wires_1d(cls, ws: list[Wire], *, width: int | None = None, signed: bool = False) -> Wire:
-        """1-D 树状求和：先扩展各 lane 防溢出，再逐对相加直到剩一个 Wire。"""
+        """1-D balanced tree sum reduction after lane extension."""
         out_width = cls._sum_output_width(ws, len(ws), width)
         cur = [cls._extend_sum_lane(w, width=out_width, signed=bool(signed)) for w in ws]
         while len(cur) > 1:
             nxt: list[Wire] = []
-            i = 0
-            while i < len(cur):
+            for i in range(0, len(cur), 2):
                 if i + 1 < len(cur):
                     nxt.append(cur[i] + cur[i + 1])
-                    i += 2
                 else:
                     nxt.append(cur[i])
-                    i += 1
             cur = nxt
         return cur[0]
 
@@ -2915,7 +2936,7 @@ class Vec:
             return list(in_signs)
         return [any(in_signs) for _ in range(out_shape[0])]
 
-    def _reduce_vector_backed(self, dim: int | None, *, is_or: bool) -> Union[Wire, "Vec"] | None:
+    def _reduce_vector_backed(self, dim: int | None, *, is_or: bool, mode: _ReduceMode) -> Union[Wire, "Vec"] | None:
         """用原生向量归约指令（v_or_reduce / v_and_reduce）。dim=None 归约到 Wire。"""
         if self.sig is None:
             return None
@@ -2925,16 +2946,20 @@ class Vec:
         if dim is None:
             if len(shape) != 1:
                 raise ValueError("reduce(dim=None) requires a 1-D Vec (leaf elements are Wire/Reg)")
-            red_sig = self.m.v_or_reduce(self.sig) if is_or else self.m.v_and_reduce(self.sig)
+            red_sig = (
+                self.m.v_or_reduce(self.sig, mode=mode)
+                if is_or
+                else self.m.v_and_reduce(self.sig, mode=mode)
+            )
             return Wire(self.m, red_sig, signed=any(self.signed))
 
         reduce_dim = int(dim)
         if reduce_dim < 0 or reduce_dim >= len(shape):
             raise ValueError(f"reduce dim out of range: {reduce_dim} for Vec rank {len(shape)}")
         red_sig = (
-            self.m.v_or_reduce(self.sig, dim=reduce_dim)
+            self.m.v_or_reduce(self.sig, dim=reduce_dim, mode=mode)
             if is_or
-            else self.m.v_and_reduce(self.sig, dim=reduce_dim)
+            else self.m.v_and_reduce(self.sig, dim=reduce_dim, mode=mode)
         )
         out_signs = self._reduced_vector_signs(shape, list(self.signed), dim=reduce_dim)
         if not out_signs:
@@ -2947,27 +2972,31 @@ class Vec:
             cycle=self.cycle,
         )
 
-    def _reduce_1d(self, *, is_or: bool) -> Wire:
-        """1-D 归约到单个 Wire。优先用向量指令，否则树状归约。"""
-        vector_reduced = self._reduce_vector_backed(None, is_or=is_or)
+    def _reduce_1d(self, *, is_or: bool, mode: _ReduceMode) -> Wire:
+        """1-D reduction to a single Wire. Prefer vector ops, otherwise use the requested mode."""
+        vector_reduced = self._reduce_vector_backed(None, is_or=is_or, mode=mode)
         if vector_reduced is not None:
             assert isinstance(vector_reduced, Wire)
             return vector_reduced
         if not self._is_leaf_1d():
             raise ValueError("reduce(dim=None) requires a 1-D Vec (leaf elements are Wire/Reg)")
         ws = [self._wire_of(e) for e in self]
-        return self._tree_reduce_wires_1d(ws, is_or=is_or)
+        if mode == "tree":
+            return self._tree_reduce_wires_1d(ws, is_or=is_or)
+        return self._linear_reduce_wires_1d(ws, is_or=is_or)
 
-    def _sum_1d(self, *, width: int | None = None, signed: bool = False) -> Wire:
-        """1-D 求和归约到单个 Wire。优先用向量指令，否则树状求和。"""
-        vector_reduced = self._sum_vector_backed(None, width=width, signed=bool(signed))
+    def _sum_1d(self, *, width: int | None = None, signed: bool = False, mode: _ReduceMode) -> Wire:
+        """1-D sum reduction to a single Wire. Prefer vector ops, otherwise use the requested mode."""
+        vector_reduced = self._sum_vector_backed(None, width=width, signed=bool(signed), mode=mode)
         if vector_reduced is not None:
             assert isinstance(vector_reduced, Wire)
             return vector_reduced
         if not self._is_leaf_1d():
             raise ValueError("reduce_sum(dim=None) requires a 1-D Vec (leaf elements are Wire/Reg)")
         ws = [self._wire_of(e) for e in self]
-        return self._tree_sum_wires_1d(ws, width=width, signed=bool(signed))
+        if mode == "tree":
+            return self._tree_sum_wires_1d(ws, width=width, signed=bool(signed))
+        return self._linear_sum_wires_1d(ws, width=width, signed=bool(signed))
 
     def _sum_vector_backed(
         self,
@@ -2975,6 +3004,7 @@ class Vec:
         *,
         width: int | None = None,
         signed: bool = False,
+        mode: _ReduceMode,
     ) -> Union[Wire, "Vec"] | None:
         """用原生向量求和指令（v_add_reduce）。必要时先扩展位宽防溢出。"""
         info = self._as_vector_signal()
@@ -2991,7 +3021,7 @@ class Vec:
         out_width = self._sum_output_width_from_input_width(elem_width, shape[reduce_dim], width)
         if elem_width < out_width:
             sig = m.sext(sig, width=out_width) if signed else m.zext(sig, width=out_width)
-        red_sig = m.v_add_reduce(sig, dim=None if dim is None else reduce_dim)
+        red_sig = m.v_add_reduce(sig, dim=None if dim is None else reduce_dim, mode=mode)
         out_shape = [d for i, d in enumerate(shape) if i != reduce_dim]
         if not out_shape:
             return Wire(m, red_sig, signed=bool(signed))
@@ -3015,14 +3045,14 @@ class Vec:
                 raise ValueError("nested reduce requires rectangular Vec dimensions")
         return out
 
-    def _reduce_dim(self, dim: int, *, is_or: bool) -> Union[Wire, "Vec"]:
+    def _reduce_dim(self, dim: int, *, is_or: bool, mode: _ReduceMode) -> Union[Wire, "Vec"]:
         """沿指定轴做 AND/OR 归约。优先用向量指令，否则递归降维。
         dim==0 且为 1-D 叶子时返回单元素 Vec（保持 rank 语义一致）。
         """
         if dim < 0:
             raise ValueError("reduce dim must be >= 0")
 
-        vector_reduced = self._reduce_vector_backed(dim, is_or=is_or)
+        vector_reduced = self._reduce_vector_backed(dim, is_or=is_or, mode=mode)
         if vector_reduced is not None:
             return vector_reduced
 
@@ -3030,7 +3060,7 @@ class Vec:
             if self._is_leaf_1d():
                 # dim-specified reductions return Vec; reducing a leaf row gives a
                 # singleton Vec containing the reduced wire.
-                return Vec([self._reduce_1d(is_or=is_or)], domain=self.domain, cycle=self.cycle)
+                return Vec([self._reduce_1d(is_or=is_or, mode=mode)], domain=self.domain, cycle=self.cycle)
 
             children = self._as_children_vecs()
             infos = [child._as_vector_signal() for child in children]
@@ -3042,7 +3072,11 @@ class Vec:
                     for row_m, row_sig, row_signs in row_infos
                 ):
                     rank2_sig = m.v_create([row_sig for _row_m, row_sig, _row_signs in row_infos])
-                    red_sig = m.v_or_reduce(rank2_sig, dim=0) if is_or else m.v_and_reduce(rank2_sig, dim=0)
+                    red_sig = (
+                        m.v_or_reduce(rank2_sig, dim=0, mode=mode)
+                        if is_or
+                        else m.v_and_reduce(rank2_sig, dim=0, mode=mode)
+                    )
                     out_signs = [
                         any(row_signs[i] for _row_m, _row_sig, row_signs in row_infos)
                         for i in range(len(first_signs))
@@ -3060,7 +3094,7 @@ class Vec:
             for j in range(width):
                 col = Vec([child[j] for child in children])
                 # Reduce this column to a single wire so dim=0 lowers rank by one.
-                out.append(col._reduce_1d(is_or=is_or))
+                out.append(col._reduce_1d(is_or=is_or, mode=mode))
             return Vec(out, domain=self.domain, cycle=self.cycle)
 
         children = self._as_children_vecs()
@@ -3074,7 +3108,11 @@ class Vec:
                     for row_m, row_sig, row_signs in row_infos
                 ):
                     rank2_sig = m.v_create([row_sig for _row_m, row_sig, _row_signs in row_infos])
-                    red_sig = m.v_or_reduce(rank2_sig, dim=1) if is_or else m.v_and_reduce(rank2_sig, dim=1)
+                    red_sig = (
+                        m.v_or_reduce(rank2_sig, dim=1, mode=mode)
+                        if is_or
+                        else m.v_and_reduce(rank2_sig, dim=1, mode=mode)
+                    )
                     return self._from_vector_signal(
                         m,
                         red_sig,
@@ -3083,23 +3121,38 @@ class Vec:
                         cycle=self.cycle,
                     )
         if dim == 1 and all(child._is_leaf_1d() for child in children):
-            return Vec([child._reduce_1d(is_or=is_or) for child in children], domain=self.domain, cycle=self.cycle)
-        return Vec([child._reduce_dim(dim - 1, is_or=is_or) for child in children], domain=self.domain, cycle=self.cycle)
+            return Vec([child._reduce_1d(is_or=is_or, mode=mode) for child in children], domain=self.domain, cycle=self.cycle)
+        return Vec(
+            [child._reduce_dim(dim - 1, is_or=is_or, mode=mode) for child in children],
+            domain=self.domain,
+            cycle=self.cycle,
+        )
 
-    def _sum_dim(self, dim: int, *, width: int | None = None, signed: bool = False) -> Union[Wire, "Vec"]:
+    def _sum_dim(
+        self,
+        dim: int,
+        *,
+        width: int | None = None,
+        signed: bool = False,
+        mode: _ReduceMode,
+    ) -> Union[Wire, "Vec"]:
         """沿指定轴做求和归约。优先用向量指令，否则递归降维。
         dim==0 且为 1-D 叶子时返回单元素 Vec。
         """
         if dim < 0:
             raise ValueError("reduce_sum dim must be >= 0")
 
-        vector_reduced = self._sum_vector_backed(dim, width=width, signed=bool(signed))
+        vector_reduced = self._sum_vector_backed(dim, width=width, signed=bool(signed), mode=mode)
         if vector_reduced is not None:
             return vector_reduced
 
         if dim == 0:
             if self._is_leaf_1d():
-                return Vec([self._sum_1d(width=width, signed=bool(signed))], domain=self.domain, cycle=self.cycle)
+                return Vec(
+                    [self._sum_1d(width=width, signed=bool(signed), mode=mode)],
+                    domain=self.domain,
+                    cycle=self.cycle,
+                )
 
             children = self._as_children_vecs()
             # Try vector path: promote children to rank-2 signal → v_add_reduce
@@ -3123,7 +3176,7 @@ class Vec:
                         domain=self.domain,
                         cycle=self.cycle,
                     )
-                    reduced = tmp._sum_vector_backed(0, width=width, signed=bool(signed))
+                    reduced = tmp._sum_vector_backed(0, width=width, signed=bool(signed), mode=mode)
                     if reduced is not None:
                         return reduced
 
@@ -3133,6 +3186,7 @@ class Vec:
                     Vec([child[j] for child in children], domain=self.domain, cycle=self.cycle)._sum_1d(
                         width=width,
                         signed=bool(signed),
+                        mode=mode,
                     )
                     for j in range(col_count)
                 ],
@@ -3143,35 +3197,39 @@ class Vec:
         children = self._as_children_vecs()
         if dim == 1 and all(child._is_leaf_1d() for child in children):
             return Vec(
-                [child._sum_1d(width=width, signed=bool(signed)) for child in children],
+                [child._sum_1d(width=width, signed=bool(signed), mode=mode) for child in children],
                 domain=self.domain,
                 cycle=self.cycle,
             )
         return Vec(
-            [child._sum_dim(dim - 1, width=width, signed=bool(signed)) for child in children],
+            [child._sum_dim(dim - 1, width=width, signed=bool(signed), mode=mode) for child in children],
             domain=self.domain,
             cycle=self.cycle,
         )
 
-    def or_reduce(self, dim: int | None = None) -> Union[Wire, "Vec"]:
+    def or_reduce(self, dim: int | None = None, *, mode: str = "chain") -> Union[Wire, "Vec"]:
         """Bitwise OR reduction.
 
-        - dim=None: require 1-D Vec, return a single Wire (tree reduction).
+        - dim=None: require 1-D Vec, return a single Wire.
         - dim=int: reduce along that axis, return Vec.
+        - mode="chain" (default) emits a source-order chain; mode="tree" emits a balanced tree.
         """
+        reduce_mode = _normalize_reduce_mode(mode)
         if dim is None:
-            return self._reduce_1d(is_or=True)
-        return self._reduce_dim(int(dim), is_or=True)
+            return self._reduce_1d(is_or=True, mode=reduce_mode)
+        return self._reduce_dim(int(dim), is_or=True, mode=reduce_mode)
 
-    def and_reduce(self, dim: int | None = None) -> Union[Wire, "Vec"]:
+    def and_reduce(self, dim: int | None = None, *, mode: str = "chain") -> Union[Wire, "Vec"]:
         """Bitwise AND reduction.
 
-        - dim=None: require 1-D Vec, return a single Wire (tree reduction).
+        - dim=None: require 1-D Vec, return a single Wire.
         - dim=int: reduce along that axis, return Vec.
+        - mode="chain" (default) emits a source-order chain; mode="tree" emits a balanced tree.
         """
+        reduce_mode = _normalize_reduce_mode(mode)
         if dim is None:
-            return self._reduce_1d(is_or=False)
-        return self._reduce_dim(int(dim), is_or=False)
+            return self._reduce_1d(is_or=False, mode=reduce_mode)
+        return self._reduce_dim(int(dim), is_or=False, mode=reduce_mode)
 
     def reduce_sum(
         self,
@@ -3179,6 +3237,7 @@ class Vec:
         width: int | None = None,
         dim: int | None = None,
         signed: bool = False,
+        mode: str = "chain",
     ) -> Union[Wire, "Vec"]:
         """Sum reduction.
 
@@ -3187,10 +3246,12 @@ class Vec:
         - ``width=None`` chooses ``max_input_width + ceil_log2(reduce_len)``.
         - ``dim=None`` requires a 1-D Vec and returns one Wire.
         - ``dim=int`` reduces along that axis and returns the lowered-rank Vec.
+        - ``mode="chain"`` (default) emits a source-order chain; ``mode="tree"`` emits a balanced tree.
         """
+        reduce_mode = _normalize_reduce_mode(mode)
         if dim is None:
-            return self._sum_1d(width=width, signed=bool(signed))
-        return self._sum_dim(int(dim), width=width, signed=bool(signed))
+            return self._sum_1d(width=width, signed=bool(signed), mode=reduce_mode)
+        return self._sum_dim(int(dim), width=width, signed=bool(signed), mode=reduce_mode)
 
     # -- arithmetic -------------------------------------------------------------
 
@@ -3363,37 +3424,29 @@ class Vec:
             ], domain=domain, cycle=cycle)
         return Vec([sel._wire_of(e).select(a, b) for e in sel], domain=domain, cycle=cycle)
 
-    def priority_mux(self, vals: Any, *, zero: Any = 0) -> Wire:
-        """Balanced binary-tree priority mux with left-to-right precedence.
+    def priority_mux(self, vals: Any, *, zero: Any = 0, assume_onehot: bool = False) -> Wire:
+        """Linear priority mux with left-to-right precedence.
 
-        Builds a tree of 2:1 muxes (``val_a if sel_a else val_b``) paired
-        with OR-reduced selects.  When the select mask is one-hot this
-        recovers the exact candidate value; when multiple bits are set the
-        leftmost candidate wins, making the result well-defined even for
-        non-onehot masks.
+        Build a simple mux chain instead of a balanced select tree.  This keeps
+        the generated scalar form close to hand-written priority logic after
+        vector unrolling, which maps more predictably through Yosys/ABC.
+
+        If ``assume_onehot`` is true, the chain is built in source order.  This
+        has the same value for one-hot masks and gives Yosys/ABC the same shape
+        as hand-written one-hot mux logic.  For non-one-hot masks, the default
+        keeps the documented leftmost-wins priority.
         """
         values = vals if isinstance(vals, Vec) else Vec(list(vals))
         n = len(self)
         if n == 0:
             return zero
-        sels = self
-        vls = values
-        # ceil(log2(n)) tree levels.
-        while n > 1:
-            n = (n + 1) // 2
-            m = len(sels)
-            new_sels = []
-            new_vls = []
-            for i in range(0, m, 2):
-                if i + 1 < m:
-                    new_sels.append(sels[i] | sels[i + 1])
-                    new_vls.append(sels[i].select(vls[i], vls[i + 1]))
-                else:
-                    new_sels.append(sels[i])
-                    new_vls.append(vls[i])
-            sels = Vec(new_sels)
-            vls = Vec(new_vls)
-        return sels[0].select(vls[0], zero)
+        if len(values) != n:
+            raise ValueError("Vec size mismatch in priority_mux")
+        out = zero
+        indices = range(n) if assume_onehot else range(n - 1, -1, -1)
+        for i in indices:
+            out = self[i].select(values[i], out)
+        return out
 
     def broadcast(self, *, dim: int, size: int) -> "Vec":
         """Broadcast this Vec by repeating along a new dimension.

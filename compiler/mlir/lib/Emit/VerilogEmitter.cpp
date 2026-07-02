@@ -180,6 +180,22 @@ static std::string treeReduceExpr(llvm::SmallVectorImpl<std::string> &terms,
   return terms.empty() ? "" : terms[0];
 }
 
+static std::string chainReduceExpr(llvm::SmallVectorImpl<std::string> &terms,
+                                   const std::string &op) {
+  if (terms.empty())
+    return "";
+  std::string out = terms[0];
+  for (size_t i = 1; i < terms.size(); ++i)
+    out = "(" + out + " " + op + " " + terms[i] + ")";
+  return out;
+}
+
+static bool isTreeReduceMode(Operation *op) {
+  if (auto mode = op->getAttrOfType<StringAttr>("mode"))
+    return mode.getValue() == "tree";
+  return false;
+}
+
 static std::string vLiteral(IntegerAttr a, Type dstTy) {
   auto intTy = dyn_cast<IntegerType>(dstTy);
   if (!intTy)
@@ -575,6 +591,7 @@ static std::optional<LogicalResult> emitScalarOpAssign(Operation &op, raw_ostrea
       return vr.emitError("pyc.") << opName << " dim out of range for verilog emission";
     if (!vr.getDim() && vt.getRank() != 1)
       return vr.emitError("pyc.") << opName << " requires explicit dim for rank > 1";
+    bool useTree = isTreeReduceMode(vr.getOperation());
 
     if (vt.getRank() == 1) {
       std::int64_t lanes = vt.getShape()[0];
@@ -583,7 +600,7 @@ static std::optional<LogicalResult> emitScalarOpAssign(Operation &op, raw_ostrea
         terms.push_back(nt.get(vr.getVec()) + "[" +
                         std::to_string(static_cast<long long>(i)) + "]");
       }
-      std::string expr = treeReduceExpr(terms, opToken);
+      std::string expr = useTree ? treeReduceExpr(terms, opToken) : chainReduceExpr(terms, opToken);
       emitConnectAssign(nt.get(vr.getResult()), expr, vr.getResult().getType(), os);
       return success();
     }
@@ -604,7 +621,7 @@ static std::optional<LogicalResult> emitScalarOpAssign(Operation &op, raw_ostrea
                           std::to_string(static_cast<long long>(i)) + "][" +
                           std::to_string(static_cast<long long>(j)) + "]");
       }
-      std::string expr = treeReduceExpr(terms, opToken);
+      std::string expr = useTree ? treeReduceExpr(terms, opToken) : chainReduceExpr(terms, opToken);
       emitConnectAssign(
           nt.get(vr.getResult()) + "[" + std::to_string(static_cast<long long>(i)) + "]",
           expr,

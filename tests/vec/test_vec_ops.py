@@ -677,3 +677,80 @@ def test_dim_reduce_emit_and_pycc(
     )
     run_cmd([str(pycc), str(pyc), "--emit=verilog", "-o", str(out_dir / "dim_reduce.v"), "--build-profile=dev-fast"], cwd=repo_root, env=env)
     check_cpp_manifest_syntax(out_dir, repo_root=repo_root)
+
+
+@pytest.mark.vec
+def test_reduce_mode_attr_and_pycc(
+    *,
+    repo_root: Path,
+    vec_test_root: Path,
+    pyc_pythonpath: str,
+    pycc: Path,
+) -> None:
+    import sys
+
+    frontend = repo_root / "compiler" / "frontend"
+    if str(frontend) not in sys.path:
+        sys.path.insert(0, str(frontend))
+
+    from pycircuit import Circuit, Vec
+
+    m = Circuit("reduce_mode_invalid")
+    bad = Vec([m.input(f"bad{i}", width=1) for i in range(2)])
+    with pytest.raises(ValueError, match="reduce mode"):
+        bad.or_reduce(mode="flat")
+
+    case_root = vec_test_root / "reduce_modes"
+    src_dir = case_root / "src"
+    out_dir = case_root / "build"
+    src_dir.mkdir(parents=True, exist_ok=True)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    src = src_dir / "reduce_modes.py"
+    src.write_text(
+        "\n".join(
+            [
+                "from __future__ import annotations",
+                "",
+                "from pycircuit import Circuit, module",
+                "",
+                "",
+                "@module",
+                "def build(m: Circuit) -> None:",
+                '    a = m.input("a", width=1, shape=4)',
+                '    b = m.input("b", width=2, shape=4)',
+                '    m.output("chain_or", a.or_reduce())',
+                '    m.output("tree_or", a.or_reduce(mode="tree"))',
+                '    m.output("tree_sum", b.reduce_sum(width=4, mode="tree"))',
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    env = merged_env(pythonpath=pyc_pythonpath, pycc=pycc)
+    pyc = out_dir / "reduce_modes.pyc"
+    run_cmd(["python3", "-m", "pycircuit.cli", "emit", str(src), "-o", str(pyc)], cwd=repo_root, env=env)
+    mlir = pyc.read_text(encoding="utf-8")
+    assert "pyc.v_or_reduce" in mlir
+    assert "pyc.v_add_reduce" in mlir
+    assert mlir.count('mode = "tree"') == 2
+    assert 'mode = "chain"' not in mlir
+
+    direct_verilog = out_dir / "reduce_modes.v"
+    run_cmd([str(pycc), str(pyc), "--emit=verilog", "-o", str(direct_verilog), "--build-profile=dev-fast"], cwd=repo_root, env=env)
+    direct_text = direct_verilog.read_text(encoding="utf-8")
+    assert "chain_or" in direct_text
+    assert "tree_or" in direct_text
+    assert "(((a__vec[0] | a__vec[1]) | a__vec[2]) | a__vec[3])" in direct_text
+    assert "((a__vec[0] | a__vec[1]) | (a__vec[2] | a__vec[3]))" in direct_text
+
+    unrolled_verilog = out_dir / "reduce_modes_unroll.v"
+    run_cmd(
+        [str(pycc), str(pyc), "--emit=verilog", "-o", str(unrolled_verilog), "--build-profile=dev-fast", "--unroll-vector"],
+        cwd=repo_root,
+        env=env,
+    )
+    unrolled_text = unrolled_verilog.read_text(encoding="utf-8")
+    assert "v_or_reduce" not in unrolled_text
+    assert "v_add_reduce" not in unrolled_text
+    assert "assign pyc_or_7 = (pyc_or_6 | pyc_v_get_4);" in unrolled_text
+    assert "assign pyc_or_9 = (pyc_or_5 | pyc_or_8);" in unrolled_text

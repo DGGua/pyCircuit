@@ -4,6 +4,7 @@
 
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/Builders.h"
+#include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/Pass/Pass.h"
 #include "llvm/ADT/SmallVector.h"
@@ -102,7 +103,13 @@ static Value unrollElementwiseOp(Operation &op, OpBuilder &builder) {
   return createVector(builder, loc, vt, lanes, shape, 0);
 }
 
-// Unroll vector reduce into tree of scalar ops.
+static bool isTreeReduceMode(Operation &op) {
+  if (auto mode = op.getAttrOfType<StringAttr>("mode"))
+    return mode.getValue() == "tree";
+  return false;
+}
+
+// Unroll vector reduce according to its mode attr.
 static Value unrollReduceOp(Operation &op, OpBuilder &builder) {
   Location loc = op.getLoc();
   Value vec = op.getOperand(0);
@@ -122,6 +129,12 @@ static Value unrollReduceOp(Operation &op, OpBuilder &builder) {
   else
     return Value();
 
+  auto chainReduce = [&](llvm::SmallVectorImpl<Value> &values) -> Value {
+    Value out = values[0];
+    for (size_t i = 1; i < values.size(); ++i)
+      out = reducePair(out, values[i]);
+    return out;
+  };
   auto treeReduce = [&](llvm::SmallVectorImpl<Value> &values) -> Value {
     while (values.size() > 1) {
       llvm::SmallVector<Value> next;
@@ -135,13 +148,16 @@ static Value unrollReduceOp(Operation &op, OpBuilder &builder) {
     }
     return values[0];
   };
+  auto reduceValues = [&](llvm::SmallVectorImpl<Value> &values) -> Value {
+    return isTreeReduceMode(op) ? treeReduce(values) : chainReduce(values);
+  };
 
   if (vt.getRank() == 1) {
     int64_t lanes = vt.getShape()[0];
     llvm::SmallVector<Value> values;
     for (int64_t i = 0; i < lanes; ++i)
       values.push_back(extractLane(builder, loc, vec, {i}));
-    return treeReduce(values);
+    return reduceValues(values);
   }
 
   int64_t rows = vt.getShape()[0], cols = vt.getShape()[1];
@@ -151,7 +167,7 @@ static Value unrollReduceOp(Operation &op, OpBuilder &builder) {
       llvm::SmallVector<Value> colVals;
       for (int64_t i = 0; i < rows; ++i)
         colVals.push_back(extractLane(builder, loc, vec, {i, j}));
-      resultLanes.push_back(treeReduce(colVals));
+      resultLanes.push_back(reduceValues(colVals));
     }
     return builder.create<pyc::VCreateOp>(loc, VectorType::get({cols}, leafTy), resultLanes);
   } else {
@@ -160,7 +176,7 @@ static Value unrollReduceOp(Operation &op, OpBuilder &builder) {
       llvm::SmallVector<Value> rowVals;
       for (int64_t j = 0; j < cols; ++j)
         rowVals.push_back(extractLane(builder, loc, vec, {i, j}));
-      resultLanes.push_back(treeReduce(rowVals));
+      resultLanes.push_back(reduceValues(rowVals));
     }
     return builder.create<pyc::VCreateOp>(loc, VectorType::get({rows}, leafTy), resultLanes);
   }
