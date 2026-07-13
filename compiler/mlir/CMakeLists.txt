@@ -163,6 +163,31 @@ target_link_libraries(pycc PRIVATE
 
 # Install binaries for packaging / reuse.
 set(PYC_INSTALL_TARGETS pycc)
+
+# vec-unroll-dump: measurement-only tool (load .pyc, run pyc-unroll-vector, print IR).
+add_executable(vec-unroll-dump EXCLUDE_FROM_ALL tools/vec_unroll_dump.cpp)
+llvm_update_compile_flags(vec-unroll-dump)
+set_target_properties(vec-unroll-dump PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+)
+target_include_directories(vec-unroll-dump PRIVATE
+  "${PYC_SOURCE_DIR}/include"
+  "${PYC_BINARY_DIR}/include"
+)
+target_link_libraries(vec-unroll-dump PRIVATE
+  pyc_dialect
+  pyc_transforms
+  MLIRArithDialect
+  MLIRIR
+  MLIRSupport
+  MLIRFuncDialect
+  MLIRParser
+  MLIRPass
+  MLIRSCFDialect
+  MLIRTransforms
+  LLVMSupport
+)
+
 if(PYC_OPT_BUILT)
   list(APPEND PYC_INSTALL_TARGETS pyc-opt)
 endif()

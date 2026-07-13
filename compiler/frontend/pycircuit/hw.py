@@ -3431,10 +3431,32 @@ class Vec:
         the generated scalar form close to hand-written priority logic after
         vector unrolling, which maps more predictably through Yosys/ABC.
 
-        If ``assume_onehot`` is true, the chain is built in source order.  This
-        has the same value for one-hot masks and gives Yosys/ABC the same shape
-        as hand-written one-hot mux logic.  For non-one-hot masks, the default
-        keeps the documented leftmost-wins priority.
+        ``assume_onehot`` selects the chain direction:
+
+        * ``False`` (default): chain built in *reverse* order
+          (``n-1 .. 0``), giving **index-0-wins** priority.  This is required
+          for true priority arbitration (multiple selectors may be active).
+          .. note:: **Resource cost.** The reverse chain is mapped noticeably
+             worse by ABC than the forward chain — for one-hot selectors it
+             typically costs **several hundred extra LUTs** (observed ~+500
+             LUTs on a 128:1 / 64-bit read mux) because the mirror-image
+             topology lands ABC's cut heuristics in a worse local minimum.
+             Only use ``False`` when you genuinely need multi-match priority.
+        * ``True``: chain built in *forward* (source) order (``0 .. n-1``).
+          Identical result for one-hot masks, and matches the shape of
+          hand-written one-hot mux logic so ABC maps it efficiently.  Use this
+          for address-decode reads, RF/CAM lookups, and any selector known to
+          be one-hot.
+
+        .. warning::
+           Independent of ``assume_onehot``, this implementation indexes the
+           selector/data element-by-element (``self[i]`` / ``values[i]``).
+           When ``self`` is a *vector-backed* Vec (the result of a vector op
+           such as ``vec == scalar``), each ``self[i]`` emits a ``v_get``
+           extraction that becomes a residual wire perturbing ABC.  For
+           wide one-hot reads over vector-backed selectors this can add
+           residual LUTs even with ``assume_onehot=True``; prefer a scalar
+           ``mux(hit, data[i], acc)`` chain in that case.
         """
         values = vals if isinstance(vals, Vec) else Vec(list(vals))
         n = len(self)
