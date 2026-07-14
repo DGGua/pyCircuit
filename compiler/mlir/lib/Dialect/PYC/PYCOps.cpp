@@ -7,6 +7,7 @@
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/OpImplementation.h"
+#include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "mlir/IR/SymbolTable.h"
 #include "mlir/IR/Types.h"
 #include "mlir/Support/LogicalResult.h"
@@ -816,6 +817,18 @@ LogicalResult CombOp::verify() {
   for (auto [v, r] : llvm::zip(yield.getOperands(), getResults())) {
     if (v.getType() != r.getType())
       return emitOpError("pyc.yield operand types must match comb result types");
+  }
+
+  // A pyc.comb body is freely topologically reorderable by code-generation
+  // placement passes. Keep that contract explicit instead of trusting the
+  // producer that originally formed the region.
+  for (Operation &op : b.without_terminator()) {
+    if (op.getNumRegions() != 0)
+      return emitOpError("body operation ")
+             << op.getName() << " must not contain nested regions";
+    if (!isMemoryEffectFree(&op))
+      return emitOpError("body operation ")
+             << op.getName() << " must be memory-effect-free";
   }
 
   return success();

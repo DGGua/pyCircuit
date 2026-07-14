@@ -703,16 +703,26 @@ static LogicalResult emitCombMethod(pyc::CombOp comb,
   CppEmitterPlacementState placement;
   unsigned combChunkNodes = std::max(1u, opts.combChunkNodes);
   if (combOps.size() > combChunkNodes) {
+    // Placement is always-on: part ownership comes from pyc.cpp.method attrs.
+    std::vector<std::pair<std::string, llvm::SmallVector<Operation *>>> parts;
+    for (Operation *op : combOps) {
+      auto method = op->getAttrOfType<StringAttr>(kCppMethodAttr);
+      if (!method)
+        return op->emitError("missing pyc.cpp.method; run pyc-cpp-placement before C++ emit");
+      if (parts.empty() || parts.back().first != method.getValue())
+        parts.emplace_back(method.getValue().str(), llvm::SmallVector<Operation *>());
+      parts.back().second.push_back(op);
+    }
+
     std::vector<std::string> partMethods;
-    partMethods.reserve((combOps.size() + combChunkNodes - 1) / combChunkNodes);
-    for (unsigned begin = 0, partIdx = 0; begin < combOps.size(); begin += combChunkNodes, ++partIdx) {
-      unsigned end = std::min<unsigned>(static_cast<unsigned>(combOps.size()), begin + combChunkNodes);
-      std::string partName = "eval_comb_" + std::to_string(idx) + "_part_" + std::to_string(partIdx);
+    partMethods.reserve(parts.size());
+    for (auto &part : parts) {
+      const std::string &partName = part.first;
       partMethods.push_back(partName);
       os << "  inline void " << partName << "() {\n";
       placement.beginMethod(partName);
-      for (unsigned i = begin; i < end; ++i) {
-        if (failed(emitCombAssign(*combOps[i], os, nt, &placement)))
+      for (Operation *op : part.second) {
+        if (failed(emitCombAssign(*op, os, nt, &placement)))
           return failure();
       }
       os << "  }\n\n";
@@ -850,7 +860,6 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
     else if (auto comb = dyn_cast<pyc::CombOp>(op))
       combs.push_back(comb);
   }
-  sortCombsByStableKey(combs);
 
   auto regKey = [&](pyc::RegOp r) { return nt.get(r.getQ()); };
   auto fifoKey = [&](pyc::FifoOp f) { return nt.get(f.getInReady()); };
@@ -1494,7 +1503,7 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
   os << "    #endif\n";
   os << "  }\n\n";
 
-  // Emit fused comb helpers.
+  // Emit fused comb helpers. Indices match body order (same as placement).
   for (auto [i, comb] : llvm::enumerate(combs)) {
     if (failed(emitCombMethod(comb, os, nt, static_cast<unsigned>(i), opts)))
       return failure();

@@ -5,6 +5,7 @@
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Value.h"
+#include <cstdint>
 #include <optional>
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
@@ -15,6 +16,7 @@ namespace pyc {
 
 inline constexpr llvm::StringLiteral kCppStorageAttr = "pyc.cpp.storage";
 inline constexpr llvm::StringLiteral kCppOwnerAttr = "pyc.cpp.owner";
+inline constexpr llvm::StringLiteral kCppMethodAttr = "pyc.cpp.method";
 
 enum class CppStorageKind { Struct, Local };
 
@@ -25,6 +27,12 @@ struct CppPlacementSummary {
   unsigned promotedCrossMethod = 0;
   /// Comb-region values without a defining op (e.g. block args) kept on the struct.
   unsigned probePinnedStruct = 0;
+  /// Cross-part localizable wires under fixed-size chunking (baseline).
+  unsigned fixedOrderCrossMethod = 0;
+  /// Cross-part localizable wires under the chosen schedule/cut (or fallback).
+  unsigned scheduledCrossMethod = 0;
+  /// Weighted cut cost for the chosen scheduled partition.
+  uint64_t scheduledCutWeight = 0;
 };
 
 /// Read storage decision for a value (default struct).
@@ -32,12 +40,6 @@ CppStorageKind getValueCppStorage(mlir::Value v);
 
 /// Owner method name for local values (empty if struct or unknown).
 llvm::StringRef getValueCppOwner(mlir::Value v);
-
-/// Stable sort key for top-level `pyc.comb` ops (placement + emit must agree).
-std::string combSortKey(pyc::CombOp comb);
-
-/// Sort combs by \p combSortKey (in-place).
-void sortCombsByStableKey(llvm::SmallVectorImpl<pyc::CombOp> &combs);
 
 inline constexpr llvm::StringLiteral kCppPlacementSummaryAttr = "pyc.cpp.placement_summary";
 inline constexpr llvm::StringLiteral kCppCombChunkNodesAttr = "pyc.cpp.comb_chunk_nodes";
