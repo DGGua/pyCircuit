@@ -715,17 +715,38 @@ static LogicalResult emitCombMethod(pyc::CombOp comb,
   CppEmitterPlacementState placement;
   unsigned combChunkNodes = std::max(1u, opts.combChunkNodes);
   if (combOps.size() > combChunkNodes) {
+    std::vector<std::pair<std::string, llvm::SmallVector<Operation *>>> parts;
+    if (localize) {
+      for (Operation *op : combOps) {
+        auto method = op->getAttrOfType<StringAttr>(kCppMethodAttr);
+        if (!method)
+          return op->emitError("missing pyc.cpp.method; run pyc-cpp-placement before localized emit");
+        if (parts.empty() || parts.back().first != method.getValue())
+          parts.emplace_back(method.getValue().str(), llvm::SmallVector<Operation *>());
+        parts.back().second.push_back(op);
+      }
+    } else {
+      for (unsigned begin = 0, partIdx = 0; begin < combOps.size();
+           begin += combChunkNodes, ++partIdx) {
+        unsigned end =
+            std::min<unsigned>(static_cast<unsigned>(combOps.size()), begin + combChunkNodes);
+        std::string partName =
+            "eval_comb_" + std::to_string(idx) + "_part_" + std::to_string(partIdx);
+        parts.emplace_back(partName, llvm::SmallVector<Operation *>());
+        parts.back().second.append(combOps.begin() + begin, combOps.begin() + end);
+      }
+    }
+
     std::vector<std::string> partMethods;
-    partMethods.reserve((combOps.size() + combChunkNodes - 1) / combChunkNodes);
-    for (unsigned begin = 0, partIdx = 0; begin < combOps.size(); begin += combChunkNodes, ++partIdx) {
-      unsigned end = std::min<unsigned>(static_cast<unsigned>(combOps.size()), begin + combChunkNodes);
-      std::string partName = "eval_comb_" + std::to_string(idx) + "_part_" + std::to_string(partIdx);
+    partMethods.reserve(parts.size());
+    for (auto &part : parts) {
+      const std::string &partName = part.first;
       partMethods.push_back(partName);
       os << "  inline void " << partName << "() {\n";
       if (localize)
         placement.beginMethod(partName);
-      for (unsigned i = begin; i < end; ++i) {
-        if (failed(emitCombAssign(*combOps[i], os, nt, localize ? &placement : nullptr)))
+      for (Operation *op : part.second) {
+        if (failed(emitCombAssign(*op, os, nt, localize ? &placement : nullptr)))
           return failure();
       }
       os << "  }\n\n";
@@ -867,7 +888,6 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
     else if (auto comb = dyn_cast<pyc::CombOp>(op))
       combs.push_back(comb);
   }
-  sortCombsByStableKey(combs);
 
   auto regKey = [&](pyc::RegOp r) { return nt.get(r.getQ()); };
   auto fifoKey = [&](pyc::FifoOp f) { return nt.get(f.getInReady()); };
@@ -1516,13 +1536,20 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
 
   // Emit fused comb helpers.
   for (auto [i, comb] : llvm::enumerate(combs)) {
-    if (failed(emitCombMethod(comb, os, nt, static_cast<unsigned>(i), opts)))
+    unsigned methodIndex = static_cast<unsigned>(i);
+    if (auto attr = comb->getAttrOfType<IntegerAttr>(kCppCombIndexAttr))
+      methodIndex = static_cast<unsigned>(attr.getValue().getZExtValue());
+    if (failed(emitCombMethod(comb, os, nt, methodIndex, opts)))
       return failure();
   }
 
   llvm::DenseMap<Operation *, unsigned> combIndex;
-  for (auto [i, comb] : llvm::enumerate(combs))
-    combIndex.try_emplace(comb.getOperation(), static_cast<unsigned>(i));
+  for (auto [i, comb] : llvm::enumerate(combs)) {
+    unsigned methodIndex = static_cast<unsigned>(i);
+    if (auto attr = comb->getAttrOfType<IntegerAttr>(kCppCombIndexAttr))
+      methodIndex = static_cast<unsigned>(attr.getValue().getZExtValue());
+    combIndex.try_emplace(comb.getOperation(), methodIndex);
+  }
 
   auto topoOrder = [&](bool includePrims, llvm::SmallVector<Operation *> &ordered) -> bool {
     ordered.clear();
