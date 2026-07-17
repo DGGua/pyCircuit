@@ -8,6 +8,7 @@ from dataclasses import dataclass, fields, is_dataclass
 from typing import Any, Callable, Iterable, Mapping, TYPE_CHECKING
 
 from .api_contract import FRONTEND_CONTRACT
+from .data import Data
 from .dsl import Module
 from .jit_cache import get_structural_metrics
 
@@ -321,9 +322,9 @@ class CompiledModule:
     sym_name: str
     mod: Module
     arg_names: tuple[str, ...]
-    arg_types: tuple[str, ...]
+    arg_types: tuple[Data, ...]
     result_names: tuple[str, ...]
-    result_types: tuple[str, ...]
+    result_types: tuple[Data, ...]
     value_param_names: tuple[str, ...]
     value_param_types: tuple[str, ...]
     struct_metrics_json: str
@@ -388,10 +389,10 @@ class Design:
 
     @staticmethod
     def _emit_dep_decl_mlir(cm: CompiledModule) -> str:
-        args_sig = ", ".join(cm.arg_types)
+        args_sig = ", ".join(str(t) for t in cm.arg_types)
         sig = f"({args_sig})"
         if cm.result_types:
-            sig += f" -> ({', '.join(cm.result_types)})"
+            sig += f" -> ({', '.join(str(t) for t in cm.result_types)})"
         kind = _kind_of(cm.fn)
         inline = "true" if _inline_of(cm.fn) else "false"
         base = _base_name(cm.fn)
@@ -432,9 +433,9 @@ class Design:
                     "base": _base_name(cm.fn),
                     "deps": deps,
                     "arg_names": list(cm.arg_names),
-                    "arg_types": list(cm.arg_types),
+                    "arg_types": [str(t) for t in cm.arg_types],
                     "result_names": list(cm.result_names),
-                    "result_types": list(cm.result_types),
+                    "result_types": [str(t) for t in cm.result_types],
                     "value_param_names": list(cm.value_param_names),
                     "value_param_types": list(cm.value_param_types),
                 }

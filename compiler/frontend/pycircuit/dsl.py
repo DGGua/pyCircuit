@@ -5,46 +5,9 @@ import json
 import re
 from typing import Callable
 
+from .data import Bits, Data, Opaque, Vector
+
 _IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
-
-
-def _split_top_level_vector_parts(body: str) -> list[str]:
-    parts: list[str] = []
-    depth = 0
-    start = 0
-    for i, ch in enumerate(body):
-        if ch == "<":
-            depth += 1
-        elif ch == ">":
-            depth -= 1
-        elif ch == "x" and depth == 0:
-            parts.append(body[start:i])
-            start = i + 1
-    parts.append(body[start:])
-    return [p.strip() for p in parts]
-
-
-def _vector_shape_elem_type(ty: str) -> tuple[list[int], str]:
-    raw = str(ty).strip()
-    if not (raw.startswith("vector<") and raw.endswith(">")):
-        raise ValueError(f"expected vector type, got {ty!r}")
-    body = raw[len("vector<") : -1]
-    parts = _split_top_level_vector_parts(body)
-    if len(parts) < 2:
-        raise ValueError(f"invalid vector type body: {body!r}")
-    dims: list[int] = []
-    for p in parts[:-1]:
-        lanes = int(p)
-        if lanes <= 0:
-            raise ValueError(f"vector lanes must be > 0, got {lanes}")
-        dims.append(lanes)
-    return dims, parts[-1]
-
-
-def _format_vector_type(shape: list[int], elem_ty: str) -> str:
-    if not shape:
-        return elem_ty
-    return "vector<" + "x".join(str(d) for d in shape) + "x" + elem_ty + ">"
 
 
 def _normalize_reduce_mode(mode: str) -> str:
@@ -53,60 +16,15 @@ def _normalize_reduce_mode(mode: str) -> str:
     return mode
 
 
-def _vector_elem_type(ty: str) -> tuple[int, str]:
-    shape, elem_ty = _vector_shape_elem_type(ty)
-    if len(shape) == 1:
-        return shape[0], elem_ty
-    return shape[0], _format_vector_type(shape[1:], elem_ty)
-
-
-def _vector_map_to_i1(ty: str) -> str:
-    shape, elem_ty = _vector_shape_elem_type(ty)
-    if elem_ty.startswith("i"):
-        return _format_vector_type(shape, "i1")
-    raise ValueError(f"unsupported vector element type for compare: {elem_ty!r}")
-
-
-def _leaf_int_type(ty: str) -> str:
-    raw = str(ty).strip()
-    if raw.startswith("vector<"):
-        _shape, elem_ty = _vector_shape_elem_type(raw)
-        if not elem_ty.startswith("i"):
-            raise TypeError(f"expected vector-of-integer type, got {ty!r}")
-        return elem_ty
-    if raw.startswith("i"):
-        return raw
-    raise TypeError(f"expected integer or vector-of-integer type, got {ty!r}")
-
-
-def _is_integer_or_vector_of_integer(ty: str) -> bool:
-    try:
-        _leaf_int_type(ty)
-    except TypeError:
-        return False
-    return True
-
-
-def _map_vector_leaf_type(ty: str, leaf_ty: str) -> str:
-    raw = str(ty).strip()
-    if raw.startswith("vector<"):
-        shape, _old_leaf = _vector_shape_elem_type(raw)
-        return _format_vector_type(shape, leaf_ty)
-    _leaf_int_type(raw)
-    return leaf_ty
-
-
-def _elementwise_binary_result_type(a_ty: str, b_ty: str, op: str) -> str:
-    a_leaf = _leaf_int_type(a_ty)
-    b_leaf = _leaf_int_type(b_ty)
+def _elementwise_binary_result_type(a_ty: Data, b_ty: Data, op: str) -> Data:
+    a_leaf = a_ty.datatype() if isinstance(a_ty, Vector) else a_ty
+    b_leaf = b_ty.datatype() if isinstance(b_ty, Vector) else b_ty
     if a_leaf != b_leaf:
         raise TypeError(f"{op} operand leaf types must match: {a_ty} vs {b_ty}")
-    a_vec = a_ty.startswith("vector<")
-    b_vec = b_ty.startswith("vector<")
+    a_vec = isinstance(a_ty, Vector)
+    b_vec = isinstance(b_ty, Vector)
     if a_vec and b_vec:
-        a_shape, _ = _vector_shape_elem_type(a_ty)
-        b_shape, _ = _vector_shape_elem_type(b_ty)
-        if a_shape != b_shape:
+        if a_ty.shape() != b_ty.shape():
             raise TypeError(f"{op} vector shapes must match: {a_ty} vs {b_ty}")
     if a_vec:
         return a_ty
@@ -115,17 +33,17 @@ def _elementwise_binary_result_type(a_ty: str, b_ty: str, op: str) -> str:
     return a_ty
 
 
-def _elementwise_compare_result_type(a_ty: str, b_ty: str, op: str) -> str:
+def _elementwise_compare_result_type(a_ty: Data, b_ty: Data, op: str) -> Data:
     value_ty = _elementwise_binary_result_type(a_ty, b_ty, op)
-    if value_ty.startswith("vector<"):
-        return _vector_map_to_i1(value_ty)
-    return "i1"
+    if isinstance(value_ty, Vector):
+        return Vector.from_shape(value_ty.shape(), Bits(1))
+    return Bits(1)
 
 
 @dataclass(frozen=True)
 class Signal:
     ref: str
-    ty: str
+    ty: Data
 
     def __str__(self) -> str:
         return self.ref
@@ -179,10 +97,10 @@ class Module:
 
     # --- types ---
     def clock(self, name: str) -> Signal:
-        return self._arg(name, "!pyc.clock")
+        return self._arg(name, Opaque("!pyc.clock"))
 
     def reset(self, name: str) -> Signal:
-        return self._arg(name, "!pyc.reset")
+        return self._arg(name, Opaque("!pyc.reset"))
 
     def reset_active(self, rst: Signal) -> Signal:
         """Return i1 where **1** means reset is asserted (same convention as ``Tb.reset`` / SV TB)."""
@@ -190,12 +108,12 @@ class Module:
             raise TypeError("reset_active expects a !pyc.reset signal (use m.reset(...))")
         tmp = self._tmp()
         self._emit(f"{tmp} = pyc.reset_active {rst.ref} : i1")
-        return Signal(ref=tmp, ty="i1")
+        return Signal(ref=tmp, ty=Bits(1))
 
-    def i(self, width: int) -> str:
+    def i(self, width: int) -> Bits:
         if width <= 0:
             raise ValueError("width must be > 0")
-        return f"i{int(width)}"
+        return Bits(int(width))
 
     def input(
         self,
@@ -215,10 +133,9 @@ class Module:
             raise ValueError("shape entries must be all int and all > 0")
 
         if not dims:
-            ty = f"i{width_i}"
+            ty: Data = Bits(width_i)
         else:
-            lanes = "x".join(str(d) for d in dims)
-            ty = f"vector<{lanes}xi{width_i}>"
+            ty = Vector.from_shape(dims, Bits(width_i))
         return self._arg(name, ty)
 
     def output(self, name: str, value: Signal) -> None:
@@ -265,27 +182,23 @@ class Module:
 
     def mux(self, sel: Signal, a: Signal, b: Signal) -> Signal:
         # Allow one vector + one scalar arm (scalar implicitly broadcasts).
-        a_is_vec = a.ty.startswith("vector<")
-        b_is_vec = b.ty.startswith("vector<")
+        a_is_vec = isinstance(a.ty, Vector)
+        b_is_vec = isinstance(b.ty, Vector)
         if a_is_vec and b_is_vec:
             self._require_same_ty(a, b, "mux")
         elif a_is_vec and not b_is_vec:
-            _av, _ae = _vector_shape_elem_type(a.ty)
-            if _ae != b.ty:
-                raise TypeError(f"mux scalar arm width must match vector element: {b.ty} vs {_ae}")
+            if a.ty.datatype() != b.ty:
+                raise TypeError(f"mux scalar arm width must match vector element: {b.ty} vs {a.ty.datatype()}")
         elif b_is_vec and not a_is_vec:
-            _bv, _be = _vector_shape_elem_type(b.ty)
-            if _be != a.ty:
-                raise TypeError(f"mux scalar arm width must match vector element: {a.ty} vs {_be}")
+            if b.ty.datatype() != a.ty:
+                raise TypeError(f"mux scalar arm width must match vector element: {a.ty} vs {b.ty.datatype()}")
         else:
             self._require_same_ty(a, b, "mux")
         if sel.ty == "i1":
             pass
-        elif sel.ty.startswith("vector<") and (a_is_vec or b_is_vec):
-            sel_shape, sel_elem_ty = _vector_shape_elem_type(sel.ty)
+        elif isinstance(sel.ty, Vector) and (a_is_vec or b_is_vec):
             vec_ty = a.ty if a_is_vec else b.ty
-            vec_shape, _vec_elem_ty = _vector_shape_elem_type(vec_ty)
-            if sel_elem_ty != "i1" or sel_shape != vec_shape:
+            if sel.ty.datatype() != Bits(1) or sel.ty.shape() != vec_ty.shape():
                 raise TypeError(f"mux vector sel must be vector<...xi1> with a/b shape: {sel.ty} vs {vec_ty}")
         else:
             raise TypeError("mux sel must be i1 or same-shape vector<...xi1>")
@@ -318,41 +231,41 @@ class Module:
         return self._emit_elementwise_binary("slt", a, b, compare=True)
 
     def trunc(self, a: Signal, *, width: int) -> Signal:
-        if not _is_integer_or_vector_of_integer(a.ty):
+        if not isinstance(a.ty, (Bits, Vector)):
             raise TypeError("trunc requires an integer or vector-of-integer input")
-        out_ty = _map_vector_leaf_type(a.ty, self.i(width))
+        out_ty = Vector.from_shape(a.ty.shape(), Bits(width)) if isinstance(a.ty, Vector) else Bits(width)
         tmp = self._tmp()
         self._emit(f"{tmp} = pyc.trunc {a.ref} : {a.ty} -> {out_ty}")
         return Signal(ref=tmp, ty=out_ty)
 
     def zext(self, a: Signal, *, width: int) -> Signal:
-        if not _is_integer_or_vector_of_integer(a.ty):
+        if not isinstance(a.ty, (Bits, Vector)):
             raise TypeError("zext requires an integer or vector-of-integer input")
-        out_ty = _map_vector_leaf_type(a.ty, self.i(width))
+        out_ty = Vector.from_shape(a.ty.shape(), Bits(width)) if isinstance(a.ty, Vector) else Bits(width)
         tmp = self._tmp()
         self._emit(f"{tmp} = pyc.zext {a.ref} : {a.ty} -> {out_ty}")
         return Signal(ref=tmp, ty=out_ty)
 
     def sext(self, a: Signal, *, width: int) -> Signal:
-        if not _is_integer_or_vector_of_integer(a.ty):
+        if not isinstance(a.ty, (Bits, Vector)):
             raise TypeError("sext requires an integer or vector-of-integer input")
-        out_ty = _map_vector_leaf_type(a.ty, self.i(width))
+        out_ty = Vector.from_shape(a.ty.shape(), Bits(width)) if isinstance(a.ty, Vector) else Bits(width)
         tmp = self._tmp()
         self._emit(f"{tmp} = pyc.sext {a.ref} : {a.ty} -> {out_ty}")
         return Signal(ref=tmp, ty=out_ty)
 
     def extract(self, a: Signal, *, lsb: int, width: int) -> Signal:
-        if not a.ty.startswith("i"):
+        if not isinstance(a.ty, Bits):
             raise TypeError("extract requires an integer input")
         if lsb < 0:
             raise ValueError("extract lsb must be >= 0")
-        out_ty = self.i(width)
+        out_ty = Bits(width)
         tmp = self._tmp()
         self._emit(f"{tmp} = pyc.extract {a.ref} {{lsb = {int(lsb)}}} : {a.ty} -> {out_ty}")
         return Signal(ref=tmp, ty=out_ty)
 
     def shli(self, a: Signal, *, amount: int) -> Signal:
-        if not _is_integer_or_vector_of_integer(a.ty):
+        if not isinstance(a.ty, (Bits, Vector)):
             raise TypeError("shli requires an integer or vector-of-integer input")
         if amount < 0:
             raise ValueError("shli amount must be >= 0")
@@ -361,7 +274,7 @@ class Module:
         return Signal(ref=tmp, ty=a.ty)
 
     def lshri(self, a: Signal, *, amount: int) -> Signal:
-        if not _is_integer_or_vector_of_integer(a.ty):
+        if not isinstance(a.ty, (Bits, Vector)):
             raise TypeError("lshri requires an integer or vector-of-integer input")
         if amount < 0:
             raise ValueError("lshri amount must be >= 0")
@@ -370,7 +283,7 @@ class Module:
         return Signal(ref=tmp, ty=a.ty)
 
     def ashri(self, a: Signal, *, amount: int) -> Signal:
-        if not _is_integer_or_vector_of_integer(a.ty):
+        if not isinstance(a.ty, (Bits, Vector)):
             raise TypeError("ashri requires an integer or vector-of-integer input")
         if amount < 0:
             raise ValueError("ashri amount must be >= 0")
@@ -379,21 +292,21 @@ class Module:
         return Signal(ref=tmp, ty=a.ty)
 
     def shl(self, a: Signal, amount: Signal) -> Signal:
-        if not _is_integer_or_vector_of_integer(a.ty) or not amount.ty.startswith("i"):
+        if not isinstance(a.ty, (Bits, Vector)) or not isinstance(amount.ty, Bits):
             raise TypeError("shl requires integer or vector-of-integer input and scalar integer amount")
         tmp = self._tmp()
         self._emit(f"{tmp} = pyc.shl {a.ref}, {amount.ref} : {a.ty}, {amount.ty}")
         return Signal(ref=tmp, ty=a.ty)
 
     def lshr(self, a: Signal, amount: Signal) -> Signal:
-        if not _is_integer_or_vector_of_integer(a.ty) or not amount.ty.startswith("i"):
+        if not isinstance(a.ty, (Bits, Vector)) or not isinstance(amount.ty, Bits):
             raise TypeError("lshr requires integer or vector-of-integer input and scalar integer amount")
         tmp = self._tmp()
         self._emit(f"{tmp} = pyc.lshr {a.ref}, {amount.ref} : {a.ty}, {amount.ty}")
         return Signal(ref=tmp, ty=a.ty)
 
     def ashr(self, a: Signal, amount: Signal) -> Signal:
-        if not _is_integer_or_vector_of_integer(a.ty) or not amount.ty.startswith("i"):
+        if not isinstance(a.ty, (Bits, Vector)) or not isinstance(amount.ty, Bits):
             raise TypeError("ashr requires integer or vector-of-integer input and scalar integer amount")
         tmp = self._tmp()
         self._emit(f"{tmp} = pyc.ashr {a.ref}, {amount.ref} : {a.ty}, {amount.ty}")
@@ -404,37 +317,30 @@ class Module:
         if not inputs:
             raise ValueError("concat requires at least one input")
 
-        def w(ty: str) -> int:
-            if not ty.startswith("i"):
+        def w(ty: Data) -> int:
+            if not isinstance(ty, Bits):
                 raise TypeError("concat only supports integer types")
-            try:
-                return int(ty[1:])
-            except ValueError as e:
-                raise TypeError(f"invalid integer type: {ty!r}") from e
+            return ty.width
 
         out_w = sum(w(s.ty) for s in inputs)
-        out_ty = self.i(out_w)
+        out_ty = Bits(out_w)
         tmp = self._tmp()
         op_list = ", ".join(s.ref for s in inputs)
-        ty_list = ", ".join(s.ty for s in inputs)
+        ty_list = ", ".join(str(s.ty) for s in inputs)
         self._emit(f"{tmp} = pyc.concat ({op_list}) : ({ty_list}) -> {out_ty}")
         return Signal(ref=tmp, ty=out_ty)
 
     def v_create(self, elements: list[Signal]) -> Signal:
         if not elements:
             raise ValueError("v_create requires at least one element")
-        elem_ty = str(elements[0].ty)
+        first_ty = elements[0].ty
         for e in elements[1:]:
-            if str(e.ty) != elem_ty:
-                raise TypeError(f"v_create requires same element type, got {elem_ty} vs {e.ty}")
-        if elem_ty.startswith("vector<"):
-            shape, leaf_ty = _vector_shape_elem_type(elem_ty)
-            out_ty = _format_vector_type([len(elements), *shape], leaf_ty)
-        else:
-            out_ty = f"vector<{len(elements)}x{elem_ty}>"
+            if e.ty != first_ty:
+                raise TypeError(f"v_create requires same element type, got {first_ty} vs {e.ty}")
+        out_ty: Data = Vector(len(elements), first_ty)
         tmp = self._tmp()
         op_list = ", ".join(s.ref for s in elements)
-        ty_list = ", ".join(s.ty for s in elements)
+        ty_list = ", ".join(str(s.ty) for s in elements)
         self._emit(f"{tmp} = pyc.v_create ({op_list}) : ({ty_list}) -> {out_ty}")
         return Signal(ref=tmp, ty=out_ty)
 
@@ -442,7 +348,7 @@ class Module:
         lanes = int(size)
         if lanes <= 0:
             raise ValueError("v_broadcast size must be > 0")
-        out_ty = f"vector<{lanes}x{scalar.ty}>"
+        out_ty: Data = Vector(lanes, scalar.ty)
         tmp = self._tmp()
         self._emit(f"{tmp} = pyc.v_broadcast {scalar.ref} to {lanes} : {scalar.ty} -> {out_ty}")
         return Signal(ref=tmp, ty=out_ty)
@@ -453,34 +359,41 @@ class Module:
         d = int(dim)
         if lanes <= 0:
             raise ValueError("v_broadcast_dim size must be > 0")
-        shape, elem_ty = _vector_shape_elem_type(vec.ty)
+        if not isinstance(vec.ty, Vector):
+            raise TypeError(f"v_broadcast_dim expects a vector, got {vec.ty}")
+        shape = vec.ty.shape()
+        elem_ty = vec.ty.datatype()
         if d < 0 or d > len(shape):
             raise ValueError(f"v_broadcast_dim dim out of range: {d} for {vec.ty}")
         new_shape = list(shape)
         new_shape.insert(d, lanes)
-        out_ty = _format_vector_type(new_shape, elem_ty)
+        out_ty = Vector.from_shape(new_shape, elem_ty)
         tmp = self._tmp()
         self._emit(f"{tmp} = pyc.v_broadcast_dim {vec.ref} to {lanes}, {d} : {vec.ty} -> {out_ty}")
         return Signal(ref=tmp, ty=out_ty)
 
     def v_get(self, vec: Signal, *, index: int) -> Signal:
-        lanes, elem_ty = _vector_elem_type(vec.ty)
+        if not isinstance(vec.ty, Vector):
+            raise TypeError(f"v_get expects a vector, got {vec.ty}")
         idx = int(index)
-        if idx < 0 or idx >= lanes:
+        if idx < 0 or idx >= vec.ty.length:
             raise ValueError(f"v_get index out of range: {idx} for {vec.ty}")
         tmp = self._tmp()
-        self._emit(f"{tmp} = pyc.v_get {vec.ref} [{idx}] : {vec.ty} -> {elem_ty}")
+        self._emit(f"{tmp} = pyc.v_get {vec.ref} [{idx}] : {vec.ty} -> {vec.ty.elem}")
         self._vec_get_map[tmp] = (str(vec.ref), idx)
-        return Signal(ref=tmp, ty=elem_ty)
+        return Signal(ref=tmp, ty=vec.ty.elem)
 
     def _v_reduce(self, op: str, vec: Signal, *, dim: int | None = None, mode: str = "chain") -> Signal:
         reduce_mode = _normalize_reduce_mode(mode)
-        shape, elem_ty = _vector_shape_elem_type(vec.ty)
+        if not isinstance(vec.ty, Vector):
+            raise TypeError(f"{op} expects a vector, got {vec.ty}")
+        shape = vec.ty.shape()
+        elem_ty = vec.ty.datatype()
         reduce_dim = 0 if dim is None else int(dim)
         if reduce_dim < 0 or reduce_dim >= len(shape):
             raise ValueError(f"{op} dim out of range: {reduce_dim} for {vec.ty}")
         out_shape = [d for i, d in enumerate(shape) if i != reduce_dim]
-        out_ty = _format_vector_type(out_shape, elem_ty)
+        out_ty = elem_ty if not out_shape else Vector.from_shape(out_shape, elem_ty)
         tmp = self._tmp()
         attr_parts: list[str] = []
         if dim is not None:
@@ -504,7 +417,7 @@ class Module:
         self,
         callee: str,
         *inputs: Signal,
-        result_types: list[str],
+        result_types: list[Data | str],
         name: str | None = None,
         short_name: str | None = None,
         keep: bool = False,
@@ -520,7 +433,8 @@ class Module:
         out: list[Signal] = []
         for ty in result_types:
             tmp = self._tmp()
-            out.append(Signal(ref=tmp, ty=str(ty)))
+            dt = ty if isinstance(ty, Data) else Data.from_str(ty)
+            out.append(Signal(ref=tmp, ty=dt))
 
         lhs = ""
         if out:
@@ -539,14 +453,14 @@ class Module:
             attrs += ", pyc.debug_keep = true"
         attrs += "}"
 
-        in_ty_sig = ", ".join(s.ty for s in inputs)
+        in_ty_sig = ", ".join(str(s.ty) for s in inputs)
         in_sig = f"({in_ty_sig})"
         if len(out) == 0:
             out_sig = "()"
         elif len(out) == 1:
-            out_sig = out[0].ty
+            out_sig = str(out[0].ty)
         else:
-            out_ty_sig = ", ".join(s.ty for s in out)
+            out_ty_sig = ", ".join(str(s.ty) for s in out)
             out_sig = f"({out_ty_sig})"
 
         if ops:
@@ -629,7 +543,7 @@ class Module:
             f"{in_ready}, {out_valid}, {out_data} = pyc.fifo {clk.ref}, {rst.ref}, {in_valid.ref}, {in_data.ref}, {out_ready.ref} "
             + f'{{depth = {int(depth)}}} : {in_data.ty}'
         )
-        return Signal(in_ready, "i1"), Signal(out_valid, "i1"), Signal(out_data, in_data.ty)
+        return Signal(in_ready, Bits(1)), Signal(out_valid, Bits(1)), Signal(out_data, in_data.ty)
 
     def byte_mem(
         self,
@@ -653,9 +567,9 @@ class Module:
             raise TypeError("byte_mem wvalid must be i1")
         if raddr.ty != waddr.ty:
             raise TypeError("byte_mem raddr/waddr must have the same type")
-        if wdata.ty != "i64" and not wdata.ty.startswith("i"):
+        if wdata.ty != "i64" and not isinstance(wdata.ty, Bits):
             raise TypeError("byte_mem wdata must be an integer type")
-        if wstrb.ty != "i8" and not wstrb.ty.startswith("i"):
+        if wstrb.ty != "i8" and not isinstance(wstrb.ty, Bits):
             raise TypeError("byte_mem wstrb must be an integer type")
         if depth <= 0:
             raise ValueError("byte_mem depth must be > 0")
@@ -778,7 +692,7 @@ class Module:
             f"{in_ready}, {out_valid}, {out_data} = pyc.async_fifo {in_clk.ref}, {in_rst.ref}, {out_clk.ref}, {out_rst.ref}, "
             + f"{in_valid.ref}, {in_data.ref}, {out_ready.ref} {{depth = {int(depth)}}} : {in_data.ty}"
         )
-        return Signal(in_ready, "i1"), Signal(out_valid, "i1"), Signal(out_data, in_data.ty)
+        return Signal(in_ready, Bits(1)), Signal(out_valid, Bits(1)), Signal(out_data, in_data.ty)
 
     def cdc_sync(self, clk: Signal, rst: Signal, a: Signal, *, stages: int | None = None) -> Signal:
         if clk.ty != "!pyc.clock":
@@ -805,11 +719,6 @@ class Module:
             raise RuntimeError("indent underflow")
         self._indent_level -= 1
 
-    def index_const(self, value: int) -> Signal:
-        tmp = self._tmp()
-        self._emit(f"{tmp} = arith.constant {int(value)} : index")
-        return Signal(ref=tmp, ty="index")
-
     # --- emission ---
     def emit_func_mlir(self) -> str:
         if not self._finalized:
@@ -826,8 +735,8 @@ class Module:
             res_sig = f"-> {res_types[0]}"
             ret_ty = res_types[0]
         else:
-            res_sig = f"-> ({', '.join(res_types)})"
-            ret_ty = ", ".join(res_types)
+            res_sig = f"-> ({', '.join(str(t) for t in res_types)})"
+            ret_ty = ", ".join(str(t) for t in res_types)
         in_names = ", ".join(f"\"{n}\"" for n, _ in self._args)
         out_names = ", ".join(f"\"{n}\"" for n, _ in self._results)
         extra = ""
@@ -855,7 +764,7 @@ class Module:
         self._finalizers.append(fn)
 
     # --- internals ---
-    def _arg(self, name: str, ty: str) -> Signal:
+    def _arg(self, name: str, ty: Data) -> Signal:
         ref = f"%{name}"
         s = Signal(ref=ref, ty=ty)
         self._args.append((name, s))

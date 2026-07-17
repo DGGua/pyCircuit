@@ -21,6 +21,7 @@ from .connectors import (
     is_connector_bundle,
     is_connector_struct,
 )
+from .data import Bits, Data, Opaque, Vector
 from .design import DesignError
 from .dsl import Module, Signal
 from .literals import LiteralValue, infer_literal_width
@@ -51,13 +52,10 @@ def _normalize_reduce_mode(mode: str) -> _ReduceMode:
     return mode
 
 
-def _int_width(ty: str) -> int:
-    if not ty.startswith("i"):
+def _int_width(ty: Data) -> int:
+    if not isinstance(ty, Bits):
         raise TypeError(f"expected integer type iN, got {ty!r}")
-    w = int(ty[1:])
-    if w <= 0:
-        raise ValueError(f"invalid integer width: {ty!r}")
-    return w
+    return ty.width
 
 
 def _removed_design_api(name: str, replacement: str) -> TypeError:
@@ -114,7 +112,7 @@ class Wire:
         return self.sig.ref
 
     @property
-    def ty(self) -> str:
+    def ty(self) -> Data:
         return self.sig.ty
 
     @property
@@ -494,7 +492,7 @@ class Reg:
         return self.q.ref
 
     @property
-    def ty(self) -> str:
+    def ty(self) -> Data:
         return self.q.ty
 
     @property
@@ -995,7 +993,7 @@ class Circuit(Module):
             return
 
         # Implicit integer resizing for convenience (zext smaller, trunc larger).
-        if dst_sig.ty.startswith("i") and src_sig.ty.startswith("i"):
+        if isinstance(dst_sig.ty, Bits) and isinstance(src_sig.ty, Bits):
             dst_w = _int_width(dst_sig.ty)
             src_w = _int_width(src_sig.ty)
             if src_w < dst_w:
@@ -1752,7 +1750,7 @@ class Circuit(Module):
                     sig_port_specs[pname] = {"kind": "clock"}
                 elif rv.ty == "!pyc.reset":
                     sig_port_specs[pname] = {"kind": "reset"}
-                elif rv.ty.startswith("i"):
+                elif isinstance(rv.ty, Bits):
                     sig_port_specs[pname] = {"kind": "wire", "ty": rv.ty, "signed": bool(getattr(c, "signed", False))}
                 else:
                     raise DesignError(f"instance port {pname!r}: unsupported signal type {rv.ty!r}")
@@ -1778,7 +1776,7 @@ class Circuit(Module):
                 parts.append("extra: " + ", ".join(extra))
             raise DesignError(f"instance port mismatch for {cm.sym_name!r} ({'; '.join(parts)})")
 
-        def coerce_to_sig(c: Connector, *, expected_ty: str, port: str) -> Signal:
+        def coerce_to_sig(c: Connector, *, expected_ty: Data, port: str) -> Signal:
             rv = c.read()
             if isinstance(rv, Vec):
                 info = rv._as_vector_signal()
@@ -1803,7 +1801,7 @@ class Circuit(Module):
                 return sig
 
             # Convenience: allow implicit integer resizing (zext/trunc) like `Circuit.assign`.
-            if sig.ty.startswith("i") and expected_ty.startswith("i"):
+            if isinstance(sig.ty, Bits) and isinstance(expected_ty, Bits):
                 got_w = _int_width(sig.ty)
                 exp_w = _int_width(expected_ty)
                 if got_w < exp_w:
@@ -1830,7 +1828,7 @@ class Circuit(Module):
         self._record_struct_instance()
         out_fields: dict[str, Connector] = {}
         for oname, sig in zip(cm.result_names, outs):
-            if sig.ty.startswith("vector<"):
+            if isinstance(sig.ty, Vector):
                 shape, _elem_ty = Vec._vector_shape_elem_type(sig.ty)
                 vec = Vec._from_vector_signal(self, sig, signs=[False for _ in range(shape[0])])
                 out_fields[oname] = VecConnector(owner=self, name=oname, vec=vec)
@@ -2376,9 +2374,9 @@ class Vec:
     # -- internal helpers -------------------------------------------------------
 
     @classmethod
-    def _vector_shape_elem_type(cls, ty: str) -> tuple[list[int], str]:
-        """从 MLIR 向量类型字符串解析 shape 和元素类型。
-        如 ``vector<4xi8>`` → ``([4], i8)``；``vector<4xvector<3xi8>>`` → ``([4, 3], i8)``。
+    def _vector_shape_elem_type(cls, ty: Data) -> tuple[list[int], Data]:
+        """从 MLIR 向量类型解析 shape 和元素类型。
+        如 ``vector<4xi8>`` → ``([4], Bits(8))``；``vector<4x3xi8>`` → ``([4, 3], Bits(8))``。
         维度是纯数字，从左边连续取；遇非数字段时剩余部分即元素类型。
         """
         raw = str(ty).strip()
@@ -2396,7 +2394,8 @@ class Vec:
             i += 1
         if i == 0 or i == len(parts):
             raise ValueError(f"invalid vector type: {ty!r}")
-        return dims, "x".join(parts[i:])
+        elem_str = "x".join(parts[i:])
+        return dims, Data.from_str(elem_str)
 
     @classmethod
     def _from_vector_signal(
@@ -2429,7 +2428,7 @@ class Vec:
         elems: list[Union[Wire, Vec]] = []
         for lane in range(shape[0]):
             lane_sig = m.v_get(sig, index=lane)
-            if lane_sig.ty.startswith("vector<"):
+            if isinstance(lane_sig.ty, Vector):
                 sub_shape, _ = cls._vector_shape_elem_type(lane_sig.ty)
                 sub_signs = [bool(signs[lane]) for _ in range(sub_shape[0])]
                 sub_elems = cls._elems_from_vector_signal(

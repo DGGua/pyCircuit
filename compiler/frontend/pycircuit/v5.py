@@ -15,6 +15,7 @@ import textwrap
 import threading
 from typing import Any, Callable, Iterable, Iterator, Mapping, TypeVar, Union
 
+from .data import Bits, Data, Vector
 from .dsl import Signal
 from .hw import Circuit, ClockDomain, Reg, Vec, Wire
 from .literals import LiteralValue, infer_literal_width
@@ -251,9 +252,9 @@ class CycleAwareDomain:
                 else:
                     actual_sig = _to_wire(actual).sig
 
-                if actual_sig.ty != port_sig.ty and actual_sig.ty.startswith("i") and port_sig.ty.startswith("i"):
-                    actual_w = int(actual_sig.ty[1:])
-                    expect_w = int(port_sig.ty[1:])
+                if actual_sig.ty != port_sig.ty and isinstance(actual_sig.ty, Bits) and isinstance(port_sig.ty, Bits):
+                    actual_w = actual_sig.ty.width
+                    expect_w = port_sig.ty.width
                     w = Wire(self._m, actual_sig)
                     if actual_w < expect_w:
                         w = w._zext(width=expect_w)
@@ -264,12 +265,12 @@ class CycleAwareDomain:
                     raise TypeError(f"input {port_name!r} type mismatch: actual {actual_sig.ty} != expected {port_sig.ty}")
                 input_sigs.append(actual_sig)
             else:
-                if port_sig.ty.startswith("vector<"):
+                if isinstance(port_sig.ty, Vector):
                     shape, elem_ty = Vec._vector_shape_elem_type(port_sig.ty)
-                    width = int(elem_ty[1:])
-                elif port_sig.ty.startswith("i"):
+                    width = elem_ty.width if isinstance(elem_ty, Bits) else 1
+                elif isinstance(port_sig.ty, Bits):
                     shape = None
-                    width = int(port_sig.ty[1:])
+                    width = port_sig.ty.width
                 else:
                     shape = None
                     width = 1
@@ -298,7 +299,7 @@ class CycleAwareDomain:
 
         out_values: list[Any] = []
         for sig in out_sigs:
-            if sig.ty.startswith("vector<"):
+            if isinstance(sig.ty, Vector):
                 shape, _elem_ty = Vec._vector_shape_elem_type(sig.ty)
                 out_values.append(Vec._from_vector_signal(self._m, sig, signs=[False for _ in range(shape[0])]))
             else:

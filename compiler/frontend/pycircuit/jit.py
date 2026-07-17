@@ -8,6 +8,7 @@ from typing import Any, Hashable, Mapping, get_args, get_origin
 
 from .api_contract import removed_call_diagnostic
 from .connectors import Connector, ConnectorBundle, is_connector, is_connector_bundle
+from .data import Bits, Data
 from .diagnostics import Diagnostic, make_diagnostic, render_diagnostic, snippet_from_text
 from .dsl import Signal
 from .hw import (
@@ -261,11 +262,11 @@ def _emit_scf_yield(m: Circuit, values: list[Wire]) -> None:
         m.emit_line("scf.yield")
         return
     refs = ", ".join(v.ref for v in values)
-    tys = ", ".join(v.ty for v in values)
+    tys = ", ".join(str(v.ty) for v in values)
     m.emit_line(f"scf.yield {refs} : {tys}")
 
 
-def _emit_scf_if_header(m: Circuit, results: list[str], cond: Wire, result_types: list[str]) -> None:
+def _emit_scf_if_header(m: Circuit, results: list[str], cond: Wire, result_types: list[Data]) -> None:
     if not results:
         m.emit_line(f"scf.if {cond.ref} {{")
         return
@@ -273,7 +274,7 @@ def _emit_scf_if_header(m: Circuit, results: list[str], cond: Wire, result_types
     if len(result_types) == 1:
         ty_sig = result_types[0]
     else:
-        ty_sig = f"({', '.join(result_types)})"
+        ty_sig = f"({', '.join(str(t) for t in result_types)})"
     m.emit_line(f"{res_lhs} = scf.if {cond.ref} -> {ty_sig} {{")
 
 
@@ -334,18 +335,21 @@ class _Compiler:
         self._value_param_types: dict[str, str] = dict(value_param_types or {})
 
     @staticmethod
-    def _ty_width(ty: str) -> int:
-        if not ty.startswith("i"):
+    def _ty_width(ty: "str | Data") -> int:
+        if isinstance(ty, Bits):
+            return ty.width
+        raw = str(ty).strip()
+        if not raw.startswith("i"):
             raise JitError(f"expected integer type iN, got {ty!r}")
         try:
-            w = int(ty[1:])
+            w = int(raw[1:])
         except ValueError as e:
             raise JitError(f"invalid integer type: {ty!r}") from e
         if w <= 0:
             raise JitError(f"invalid integer width in type: {ty!r}")
         return w
 
-    def _coerce_to_type(self, v: Any, *, expected_ty: str, ctx: str) -> Wire:
+    def _coerce_to_type(self, v: Any, *, expected_ty: "str | Data", ctx: str) -> Wire:
         """Coerce a value into a Wire of `expected_ty` (ints become constants)."""
         if isinstance(v, Connector):
             v = v.read()
@@ -370,8 +374,8 @@ class _Compiler:
         if w.ty == expected_ty:
             return w
 
-        if w.ty.startswith("i") and expected_ty.startswith("i"):
-            ew = self._ty_width(expected_ty)
+        if isinstance(w.ty, Bits) and isinstance(expected_ty, Bits):
+            ew = expected_ty.width
             if w.width < ew:
                 return w._sext(width=ew) if w.signed else w._zext(width=ew)
             if w.width > ew:
@@ -1616,7 +1620,7 @@ class _Compiler:
                 self.m._lines = saved_lines  # noqa: SLF001
             return local_lines
 
-        def value_ty(v: Any) -> str | None:
+        def value_ty(v: Any) -> Data | None:
             if isinstance(v, Reg):
                 v = v.q
             if isinstance(v, Wire):
@@ -1624,7 +1628,7 @@ class _Compiler:
             if isinstance(v, Signal):
                 return v.ty
             if isinstance(v, LiteralValue) and v.width is not None:
-                return f"i{int(v.width)}"
+                return Bits(int(v.width))
             return None
 
         def int_width(v: int) -> int:
@@ -1683,7 +1687,7 @@ class _Compiler:
 
         phi_vars = list(assigned)
 
-        expected_types: list[str] = []
+        expected_types: list[Data] = []
         for name in phi_vars:
             pre_v = pre_env.get(name)
             if isinstance(pre_v, Wire):
@@ -1707,8 +1711,8 @@ class _Compiler:
                 if then_ty == else_ty:
                     expected_types.append(then_ty)
                     continue
-                if then_ty.startswith("i") and else_ty.startswith("i"):
-                    expected_types.append(f"i{max(self._ty_width(then_ty), self._ty_width(else_ty))}")
+                if isinstance(then_ty, Bits) and isinstance(else_ty, Bits):
+                    expected_types.append(Bits(max(self._ty_width(then_ty), self._ty_width(else_ty))))
                     continue
                 raise JitError(f"if assigns {name!r} with incompatible types: {then_ty} vs {else_ty}")
 
@@ -1725,7 +1729,7 @@ class _Compiler:
             tv_i = int(tv.value) if isinstance(tv, LiteralValue) else int(tv)
             ev_i = int(ev.value) if isinstance(ev, LiteralValue) else int(ev)
             w = max(int_width(tv_i), int_width(ev_i))
-            expected_types.append(f"i{w}")
+            expected_types.append(Bits(w))
 
         results: list[str] = []
         if phi_vars:
@@ -2049,15 +2053,12 @@ def compile_module(
             if not ty.startswith("vector<"):
                 raise JitError(f"invalid vector type in signature-bound port {p.name!r}: {ty!r}")
             try:
-                shape, elem_ty = Vec._vector_shape_elem_type(ty)
+                shape, elem_ty = Vec._vector_shape_elem_type(Data.from_str(ty))
             except ValueError as e:
                 raise JitError(f"invalid vector type in signature-bound port {p.name!r}: {ty!r}") from e
-            if not elem_ty.startswith("i"):
+            if not isinstance(elem_ty, Bits):
                 raise JitError(f"invalid vector element type in signature-bound port {p.name!r}: {elem_ty!r}")
-            try:
-                width = int(elem_ty[1:])
-            except ValueError as e:
-                raise JitError(f"invalid vector element width in signature-bound port {p.name!r}: {elem_ty!r}") from e
+            width = elem_ty.width
             if width <= 0:
                 raise JitError(f"invalid vector element width in signature-bound port {p.name!r}: {elem_ty!r}")
             signed_raw = spec.get("signed", False)
