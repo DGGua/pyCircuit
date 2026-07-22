@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 import hashlib
 import inspect
 import json
-from typing import Any, Iterable, Iterator, Mapping, Union, overload
+from typing import Any, Iterable, Iterator, Literal, Mapping, Protocol, Union, overload
 
 from .connectors import (
     Connector,
@@ -15,6 +15,7 @@ from .connectors import (
     ModuleCollectionHandle,
     ModuleInstanceHandle,
     RegConnector,
+    VecConnector,
     WireConnector,
     is_connector,
     is_connector_bundle,
@@ -41,6 +42,13 @@ _VEC_BINARY_METHODS: dict[str, str] = {
     "slt": "slt",
 }
 _VEC_COMPARE_OPS = {"eq", "ult", "slt"}
+_ReduceMode = Literal["chain", "tree"]
+
+
+def _normalize_reduce_mode(mode: str) -> _ReduceMode:
+    if mode not in ("chain", "tree"):
+        raise ValueError(f"reduce mode must be 'chain' or 'tree', got {mode!r}")
+    return mode
 
 
 def _int_width(ty: str) -> int:
@@ -1183,7 +1191,7 @@ class Circuit(Module):
 
     def as_connector(
         self,
-        value: Union[Connector, Wire, Reg, Signal, LiteralValue, int],
+        value: Union[Connector, Wire, Reg, Signal, LiteralValue, int, "Vec"],
         *,
         name: str | None = None,
     ) -> Connector:
@@ -1199,6 +1207,14 @@ class Circuit(Module):
             if value.m is not self:
                 raise ConnectorError("wire belongs to a different Circuit")
             return WireConnector(owner=self, name=str(name or value.ref), wire=value)
+        if isinstance(value, Vec):
+            info = value._as_vector_signal()
+            if info is None:
+                raise ConnectorError("Vec cannot be converted to a vector signal")
+            vec_m, _vec_sig, _vec_signs = info
+            if vec_m is not self:
+                raise ConnectorError("Vec belongs to a different Circuit")
+            return VecConnector(owner=self, name=str(name or "vec"), vec=value)
         if isinstance(value, Signal):
             return WireConnector(owner=self, name=str(name or value.ref), wire=value)
         if isinstance(value, LiteralValue):
@@ -1209,7 +1225,7 @@ class Circuit(Module):
             ww = infer_literal_width(int(value), signed=(int(value) < 0))
             w = self.const(int(value), width=ww)
             return WireConnector(owner=self, name=str(name or f"lit_{int(value)}"), wire=w)
-        raise ConnectorError(f"expected Connector/Wire/Reg/Signal/int/literal, got {type(value).__name__}")
+        raise ConnectorError(f"expected Connector/Wire/Reg/Vec/Signal/int/literal, got {type(value).__name__}")
 
     def input_connector(self, name: str, *, width: int, signed: bool = False) -> WireConnector:
         w = self.input(str(name), width=width, signed=signed)
@@ -1651,7 +1667,7 @@ class Circuit(Module):
         except Exception as e:  # noqa: BLE001
             raise DesignError(
                 f"instance port {port!r}: unsupported value {type(v).__name__}; "
-                "expected Connector/Wire/Reg/Signal/int/literal"
+                "expected Connector/Wire/Reg/Vec/Signal/int/literal"
             ) from e
 
     def instance_handle(
@@ -1713,6 +1729,19 @@ class Circuit(Module):
 
             c = normalized_ports[pname]
             rv = c.read()
+            if isinstance(rv, Vec):
+                info = rv._as_vector_signal()
+                if info is None:
+                    raise DesignError(f"instance port {pname!r}: Vec cannot be converted to a vector signal")
+                rv_m, rv_sig, rv_signs = info
+                if rv_m is not self:
+                    raise DesignError(f"instance port {pname!r}: cannot connect a Vec from a different module")
+                sig_port_specs[pname] = {
+                    "kind": "vec",
+                    "ty": rv_sig.ty,
+                    "signed": [bool(s) for s in rv_signs],
+                }
+                continue
             if isinstance(rv, Wire):
                 if rv.m is not self:
                     raise DesignError(f"instance port {pname!r}: cannot connect a wire from a different module")
@@ -1751,7 +1780,15 @@ class Circuit(Module):
 
         def coerce_to_sig(c: Connector, *, expected_ty: str, port: str) -> Signal:
             rv = c.read()
-            if isinstance(rv, Wire):
+            if isinstance(rv, Vec):
+                info = rv._as_vector_signal()
+                if info is None:
+                    raise DesignError(f"instance port {port!r}: Vec cannot be converted to a vector signal")
+                rv_m, sig, _rv_signs = info
+                if rv_m is not self:
+                    raise DesignError(f"instance port {port!r}: cannot connect a Vec from a different module")
+                src_signed = False
+            elif isinstance(rv, Wire):
                 if rv.m is not self:
                     raise DesignError(f"instance port {port!r}: cannot connect a wire from a different module")
                 sig = rv.sig
@@ -1793,7 +1830,12 @@ class Circuit(Module):
         self._record_struct_instance()
         out_fields: dict[str, Connector] = {}
         for oname, sig in zip(cm.result_names, outs):
-            out_fields[oname] = WireConnector(owner=self, name=oname, wire=Wire(self, sig))
+            if sig.ty.startswith("vector<"):
+                shape, _elem_ty = Vec._vector_shape_elem_type(sig.ty)
+                vec = Vec._from_vector_signal(self, sig, signs=[False for _ in range(shape[0])])
+                out_fields[oname] = VecConnector(owner=self, name=oname, vec=vec)
+            else:
+                out_fields[oname] = WireConnector(owner=self, name=oname, wire=Wire(self, sig))
         force_bundle = False
         try:
             ann = inspect.signature(cm.fn).return_annotation
@@ -2100,31 +2142,44 @@ def _shift_amount_wire(m: Module, amount: Any) -> Wire | None:
 
 
 
+class _CycleAwareDomainLike(Protocol):
+    def delay_to(self, w: Wire, *, from_cycle: int, to_cycle: int, width: int) -> Wire:
+        ...
+
+
 @dataclass(frozen=True)
 class Vec:
     """A small fixed-length container of wires/regs for building pipelines."""
 
     elems: list[Union[Wire, Reg, "Vec"]]
-    _vector_module: Module | None = None
-    _vector_sig: Signal | None = None
-    _vector_signs: list[bool] | None = None
-    _lane_cache: dict[int, Union[Wire, "Vec"]] = field(default_factory=dict, compare=False)
+    m: Module | None = None
+    sig: Signal | None = None
+    signed: list[bool] | None = None
+    domain: _CycleAwareDomainLike | None = None
+    cycle: int | None = None
+    _assign_elems: list[Any] | None = field(default=None, repr=False, compare=False)
+
+    @staticmethod
+    def _cycle_aware_init_elem(e: Any) -> tuple[Wire, _CycleAwareDomainLike, int] | None:
+        cas = getattr(e, "_cas", e)
+        w = getattr(cas, "_w", None)
+        domain = getattr(cas, "_domain", None)
+        cycle = getattr(cas, "_cycle", None)
+        if isinstance(w, Wire) and domain is not None and cycle is not None:
+            return w, domain, int(cycle)
+        return None
 
     @staticmethod
     def _normalize_init_elem(e: Any) -> Union[Wire, Reg, "Vec"]:
         if isinstance(e, (Wire, Reg, Vec)):
             return e
 
-        # Accept cycle-aware wrappers only when they denote the current-cycle
-        # value.  Reg is intentionally left untouched; Vec([reg]) should still
-        # expose Reg elements rather than silently rewriting them to reg.q.
-        cas = getattr(e, "_cas", e)
-        w = getattr(cas, "_w", None)
-        cycle = getattr(cas, "_cycle", None)
-        if isinstance(w, Wire) and cycle is not None:
-            if int(cycle) != 0:
-                raise ValueError(f"Vec only accepts cycle-aware signals at cycle=0, got cycle={int(cycle)}")
-            return w
+        # Accept cycle-aware wrappers as lane values. Reg is intentionally left
+        # untouched; Vec([reg]) should still expose Reg elements rather than
+        # silently rewriting them to reg.q.
+        cycle_aware = Vec._cycle_aware_init_elem(e)
+        if cycle_aware is not None:
+            return cycle_aware[0]
 
         return e
 
@@ -2134,32 +2189,85 @@ class Vec:
                 object.__setattr__(self, "elems", list(self.elems))
             except TypeError as e:
                 raise TypeError("Vec expects an iterable of elements") from e
+        if self._assign_elems is None:
+            object.__setattr__(self, "_assign_elems", list(self.elems))
+        cycles: list[int] = []
+        domains: list[_CycleAwareDomainLike] = []
+        raw_cycleless = 0
+        for e in self.elems:
+            info = self._cycle_aware_init_elem(e)
+            if info is not None:
+                _w, domain, cycle = info
+                domains.append(domain)
+                cycles.append(cycle)
+            elif isinstance(e, Vec) and e._is_cycle_aware():
+                domains.append(e.domain)
+                cycles.append(int(e.cycle))
+            elif isinstance(e, (Wire, Reg, Vec)):
+                raw_cycleless += 1
+        if (self.domain is None) != (self.cycle is None):
+            raise ValueError("Vec cycle metadata requires both domain and cycle")
+        if cycles and raw_cycleless:
+            raise ValueError("Vec cannot mix cycle-aware elements with raw Wire/Reg/Vec elements")
+        if cycles and any(cycle != cycles[0] for cycle in cycles[1:]):
+            raise ValueError(f"Vec cycle-aware elements must have the same cycle, got cycles={cycles}")
+        if domains and any(domain is not domains[0] for domain in domains[1:]):
+            raise ValueError("Vec cycle-aware elements must belong to the same domain")
+        if cycles:
+            if self.domain is not None and self.domain is not domains[0]:
+                raise ValueError("Vec explicit domain must match cycle-aware elements")
+            if self.cycle is not None and int(self.cycle) != cycles[0]:
+                raise ValueError("Vec explicit cycle must match cycle-aware elements")
+            object.__setattr__(self, "domain", domains[0])
+            object.__setattr__(self, "cycle", cycles[0])
+        elif self.cycle is not None:
+            object.__setattr__(self, "cycle", int(self.cycle))
         object.__setattr__(self, "elems", [self._normalize_init_elem(e) for e in self.elems])
 
-        if self._vector_sig is not None:
-            if self._vector_module is None:
-                raise ValueError("vector-backed Vec requires a module")
-            if self._vector_signs is None:
-                raise ValueError("vector-backed Vec requires lane signedness")
-            shape, _ = self._vector_shape_elem_type(self._vector_sig.ty)
-            if shape[0] != len(self._vector_signs):
-                raise ValueError("vector-backed Vec lane count must match vector type")
-            if self.elems:
-                raise ValueError("vector-backed Vec must not also store eager elements")
+        if self.sig is not None:
+            if self.m is None:
+                raise ValueError("Vec with sig requires a module")
+            if self.signed is None:
+                raise ValueError("Vec with sig requires lane signedness")
+            shape, _ = self._vector_shape_elem_type(self.sig.ty)
+            if shape[0] != len(self.signed):
+                raise ValueError("Vec lane count must match vector type")
+            if not self.elems:
+                object.__setattr__(
+                    self,
+                    "elems",
+                    self._elems_from_vector_signal(
+                        self.m,
+                        self.sig,
+                        signs=list(self.signed),
+                        domain=self.domain,
+                        cycle=self.cycle,
+                    ),
+                )
+            elif len(self.elems) != shape[0]:
+                raise ValueError("Vec elems length must match vector outer dimension")
+            for e in self.elems:
+                if self._module_of(e) is not self.m:
+                    raise ValueError("Vec elems module must match sig module")
             return
 
         if not self.elems:
             raise ValueError("Vec cannot be empty")
 
-        first = self.elems[0]
-        if isinstance(first, Vec):
-            return  # nested Vec — defer module check to innermost Vec
-        m0 = self._module_of(first)
+        m0 = self._module_of(self.elems[0])
         for e in self.elems[1:]:
-            if isinstance(e, Vec):
-                continue
             if self._module_of(e) is not m0:
                 raise ValueError("Vec elements must belong to the same Circuit/Module")
+        if self.m is None:
+            object.__setattr__(self, "m", m0)
+        elif self.m is not m0:
+            raise ValueError("Vec module must match element module")
+        info = self._try_build_vector_sig_from_elems()
+        if info is not None:
+            m, sig, signs = info
+            object.__setattr__(self, "m", m)
+            object.__setattr__(self, "sig", sig)
+            object.__setattr__(self, "signed", signs)
 
     @staticmethod
     def _module_of(e: Union[Wire, Reg, "Vec"]) -> Module:
@@ -2167,22 +2275,14 @@ class Vec:
             return e.m
         if isinstance(e, Reg):
             return e.q.m
-        return e.m  # fallback (Vec or other with .m)
-
-    @property
-    def m(self) -> Module:
-        if self._vector_module is not None:
-            return self._vector_module
-        return self._module_of(self.elems[0])
+        if e.m is None:
+            return e._module_of(e.elems[0])
+        return e.m
 
     def __len__(self) -> int:
-        if self._vector_sig is not None:
-            return len(self._vector_signs or [])
         return len(self.elems)
 
-    def __iter__(self) -> Iterator[Union[Wire, Reg]]:
-        if self._vector_sig is not None:
-            return iter([self[i] for i in range(len(self))])
+    def __iter__(self) -> Iterator[Union[Wire, Reg, Vec]]:
         return iter(self.elems)
 
     @overload
@@ -2195,12 +2295,24 @@ class Vec:
     def __getitem__(self, idx: tuple[int | slice, ...]) -> Union[Wire, Reg, "Vec"]: ...
 
     def __getitem__(self, idx: int | slice | tuple[int | slice, ...]) -> Union[Wire, Reg, "Vec"]:
-        if self._vector_sig is not None:
+        if self.elems:
             if isinstance(idx, tuple):
                 if len(idx) == 0:
                     return self
                 head, *tail = idx
-                elem = self[head]
+                if isinstance(head, slice):
+                    selected = self.elems[head]
+                    if not tail:
+                        return Vec(selected, domain=self.domain, cycle=self.cycle)
+                    rest: int | slice | tuple[int | slice, ...]
+                    rest = tuple(tail) if len(tail) > 1 else tail[0]
+                    out: list[Union[Wire, Reg, Vec]] = []
+                    for e in selected:
+                        if not isinstance(e, Vec):
+                            raise TypeError("tuple indexing into nested dimensions requires Vec elements")
+                        out.append(e[rest])
+                    return Vec(out, domain=self.domain, cycle=self.cycle)
+                elem = self.elems[int(head)]
                 if not tail:
                     return elem
                 if not isinstance(elem, Vec):
@@ -2208,54 +2320,58 @@ class Vec:
                 rest = tuple(tail) if len(tail) > 1 else tail[0]
                 return elem[rest]
             if isinstance(idx, slice):
-                return Vec([self[i] for i in range(len(self))[idx]])
-            lane = int(idx)
-            if lane < 0:
-                lane += len(self)
-            if lane < 0 or lane >= len(self):
-                raise IndexError("Vec index out of range")
-            cached = self._lane_cache.get(lane)
-            if cached is not None:
-                return cached
-            assert self._vector_sig is not None
-            assert self._vector_signs is not None
-            lane_sig = self.m.v_get(self._vector_sig, index=lane)
-            if lane_sig.ty.startswith("vector<"):
-                shape, _elem_ty = self._vector_shape_elem_type(lane_sig.ty)
-                sub_signs = [bool(self._vector_signs[lane]) for _ in range(shape[0])]
-                sub_vec = self._from_vector_signal(self.m, lane_sig, signs=sub_signs)
-                self._lane_cache[lane] = sub_vec
-                return sub_vec
-            wire = Wire(self.m, lane_sig, signed=bool(self._vector_signs[lane]))
-            self._lane_cache[lane] = wire
-            return wire
+                return Vec(self.elems[idx], domain=self.domain, cycle=self.cycle)
+            return self.elems[int(idx)]
 
-        if isinstance(idx, tuple):
-            if len(idx) == 0:
-                return self
-            head, *tail = idx
-            if isinstance(head, slice):
-                selected = self.elems[head]
-                if not tail:
-                    return Vec(selected)
-                rest: int | slice | tuple[int | slice, ...]
-                rest = tuple(tail) if len(tail) > 1 else tail[0]
-                out: list[Union[Wire, Reg, Vec]] = []
-                for e in selected:
-                    if not isinstance(e, Vec):
-                        raise TypeError("tuple indexing into nested dimensions requires Vec elements")
-                    out.append(e[rest])
-                return Vec(out)
-            elem = self.elems[int(head)]
-            if not tail:
-                return elem
-            if not isinstance(elem, Vec):
-                raise TypeError("tuple indexing into nested dimensions requires Vec elements")
-            rest = tuple(tail) if len(tail) > 1 else tail[0]
-            return elem[rest]
-        if isinstance(idx, slice):
-            return Vec(self.elems[idx])
-        return self.elems[int(idx)]
+        raise IndexError("Vec index out of range")
+
+    def _broadcast_assign_arg(self, value: Any, *, arg_name: str) -> list[Any]:
+        if isinstance(value, Vec):
+            if len(value) != len(self):
+                raise ValueError(f"Vec.assign {arg_name} length mismatch: {len(value)} != {len(self)}")
+            return list(value)
+        if isinstance(value, (list, tuple)):
+            if len(value) != len(self):
+                raise ValueError(f"Vec.assign {arg_name} length mismatch: {len(value)} != {len(self)}")
+            return list(value)
+        return [value for _ in range(len(self))]
+
+    @staticmethod
+    def _assign_one(dst: Any, src: Any, when: Any | None) -> None:
+        if isinstance(dst, Vec):
+            dst.assign(src, when=when)
+            return
+        if hasattr(dst, "assign"):
+            if when is None:
+                dst.assign(src)
+            else:
+                dst.assign(src, when=when)
+            return
+        if hasattr(dst, "set"):
+            if when is None:
+                dst.set(src)
+            else:
+                dst.set(src, when=when)
+            return
+        raise TypeError(f"Vec.assign target lane is not assignable: {type(dst).__name__}")
+
+    def assign(self, value: Any, *, when: Any | None = None) -> "Vec":
+        """Lane-wise assignment into a list-backed Vec of assignable lanes.
+
+        ``dst.assign(src, when=mask)`` is equivalent to assigning each lane:
+        ``dst[i].assign(src[i], when=mask[i])``.  ``src`` and ``when`` may be
+        Vec/list values of matching length or scalars broadcast to all lanes.
+        Vector-backed expression Vecs are read-only and fail per lane because
+        their lanes are plain ``Wire`` read views.
+        """
+        targets = self._assign_elems
+        if targets is None or len(targets) != len(self):
+            raise TypeError("Vec.assign requires a list-backed Vec")
+        values = self._broadcast_assign_arg(value, arg_name="value")
+        whens = [None for _ in range(len(self))] if when is None else self._broadcast_assign_arg(when, arg_name="when")
+        for dst, src, cond in zip(targets, values, whens):
+            self._assign_one(dst, src, cond)
+        return self
 
     # -- internal helpers -------------------------------------------------------
 
@@ -2283,9 +2399,50 @@ class Vec:
         return dims, "x".join(parts[i:])
 
     @classmethod
-    def _from_vector_signal(cls, m: Module, sig: Signal, *, signs: list[bool]) -> "Vec":
-        """从底层向量 Signal 构造惰性 Vec（elems 为空，按需提取 lane）。"""
-        return cls([], _vector_module=m, _vector_sig=sig, _vector_signs=list(signs))
+    def _from_vector_signal(
+        cls,
+        m: Module,
+        sig: Signal,
+        *,
+        signs: list[bool],
+        domain: _CycleAwareDomainLike | None = None,
+        cycle: int | None = None,
+    ) -> "Vec":
+        """从底层向量 Signal 构造 Vec，同时保留 Python lane-list 视图。"""
+        lane_signs = list(signs)
+        elems = cls._elems_from_vector_signal(m, sig, signs=lane_signs, domain=domain, cycle=cycle)
+        return cls(elems, m=m, sig=sig, signed=lane_signs, domain=domain, cycle=cycle)
+
+    @classmethod
+    def _elems_from_vector_signal(
+        cls,
+        m: Module,
+        sig: Signal,
+        *,
+        signs: list[bool],
+        domain: _CycleAwareDomainLike | None = None,
+        cycle: int | None = None,
+    ) -> list[Union[Wire, "Vec"]]:
+        shape, _elem_ty = cls._vector_shape_elem_type(sig.ty)
+        if shape[0] != len(signs):
+            raise ValueError("vector lane signs must match outer dimension")
+        elems: list[Union[Wire, Vec]] = []
+        for lane in range(shape[0]):
+            lane_sig = m.v_get(sig, index=lane)
+            if lane_sig.ty.startswith("vector<"):
+                sub_shape, _ = cls._vector_shape_elem_type(lane_sig.ty)
+                sub_signs = [bool(signs[lane]) for _ in range(sub_shape[0])]
+                sub_elems = cls._elems_from_vector_signal(
+                    m,
+                    lane_sig,
+                    signs=sub_signs,
+                    domain=domain,
+                    cycle=cycle,
+                )
+                elems.append(cls(sub_elems, m=m, sig=lane_sig, signed=sub_signs, domain=domain, cycle=cycle))
+            else:
+                elems.append(Wire(m, lane_sig, signed=bool(signs[lane])))
+        return elems
 
     @staticmethod
     def _wire_of(e: Union[Wire, Reg, "Vec"]) -> Wire:
@@ -2298,23 +2455,86 @@ class Vec:
 
     def _map1(self, fn: Callable[[Wire], Wire]) -> "Vec":
         """逐元素一元运算。元素可以是 Wire/Reg/Vec（嵌套递归）。"""
-        return Vec([fn(e) for e in self])
+        return Vec([fn(e) for e in self], domain=self.domain, cycle=self.cycle)
 
     def _map2(self, other: Any, fn: Callable[[Any, Any], Any]) -> "Vec":
         """逐元素二元运算。fn 直接作用于元素，Python 运算符分发自动处理嵌套 Vec。"""
+        lhs, rhs, meta = self._align_cycle_with(other)
         if isinstance(other, Vec):
-            if len(other) != len(self):
-                raise ValueError(f"Vec size mismatch: {len(self)} vs {len(other)}")
-            return Vec([fn(e1, e2) for e1, e2 in zip(self, other)])
+            assert isinstance(rhs, Vec)
+            if len(rhs) != len(lhs):
+                raise ValueError(f"Vec size mismatch: {len(lhs)} vs {len(rhs)}")
+            return Vec([fn(e1, e2) for e1, e2 in zip(lhs, rhs)], domain=meta[0], cycle=meta[1])
         if isinstance(other, (Wire, Reg, int)):
-            scalar = other if isinstance(other, Wire) else (other.q if isinstance(other, Reg) else other)
-            return Vec([fn(e, scalar) for e in self])
+            scalar = rhs if isinstance(rhs, Wire) else (rhs.q if isinstance(rhs, Reg) else rhs)
+            return Vec([fn(e, scalar) for e in lhs], domain=meta[0], cycle=meta[1])
         return NotImplemented
+
+    def _is_cycle_aware(self) -> bool:
+        return self.domain is not None and self.cycle is not None
+
+    def _delay_to_cycle(self, cycle: int) -> "Vec":
+        if not self._is_cycle_aware():
+            return self
+        assert self.domain is not None
+        assert self.cycle is not None
+        target = int(cycle)
+        source = int(self.cycle)
+        if target < source:
+            raise ValueError(f"cannot align Vec backward from cycle {source} to {target}")
+        if target == source:
+            return self
+
+        def delay_elem(e: Union[Wire, Reg, Vec]) -> Union[Wire, Vec]:
+            if isinstance(e, Vec):
+                if e._is_cycle_aware():
+                    return e._delay_to_cycle(target)
+                return Vec([delay_elem(child) for child in e], domain=self.domain, cycle=target)
+            w = self._wire_of(e)
+            delayed = self.domain.delay_to(w, from_cycle=source, to_cycle=target, width=w.width)
+            return Wire(delayed.m, delayed.sig, signed=w.signed)
+
+        return Vec(
+            [delay_elem(e) for e in self],
+            domain=self.domain,
+            cycle=target,
+        )
+
+    @staticmethod
+    def _cycle_meta_from_values(*values: Any) -> tuple[_CycleAwareDomainLike | None, int | None]:
+        domain: _CycleAwareDomainLike | None = None
+        cycle: int | None = None
+        for value in values:
+            if not isinstance(value, Vec) or not value._is_cycle_aware():
+                continue
+            if domain is None:
+                domain = value.domain
+                cycle = int(value.cycle)
+                continue
+            if value.domain is not domain:
+                raise ValueError("cycle-aware Vec operands must belong to the same domain")
+            assert cycle is not None
+            cycle = max(cycle, int(value.cycle))
+        return domain, cycle
+
+    @staticmethod
+    def _delay_value_to_cycle(value: Any, *, domain: _CycleAwareDomainLike | None, cycle: int | None) -> Any:
+        if isinstance(value, Vec) and value._is_cycle_aware():
+            if value.domain is not domain:
+                raise ValueError("cycle-aware Vec operands must belong to the same domain")
+            assert cycle is not None
+            return value._delay_to_cycle(cycle)
+        return value
+
+    def _align_cycle_with(self, other: Any) -> tuple["Vec", Any, tuple[_CycleAwareDomainLike | None, int | None]]:
+        domain, cycle = self._cycle_meta_from_values(self, other)
+        lhs = self._delay_value_to_cycle(self, domain=domain, cycle=cycle)
+        rhs = self._delay_value_to_cycle(other, domain=domain, cycle=cycle)
+        assert isinstance(lhs, Vec)
+        return lhs, rhs, (domain, cycle)
 
     def _leaf_wires(self) -> list[Wire] | None:
         """若为 1-D 叶子 Vec，返回所有 Wire 列表；含嵌套 Vec 或空则返回 None。"""
-        if self._vector_sig is not None:
-            return [self[i] for i in range(len(self))]
         if not self.elems or any(isinstance(e, Vec) for e in self.elems):
             return None
         out = [self._wire_of(e) for e in self.elems]
@@ -2327,8 +2547,8 @@ class Vec:
         return out
     def _any_lane_signed(self) -> bool:
         """判断是否存在任何 lane 为有符号类型。"""
-        if self._vector_signs is not None:
-            return any(self._vector_signs)
+        if self.signed is not None:
+            return any(self.signed)
         ws = self._leaf_wires()
         if ws is not None:
             return any(w.signed for w in ws)
@@ -2336,14 +2556,25 @@ class Vec:
 
     def _as_vector_signal(self) -> tuple[Module, Signal, list[bool]] | None:
         """尝试将 Vec 提升为单一向量 Signal。
-        1) 已为 vector-backed → 直接返回；
+        1) 已有关联 sig → 直接返回；
         2) 所有元素为同构子 Vec → v_create 合并成高维向量；
         3) 叶子 Wire → v_create 构造 1-D 向量，或识别 v_get 链路反推原始向量。
         提升失败返回 None，调用方回退到逐元素映射路径。
         """
-        if self._vector_sig is not None:
-            assert self._vector_signs is not None
-            return self.m, self._vector_sig, list(self._vector_signs)
+        if self.sig is not None:
+            assert self.m is not None
+            assert self.signed is not None
+            return self.m, self.sig, list(self.signed)
+        info = self._try_build_vector_sig_from_elems()
+        if info is not None:
+            m, sig, signs = info
+            object.__setattr__(self, "m", m)
+            object.__setattr__(self, "sig", sig)
+            object.__setattr__(self, "signed", signs)
+            return m, sig, list(signs)
+        return None
+
+    def _try_build_vector_sig_from_elems(self) -> tuple[Module, Signal, list[bool]] | None:
         if self.elems and all(isinstance(e, Vec) for e in self.elems):
             row_infos = [e._as_vector_signal() for e in self.elems]
             if all(info is not None for info in row_infos):
@@ -2422,14 +2653,15 @@ class Vec:
         m, in_sig, signs = info
         if op == "not":
             out_sig = m.not_(in_sig)
-            return self._from_vector_signal(m, out_sig, signs=signs)
+            return self._from_vector_signal(m, out_sig, signs=signs, domain=self.domain, cycle=self.cycle)
         return None
 
     def _try_vector_binary(self, other: Any, op: str, *, reverse: bool = False) -> "Vec | None":
         """尝试用原生向量指令做二元运算（add/sub/mul/and/or/xor 等）。
         成功返回新的惰性 Vec；失败返回 None，调用方回退到逐元素 ``_map2`` 路径。
         """
-        lhs_info = self._as_vector_signal()
+        lhs, rhs, meta = self._align_cycle_with(other)
+        lhs_info = lhs._as_vector_signal()
         method_name = _VEC_BINARY_METHODS.get(op)
         if lhs_info is None or method_name is None:
             return None
@@ -2437,8 +2669,8 @@ class Vec:
         shape, elem_ty = self._vector_shape_elem_type(lhs_sig.ty)
         width = _int_width(elem_ty)
 
-        rhs_info = self._vector_operand_info(
-            other,
+        rhs_info = lhs._vector_operand_info(
+            rhs,
             module=m,
             width=width,
             shape=shape,
@@ -2455,7 +2687,7 @@ class Vec:
             return None
         out_sig = builder(a_sig, b_sig)
         out_signs = [False for _ in lhs_signs] if op in _VEC_COMPARE_OPS else [ls or rs for ls, rs in zip(lhs_signs, rhs_signs)]
-        return self._from_vector_signal(m, out_sig, signs=out_signs)
+        return lhs._from_vector_signal(m, out_sig, signs=out_signs, domain=meta[0], cycle=meta[1])
 
     def _try_vector_signed_binary(
         self,
@@ -2496,7 +2728,13 @@ class Vec:
         ``sel`` 必须为 i1 向量。a/b 可以是同模同型 Vec，也可以是
         与另一侧 Vec leaf width 匹配的标量；标量 arm 会广播到 Vec shape。
         """
-        sel_info = self._as_vector_signal()
+        domain, cycle = self._cycle_meta_from_values(self, a, b)
+        sel = self._delay_value_to_cycle(self, domain=domain, cycle=cycle)
+        a = self._delay_value_to_cycle(a, domain=domain, cycle=cycle)
+        b = self._delay_value_to_cycle(b, domain=domain, cycle=cycle)
+        assert isinstance(sel, Vec)
+
+        sel_info = sel._as_vector_signal()
         if sel_info is None:
             return None
         m, sel_sig, _sel_signs = sel_info
@@ -2536,7 +2774,13 @@ class Vec:
         a_sig, a_signs = a_arm
         b_sig, b_signs = b_arm
         out_sig = m.mux(sel_sig, a_sig, b_sig)
-        return self._from_vector_signal(m, out_sig, signs=[as_ or bs for as_, bs in zip(a_signs, b_signs)])
+        return sel._from_vector_signal(
+            m,
+            out_sig,
+            signs=[as_ or bs for as_, bs in zip(a_signs, b_signs)],
+            domain=domain,
+            cycle=cycle,
+        )
 
     @staticmethod
     def _broadcast_scalar_signal(m: Module, scalar: Signal, *, shape: list[int]) -> Signal:
@@ -2563,7 +2807,7 @@ class Vec:
             out_signs = [True for _ in signs]
         else:
             out_signs = signs
-        return self._from_vector_signal(m, out_sig, signs=out_signs)
+        return self._from_vector_signal(m, out_sig, signs=out_signs, domain=self.domain, cycle=self.cycle)
 
     def _try_vector_shift(self, op: str, amount: Any) -> "Vec | None":
         """尝试用向量指令做移位。立即数用 shli/lshri/ashri，动态移位量用 shl/lshr/ashr。
@@ -2592,24 +2836,31 @@ class Vec:
                 return None
             out_sig = builder(in_sig, amount_wire.sig)
         out_signs = [False for _ in signs] if op == "lshr" else signs
-        return self._from_vector_signal(m, out_sig, signs=out_signs)
+        return self._from_vector_signal(m, out_sig, signs=out_signs, domain=self.domain, cycle=self.cycle)
+
+    @staticmethod
+    def _linear_reduce_wires_1d(ws: list[Wire], *, is_or: bool) -> Wire:
+        """1-D linear reduction using source order."""
+        if not ws:
+            raise ValueError("reduce requires at least one element")
+        out = ws[0]
+        for w in ws[1:]:
+            out = (out | w) if is_or else (out & w)
+        return out
 
     @staticmethod
     def _tree_reduce_wires_1d(ws: list[Wire], *, is_or: bool) -> Wire:
-        """1-D 树状归约：逐对 | (OR) 或 & (AND) 直到剩一个 Wire。"""
+        """1-D balanced tree reduction using source order within pairs."""
         if not ws:
             raise ValueError("reduce requires at least one element")
         cur = list(ws)
         while len(cur) > 1:
             nxt: list[Wire] = []
-            i = 0
-            while i < len(cur):
+            for i in range(0, len(cur), 2):
                 if i + 1 < len(cur):
                     nxt.append((cur[i] | cur[i + 1]) if is_or else (cur[i] & cur[i + 1]))
-                    i += 2
                 else:
                     nxt.append(cur[i])
-                    i += 1
             cur = nxt
         return cur[0]
 
@@ -2640,27 +2891,34 @@ class Vec:
         return Wire(w.m, w.sig, signed=bool(signed))
 
     @classmethod
+    def _linear_sum_wires_1d(cls, ws: list[Wire], *, width: int | None = None, signed: bool = False) -> Wire:
+        """1-D linear sum reduction after lane extension."""
+        out_width = cls._sum_output_width(ws, len(ws), width)
+        cur = [cls._extend_sum_lane(w, width=out_width, signed=bool(signed)) for w in ws]
+        out = cur[0]
+        for w in cur[1:]:
+            out = out + w
+        return out
+
+    @classmethod
     def _tree_sum_wires_1d(cls, ws: list[Wire], *, width: int | None = None, signed: bool = False) -> Wire:
-        """1-D 树状求和：先扩展各 lane 防溢出，再逐对相加直到剩一个 Wire。"""
+        """1-D balanced tree sum reduction after lane extension."""
         out_width = cls._sum_output_width(ws, len(ws), width)
         cur = [cls._extend_sum_lane(w, width=out_width, signed=bool(signed)) for w in ws]
         while len(cur) > 1:
             nxt: list[Wire] = []
-            i = 0
-            while i < len(cur):
+            for i in range(0, len(cur), 2):
                 if i + 1 < len(cur):
                     nxt.append(cur[i] + cur[i + 1])
-                    i += 2
                 else:
                     nxt.append(cur[i])
-                    i += 1
             cur = nxt
         return cur[0]
 
     def _is_leaf_1d(self) -> bool:
         """判断是否为 1-D 叶子 Vec（所有元素为 Wire/Reg，无嵌套 Vec）。"""
-        if self._vector_sig is not None:
-            shape, _ = self._vector_shape_elem_type(self._vector_sig.ty)
+        if self.sig is not None:
+            shape, _ = self._vector_shape_elem_type(self.sig.ty)
             return len(shape) == 1
         return all(not isinstance(e, Vec) for e in self.elems)
 
@@ -2670,7 +2928,7 @@ class Vec:
         out_shape = [d for i, d in enumerate(in_shape) if i != dim]
         if not out_shape:
             return []
-        # `_vector_signs` tracks the outer visible lane signs. After reducing
+        # `signed` tracks the outer visible lane signs. After reducing
         # away that axis, use a conservative sign for each new outer lane.
         if dim == 0:
             return [any(in_signs) for _ in range(out_shape[0])]
@@ -2678,52 +2936,67 @@ class Vec:
             return list(in_signs)
         return [any(in_signs) for _ in range(out_shape[0])]
 
-    def _reduce_vector_backed(self, dim: int | None, *, is_or: bool) -> Union[Wire, "Vec"] | None:
+    def _reduce_vector_backed(self, dim: int | None, *, is_or: bool, mode: _ReduceMode) -> Union[Wire, "Vec"] | None:
         """用原生向量归约指令（v_or_reduce / v_and_reduce）。dim=None 归约到 Wire。"""
-        if self._vector_sig is None:
+        if self.sig is None:
             return None
-        assert self._vector_signs is not None
-        shape, _elem_ty = self._vector_shape_elem_type(self._vector_sig.ty)
+        assert self.m is not None
+        assert self.signed is not None
+        shape, _elem_ty = self._vector_shape_elem_type(self.sig.ty)
         if dim is None:
             if len(shape) != 1:
                 raise ValueError("reduce(dim=None) requires a 1-D Vec (leaf elements are Wire/Reg)")
-            red_sig = self.m.v_or_reduce(self._vector_sig) if is_or else self.m.v_and_reduce(self._vector_sig)
-            return Wire(self.m, red_sig, signed=any(self._vector_signs))
+            red_sig = (
+                self.m.v_or_reduce(self.sig, mode=mode)
+                if is_or
+                else self.m.v_and_reduce(self.sig, mode=mode)
+            )
+            return Wire(self.m, red_sig, signed=any(self.signed))
 
         reduce_dim = int(dim)
         if reduce_dim < 0 or reduce_dim >= len(shape):
             raise ValueError(f"reduce dim out of range: {reduce_dim} for Vec rank {len(shape)}")
         red_sig = (
-            self.m.v_or_reduce(self._vector_sig, dim=reduce_dim)
+            self.m.v_or_reduce(self.sig, dim=reduce_dim, mode=mode)
             if is_or
-            else self.m.v_and_reduce(self._vector_sig, dim=reduce_dim)
+            else self.m.v_and_reduce(self.sig, dim=reduce_dim, mode=mode)
         )
-        out_signs = self._reduced_vector_signs(shape, list(self._vector_signs), dim=reduce_dim)
+        out_signs = self._reduced_vector_signs(shape, list(self.signed), dim=reduce_dim)
         if not out_signs:
-            return Wire(self.m, red_sig, signed=any(self._vector_signs))
-        return self._from_vector_signal(self.m, red_sig, signs=out_signs)
+            return Wire(self.m, red_sig, signed=any(self.signed))
+        return self._from_vector_signal(
+            self.m,
+            red_sig,
+            signs=out_signs,
+            domain=self.domain,
+            cycle=self.cycle,
+        )
 
-    def _reduce_1d(self, *, is_or: bool) -> Wire:
-        """1-D 归约到单个 Wire。优先用向量指令，否则树状归约。"""
-        vector_reduced = self._reduce_vector_backed(None, is_or=is_or)
+    def _reduce_1d(self, *, is_or: bool, mode: _ReduceMode) -> Wire:
+        """1-D reduction to a single Wire. Prefer vector ops, otherwise use the requested mode."""
+        vector_reduced = self._reduce_vector_backed(None, is_or=is_or, mode=mode)
         if vector_reduced is not None:
             assert isinstance(vector_reduced, Wire)
             return vector_reduced
         if not self._is_leaf_1d():
             raise ValueError("reduce(dim=None) requires a 1-D Vec (leaf elements are Wire/Reg)")
         ws = [self._wire_of(e) for e in self]
-        return self._tree_reduce_wires_1d(ws, is_or=is_or)
+        if mode == "tree":
+            return self._tree_reduce_wires_1d(ws, is_or=is_or)
+        return self._linear_reduce_wires_1d(ws, is_or=is_or)
 
-    def _sum_1d(self, *, width: int | None = None, signed: bool = False) -> Wire:
-        """1-D 求和归约到单个 Wire。优先用向量指令，否则树状求和。"""
-        vector_reduced = self._sum_vector_backed(None, width=width, signed=bool(signed))
+    def _sum_1d(self, *, width: int | None = None, signed: bool = False, mode: _ReduceMode) -> Wire:
+        """1-D sum reduction to a single Wire. Prefer vector ops, otherwise use the requested mode."""
+        vector_reduced = self._sum_vector_backed(None, width=width, signed=bool(signed), mode=mode)
         if vector_reduced is not None:
             assert isinstance(vector_reduced, Wire)
             return vector_reduced
         if not self._is_leaf_1d():
             raise ValueError("reduce_sum(dim=None) requires a 1-D Vec (leaf elements are Wire/Reg)")
         ws = [self._wire_of(e) for e in self]
-        return self._tree_sum_wires_1d(ws, width=width, signed=bool(signed))
+        if mode == "tree":
+            return self._tree_sum_wires_1d(ws, width=width, signed=bool(signed))
+        return self._linear_sum_wires_1d(ws, width=width, signed=bool(signed))
 
     def _sum_vector_backed(
         self,
@@ -2731,6 +3004,7 @@ class Vec:
         *,
         width: int | None = None,
         signed: bool = False,
+        mode: _ReduceMode,
     ) -> Union[Wire, "Vec"] | None:
         """用原生向量求和指令（v_add_reduce）。必要时先扩展位宽防溢出。"""
         info = self._as_vector_signal()
@@ -2747,12 +3021,12 @@ class Vec:
         out_width = self._sum_output_width_from_input_width(elem_width, shape[reduce_dim], width)
         if elem_width < out_width:
             sig = m.sext(sig, width=out_width) if signed else m.zext(sig, width=out_width)
-        red_sig = m.v_add_reduce(sig, dim=None if dim is None else reduce_dim)
+        red_sig = m.v_add_reduce(sig, dim=None if dim is None else reduce_dim, mode=mode)
         out_shape = [d for i, d in enumerate(shape) if i != reduce_dim]
         if not out_shape:
             return Wire(m, red_sig, signed=bool(signed))
         out_signs = self._reduced_vector_signs(shape, [bool(signed) for _ in signs], dim=reduce_dim)
-        return self._from_vector_signal(m, red_sig, signs=out_signs)
+        return self._from_vector_signal(m, red_sig, signs=out_signs, domain=self.domain, cycle=self.cycle)
 
     def _as_children_vecs(self) -> list["Vec"]:
         """将嵌套 Vec 的子 Vec 展开为列表，同时校验矩形维度（所有子 Vec 等长）。"""
@@ -2771,14 +3045,14 @@ class Vec:
                 raise ValueError("nested reduce requires rectangular Vec dimensions")
         return out
 
-    def _reduce_dim(self, dim: int, *, is_or: bool) -> Union[Wire, "Vec"]:
+    def _reduce_dim(self, dim: int, *, is_or: bool, mode: _ReduceMode) -> Union[Wire, "Vec"]:
         """沿指定轴做 AND/OR 归约。优先用向量指令，否则递归降维。
         dim==0 且为 1-D 叶子时返回单元素 Vec（保持 rank 语义一致）。
         """
         if dim < 0:
             raise ValueError("reduce dim must be >= 0")
 
-        vector_reduced = self._reduce_vector_backed(dim, is_or=is_or)
+        vector_reduced = self._reduce_vector_backed(dim, is_or=is_or, mode=mode)
         if vector_reduced is not None:
             return vector_reduced
 
@@ -2786,7 +3060,7 @@ class Vec:
             if self._is_leaf_1d():
                 # dim-specified reductions return Vec; reducing a leaf row gives a
                 # singleton Vec containing the reduced wire.
-                return Vec([self._reduce_1d(is_or=is_or)])
+                return Vec([self._reduce_1d(is_or=is_or, mode=mode)], domain=self.domain, cycle=self.cycle)
 
             children = self._as_children_vecs()
             infos = [child._as_vector_signal() for child in children]
@@ -2798,20 +3072,30 @@ class Vec:
                     for row_m, row_sig, row_signs in row_infos
                 ):
                     rank2_sig = m.v_create([row_sig for _row_m, row_sig, _row_signs in row_infos])
-                    red_sig = m.v_or_reduce(rank2_sig, dim=0) if is_or else m.v_and_reduce(rank2_sig, dim=0)
+                    red_sig = (
+                        m.v_or_reduce(rank2_sig, dim=0, mode=mode)
+                        if is_or
+                        else m.v_and_reduce(rank2_sig, dim=0, mode=mode)
+                    )
                     out_signs = [
                         any(row_signs[i] for _row_m, _row_sig, row_signs in row_infos)
                         for i in range(len(first_signs))
                     ]
-                    return self._from_vector_signal(m, red_sig, signs=out_signs)
+                    return self._from_vector_signal(
+                        m,
+                        red_sig,
+                        signs=out_signs,
+                        domain=self.domain,
+                        cycle=self.cycle,
+                    )
 
             width = len(children[0])
             out: list[Union[Wire, Reg, Vec]] = []
             for j in range(width):
                 col = Vec([child[j] for child in children])
                 # Reduce this column to a single wire so dim=0 lowers rank by one.
-                out.append(col._reduce_1d(is_or=is_or))
-            return Vec(out)
+                out.append(col._reduce_1d(is_or=is_or, mode=mode))
+            return Vec(out, domain=self.domain, cycle=self.cycle)
 
         children = self._as_children_vecs()
         if dim == 1:
@@ -2824,33 +3108,54 @@ class Vec:
                     for row_m, row_sig, row_signs in row_infos
                 ):
                     rank2_sig = m.v_create([row_sig for _row_m, row_sig, _row_signs in row_infos])
-                    red_sig = m.v_or_reduce(rank2_sig, dim=1) if is_or else m.v_and_reduce(rank2_sig, dim=1)
+                    red_sig = (
+                        m.v_or_reduce(rank2_sig, dim=1, mode=mode)
+                        if is_or
+                        else m.v_and_reduce(rank2_sig, dim=1, mode=mode)
+                    )
                     return self._from_vector_signal(
                         m,
                         red_sig,
                         signs=[any(row_signs) for _row_m, _row_sig, row_signs in row_infos],
+                        domain=self.domain,
+                        cycle=self.cycle,
                     )
         if dim == 1 and all(child._is_leaf_1d() for child in children):
-            return Vec([child._reduce_1d(is_or=is_or) for child in children])
-        return Vec([child._reduce_dim(dim - 1, is_or=is_or) for child in children])
+            return Vec([child._reduce_1d(is_or=is_or, mode=mode) for child in children], domain=self.domain, cycle=self.cycle)
+        return Vec(
+            [child._reduce_dim(dim - 1, is_or=is_or, mode=mode) for child in children],
+            domain=self.domain,
+            cycle=self.cycle,
+        )
 
-    def _sum_dim(self, dim: int, *, width: int | None = None, signed: bool = False) -> Union[Wire, "Vec"]:
+    def _sum_dim(
+        self,
+        dim: int,
+        *,
+        width: int | None = None,
+        signed: bool = False,
+        mode: _ReduceMode,
+    ) -> Union[Wire, "Vec"]:
         """沿指定轴做求和归约。优先用向量指令，否则递归降维。
         dim==0 且为 1-D 叶子时返回单元素 Vec。
         """
         if dim < 0:
             raise ValueError("reduce_sum dim must be >= 0")
 
-        vector_reduced = self._sum_vector_backed(dim, width=width, signed=bool(signed))
+        vector_reduced = self._sum_vector_backed(dim, width=width, signed=bool(signed), mode=mode)
         if vector_reduced is not None:
             return vector_reduced
 
         if dim == 0:
             if self._is_leaf_1d():
-                return Vec([self._sum_1d(width=width, signed=bool(signed))])
+                return Vec(
+                    [self._sum_1d(width=width, signed=bool(signed), mode=mode)],
+                    domain=self.domain,
+                    cycle=self.cycle,
+                )
 
             children = self._as_children_vecs()
-            # Try vector-backed path: promote children to rank-2 signal → v_add_reduce
+            # Try vector path: promote children to rank-2 signal → v_add_reduce
             infos = [child._as_vector_signal() for child in children]
             if all(info is not None for info in infos):
                 row_infos = [info for info in infos if info is not None]
@@ -2864,41 +3169,67 @@ class Vec:
                         any(row_signs[i] for _row_m, _row_sig, row_signs in row_infos)
                         for i in range(len(first_signs))
                     ]
-                    tmp = Vec._from_vector_signal(m, rank2_sig, signs=outer_signs)
-                    reduced = tmp._sum_vector_backed(0, width=width, signed=bool(signed))
+                    tmp = Vec._from_vector_signal(
+                        m,
+                        rank2_sig,
+                        signs=outer_signs,
+                        domain=self.domain,
+                        cycle=self.cycle,
+                    )
+                    reduced = tmp._sum_vector_backed(0, width=width, signed=bool(signed), mode=mode)
                     if reduced is not None:
                         return reduced
 
             col_count = len(children[0])
-            return Vec([
-                Vec([child[j] for child in children])._sum_1d(width=width, signed=bool(signed))
-                for j in range(col_count)
-            ])
+            return Vec(
+                [
+                    Vec([child[j] for child in children], domain=self.domain, cycle=self.cycle)._sum_1d(
+                        width=width,
+                        signed=bool(signed),
+                        mode=mode,
+                    )
+                    for j in range(col_count)
+                ],
+                domain=self.domain,
+                cycle=self.cycle,
+            )
 
         children = self._as_children_vecs()
         if dim == 1 and all(child._is_leaf_1d() for child in children):
-            return Vec([child._sum_1d(width=width, signed=bool(signed)) for child in children])
-        return Vec([child._sum_dim(dim - 1, width=width, signed=bool(signed)) for child in children])
+            return Vec(
+                [child._sum_1d(width=width, signed=bool(signed), mode=mode) for child in children],
+                domain=self.domain,
+                cycle=self.cycle,
+            )
+        return Vec(
+            [child._sum_dim(dim - 1, width=width, signed=bool(signed), mode=mode) for child in children],
+            domain=self.domain,
+            cycle=self.cycle,
+        )
 
-    def or_reduce(self, dim: int | None = None) -> Union[Wire, "Vec"]:
+    def or_reduce(self, dim: int | None = None, *, mode: str = "chain") -> Union[Wire, "Vec"]:
         """Bitwise OR reduction.
 
-        - dim=None: require 1-D Vec, return a single Wire (tree reduction).
+        - dim=None: require 1-D Vec, return a single Wire.
         - dim=int: reduce along that axis, return Vec.
+        - mode="chain" (default) emits a source-order chain; mode="tree" emits a balanced tree.
         """
+        reduce_mode = _normalize_reduce_mode(mode)
         if dim is None:
-            return self._reduce_1d(is_or=True)
-        return self._reduce_dim(int(dim), is_or=True)
+            return self._reduce_1d(is_or=True, mode=reduce_mode)
+        return self._reduce_dim(int(dim), is_or=True, mode=reduce_mode)
 
-    def and_reduce(self, dim: int | None = None) -> Union[Wire, "Vec"]:
+    def and_reduce(self, dim: int | None = None, *, mode: str = "chain") -> Union[Wire, "Vec"]:
         """Bitwise AND reduction.
 
-        - dim=None: require 1-D Vec, return a single Wire (tree reduction).
+        - dim=None: require 1-D Vec, return a single Wire.
         - dim=int: reduce along that axis, return Vec.
+        - mode="chain" (default) emits a source-order chain; mode="tree" emits a balanced tree.
         """
+        reduce_mode = _normalize_reduce_mode(mode)
         if dim is None:
-            return self._reduce_1d(is_or=False)
-        return self._reduce_dim(int(dim), is_or=False)
+            return self._reduce_1d(is_or=False, mode=reduce_mode)
+        return self._reduce_dim(int(dim), is_or=False, mode=reduce_mode)
 
     def reduce_sum(
         self,
@@ -2906,6 +3237,7 @@ class Vec:
         width: int | None = None,
         dim: int | None = None,
         signed: bool = False,
+        mode: str = "chain",
     ) -> Union[Wire, "Vec"]:
         """Sum reduction.
 
@@ -2914,10 +3246,12 @@ class Vec:
         - ``width=None`` chooses ``max_input_width + ceil_log2(reduce_len)``.
         - ``dim=None`` requires a 1-D Vec and returns one Wire.
         - ``dim=int`` reduces along that axis and returns the lowered-rank Vec.
+        - ``mode="chain"`` (default) emits a source-order chain; ``mode="tree"`` emits a balanced tree.
         """
+        reduce_mode = _normalize_reduce_mode(mode)
         if dim is None:
-            return self._sum_1d(width=width, signed=bool(signed))
-        return self._sum_dim(int(dim), width=width, signed=bool(signed))
+            return self._sum_1d(width=width, signed=bool(signed), mode=reduce_mode)
+        return self._sum_dim(int(dim), width=width, signed=bool(signed), mode=reduce_mode)
 
     # -- arithmetic -------------------------------------------------------------
 
@@ -3076,23 +3410,89 @@ class Vec:
         v = self._try_vector_select(a, b)
         if v is not None:
             return v
+        domain, cycle = self._cycle_meta_from_values(self, a, b)
+        sel = self._delay_value_to_cycle(self, domain=domain, cycle=cycle)
+        a = self._delay_value_to_cycle(a, domain=domain, cycle=cycle)
+        b = self._delay_value_to_cycle(b, domain=domain, cycle=cycle)
+        assert isinstance(sel, Vec)
         if isinstance(a, Vec) and isinstance(b, Vec):
-            if len(a) != len(self) or len(b) != len(self):
+            if len(a) != len(sel) or len(b) != len(sel):
                 raise ValueError("Vec size mismatch in select")
             return Vec([
-                self._wire_of(s).select(va, vb)
-                for s, va, vb in zip(self, a, b)
-            ])
-        return Vec([self._wire_of(e).select(a, b) for e in self])
+                sel._wire_of(s).select(va, vb)
+                for s, va, vb in zip(sel, a, b)
+            ], domain=domain, cycle=cycle)
+        return Vec([sel._wire_of(e).select(a, b) for e in sel], domain=domain, cycle=cycle)
 
-    def masked_or(self, vals: Any, *, zero: Any = 0) -> Wire:
-        """Select ``vals`` where this mask is true, then OR-reduce the lanes."""
+    def priority_mux(self, vals: Any, *, zero: Any = 0, assume_onehot: bool = False) -> Wire:
+        """Linear priority mux with left-to-right precedence.
+
+        Build a simple mux chain instead of a balanced select tree.  This keeps
+        the generated scalar form close to hand-written priority logic after
+        vector unrolling, which maps more predictably through Yosys/ABC.
+
+        ``assume_onehot`` selects the chain direction:
+
+        * ``False`` (default): chain built in *reverse* order
+          (``n-1 .. 0``), giving **index-0-wins** priority.  This is required
+          for true priority arbitration (multiple selectors may be active).
+          .. note:: **Resource cost.** The reverse chain is mapped noticeably
+             worse by ABC than the forward chain — for one-hot selectors it
+             typically costs **several hundred extra LUTs** (observed ~+500
+             LUTs on a 128:1 / 64-bit read mux) because the mirror-image
+             topology lands ABC's cut heuristics in a worse local minimum.
+             Only use ``False`` when you genuinely need multi-match priority.
+        * ``True``: chain built in *forward* (source) order (``0 .. n-1``).
+          Identical result for one-hot masks, and matches the shape of
+          hand-written one-hot mux logic so ABC maps it efficiently.  Use this
+          for address-decode reads, RF/CAM lookups, and any selector known to
+          be one-hot.
+
+        .. warning::
+           Independent of ``assume_onehot``, this implementation indexes the
+           selector/data element-by-element (``self[i]`` / ``values[i]``).
+           When ``self`` is a *vector-backed* Vec (the result of a vector op
+           such as ``vec == scalar``), each ``self[i]`` emits a ``v_get``
+           extraction that becomes a residual wire perturbing ABC.  For
+           wide one-hot reads over vector-backed selectors this can add
+           residual LUTs even with ``assume_onehot=True``; prefer a scalar
+           ``mux(hit, data[i], acc)`` chain in that case.
+        """
         values = vals if isinstance(vals, Vec) else Vec(list(vals))
-        return self.select(values, zero).or_reduce()
+        n = len(self)
+        if n == 0:
+            return zero
+        if len(values) != n:
+            raise ValueError("Vec size mismatch in priority_mux")
+        out = zero
+        indices = range(n) if assume_onehot else range(n - 1, -1, -1)
+        for i in indices:
+            out = self[i].select(values[i], out)
+        return out
 
-    def onehot_mux(self, vals: Any, *, zero: Any = 0) -> Wire:
-        """One-hot mux implemented as masked OR over a Vec of candidate values."""
-        return self.masked_or(vals, zero=zero)
+    def broadcast(self, *, dim: int, size: int) -> "Vec":
+        """Broadcast this Vec by repeating along a new dimension.
+
+        ``broadcast(dim=0, size=6)`` on a ``Vec<8, T>`` → ``Vec<6, Vec<8, T>>``
+        (6 outer copies, each an independent copy of the original 8-element vector).
+
+        ``broadcast(dim=1, size=6)`` on a ``Vec<8, T>`` → ``Vec<8, Vec<6, T>>``
+        (each of the 8 lanes becomes a 6-element sub-vector of copies).
+        """
+        info = self._as_vector_signal()
+        if info is None:
+            raise ValueError("broadcast requires a vectorizable Vec")
+        m, sig, signs = info
+        shape, _elem_ty = self._vector_shape_elem_type(sig.ty)
+        d = int(dim)
+        if d < 0 or d > len(shape):
+            raise ValueError(f"broadcast dim {d} out of range for shape {shape}")
+        new_sig = m.v_broadcast_dim(sig, size=int(size), dim=d)
+        # Adjust signs for the new outer dimension count.
+        if d == 0:
+            signs = [signs[0]] * int(size)
+        # dim > 0: outer dim unchanged, signs stay the same
+        return Vec._from_vector_signal(m, new_sig, signs=signs, domain=self.domain, cycle=self.cycle)
 
     # -- width transforms -------------------------------------------------------
 
@@ -3374,6 +3774,43 @@ def cat(*elems: Union[Wire, Reg, int, LiteralValue]) -> Wire:
             continue
         raise TypeError(f"cat() element must be Wire/Reg/int/literal, got {type(e).__name__}")
     return Vec(ws).pack()
+
+
+def _cast_value(value: Any, *, width: int, op: str) -> Wire | Vec:
+    if isinstance(value, Connector):
+        value = value.read()
+    if isinstance(value, Reg):
+        value = value.q
+    if isinstance(value, Wire):
+        if op == "zext":
+            return value._zext(width=int(width))
+        if op == "sext":
+            return value._sext(width=int(width))
+        if op == "trunc":
+            return value._trunc(width=int(width))
+    if isinstance(value, Vec):
+        if op == "zext":
+            return value.zext(width=int(width))
+        if op == "sext":
+            return value.sext(width=int(width))
+        if op == "trunc":
+            return value.trunc(width=int(width))
+    raise TypeError(f"{op}() expects Wire/Reg/Vec/Connector, got {type(value).__name__}")
+
+
+def zext(value: Any, *, width: int) -> Wire | Vec:
+    """Zero-extend a Wire/Reg/Vec using the canonical function-style API."""
+    return _cast_value(value, width=int(width), op="zext")
+
+
+def sext(value: Any, *, width: int) -> Wire | Vec:
+    """Sign-extend a Wire/Reg/Vec using the canonical function-style API."""
+    return _cast_value(value, width=int(width), op="sext")
+
+
+def trunc(value: Any, *, width: int) -> Wire | Vec:
+    """Truncate a Wire/Reg/Vec using the canonical function-style API."""
+    return _cast_value(value, width=int(width), op="trunc")
 
 
 

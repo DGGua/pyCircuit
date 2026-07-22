@@ -13,9 +13,21 @@ from .connectors import (
     WireConnector,
 )
 from .design import const, function, module, probe as _probe_decorator, testbench as _testbench_decorator
-from .hw import Bundle, Circuit, ClockDomain, Pop, Reg, Vec, Wire, cat, unsigned
+from .hw import Bundle, Circuit, ClockDomain, Pop, Reg, Vec, Wire, cat, sext, trunc, unsigned, zext
 from .jit import JitError, compile
 from .literals import LiteralValue, S, U, s, u
+from .record import (
+    Record,
+    RecordArray,
+    RecordField,
+    RecordSpec,
+    record_input,
+    record_mux,
+    record_next,
+    record_output,
+    record_outputs_dict,
+    record_state,
+)
 from .v5 import (
     CycleAwareCircuit,
     CycleAwareDomain,
@@ -77,6 +89,10 @@ __all__ = [
     "ProbeBuilder",
     "ProbeRef",
     "ProbeView",
+    "Record",
+    "RecordArray",
+    "RecordField",
+    "RecordSpec",
     "Reg",
     "RegConnector",
     "S",
@@ -96,11 +112,20 @@ __all__ = [
     "logic",
     "module",
     "probe",
+    "record_input",
+    "record_mux",
+    "record_next",
+    "record_output",
+    "record_outputs_dict",
+    "record_state",
     "spec",
     "testbench",
     "wiring",
     "s",
+    "sext",
     "sva",
+    "trunc",
     "u",
     "unsigned",
+    "zext",
 ]

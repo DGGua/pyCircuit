@@ -9,6 +9,7 @@
 #include "mlir/IR/Operation.h"
 #include "mlir/IR/Value.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/SmallSet.h"
 #include "llvm/ADT/StringMap.h"
@@ -36,7 +37,7 @@ static std::string vRange(Type ty) {
   // Clocks/resets are treated as 1-bit scalar ports/nets in Verilog.
   if (isa<pyc::ClockType>(ty) || isa<pyc::ResetType>(ty))
     return "";
-  // VectorType uses element packed width; unpacked dims are handled by caller.
+  // VectorType uses element packed width for internal unpacked-array views.
   if (auto vt = dyn_cast<VectorType>(ty))
     return vRange(vt.getElementType());
   auto intTy = dyn_cast<IntegerType>(ty);
@@ -45,6 +46,38 @@ static std::string vRange(Type ty) {
   if (intTy.getWidth() <= 1)
     return "";
   return "[" + std::to_string(intTy.getWidth() - 1) + ":0]";
+}
+
+static std::optional<unsigned> leafWidth(Type ty) {
+  auto intTy = leafIntType(ty);
+  if (!intTy)
+    return std::nullopt;
+  return intTy.getWidth();
+}
+
+static int64_t vectorLaneCount(ArrayRef<int64_t> shape) {
+  int64_t lanes = 1;
+  for (int64_t d : shape)
+    lanes *= d;
+  return lanes;
+}
+
+static std::optional<int64_t> flatBitWidth(Type ty) {
+  auto width = leafWidth(ty);
+  if (!width)
+    return std::nullopt;
+  if (auto vt = dyn_cast<VectorType>(ty))
+    return vectorLaneCount(vt.getShape()) * static_cast<int64_t>(*width);
+  return static_cast<int64_t>(*width);
+}
+
+/// Packed range for module boundary ports.  Vector ports are flattened into a
+/// single packed bus so Yosys does not have to parse unpacked array ports.
+static std::string vPortRange(Type ty) {
+  auto bits = flatBitWidth(ty);
+  if (!bits || *bits <= 1)
+    return "";
+  return "[" + std::to_string(*bits - 1) + ":0]";
 }
 
 /// Return the unpacked array dimensions for a VectorType, e.g. " [0:3][0:7]".
@@ -57,6 +90,110 @@ static std::string vUnpacked(Type ty) {
     return dims;
   }
   return "";
+}
+
+static std::string indexSuffix(ArrayRef<int64_t> indices) {
+  std::string out;
+  for (int64_t i : indices)
+    out += "[" + std::to_string(i) + "]";
+  return out;
+}
+
+static int64_t flatLaneIndex(ArrayRef<int64_t> shape, ArrayRef<int64_t> indices) {
+  int64_t flat = 0;
+  for (size_t i = 0; i < indices.size(); ++i)
+    flat = flat * shape[i] + indices[i];
+  return flat;
+}
+
+static std::string packedSlice(llvm::StringRef base, ArrayRef<int64_t> shape, ArrayRef<int64_t> indices, unsigned width) {
+  int64_t lane = flatLaneIndex(shape, indices);
+  int64_t lsb = lane * static_cast<int64_t>(width);
+  if (width == 1)
+    return base.str() + "[" + std::to_string(lsb) + "]";
+  return base.str() + "[" + std::to_string(lsb + static_cast<int64_t>(width) - 1) + ":" + std::to_string(lsb) + "]";
+}
+
+static void walkVectorIndices(ArrayRef<int64_t> shape,
+                              const std::function<void(ArrayRef<int64_t>)> &emit) {
+  llvm::SmallVector<int64_t> indices;
+  std::function<void(unsigned)> walk = [&](unsigned depth) {
+    if (depth == shape.size()) {
+      emit(indices);
+      return;
+    }
+    for (int64_t i = 0; i < shape[depth]; ++i) {
+      indices.push_back(i);
+      walk(depth + 1);
+      indices.pop_back();
+    }
+  };
+  walk(0);
+}
+
+static void emitUnpackFromPacked(llvm::StringRef arrayBase, llvm::StringRef packedBase, Type ty, raw_ostream &os) {
+  auto vt = dyn_cast<VectorType>(ty);
+  if (!vt) {
+    os << "assign " << arrayBase << " = " << packedBase << ";\n";
+    return;
+  }
+  auto width = leafWidth(ty);
+  if (!width)
+    return;
+  ArrayRef<int64_t> shape = vt.getShape();
+  walkVectorIndices(shape, [&](ArrayRef<int64_t> indices) {
+    os << "assign " << arrayBase << indexSuffix(indices) << " = "
+       << packedSlice(packedBase, shape, indices, *width) << ";\n";
+  });
+}
+
+static void emitPackToPacked(llvm::StringRef packedBase, llvm::StringRef arrayBase, Type ty, raw_ostream &os) {
+  auto vt = dyn_cast<VectorType>(ty);
+  if (!vt) {
+    os << "assign " << packedBase << " = " << arrayBase << ";\n";
+    return;
+  }
+  auto width = leafWidth(ty);
+  if (!width)
+    return;
+  ArrayRef<int64_t> shape = vt.getShape();
+  walkVectorIndices(shape, [&](ArrayRef<int64_t> indices) {
+    os << "assign " << packedSlice(packedBase, shape, indices, *width)
+       << " = " << arrayBase << indexSuffix(indices) << ";\n";
+  });
+}
+
+/// Build a balanced binary-tree expression from a list of term strings.
+/// e.g. {"v[0]","v[1]","v[2]","v[3]"} with "|" → "((v[0] | v[1]) | (v[2] | v[3]))"
+static std::string treeReduceExpr(llvm::SmallVectorImpl<std::string> &terms,
+                                  const std::string &op) {
+  while (terms.size() > 1) {
+    llvm::SmallVector<std::string> next;
+    for (size_t i = 0; i < terms.size(); i += 2) {
+      if (i + 1 < terms.size())
+        next.push_back("(" + terms[i] + " " + op + " " + terms[i + 1] + ")");
+      else
+        next.push_back(terms[i]);
+    }
+    terms = std::move(next);
+  }
+  return terms.empty() ? "" : terms[0];
+}
+
+static std::string chainReduceExpr(llvm::SmallVectorImpl<std::string> &terms,
+                                   const std::string &op) {
+  if (terms.empty())
+    return "";
+  std::string out = terms[0];
+  for (size_t i = 1; i < terms.size(); ++i)
+    out = "(" + out + " " + op + " " + terms[i] + ")";
+  return out;
+}
+
+static bool isTreeReduceMode(Operation *op) {
+  if (auto mode = op->getAttrOfType<StringAttr>("mode"))
+    return mode.getValue() == "tree";
+  return false;
 }
 
 static std::string vLiteral(IntegerAttr a, Type dstTy) {
@@ -220,13 +357,13 @@ static std::optional<LogicalResult> emitScalarOpAssign(Operation &op, raw_ostrea
   }
   if (auto d = dyn_cast<pyc::SdivOp>(op)) {
     os << "assign " << nt.get(d.getResult()) << " = (" << nt.get(d.getRhs()) << " == " << vZero(d.getRhs().getType())
-       << " ? " << vZero(d.getResult().getType()) << " : ($signed(" << nt.get(d.getLhs()) << ") / $signed("
+       << " ? $signed(" << vZero(d.getResult().getType()) << ") : ($signed(" << nt.get(d.getLhs()) << ") / $signed("
        << nt.get(d.getRhs()) << ")));\n";
     return success();
   }
   if (auto r = dyn_cast<pyc::SremOp>(op)) {
     os << "assign " << nt.get(r.getResult()) << " = (" << nt.get(r.getRhs()) << " == " << vZero(r.getRhs().getType())
-       << " ? " << vZero(r.getResult().getType()) << " : ($signed(" << nt.get(r.getLhs()) << ") % $signed("
+       << " ? $signed(" << vZero(r.getResult().getType()) << ") : ($signed(" << nt.get(r.getLhs()) << ") % $signed("
        << nt.get(r.getRhs()) << ")));\n";
     return success();
   }
@@ -405,6 +542,40 @@ static std::optional<LogicalResult> emitScalarOpAssign(Operation &op, raw_ostrea
       os << "assign " << dst << "[" << i << "] = " << src << ";\n";
     return success();
   }
+  if (auto vbd = dyn_cast<pyc::VBroadcastDimOp>(op)) {
+    auto srcVT = dyn_cast<VectorType>(vbd.getVec().getType());
+    auto dstVT = dyn_cast<VectorType>(vbd.getResult().getType());
+    if (!srcVT || !dstVT)
+      return {vbd.emitError("verilog emitter expects vector types for v_broadcast_dim")};
+    int64_t dim = vbd.getDimAttr().getInt();
+    std::string dstBase = nt.get(vbd.getResult());
+    std::string srcBase = nt.get(vbd.getVec());
+    // Walk all result lanes, mapping each to the appropriate source lane.
+    std::function<void(unsigned, std::string &, std::string &)> walkDst;
+    walkDst = [&](unsigned depth, std::string &dstIdx, std::string &srcIdx) -> void {
+      if (depth == static_cast<unsigned>(dstVT.getRank())) {
+        os << "assign " << dstBase << dstIdx << " = " << srcBase << srcIdx << ";\n";
+        return;
+      }
+      for (int64_t i = 0; i < dstVT.getDimSize(depth); ++i) {
+        std::string d = "[" + std::to_string(i) + "]";
+        size_t dOld = dstIdx.size();
+        dstIdx += d;
+        if (static_cast<int64_t>(depth) != dim) {
+          size_t sOld = srcIdx.size();
+          srcIdx += d;
+          walkDst(depth + 1, dstIdx, srcIdx);
+          srcIdx.resize(sOld);
+        } else {
+          walkDst(depth + 1, dstIdx, srcIdx);
+        }
+        dstIdx.resize(dOld);
+      }
+    };
+    std::string dstIdx, srcIdx;
+    walkDst(0, dstIdx, srcIdx);
+    return success();
+  }
   auto emitVectorReduce = [&](auto vr, const char *opName, const std::string &opToken) -> LogicalResult {
     auto vt = dyn_cast<VectorType>(vr.getVec().getType());
     if (!vt)
@@ -420,19 +591,16 @@ static std::optional<LogicalResult> emitScalarOpAssign(Operation &op, raw_ostrea
       return vr.emitError("pyc.") << opName << " dim out of range for verilog emission";
     if (!vr.getDim() && vt.getRank() != 1)
       return vr.emitError("pyc.") << opName << " requires explicit dim for rank > 1";
+    bool useTree = isTreeReduceMode(vr.getOperation());
 
     if (vt.getRank() == 1) {
       std::int64_t lanes = vt.getShape()[0];
-      std::string expr = "(";
+      llvm::SmallVector<std::string> terms;
       for (std::int64_t i = 0; i < lanes; ++i) {
-        if (i)
-          expr += " " + opToken + " ";
-        expr += nt.get(vr.getVec());
-        expr += "[";
-        expr += std::to_string(static_cast<long long>(i));
-        expr += "]";
+        terms.push_back(nt.get(vr.getVec()) + "[" +
+                        std::to_string(static_cast<long long>(i)) + "]");
       }
-      expr += ")";
+      std::string expr = useTree ? treeReduceExpr(terms, opToken) : chainReduceExpr(terms, opToken);
       emitConnectAssign(nt.get(vr.getResult()), expr, vr.getResult().getType(), os);
       return success();
     }
@@ -442,19 +610,18 @@ static std::optional<LogicalResult> emitScalarOpAssign(Operation &op, raw_ostrea
     std::int64_t outLanes = (dim == 0) ? cols : rows;
     std::int64_t reduceLanes = (dim == 0) ? rows : cols;
     for (std::int64_t i = 0; i < outLanes; ++i) {
-      std::string expr = "(";
+      llvm::SmallVector<std::string> terms;
       for (std::int64_t j = 0; j < reduceLanes; ++j) {
-        if (j)
-          expr += " " + opToken + " ";
-        expr += nt.get(vr.getVec());
         if (dim == 0)
-          expr += "[" + std::to_string(static_cast<long long>(j)) + "][" +
-                  std::to_string(static_cast<long long>(i)) + "]";
+          terms.push_back(nt.get(vr.getVec()) + "[" +
+                          std::to_string(static_cast<long long>(j)) + "][" +
+                          std::to_string(static_cast<long long>(i)) + "]");
         else
-          expr += "[" + std::to_string(static_cast<long long>(i)) + "][" +
-                  std::to_string(static_cast<long long>(j)) + "]";
+          terms.push_back(nt.get(vr.getVec()) + "[" +
+                          std::to_string(static_cast<long long>(i)) + "][" +
+                          std::to_string(static_cast<long long>(j)) + "]");
       }
-      expr += ")";
+      std::string expr = useTree ? treeReduceExpr(terms, opToken) : chainReduceExpr(terms, opToken);
       emitConnectAssign(
           nt.get(vr.getResult()) + "[" + std::to_string(static_cast<long long>(i)) + "]",
           expr,
@@ -483,10 +650,14 @@ static LogicalResult emitVectorElementwise(Operation &op, VectorType vt, raw_ost
 
   std::function<LogicalResult(unsigned, std::string &)> walk;
   std::vector<std::pair<Value, std::string>> saved;
+  llvm::SmallDenseSet<Value, 8> rebound;
   walk = [&](unsigned depth, std::string &idx) -> LogicalResult {
     if (depth == rank) {
       saved.clear();
+      rebound.clear();
       auto rebind = [&](Value v) {
+        if (!rebound.insert(v).second)
+          return;
         std::string base = nt.get(v);
         saved.emplace_back(v, base);
         nt.names[v] = base + idx;
@@ -524,6 +695,7 @@ static LogicalResult emitNetlistOp(Operation &op, raw_ostream &os, NameTable &nt
       if (!isa<pyc::VGetOp,
                pyc::VCreateOp,
                pyc::VBroadcastOp,
+               pyc::VBroadcastDimOp,
                pyc::VOrReduceOp,
                pyc::VAndReduceOp,
                pyc::VAddReduceOp>(op))
@@ -718,6 +890,12 @@ static LogicalResult emitFunc(func::FuncOp f, raw_ostream &os, const VerilogEmit
   NameTable nt;
   std::vector<std::string> outNames;
   outNames.reserve(f.getNumResults());
+  struct VectorInputAlias {
+    std::string alias;
+    std::string port;
+    Type ty;
+  };
+  std::vector<VectorInputAlias> vectorInputAliases;
 
   os << "// Generated by pycc (pyCircuit)\n";
   os << "// Module: " << f.getSymName() << "\n\n";
@@ -726,27 +904,42 @@ static LogicalResult emitFunc(func::FuncOp f, raw_ostream &os, const VerilogEmit
   os << "module " << f.getSymName() << " (\n";
   for (auto [i, arg] : llvm::enumerate(f.getArguments())) {
     std::string portName = nt.unique(getPortName(f, i, /*isResult=*/false));
-    std::string range = vRange(arg.getType());
-    std::string unpacked = vUnpacked(arg.getType());
+    std::string range = vPortRange(arg.getType());
     os << "  input ";
     if (!range.empty())
       os << range << " ";
-    os << portName << unpacked;
+    os << portName;
     os << ((i + 1 == f.getNumArguments() && f.getNumResults() == 0) ? "\n" : ",\n");
-    nt.names.try_emplace(arg, portName);
+    if (isa<VectorType>(arg.getType())) {
+      std::string alias = nt.unique(portName + "__vec");
+      nt.names.try_emplace(arg, alias);
+      vectorInputAliases.push_back({alias, portName, arg.getType()});
+    } else {
+      nt.names.try_emplace(arg, portName);
+    }
   }
   for (unsigned i = 0; i < f.getNumResults(); ++i) {
     std::string portName = nt.unique(getPortName(f, i, /*isResult=*/true));
     outNames.push_back(portName);
-    std::string range = vRange(f.getResultTypes()[i]);
-    std::string unpacked = vUnpacked(f.getResultTypes()[i]);
+    std::string range = vPortRange(f.getResultTypes()[i]);
     os << "  output ";
     if (!range.empty())
       os << range << " ";
-    os << portName << unpacked;
+    os << portName;
     os << ((i + 1 == f.getNumResults()) ? "\n" : ",\n");
   }
   os << ");\n\n";
+
+  for (auto &aliasInfo : vectorInputAliases) {
+    std::string range = vRange(aliasInfo.ty);
+    os << "wire ";
+    if (!range.empty())
+      os << range << " ";
+    os << aliasInfo.alias << vUnpacked(aliasInfo.ty) << "; // port=" << aliasInfo.port << "\n";
+    emitUnpackFromPacked(aliasInfo.alias, aliasInfo.port, aliasInfo.ty, os);
+  }
+  if (!vectorInputAliases.empty())
+    os << "\n";
 
   // Declare internal nets for op results (including results inside pyc.comb regions).
   std::vector<NetDecl> decls;
@@ -825,6 +1018,7 @@ static LogicalResult emitFunc(func::FuncOp f, raw_ostream &os, const VerilogEmit
               pyc::VGetOp,
               pyc::VCreateOp,
               pyc::VBroadcastOp,
+              pyc::VBroadcastDimOp,
               pyc::VOrReduceOp,
               pyc::VAndReduceOp,
               pyc::VAddReduceOp>(op)) {
@@ -924,21 +1118,61 @@ static LogicalResult emitFunc(func::FuncOp f, raw_ostream &os, const VerilogEmit
         instName = sanitizeId(shortAttr.getValue());
       instName = nt.unique(instName);
 
+      std::vector<std::string> inConn;
+      std::vector<std::string> outConn;
+      inConn.reserve(inPorts.size());
+      outConn.reserve(outPorts.size());
+
+      for (unsigned i = 0; i < inPorts.size(); ++i) {
+        Value operand = inst.getOperand(i);
+        if (isa<VectorType>(operand.getType())) {
+          std::string bridge = nt.unique(instName + "_" + inPorts[i] + "__flat");
+          std::string range = vPortRange(operand.getType());
+          os << "wire ";
+          if (!range.empty())
+            os << range << " ";
+          os << bridge << ";\n";
+          emitPackToPacked(bridge, nt.get(operand), operand.getType(), os);
+          inConn.push_back(bridge);
+        } else {
+          inConn.push_back(nt.get(operand));
+        }
+      }
+      for (unsigned i = 0; i < outPorts.size(); ++i) {
+        Value result = inst.getResult(i);
+        if (isa<VectorType>(result.getType())) {
+          std::string bridge = nt.unique(instName + "_" + outPorts[i] + "__flat");
+          std::string range = vPortRange(result.getType());
+          os << "wire ";
+          if (!range.empty())
+            os << range << " ";
+          os << bridge << ";\n";
+          outConn.push_back(bridge);
+        } else {
+          outConn.push_back(nt.get(result));
+        }
+      }
+
       os << callee.getSymName() << " " << instName << " (\n";
       unsigned totalPorts = static_cast<unsigned>(inPorts.size() + outPorts.size());
       unsigned emitted = 0;
 
       for (unsigned i = 0; i < inPorts.size(); ++i) {
-        os << "  ." << inPorts[i] << "(" << nt.get(inst.getOperand(i)) << ")";
+        os << "  ." << inPorts[i] << "(" << inConn[i] << ")";
         emitted++;
         os << ((emitted == totalPorts) ? "\n" : ",\n");
       }
       for (unsigned i = 0; i < outPorts.size(); ++i) {
-        os << "  ." << outPorts[i] << "(" << nt.get(inst.getResult(i)) << ")";
+        os << "  ." << outPorts[i] << "(" << outConn[i] << ")";
         emitted++;
         os << ((emitted == totalPorts) ? "\n" : ",\n");
       }
       os << ");\n";
+      for (unsigned i = 0; i < outPorts.size(); ++i) {
+        Value result = inst.getResult(i);
+        if (isa<VectorType>(result.getType()))
+          emitUnpackFromPacked(nt.get(result), outConn[i], result.getType(), os);
+      }
     }
     os << "\n";
   }
@@ -1113,9 +1347,12 @@ static LogicalResult emitFunc(func::FuncOp f, raw_ostream &os, const VerilogEmit
   if (!ret)
     return f.emitError("missing return");
   for (auto [i, v] : llvm::enumerate(ret.getOperands())) {
-    if (nt.get(v) == outNames[i])
+    if (!isa<VectorType>(f.getResultTypes()[i]) && nt.get(v) == outNames[i])
       continue;
-    emitConnectAssign(outNames[i], nt.get(v), f.getResultTypes()[i], os);
+    if (isa<VectorType>(f.getResultTypes()[i]))
+      emitPackToPacked(outNames[i], nt.get(v), f.getResultTypes()[i], os);
+    else
+      emitConnectAssign(outNames[i], nt.get(v), f.getResultTypes()[i], os);
   }
 
   os << "\nendmodule\n\n";

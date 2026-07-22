@@ -175,8 +175,8 @@ BINARY_SPECS: tuple[BinarySpec, ...] = (
     BinarySpec("slt", ("vector<", "pyc.slt"), _samples({"a": SIGNED_A, "b": SIGNED_B}, {"a": SIGNED_A, "scalar": 0b1110}, {"a": SIGNED_A, "scalar": 0b1110}), oracle_op="lt", signed=True, out_width=1),
     BinarySpec("udiv", ("vector<", "pyc.udiv"), _samples({"a": DIV_A, "b": DIV_B}, {"a": DIV_A, "scalar": 3}, {"a": DIV_B, "scalar": 15}), oracle_op="div"),
     BinarySpec("urem", ("vector<", "pyc.urem"), _samples({"a": DIV_A, "b": DIV_B}, {"a": DIV_A, "scalar": 3}, {"a": DIV_B, "scalar": 15}), oracle_op="rem"),
-    BinarySpec("sdiv", ("vector<", "pyc.sdiv"), _samples({"a": SDIV_A, "b": SDIV_B}, {"a": SDIV_A, "scalar": 0b1110}, {"a": SDIV_B, "scalar": 0b0110}), oracle_op="div", signed=True, verilator=False),
-    BinarySpec("srem", ("vector<", "pyc.srem"), _samples({"a": SDIV_A, "b": SDIV_B}, {"a": SDIV_A, "scalar": 0b1110}, {"a": SDIV_B, "scalar": 0b0110}), oracle_op="rem", signed=True, verilator=False),
+    BinarySpec("sdiv", ("vector<", "pyc.sdiv"), _samples({"a": SDIV_A, "b": SDIV_B}, {"a": SDIV_A, "scalar": 0b1110}, {"a": SDIV_B, "scalar": 0b0110}), oracle_op="div", signed=True),
+    BinarySpec("srem", ("vector<", "pyc.srem"), _samples({"a": SDIV_A, "b": SDIV_B}, {"a": SDIV_A, "scalar": 0b1110}, {"a": SDIV_B, "scalar": 0b0110}), oracle_op="rem", signed=True),
 )
 
 
@@ -205,9 +205,9 @@ VEC_CASES: tuple[VecCase, ...] = (
     VecCase("select_vv", "select_vv", samples=({"cond": [1, 0, 1, 0], "a": BASE_A, "b": BASE_B},), expected=_select, ir_tokens=("vector<", "pyc.mux")),
     VecCase("select_vs", "select_vs", samples=({"cond": [1, 0, 1, 0], "a": BASE_A, "scalar": 9},), expected=_select_vs, ir_tokens=("vector<", "pyc.mux")),
     VecCase("select_sv", "select_sv", samples=({"cond": [1, 0, 1, 0], "a": BASE_A, "scalar": 9},), expected=_select_sv, ir_tokens=("vector<", "pyc.mux")),
-    VecCase("zext", "zext", out_width=6, samples=({"a": SIGNED_A},), expected=_zext, ir_tokens=("vector<", "pyc.zext"), full_backend=False),
-    VecCase("sext", "sext", signed=True, out_width=6, samples=({"a": SIGNED_A},), expected=_sext, ir_tokens=("vector<", "pyc.sext"), full_backend=False),
-    VecCase("trunc", "trunc", out_width=3, samples=({"a": BASE_A},), expected=_trunc, ir_tokens=("pyc.extract",), allow_scalarized=True, full_backend=False),
+    VecCase("zext", "zext", out_width=6, samples=({"a": SIGNED_A},), expected=_zext, ir_tokens=("vector<", "pyc.zext")),
+    VecCase("sext", "sext", signed=True, out_width=6, samples=({"a": SIGNED_A},), expected=_sext, ir_tokens=("vector<", "pyc.sext")),
+    VecCase("trunc", "trunc", out_width=3, samples=({"a": BASE_A},), expected=_trunc, ir_tokens=("vector<", "pyc.trunc")),
     VecCase("slice", "slice", out_width=2, samples=({"a": BASE_A},), expected=_slice, ir_tokens=("pyc.extract",), allow_scalarized=True, full_backend=False),
     VecCase("shl_imm", "shl_imm", samples=({"a": BASE_A},), expected=_shl, ir_tokens=("vector<", "pyc.shli")),
     VecCase("lshr_imm", "lshr_imm", samples=({"a": BASE_A},), expected=_lshr, ir_tokens=("vector<", "pyc.lshri")),

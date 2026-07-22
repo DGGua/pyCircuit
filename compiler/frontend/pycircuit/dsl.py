@@ -47,6 +47,12 @@ def _format_vector_type(shape: list[int], elem_ty: str) -> str:
     return "vector<" + "x".join(str(d) for d in shape) + "x" + elem_ty + ">"
 
 
+def _normalize_reduce_mode(mode: str) -> str:
+    if mode not in ("chain", "tree"):
+        raise ValueError(f"reduce mode must be 'chain' or 'tree', got {mode!r}")
+    return mode
+
+
 def _vector_elem_type(ty: str) -> tuple[int, str]:
     shape, elem_ty = _vector_shape_elem_type(ty)
     if len(shape) == 1:
@@ -441,6 +447,22 @@ class Module:
         self._emit(f"{tmp} = pyc.v_broadcast {scalar.ref} to {lanes} : {scalar.ty} -> {out_ty}")
         return Signal(ref=tmp, ty=out_ty)
 
+    def v_broadcast_dim(self, vec: Signal, *, size: int, dim: int) -> Signal:
+        """Broadcast a vector by repeating along a new dimension."""
+        lanes = int(size)
+        d = int(dim)
+        if lanes <= 0:
+            raise ValueError("v_broadcast_dim size must be > 0")
+        shape, elem_ty = _vector_shape_elem_type(vec.ty)
+        if d < 0 or d > len(shape):
+            raise ValueError(f"v_broadcast_dim dim out of range: {d} for {vec.ty}")
+        new_shape = list(shape)
+        new_shape.insert(d, lanes)
+        out_ty = _format_vector_type(new_shape, elem_ty)
+        tmp = self._tmp()
+        self._emit(f"{tmp} = pyc.v_broadcast_dim {vec.ref} to {lanes}, {d} : {vec.ty} -> {out_ty}")
+        return Signal(ref=tmp, ty=out_ty)
+
     def v_get(self, vec: Signal, *, index: int) -> Signal:
         lanes, elem_ty = _vector_elem_type(vec.ty)
         idx = int(index)
@@ -451,7 +473,8 @@ class Module:
         self._vec_get_map[tmp] = (str(vec.ref), idx)
         return Signal(ref=tmp, ty=elem_ty)
 
-    def _v_reduce(self, op: str, vec: Signal, *, dim: int | None = None) -> Signal:
+    def _v_reduce(self, op: str, vec: Signal, *, dim: int | None = None, mode: str = "chain") -> Signal:
+        reduce_mode = _normalize_reduce_mode(mode)
         shape, elem_ty = _vector_shape_elem_type(vec.ty)
         reduce_dim = 0 if dim is None else int(dim)
         if reduce_dim < 0 or reduce_dim >= len(shape):
@@ -459,18 +482,23 @@ class Module:
         out_shape = [d for i, d in enumerate(shape) if i != reduce_dim]
         out_ty = _format_vector_type(out_shape, elem_ty)
         tmp = self._tmp()
-        attrs = f" {{dim = {reduce_dim}}}" if dim is not None else ""
+        attr_parts: list[str] = []
+        if dim is not None:
+            attr_parts.append(f"dim = {reduce_dim}")
+        if reduce_mode == "tree":
+            attr_parts.append('mode = "tree"')
+        attrs = " {" + ", ".join(attr_parts) + "}" if attr_parts else ""
         self._emit(f"{tmp} = pyc.{op} {vec.ref}{attrs} : {vec.ty} -> {out_ty}")
         return Signal(ref=tmp, ty=out_ty)
 
-    def v_or_reduce(self, vec: Signal, *, dim: int | None = None) -> Signal:
-        return self._v_reduce("v_or_reduce", vec, dim=dim)
+    def v_or_reduce(self, vec: Signal, *, dim: int | None = None, mode: str = "chain") -> Signal:
+        return self._v_reduce("v_or_reduce", vec, dim=dim, mode=mode)
 
-    def v_and_reduce(self, vec: Signal, *, dim: int | None = None) -> Signal:
-        return self._v_reduce("v_and_reduce", vec, dim=dim)
+    def v_and_reduce(self, vec: Signal, *, dim: int | None = None, mode: str = "chain") -> Signal:
+        return self._v_reduce("v_and_reduce", vec, dim=dim, mode=mode)
 
-    def v_add_reduce(self, vec: Signal, *, dim: int | None = None) -> Signal:
-        return self._v_reduce("v_add_reduce", vec, dim=dim)
+    def v_add_reduce(self, vec: Signal, *, dim: int | None = None, mode: str = "chain") -> Signal:
+        return self._v_reduce("v_add_reduce", vec, dim=dim, mode=mode)
 
     def instance_op(
         self,

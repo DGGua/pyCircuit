@@ -5,6 +5,7 @@
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/OpImplementation.h"
 #include "mlir/IR/SymbolTable.h"
@@ -1317,7 +1318,39 @@ LogicalResult VBroadcastOp::verify() {
   return success();
 }
 
-static LogicalResult verifyVectorReduce(Operation *op, Value vec, std::optional<int64_t> dimAttr, Type resultTy) {
+LogicalResult VBroadcastDimOp::verify() {
+  auto srcVT = dyn_cast<VectorType>(getVec().getType());
+  if (!srcVT || srcVT.getRank() < 1)
+    return emitOpError("vec operand must have a vector type");
+  auto resultVT = dyn_cast<VectorType>(getResult().getType());
+  if (!resultVT)
+    return emitOpError("result type must be a vector type");
+  int64_t size = getSizeAttr().getInt();
+  int64_t dim = getDimAttr().getInt();
+  if (dim < 0 || dim > srcVT.getRank())
+    return emitOpError("dim out of range: ") << dim << " (src rank=" << srcVT.getRank() << ")";
+  if (size <= 0)
+    return emitOpError("size must be positive");
+  if (resultVT.getRank() != srcVT.getRank() + 1)
+    return emitOpError("result rank must be src rank + 1");
+  for (int64_t s = 0; s < srcVT.getRank(); ++s) {
+    int64_t rd = s < dim ? s : s + 1;
+    if (resultVT.getDimSize(rd) != srcVT.getDimSize(s))
+      return emitOpError("result dim ") << rd << " must match src dim " << s;
+  }
+  if (resultVT.getDimSize(dim) != size)
+    return emitOpError("result dim ") << dim << " size must be " << size;
+  if (resultVT.getElementType() != srcVT.getElementType())
+    return emitOpError("result element type must match src element type");
+  return success();
+}
+
+static LogicalResult verifyVectorReduce(
+    Operation *op,
+    Value vec,
+    std::optional<int64_t> dimAttr,
+    StringAttr modeAttr,
+    Type resultTy) {
   auto vecTy = dyn_cast<VectorType>(vec.getType());
   if (!vecTy)
     return op->emitOpError("vec operand must have vector type");
@@ -1335,6 +1368,11 @@ static LogicalResult verifyVectorReduce(Operation *op, Value vec, std::optional<
     return op->emitOpError("dim out of range: ") << dim << " for rank " << vecTy.getRank();
   if (!dimAttr && vecTy.getRank() != 1)
     return op->emitOpError("omitted dim is only valid for rank-1 vectors");
+  if (modeAttr) {
+    StringRef mode = modeAttr.getValue();
+    if (mode != "chain" && mode != "tree")
+      return op->emitOpError("mode must be \"chain\" or \"tree\"");
+  }
 
   SmallVector<int64_t> outShape;
   for (auto [i, d] : llvm::enumerate(vecTy.getShape())) {
@@ -1350,15 +1388,15 @@ static LogicalResult verifyVectorReduce(Operation *op, Value vec, std::optional<
 }
 
 LogicalResult VOrReduceOp::verify() {
-  return verifyVectorReduce(getOperation(), getVec(), getDim(), getResult().getType());
+  return verifyVectorReduce(getOperation(), getVec(), getDim(), getModeAttr(), getResult().getType());
 }
 
 LogicalResult VAndReduceOp::verify() {
-  return verifyVectorReduce(getOperation(), getVec(), getDim(), getResult().getType());
+  return verifyVectorReduce(getOperation(), getVec(), getDim(), getModeAttr(), getResult().getType());
 }
 
 LogicalResult VAddReduceOp::verify() {
-  return verifyVectorReduce(getOperation(), getVec(), getDim(), getResult().getType());
+  return verifyVectorReduce(getOperation(), getVec(), getDim(), getModeAttr(), getResult().getType());
 }
 
 #define GET_OP_CLASSES
