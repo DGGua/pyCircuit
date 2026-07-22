@@ -20,6 +20,15 @@ static std::optional<uint64_t> getConstUInt(Value v) {
     if (auto i = dyn_cast<IntegerAttr>(c.getValue()))
       return i.getValue().getZExtValue();
   }
+  // Vector constant: v_broadcast of a constant scalar.
+  if (auto vb = v.getDefiningOp<pyc::VBroadcastOp>()) {
+    if (auto c = vb.getScalar().getDefiningOp<pyc::ConstantOp>())
+      return c.getValueAttr().getValue().getZExtValue();
+    if (auto c = vb.getScalar().getDefiningOp<arith::ConstantOp>()) {
+      if (auto i = dyn_cast<IntegerAttr>(c.getValue()))
+        return i.getValue().getZExtValue();
+    }
+  }
   return std::nullopt;
 }
 
@@ -43,14 +52,37 @@ static bool andMatches(pyc::AndOp op, Value a, bool aNot, Value b, bool bNot) {
          (lBase == b && lNot == bNot && rBase == a && rNot == aNot);
 }
 
+// Create a constant value, broadcasting to a vector when needed.
 static Value constInt(PatternRewriter &rewriter, Location loc, Type ty, const llvm::APInt &v) {
-  auto intTy = dyn_cast<IntegerType>(ty);
-  if (!intTy)
-    return {};
-  llvm::APInt vv = v;
-  if (vv.getBitWidth() != intTy.getWidth())
-    vv = vv.zextOrTrunc(intTy.getWidth());
-  return rewriter.create<pyc::ConstantOp>(loc, intTy, IntegerAttr::get(intTy, vv));
+  // Scalar path.
+  if (auto intTy = dyn_cast<IntegerType>(ty)) {
+    llvm::APInt vv = v;
+    if (vv.getBitWidth() != intTy.getWidth())
+      vv = vv.zextOrTrunc(intTy.getWidth());
+    return rewriter.create<pyc::ConstantOp>(loc, intTy, IntegerAttr::get(intTy, vv));
+  }
+  // Vector path: constant + broadcast.
+  if (auto vt = dyn_cast<VectorType>(ty)) {
+    auto elemTy = dyn_cast<IntegerType>(vt.getElementType());
+    if (!elemTy)
+      return {};
+    llvm::APInt vv = v;
+    if (vv.getBitWidth() != elemTy.getWidth())
+      vv = vv.zextOrTrunc(elemTy.getWidth());
+    Value scalar = rewriter.create<pyc::ConstantOp>(loc, elemTy, IntegerAttr::get(elemTy, vv));
+    return rewriter.create<pyc::VBroadcastOp>(loc, vt, scalar, vt.getShape()[0]);
+  }
+  return {};
+}
+
+/// Return the element type for i1 checks: scalar i1 or vector<…xi1>.
+static bool isI1OrI1Vector(Type ty) {
+  if (auto intTy = dyn_cast<IntegerType>(ty))
+    return intTy.getWidth() == 1;
+  if (auto vt = dyn_cast<VectorType>(ty))
+    if (auto et = dyn_cast<IntegerType>(vt.getElementType()))
+      return et.getWidth() == 1;
+  return false;
 }
 
 struct MuxSameSelSimplify : public OpRewritePattern<pyc::MuxOp> {
@@ -89,8 +121,7 @@ struct MuxI1ToLogic : public OpRewritePattern<pyc::MuxOp> {
   using OpRewritePattern::OpRewritePattern;
 
   LogicalResult matchAndRewrite(pyc::MuxOp op, PatternRewriter &rewriter) const override {
-    auto ty = dyn_cast<IntegerType>(op.getType());
-    if (!ty || ty.getWidth() != 1)
+    if (!isI1OrI1Vector(op.getType()))
       return failure();
 
     auto aConst = getConstUInt(op.getA());
@@ -117,24 +148,24 @@ struct MuxI1ToLogic : public OpRewritePattern<pyc::MuxOp> {
     // For i1, convert muxes with constant arms into simple gates.
     if (bConst && (((*bConst) & 1) == 0)) {
       // sel ? a : 0  ==>  sel & a
-      rewriter.replaceOpWithNewOp<pyc::AndOp>(op, op.getSel(), op.getA());
+      rewriter.replaceOpWithNewOp<pyc::AndOp>(op, op.getResult().getType(), op.getSel(), op.getA());
       return success();
     }
     if (aConst && (((*aConst) & 1) == 1)) {
       // sel ? 1 : b  ==>  sel | b
-      rewriter.replaceOpWithNewOp<pyc::OrOp>(op, op.getSel(), op.getB());
+      rewriter.replaceOpWithNewOp<pyc::OrOp>(op, op.getResult().getType(), op.getSel(), op.getB());
       return success();
     }
     if (bConst && (((*bConst) & 1) == 1)) {
       // sel ? a : 1  ==>  (~sel) | a
       Value nsel = rewriter.create<pyc::NotOp>(op.getLoc(), op.getSel());
-      rewriter.replaceOpWithNewOp<pyc::OrOp>(op, nsel, op.getA());
+      rewriter.replaceOpWithNewOp<pyc::OrOp>(op, op.getResult().getType(), nsel, op.getA());
       return success();
     }
     if (aConst && (((*aConst) & 1) == 0)) {
       // sel ? 0 : b  ==>  (~sel) & b
       Value nsel = rewriter.create<pyc::NotOp>(op.getLoc(), op.getSel());
-      rewriter.replaceOpWithNewOp<pyc::AndOp>(op, nsel, op.getB());
+      rewriter.replaceOpWithNewOp<pyc::AndOp>(op, op.getResult().getType(), nsel, op.getB());
       return success();
     }
 
@@ -187,10 +218,8 @@ struct OrBasicSimplify : public OpRewritePattern<pyc::OrOp> {
     auto [lb, ln] = stripNot(lhs);
     auto [rb, rn] = stripNot(rhs);
     if ((lb == rb) && (ln != rn)) {
-      auto intTy = dyn_cast<IntegerType>(op.getType());
-      if (!intTy)
-        return failure();
-      Value ones = constInt(rewriter, op.getLoc(), intTy, llvm::APInt::getAllOnes(intTy.getWidth()));
+      Value ones = constInt(rewriter, op.getLoc(), op.getType(), llvm::APInt::getAllOnes(
+          isa<IntegerType>(op.getType()) ? cast<IntegerType>(op.getType()).getWidth() : 1));
       if (!ones)
         return failure();
       rewriter.replaceOp(op, ones);
@@ -248,6 +277,142 @@ struct OrAndXorFactor : public OpRewritePattern<pyc::OrOp> {
   }
 };
 
+struct VGetOfVCreate : public OpRewritePattern<pyc::VGetOp> {
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(pyc::VGetOp op, PatternRewriter &rewriter) const override {
+    auto create = op.getVec().getDefiningOp<pyc::VCreateOp>();
+    if (!create)
+      return failure();
+    std::uint64_t idx = op.getIndex();
+    if (idx >= create.getElements().size())
+      return failure();
+    rewriter.replaceOp(op, *std::next(create.getElements().begin(), static_cast<long>(idx)));
+    return success();
+  }
+};
+
+struct VGetOfVBroadcast : public OpRewritePattern<pyc::VGetOp> {
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(pyc::VGetOp op, PatternRewriter &rewriter) const override {
+    auto broadcast = op.getVec().getDefiningOp<pyc::VBroadcastOp>();
+    if (!broadcast)
+      return failure();
+    rewriter.replaceOp(op, broadcast.getScalar());
+    return success();
+  }
+};
+
+struct VGetOfVectorMux : public OpRewritePattern<pyc::VGetOp> {
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(pyc::VGetOp op, PatternRewriter &rewriter) const override {
+    auto mux = op.getVec().getDefiningOp<pyc::MuxOp>();
+    if (!mux || !mux.getResult().hasOneUse())
+      return failure();
+    auto muxVT = dyn_cast<VectorType>(mux.getResult().getType());
+    if (!muxVT)
+      return failure();
+    std::uint64_t idx = op.getIndex();
+    if (idx >= static_cast<std::uint64_t>(muxVT.getDimSize(0)))
+      return failure();
+
+    Value sel = mux.getSel();
+    if (auto selVT = dyn_cast<VectorType>(sel.getType())) {
+      Type selLaneTy = selVT.getRank() == 1
+                           ? Type(selVT.getElementType())
+                           : Type(VectorType::get(selVT.getShape().drop_front(), selVT.getElementType()));
+      sel = rewriter.create<pyc::VGetOp>(op.getLoc(), selLaneTy, sel, idx);
+    }
+
+    Type laneTy = op.getResult().getType();
+    Value a = rewriter.create<pyc::VGetOp>(op.getLoc(), laneTy, mux.getA(), idx);
+    Value b = rewriter.create<pyc::VGetOp>(op.getLoc(), laneTy, mux.getB(), idx);
+    rewriter.replaceOpWithNewOp<pyc::MuxOp>(op, laneTy, sel, a, b);
+    return success();
+  }
+};
+
+struct VCreateOfConsecutiveVGets : public OpRewritePattern<pyc::VCreateOp> {
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(pyc::VCreateOp op, PatternRewriter &rewriter) const override {
+    if (op.getElements().empty())
+      return failure();
+
+    Value src;
+    std::uint64_t expected = 0;
+    for (Value elem : op.getElements()) {
+      auto get = elem.getDefiningOp<pyc::VGetOp>();
+      if (!get || get.getIndex() != expected++)
+        return failure();
+      if (!src)
+        src = get.getVec();
+      else if (src != get.getVec())
+        return failure();
+    }
+
+    if (!src || src.getType() != op.getResult().getType())
+      return failure();
+    rewriter.replaceOp(op, src);
+    return success();
+  }
+};
+
+template <typename ReduceOp>
+struct VReduceOfVBroadcast : public OpRewritePattern<ReduceOp> {
+  using OpRewritePattern<ReduceOp>::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(ReduceOp op, PatternRewriter &rewriter) const override {
+    auto broadcast = op.getVec().template getDefiningOp<pyc::VBroadcastOp>();
+    if (!broadcast)
+      return failure();
+    auto vecTy = dyn_cast<VectorType>(op.getVec().getType());
+    if (!vecTy || vecTy.getRank() != 1)
+      return failure();
+    if (op.getResult().getType() != broadcast.getScalar().getType())
+      return failure();
+    rewriter.replaceOp(op, broadcast.getScalar());
+    return success();
+  }
+};
+
+template <typename ReduceOp>
+struct VReduceSingleLaneDim : public OpRewritePattern<ReduceOp> {
+  using OpRewritePattern<ReduceOp>::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(ReduceOp op, PatternRewriter &rewriter) const override {
+    auto vecTy = dyn_cast<VectorType>(op.getVec().getType());
+    if (!vecTy)
+      return failure();
+    std::int64_t dim = op.getDim().value_or(0);
+    if (dim < 0 || dim >= vecTy.getRank() || vecTy.getDimSize(dim) != 1)
+      return failure();
+
+    if (dim == 0) {
+      rewriter.replaceOpWithNewOp<pyc::VGetOp>(op, op.getResult().getType(), op.getVec(), 0);
+      return success();
+    }
+
+    // For rank-2 vectors represented as v_create(row0, row1, ...), reducing a
+    // single-column inner dimension picks lane 0 from every row.
+    auto create = op.getVec().template getDefiningOp<pyc::VCreateOp>();
+    if (!create)
+      return failure();
+    SmallVector<Value> elems;
+    elems.reserve(create.getElements().size());
+    for (Value row : create.getElements()) {
+      auto rowTy = dyn_cast<VectorType>(row.getType());
+      if (!rowTy || rowTy.getRank() != 1 || rowTy.getDimSize(0) != 1)
+        return failure();
+      elems.push_back(rewriter.create<pyc::VGetOp>(op.getLoc(), rowTy.getElementType(), row, 0));
+    }
+    rewriter.replaceOpWithNewOp<pyc::VCreateOp>(op, op.getResult().getType(), elems);
+    return success();
+  }
+};
+
 struct CombCanonicalizePass : public PassWrapper<CombCanonicalizePass, OperationPass<func::FuncOp>> {
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(CombCanonicalizePass)
 
@@ -259,7 +424,20 @@ struct CombCanonicalizePass : public PassWrapper<CombCanonicalizePass, Operation
   void runOnOperation() override {
     func::FuncOp f = getOperation();
     RewritePatternSet patterns(f.getContext());
-    patterns.add<MuxSameSelSimplify, MuxI1ToLogic, AndBasicSimplify, OrBasicSimplify, OrAndXorFactor>(f.getContext());
+    patterns.add<MuxSameSelSimplify,
+                 MuxI1ToLogic,
+                 AndBasicSimplify,
+                 OrBasicSimplify,
+                 OrAndXorFactor,
+                 VGetOfVCreate,
+                 VGetOfVBroadcast,
+                 VGetOfVectorMux,
+                 VCreateOfConsecutiveVGets,
+                 VReduceOfVBroadcast<pyc::VOrReduceOp>,
+                 VReduceOfVBroadcast<pyc::VAndReduceOp>,
+                 VReduceSingleLaneDim<pyc::VOrReduceOp>,
+                 VReduceSingleLaneDim<pyc::VAndReduceOp>,
+                 VReduceSingleLaneDim<pyc::VAddReduceOp>>(f.getContext());
 
     GreedyRewriteConfig cfg;
     if (failed(applyPatternsAndFoldGreedily(f, std::move(patterns), cfg)))
