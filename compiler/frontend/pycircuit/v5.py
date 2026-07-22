@@ -960,10 +960,16 @@ def _is_cas(v: object) -> bool:
 
 
 def mux(
-    cond: Union[Wire, Reg, CycleAwareSignal, StateSignal, ForwardSignal],
-    a: Union[Wire, Reg, CycleAwareSignal, StateSignal, ForwardSignal, int, LiteralValue],
-    b: Union[Wire, Reg, CycleAwareSignal, StateSignal, ForwardSignal, int, LiteralValue],
-) -> Union[Wire, CycleAwareSignal]:
+    cond: Union[Wire, Reg, Vec, CycleAwareSignal, StateSignal, ForwardSignal],
+    a: Union[Wire, Reg, Vec, CycleAwareSignal, StateSignal, ForwardSignal, int, LiteralValue],
+    b: Union[Wire, Reg, Vec, CycleAwareSignal, StateSignal, ForwardSignal, int, LiteralValue],
+) -> Union[Wire, Vec, CycleAwareSignal]:
+    # Vec-level mux: delegate to Vec._try_vector_select.
+    if isinstance(cond, Vec):
+        result = cond._try_vector_select(a, b)
+        if result is not None:
+            return result
+        raise TypeError(f"mux(Vec, ...) requires compatible Vec a/b arms")
     if _is_cas(cond) or _is_cas(a) or _is_cas(b):
         def _unwrap(v: object) -> object:
             if isinstance(v, ForwardSignal):

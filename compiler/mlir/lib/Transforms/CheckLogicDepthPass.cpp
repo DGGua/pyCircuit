@@ -4,6 +4,7 @@
 #include "pyc/Dialect/PYC/PYCOps.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/SymbolTable.h"
@@ -50,7 +51,12 @@ static int64_t vectorReduceCost(ReduceOp op) {
   int64_t dim = op.getDim().value_or(0);
   if (dim < 0 || dim >= vecTy.getRank())
     return 1;
-  return std::max<int64_t>(1, ceilLog2(vecTy.getDimSize(dim)));
+  int64_t lanes = vecTy.getDimSize(dim);
+  if (auto mode = op->template getAttrOfType<StringAttr>("mode")) {
+    if (mode.getValue() == "tree")
+      return std::max<int64_t>(1, ceilLog2(lanes));
+  }
+  return std::max<int64_t>(1, lanes - 1);
 }
 
 static int64_t opCost(Operation *op) {

@@ -2044,6 +2044,26 @@ def compile_module(
             signed = bool(spec.get("signed", False))
             c.env[p.name] = m.input(p.name, width=width, signed=signed)
             continue
+        if kind == "vec":
+            ty = str(spec.get("ty", "")).strip()
+            if not ty.startswith("vector<"):
+                raise JitError(f"invalid vector type in signature-bound port {p.name!r}: {ty!r}")
+            try:
+                shape, elem_ty = Vec._vector_shape_elem_type(ty)
+            except ValueError as e:
+                raise JitError(f"invalid vector type in signature-bound port {p.name!r}: {ty!r}") from e
+            if not elem_ty.startswith("i"):
+                raise JitError(f"invalid vector element type in signature-bound port {p.name!r}: {elem_ty!r}")
+            try:
+                width = int(elem_ty[1:])
+            except ValueError as e:
+                raise JitError(f"invalid vector element width in signature-bound port {p.name!r}: {elem_ty!r}") from e
+            if width <= 0:
+                raise JitError(f"invalid vector element width in signature-bound port {p.name!r}: {elem_ty!r}")
+            signed_raw = spec.get("signed", False)
+            signed = any(bool(v) for v in signed_raw) if isinstance(signed_raw, list) else bool(signed_raw)
+            c.env[p.name] = m.input(p.name, width=width, shape=shape, signed=signed)
+            continue
         raise JitError(f"unsupported signature-bound port kind for {p.name!r}: {kind!r}")
 
     returned: list[Any] = []

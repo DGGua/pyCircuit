@@ -194,6 +194,40 @@ class WireConnector(Connector):
 
 
 @dataclass(frozen=True, eq=False)
+class VecConnector(Connector):
+    owner: Any
+    name: str
+    vec: Any
+
+    def __post_init__(self) -> None:
+        maybe_owner = getattr(self.vec, "m", None)
+        if maybe_owner is not None and maybe_owner is not self.owner:
+            raise ConnectorError("vec connector must belong to the declaring Circuit")
+        if not hasattr(self.vec, "sig"):
+            raise ConnectorError("vec connector payload must expose a `sig` attribute")
+
+    @property
+    def ty(self) -> str:
+        sig = getattr(self.vec, "sig", None)
+        if sig is None:
+            info_fn = getattr(self.vec, "_as_vector_signal", None)
+            if callable(info_fn):
+                info = info_fn()
+                if info is not None:
+                    _m, sig, _signs = info
+        if sig is None:
+            raise ConnectorError("vec connector payload cannot be converted to a vector signal")
+        return str(sig.ty)
+
+    @property
+    def signed(self) -> list[bool]:
+        return list(getattr(self.vec, "signed", None) or [])
+
+    def read(self) -> Any:
+        return self.vec
+
+
+@dataclass(frozen=True, eq=False)
 class RegConnector(Connector):
     owner: Any
     name: str

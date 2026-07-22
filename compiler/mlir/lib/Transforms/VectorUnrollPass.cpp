@@ -4,6 +4,7 @@
 
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/Builders.h"
+#include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/Pass/Pass.h"
 #include "llvm/ADT/SmallVector.h"
@@ -102,7 +103,13 @@ static Value unrollElementwiseOp(Operation &op, OpBuilder &builder) {
   return createVector(builder, loc, vt, lanes, shape, 0);
 }
 
-// Unroll vector reduce into tree of scalar ops.
+static bool isTreeReduceMode(Operation &op) {
+  if (auto mode = op.getAttrOfType<StringAttr>("mode"))
+    return mode.getValue() == "tree";
+  return false;
+}
+
+// Unroll vector reduce according to its mode attr.
 static Value unrollReduceOp(Operation &op, OpBuilder &builder) {
   Location loc = op.getLoc();
   Value vec = op.getOperand(0);
@@ -122,6 +129,12 @@ static Value unrollReduceOp(Operation &op, OpBuilder &builder) {
   else
     return Value();
 
+  auto chainReduce = [&](llvm::SmallVectorImpl<Value> &values) -> Value {
+    Value out = values[0];
+    for (size_t i = 1; i < values.size(); ++i)
+      out = reducePair(out, values[i]);
+    return out;
+  };
   auto treeReduce = [&](llvm::SmallVectorImpl<Value> &values) -> Value {
     while (values.size() > 1) {
       llvm::SmallVector<Value> next;
@@ -135,13 +148,16 @@ static Value unrollReduceOp(Operation &op, OpBuilder &builder) {
     }
     return values[0];
   };
+  auto reduceValues = [&](llvm::SmallVectorImpl<Value> &values) -> Value {
+    return isTreeReduceMode(op) ? treeReduce(values) : chainReduce(values);
+  };
 
   if (vt.getRank() == 1) {
     int64_t lanes = vt.getShape()[0];
     llvm::SmallVector<Value> values;
     for (int64_t i = 0; i < lanes; ++i)
       values.push_back(extractLane(builder, loc, vec, {i}));
-    return treeReduce(values);
+    return reduceValues(values);
   }
 
   int64_t rows = vt.getShape()[0], cols = vt.getShape()[1];
@@ -151,7 +167,7 @@ static Value unrollReduceOp(Operation &op, OpBuilder &builder) {
       llvm::SmallVector<Value> colVals;
       for (int64_t i = 0; i < rows; ++i)
         colVals.push_back(extractLane(builder, loc, vec, {i, j}));
-      resultLanes.push_back(treeReduce(colVals));
+      resultLanes.push_back(reduceValues(colVals));
     }
     return builder.create<pyc::VCreateOp>(loc, VectorType::get({cols}, leafTy), resultLanes);
   } else {
@@ -160,7 +176,7 @@ static Value unrollReduceOp(Operation &op, OpBuilder &builder) {
       llvm::SmallVector<Value> rowVals;
       for (int64_t j = 0; j < cols; ++j)
         rowVals.push_back(extractLane(builder, loc, vec, {i, j}));
-      resultLanes.push_back(treeReduce(rowVals));
+      resultLanes.push_back(reduceValues(rowVals));
     }
     return builder.create<pyc::VCreateOp>(loc, VectorType::get({rows}, leafTy), resultLanes);
   }
@@ -171,6 +187,29 @@ static Value unrollBroadcast(pyc::VBroadcastOp op, OpBuilder &builder) {
   auto vt = cast<VectorType>(op.getResult().getType());
   llvm::SmallVector<Value> elements(vt.getShape()[0], op.getScalar());
   return builder.create<pyc::VCreateOp>(op.getLoc(), vt, elements);
+}
+
+// Unroll v_broadcast_dim: walk result lanes, mapping each to source lane.
+static Value unrollBroadcastDim(pyc::VBroadcastDimOp op, OpBuilder &builder) {
+  auto srcVT = cast<VectorType>(op.getVec().getType());
+  auto dstVT = cast<VectorType>(op.getResult().getType());
+  int64_t dim = op.getDimAttr().getInt();
+  ArrayRef<int64_t> dstShape = dstVT.getShape();
+
+  llvm::SmallVector<Value> lanes;
+  llvm::SmallVector<int64_t> indices;
+  walkShape(dstShape, 0, indices, [&](const llvm::SmallVectorImpl<int64_t> &dstIdx) {
+    // Build source index by dropping the broadcast dimension.
+    llvm::SmallVector<int64_t> srcIdx;
+    for (unsigned d = 0; d < dstShape.size(); ++d)
+      if (static_cast<int64_t>(d) != dim)
+        srcIdx.push_back(dstIdx[d]);
+    lanes.push_back(extractLane(builder, op.getLoc(), op.getVec(), srcIdx));
+  });
+
+  if (dstShape.size() == 1)
+    return builder.create<pyc::VCreateOp>(op.getLoc(), dstVT, lanes);
+  return createVector(builder, op.getLoc(), dstVT, lanes, dstShape, 0);
 }
 
 // Unroll WireOp: split into N scalar wires, rebuild with v_create.
@@ -228,7 +267,7 @@ static void unrollReg(pyc::RegOp op, OpBuilder &builder) {
 static bool isElementWiseVectorOp(Operation &op) {
   if (op.getNumResults() != 1) return false;
   if (!isa<VectorType>(op.getResult(0).getType())) return false;
-  if (isa<pyc::VGetOp, pyc::VCreateOp, pyc::VBroadcastOp,
+  if (isa<pyc::VGetOp, pyc::VCreateOp, pyc::VBroadcastOp, pyc::VBroadcastDimOp,
           pyc::VOrReduceOp, pyc::VAndReduceOp, pyc::VAddReduceOp,
           pyc::WireOp, pyc::AssignOp, pyc::RegOp>(op))
     return false;
@@ -259,7 +298,7 @@ struct VectorUnrollPass : public PassWrapper<VectorUnrollPass, OperationPass<fun
     OpBuilder builder(f.getContext());
 
     // Collect all vector ops in the function body and CombOp regions.
-    llvm::SmallVector<Operation *> vgetOps, reduceOps, broadcastOps;
+    llvm::SmallVector<Operation *> vgetOps, reduceOps, broadcastOps, broadcastDimOps;
     llvm::SmallVector<Operation *> wireOps, assignOps, regOps, elemOps;
 
     std::function<void(Operation &)> collect;
@@ -270,6 +309,8 @@ struct VectorUnrollPass : public PassWrapper<VectorUnrollPass, OperationPass<fun
         vgetOps.push_back(&op);
       else if (isa<pyc::VBroadcastOp>(op))
         broadcastOps.push_back(&op);
+      else if (isa<pyc::VBroadcastDimOp>(op))
+        broadcastDimOps.push_back(&op);
       else if (isa<pyc::WireOp>(op) && isa<VectorType>(op.getResult(0).getType()))
         wireOps.push_back(&op);
       else if (isa<pyc::AssignOp>(op) && isa<VectorType>(op.getOperand(0).getType()))
@@ -307,6 +348,12 @@ struct VectorUnrollPass : public PassWrapper<VectorUnrollPass, OperationPass<fun
       builder.setInsertionPoint(op);
       auto vb = cast<pyc::VBroadcastOp>(op);
       Value r = unrollBroadcast(vb, builder);
+      op->getResult(0).replaceAllUsesWith(r); op->erase();
+    }
+    for (auto *op : broadcastDimOps) {
+      builder.setInsertionPoint(op);
+      auto vbd = cast<pyc::VBroadcastDimOp>(op);
+      Value r = unrollBroadcastDim(vbd, builder);
       op->getResult(0).replaceAllUsesWith(r); op->erase();
     }
     for (auto *op : wireOps) {

@@ -12,6 +12,7 @@ import shutil
 import subprocess
 import sys
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -322,12 +323,95 @@ def _runtime_manifest_for_toolchain(toolchain_root: Path | None) -> dict[str, ob
     }
 
 
+@dataclass(frozen=True)
+class _PortInfo:
+    ty: str
+    shape: tuple[int, ...]
+    leaf_width: int
+
+    @property
+    def is_vector(self) -> bool:
+        return bool(self.shape)
+
+    @property
+    def total_width(self) -> int:
+        n = int(self.leaf_width)
+        for d in self.shape:
+            n *= int(d)
+        return n
+
+
+def _int_width_from_ty(ty: str) -> int:
+    raw = str(ty).strip()
+    if not raw.startswith("i"):
+        raise SystemExit(f"unsupported port type for TB generation: {ty!r}")
+    try:
+        width = int(raw[1:])
+    except ValueError as e:
+        raise SystemExit(f"unsupported port type for TB generation: {ty!r}") from e
+    if width <= 0:
+        raise SystemExit(f"unsupported port type for TB generation: {ty!r}")
+    return width
+
+
+def _split_vector_type_parts(body: str) -> list[str]:
+    parts: list[str] = []
+    depth = 0
+    start = 0
+    for i, ch in enumerate(body):
+        if ch == "<":
+            depth += 1
+        elif ch == ">":
+            depth -= 1
+        elif ch == "x" and depth == 0:
+            parts.append(body[start:i])
+            start = i + 1
+    parts.append(body[start:])
+    return [p.strip() for p in parts]
+
+
+def _parse_vector_type_for_tb(ty: str) -> tuple[list[int], str]:
+    raw = str(ty).strip()
+    if not (raw.startswith("vector<") and raw.endswith(">")):
+        raise SystemExit(f"unsupported port type for TB generation: {ty!r}")
+    body = raw[len("vector<") : -1]
+    parts = _split_vector_type_parts(body)
+    if len(parts) < 2:
+        raise SystemExit(f"unsupported port type for TB generation: {ty!r}")
+    dims: list[int] = []
+    try:
+        for p in parts[:-1]:
+            lanes = int(p)
+            if lanes <= 0:
+                raise ValueError
+            dims.append(lanes)
+    except ValueError as e:
+        raise SystemExit(f"unsupported port type for TB generation: {ty!r}") from e
+    return dims, parts[-1]
+
+
+def _port_info(ty: str) -> _PortInfo:
+    raw = str(ty).strip()
+    if raw == "!pyc.clock" or raw == "!pyc.reset":
+        return _PortInfo(raw, (), 1)
+    if raw.startswith("i"):
+        return _PortInfo(raw, (), _int_width_from_ty(raw))
+    if raw.startswith("vector<"):
+        shape, elem_ty = _parse_vector_type_for_tb(raw)
+        dims = list(shape)
+        while elem_ty.startswith("vector<"):
+            sub_shape, elem_ty = _parse_vector_type_for_tb(elem_ty)
+            dims.extend(sub_shape)
+        if not dims or any(int(d) <= 0 for d in dims):
+            raise SystemExit(f"unsupported port type for TB generation: {ty!r}")
+        return _PortInfo(raw, tuple(int(d) for d in dims), _int_width_from_ty(elem_ty))
+    raise SystemExit(f"unsupported port type for TB generation: {ty!r}")
+
+
 def _as_int_width(ty: str) -> int:
     if ty == "!pyc.clock" or ty == "!pyc.reset":
         return 1
-    if not ty.startswith("i"):
-        raise SystemExit(f"unsupported port type for TB generation: {ty!r}")
-    return int(ty[1:])
+    return _port_info(ty).total_width
 
 
 def _collect_build(mod: object, src: Path, args: argparse.Namespace) -> Module | Design:
@@ -460,6 +544,101 @@ def _render_tb_cpp(iface: _TopIface, t: Tb, *, trace_plan: TracePlan | None = No
             raw_words.append(f"0x{((vv >> (64 * i)) & ((1 << 64) - 1)):x}ull")
         return f"pyc::cpp::Wire<{width}>({{{', '.join(raw_words)}}})"
 
+    def flat_indices(shape: tuple[int, ...]) -> list[tuple[int, ...]]:
+        if not shape:
+            return [()]
+        out: list[tuple[int, ...]] = []
+
+        def walk(prefix: tuple[int, ...], rest: tuple[int, ...]) -> None:
+            if not rest:
+                out.append(prefix)
+                return
+            for i in range(int(rest[0])):
+                walk((*prefix, i), rest[1:])
+
+        walk((), tuple(shape))
+        return out
+
+    def cpp_access(sn: str, idx: tuple[int, ...]) -> str:
+        return "dut." + str(sn) + "".join(f"[{i}]" for i in idx)
+
+    def lane_value(v: int | bool, info: _PortInfo, lane: int) -> int:
+        vv = mask_value(v, info.total_width)
+        return (vv >> (lane * info.leaf_width)) & ((1 << info.leaf_width) - 1)
+
+    def drive_const_lines(sn: str, value: int | bool, ty: str, *, indent: str) -> list[str]:
+        info = _port_info(ty)
+        if not info.is_vector:
+            return [f"{indent}dut.{sn} = {wire_literal(value, info.leaf_width)};\n"]
+        out: list[str] = []
+        for lane, idx in enumerate(flat_indices(info.shape)):
+            out.append(f"{indent}{cpp_access(sn, idx)} = {wire_literal(lane_value(value, info, lane), info.leaf_width)};\n")
+        return out
+
+    def drive_expr_lines(sn: str, expr: str, ty: str, *, indent: str) -> list[str]:
+        info = _port_info(ty)
+        if info.total_width > 64:
+            raise SystemExit(f"random() for i{info.total_width} not supported in C++ TB generator (prototype limitation)")
+        if not info.is_vector:
+            return [f"{indent}dut.{sn} = pyc::cpp::Wire<{info.leaf_width}>({expr});\n"]
+        out: list[str] = []
+        for lane, idx in enumerate(flat_indices(info.shape)):
+            mask = (1 << info.leaf_width) - 1
+            shift = lane * info.leaf_width
+            out.append(
+                f"{indent}{cpp_access(sn, idx)} = pyc::cpp::Wire<{info.leaf_width}>((({expr}) >> {shift}) & 0x{mask:x}ull);\n"
+            )
+        return out
+
+    def packed_value_expr(sn: str, ty: str) -> str:
+        info = _port_info(ty)
+        if info.total_width > 64:
+            raise SystemExit(f"print() for i{info.total_width} not supported in C++ TB generator (prototype limitation)")
+        if not info.is_vector:
+            return f"dut.{sn}.value()"
+        parts: list[str] = []
+        for lane, idx in enumerate(flat_indices(info.shape)):
+            mask = (1 << info.leaf_width) - 1
+            shift = lane * info.leaf_width
+            access = cpp_access(sn, idx)
+            term = f"(({access}.value() & 0x{mask:x}ull) << {shift})"
+            parts.append(term)
+        return "(" + " | ".join(parts or ["0ull"]) + ")"
+
+    def expect_lines(sn: str, value: int | bool, msg: str, ty: str, *, indent: str, phase: str) -> list[str]:
+        info = _port_info(ty)
+        if not info.is_vector:
+            vv = mask_value(value, info.leaf_width)
+            exp = wire_literal(value, info.leaf_width)
+            if info.leaf_width == 1:
+                return [
+                    f"{indent}if (dut.{sn}.value() != {vv}u) {{ std::cerr << \"ERROR{phase}: {msg}: got=\" << dut.{sn}.value() << \" exp={vv}\\n\"; return 1; }}\n"
+                ]
+            if info.leaf_width <= 64:
+                return [
+                    f"{indent}if (dut.{sn}.value() != {vv}u) {{ std::cerr << \"ERROR{phase}: {msg}: got=0x\" << std::hex << dut.{sn}.value() << \" exp=0x{vv:x}\" << std::dec << \"\\n\"; return 1; }}\n"
+                ]
+            return [f"{indent}if (!(dut.{sn} == {exp})) {{ std::cerr << \"ERROR{phase}: {msg}\\n\"; return 1; }}\n"]
+
+        out: list[str] = []
+        for lane, idx in enumerate(flat_indices(info.shape)):
+            access = cpp_access(sn, idx)
+            vv = lane_value(value, info, lane)
+            lane_msg = f"{msg}[{']['.join(str(i) for i in idx)}]"
+            if info.leaf_width == 1:
+                out.append(
+                    f"{indent}if ({access}.value() != {vv}u) {{ std::cerr << \"ERROR{phase}: {lane_msg}: got=\" << {access}.value() << \" exp={vv}\\n\"; return 1; }}\n"
+                )
+            elif info.leaf_width <= 64:
+                out.append(
+                    f"{indent}if ({access}.value() != {vv}u) {{ std::cerr << \"ERROR{phase}: {lane_msg}: got=0x\" << std::hex << {access}.value() << \" exp=0x{vv:x}\" << std::dec << \"\\n\"; return 1; }}\n"
+                )
+            else:
+                out.append(
+                    f"{indent}if (!({access} == {wire_literal(vv, info.leaf_width)})) {{ std::cerr << \"ERROR{phase}: {lane_msg}\\n\"; return 1; }}\n"
+                )
+        return out
+
     # Group actions by cycle for compact emission.
     drives_by: dict[int, list[tuple[str, int | bool, str]]] = {}
     expects_pre_by: dict[int, list[tuple[str, int | bool, str | None, str]]] = {}
@@ -495,7 +674,7 @@ def _render_tb_cpp(iface: _TopIface, t: Tb, *, trace_plan: TracePlan | None = No
             ev = 1 if p.every is None else int(p.every)
             prints_every.append((fmt, st, ev, port_specs))
 
-    rand_specs: list[tuple[str, int, int, int, int]] = []
+    rand_specs: list[tuple[str, int, str, int, int, int]] = []
     if t.random_streams:
         used_ports: set[str] = set()
         for r in t.random_streams:
@@ -510,7 +689,7 @@ def _render_tb_cpp(iface: _TopIface, t: Tb, *, trace_plan: TracePlan | None = No
             w = _as_int_width(ty)
             if w > 64:
                 raise SystemExit(f"random() for i{w} not supported in C++ TB generator (prototype limitation)")
-            rand_specs.append((sn, w, int(r.seed), int(r.start), int(r.every)))
+            rand_specs.append((sn, w, ty, int(r.seed), int(r.start), int(r.every)))
 
     clk_sn = ""
     rst_sn = ""
@@ -546,7 +725,7 @@ def _render_tb_cpp(iface: _TopIface, t: Tb, *, trace_plan: TracePlan | None = No
     lines.append("  std::optional<pyc::cpp::PycTraceBinWriter> bin_trace;\n\n")
     if rand_specs:
         lines.append("  // Random streams (deterministic).\n")
-        for sn, _w, seed, _st, _ev in rand_specs:
+        for sn, _w, _ty, seed, _st, _ev in rand_specs:
             seed64 = int(seed) & ((1 << 64) - 1)
             lines.append(f"  std::uint64_t rng_{sn} = 0x{seed64:x}ull;\n")
         lines.append("\n")
@@ -690,14 +869,14 @@ def _render_tb_cpp(iface: _TopIface, t: Tb, *, trace_plan: TracePlan | None = No
 
     if rand_specs:
         lines.append("    // Random drives for this cycle (applied before explicit drives).\n")
-        for sn, w, _seed, st, ev in rand_specs:
+        for sn, w, ty, _seed, st, ev in rand_specs:
             mask = (1 << w) - 1 if w < 64 else (1 << 64) - 1
             lines.append(
                 f"    if (cyc >= {int(st)}ull && ((cyc - {int(st)}ull) % {int(ev)}ull) == 0ull) {{\n"
                 f"      rng_{sn} = rng_{sn} * 6364136223846793005ull + 1ull;\n"
-                f"      dut.{sn} = pyc::cpp::Wire<{w}>(0x{mask:x}ull & rng_{sn});\n"
-                f"    }}\n"
             )
+            lines.extend(drive_expr_lines(sn, f"(0x{mask:x}ull & rng_{sn})", ty, indent="      "))
+            lines.append("    }\n")
         lines.append("\n")
 
     if drives_by:
@@ -705,8 +884,7 @@ def _render_tb_cpp(iface: _TopIface, t: Tb, *, trace_plan: TracePlan | None = No
         for cyc in sorted(drives_by.keys()):
             lines.append(f"    case {cyc}:\n")
             for sn, val, ty in drives_by[cyc]:
-                w = _as_int_width(ty)
-                lines.append(f"      dut.{sn} = {wire_literal(val, w)};\n")
+                lines.extend(drive_const_lines(sn, val, ty, indent="      "))
             lines.append("      break;\n")
         lines.append("    default: break;\n")
         lines.append("    }\n")
@@ -721,20 +899,8 @@ def _render_tb_cpp(iface: _TopIface, t: Tb, *, trace_plan: TracePlan | None = No
         for cyc in sorted(expects_pre_by.keys()):
             lines.append(f"    case {cyc}: {{\n")
             for sn, val, msg, ty in expects_pre_by[cyc]:
-                w = _as_int_width(ty)
-                vv = mask_value(val, w)
-                exp = wire_literal(val, w)
                 m = msg if msg is not None else f"{sn} mismatch"
-                if w == 1:
-                    lines.append(
-                        f"      if (dut.{sn}.value() != {vv}u) {{ std::cerr << \"ERROR(pre): {m}: got=\" << dut.{sn}.value() << \" exp={vv}\\n\"; return 1; }}\n"
-                    )
-                elif w <= 64:
-                    lines.append(
-                        f"      if (dut.{sn}.value() != {vv}u) {{ std::cerr << \"ERROR(pre): {m}: got=0x\" << std::hex << dut.{sn}.value() << \" exp=0x{vv:x}\" << std::dec << \"\\n\"; return 1; }}\n"
-                    )
-                else:
-                    lines.append(f"      if (!(dut.{sn} == {exp})) {{ std::cerr << \"ERROR(pre): {m}\\n\"; return 1; }}\n")
+                lines.extend(expect_lines(sn, val, m, ty, indent="      ", phase="(pre)"))
             lines.append("      break; }\n")
         lines.append("    default: break;\n")
         lines.append("    }\n")
@@ -762,21 +928,8 @@ def _render_tb_cpp(iface: _TopIface, t: Tb, *, trace_plan: TracePlan | None = No
         for cyc in sorted(expects_post_by.keys()):
             lines.append(f"    case {cyc}: {{\n")
             for sn, val, msg, ty in expects_post_by[cyc]:
-                w = _as_int_width(ty)
-                vv = mask_value(val, w)
-                exp = wire_literal(val, w)
                 m = msg if msg is not None else f"{sn} mismatch"
-                # Print decimal for i1, hex for <=64 wider signals.
-                if w == 1:
-                    lines.append(
-                        f"      if (dut.{sn}.value() != {vv}u) {{ std::cerr << \"ERROR: {m}: got=\" << dut.{sn}.value() << \" exp={vv}\\n\"; return 1; }}\n"
-                    )
-                elif w <= 64:
-                    lines.append(
-                        f"      if (dut.{sn}.value() != {vv}u) {{ std::cerr << \"ERROR: {m}: got=0x\" << std::hex << dut.{sn}.value() << \" exp=0x{vv:x}\" << std::dec << \"\\n\"; return 1; }}\n"
-                    )
-                else:
-                    lines.append(f"      if (!(dut.{sn} == {exp})) {{ std::cerr << \"ERROR: {m}\\n\"; return 1; }}\n")
+                lines.extend(expect_lines(sn, val, m, ty, indent="      ", phase=""))
             lines.append("      break; }\n")
         lines.append("    default: break;\n")
         lines.append("    }\n")
@@ -792,10 +945,11 @@ def _render_tb_cpp(iface: _TopIface, t: Tb, *, trace_plan: TracePlan | None = No
                     lines.append(f"      std::cerr << \"[tb] cyc=\" << cyc << {msg_lit}")
                     for raw, sn, w in ports:
                         raw_lit = json.dumps(f" {raw}=")
+                        expr = packed_value_expr(sn, iface.resolve(raw)[2])
                         if w == 1:
-                            lines.append(f" << {raw_lit} << dut.{sn}.value()")
+                            lines.append(f" << {raw_lit} << {expr}")
                         else:
-                            lines.append(f" << {raw_lit} << \"0x\" << std::hex << dut.{sn}.value() << std::dec")
+                            lines.append(f" << {raw_lit} << \"0x\" << std::hex << {expr} << std::dec")
                     lines.append(" << \"\\n\";\n")
                 lines.append("      break; }\n")
             lines.append("    default: break;\n")
@@ -808,10 +962,11 @@ def _render_tb_cpp(iface: _TopIface, t: Tb, *, trace_plan: TracePlan | None = No
                 lines.append(f"      std::cerr << \"[tb] cyc=\" << cyc << {msg_lit}")
                 for raw, sn, w in ports:
                     raw_lit = json.dumps(f" {raw}=")
+                    expr = packed_value_expr(sn, iface.resolve(raw)[2])
                     if w == 1:
-                        lines.append(f" << {raw_lit} << dut.{sn}.value()")
+                        lines.append(f" << {raw_lit} << {expr}")
                     else:
-                        lines.append(f" << {raw_lit} << \"0x\" << std::hex << dut.{sn}.value() << std::dec")
+                        lines.append(f" << {raw_lit} << \"0x\" << std::hex << {expr} << std::dec")
                 lines.append(" << \"\\n\";\n")
                 lines.append("    }\n")
 
@@ -848,16 +1003,89 @@ def _render_tb_sv(iface: _TopIface, t: Tb, *, trace_plan: TracePlan | None = Non
         return f"{width}'h{vv:x}"
 
     def decl(name: str, ty: str) -> str:
-        w = _as_int_width(ty)
-        if w == 1:
-            return f"  logic {name};\n"
-        return f"  logic [{w - 1}:0] {name};\n"
+        info = _port_info(ty)
+        if not info.is_vector:
+            w = info.leaf_width
+            if w == 1:
+                return f"  logic {name};\n"
+            return f"  logic [{w - 1}:0] {name};\n"
+        unpacked = "".join(f" [0:{int(d) - 1}]" for d in info.shape)
+        if info.leaf_width == 1:
+            return f"  logic {name}{unpacked};\n"
+        return f"  logic [{info.leaf_width - 1}:0] {name}{unpacked};\n"
+
+    def flat_indices(shape: tuple[int, ...]) -> list[tuple[int, ...]]:
+        if not shape:
+            return [()]
+        out: list[tuple[int, ...]] = []
+
+        def walk(prefix: tuple[int, ...], rest: tuple[int, ...]) -> None:
+            if not rest:
+                out.append(prefix)
+                return
+            for i in range(int(rest[0])):
+                walk((*prefix, i), rest[1:])
+
+        walk((), tuple(shape))
+        return out
+
+    def sv_access(name: str, idx: tuple[int, ...]) -> str:
+        return str(name) + "".join(f"[{i}]" for i in idx)
+
+    def lane_value(v: int | bool, info: _PortInfo, lane: int) -> int:
+        vv = int(v) if not isinstance(v, bool) else (1 if v else 0)
+        vv &= (1 << info.total_width) - 1
+        return (vv >> (lane * info.leaf_width)) & ((1 << info.leaf_width) - 1)
+
+    def sv_packed_expr(name: str, ty: str) -> str:
+        info = _port_info(ty)
+        if not info.is_vector:
+            return str(name)
+        lanes = [sv_access(name, idx) for idx in flat_indices(info.shape)]
+        return "{" + ", ".join(reversed(lanes)) + "}"
+
+    def sv_drive_const_lines(name: str, value: int | bool, ty: str, *, indent: str) -> list[str]:
+        info = _port_info(ty)
+        if not info.is_vector:
+            return [f"{indent}{name} = {sv_lit(info.leaf_width, value)};\n"]
+        out: list[str] = []
+        for lane, idx in enumerate(flat_indices(info.shape)):
+            out.append(f"{indent}{sv_access(name, idx)} = {sv_lit(info.leaf_width, lane_value(value, info, lane))};\n")
+        return out
+
+    def sv_drive_expr_lines(name: str, expr: str, ty: str, *, indent: str) -> list[str]:
+        info = _port_info(ty)
+        if info.total_width > 64:
+            raise SystemExit(f"random() for i{info.total_width} not supported in SV TB generator (prototype limitation)")
+        if not info.is_vector:
+            hi = 63 if info.leaf_width >= 64 else (info.leaf_width - 1)
+            return [f"{indent}{name} = {expr}[{hi}:0];\n"]
+        out: list[str] = []
+        for lane, idx in enumerate(flat_indices(info.shape)):
+            lo = lane * info.leaf_width
+            hi = lo + info.leaf_width - 1
+            out.append(f"{indent}{sv_access(name, idx)} = {expr}[{hi}:{lo}];\n")
+        return out
+
+    def sv_expect_lines(name: str, value: int | bool, msg: str, ty: str, *, indent: str, phase: str) -> list[str]:
+        info = _port_info(ty)
+        if not info.is_vector:
+            prefix = "PRE: " if phase == "pre" else ""
+            return [f"{indent}if ({name} !== {sv_lit(info.leaf_width, value)}) $fatal(1, \"{prefix}{msg}\");\n"]
+        out: list[str] = []
+        prefix = "PRE: " if phase == "pre" else ""
+        for lane, idx in enumerate(flat_indices(info.shape)):
+            lane_msg = f"{msg}[{']['.join(str(i) for i in idx)}]"
+            out.append(
+                f"{indent}if ({sv_access(name, idx)} !== {sv_lit(info.leaf_width, lane_value(value, info, lane))}) $fatal(1, \"{prefix}{lane_msg}\");\n"
+            )
+        return out
 
     drives_by: dict[int, list[tuple[str, int | bool, str]]] = {}
     expects_pre_by: dict[int, list[tuple[str, int | bool, str | None, str]]] = {}
     expects_post_by: dict[int, list[tuple[str, int | bool, str | None, str]]] = {}
-    prints_at: dict[int, list[tuple[str, list[str]]]] = {}
-    prints_every: list[tuple[str, int, int, list[str]]] = []
+    prints_at: dict[int, list[tuple[str, list[tuple[str, str, str]]]]] = {}
+    prints_every: list[tuple[str, int, int, list[tuple[str, str, str]]]] = []
     for d in t.drives:
         dir_, sn, ty = iface.resolve(d.port)
         if dir_ != "in":
@@ -874,8 +1102,8 @@ def _render_tb_sv(iface: _TopIface, t: Tb, *, trace_plan: TracePlan | None = Non
         fmt = str(p.fmt)
         ports = []
         for raw in p.ports:
-            _dir, sn, _ty = iface.resolve(raw)
-            ports.append(sn)
+            _dir, sn, ty = iface.resolve(raw)
+            ports.append((str(raw), sn, ty))
         if p.at is not None:
             prints_at.setdefault(int(p.at), []).append((fmt, ports))
         else:
@@ -883,7 +1111,7 @@ def _render_tb_sv(iface: _TopIface, t: Tb, *, trace_plan: TracePlan | None = Non
             ev = 1 if p.every is None else int(p.every)
             prints_every.append((fmt, st, ev, ports))
 
-    rand_specs: list[tuple[str, int, int, int, int]] = []
+    rand_specs: list[tuple[str, int, str, int, int, int]] = []
     if t.random_streams:
         used_ports: set[str] = set()
         for r in t.random_streams:
@@ -898,7 +1126,7 @@ def _render_tb_sv(iface: _TopIface, t: Tb, *, trace_plan: TracePlan | None = Non
             w = _as_int_width(ty)
             if w > 64:
                 raise SystemExit(f"random() for i{w} not supported in SV TB generator (prototype limitation)")
-            rand_specs.append((sn, w, int(r.seed), int(r.start), int(r.every)))
+            rand_specs.append((sn, w, ty, int(r.seed), int(r.start), int(r.every)))
 
     clk_sn = ""
     rst_sn = ""
@@ -926,7 +1154,7 @@ def _render_tb_sv(iface: _TopIface, t: Tb, *, trace_plan: TracePlan | None = Non
     if rand_specs:
         lines.append("\n")
         lines.append("  // Random stream state.\n")
-        for sn, _w, _seed, _st, _ev in rand_specs:
+        for sn, _w, _ty, _seed, _st, _ev in rand_specs:
             lines.append(f"  longint unsigned rng_{sn};\n")
     lines.append("  integer timeout_cycles;\n")
     lines.append("  integer cyc;\n")
@@ -990,14 +1218,13 @@ def _render_tb_sv(iface: _TopIface, t: Tb, *, trace_plan: TracePlan | None = Non
     for sn, ty in zip(iface.in_names, iface.in_tys):
         if sn == clk_sn:
             continue
-        w = _as_int_width(ty)
-        lines.append(f"    {sn} = {w}'d0;\n")
+        lines.extend(sv_drive_const_lines(sn, 0, ty, indent="    "))
     lines.append("    __pyc_tb_active = 1'b0;\n")
     lines.append("    __pyc_tb_done = 1'b0;\n")
     if rand_specs:
         lines.append("\n")
         lines.append("    // Random stream seeds.\n")
-        for sn, _w, seed, _st, _ev in rand_specs:
+        for sn, _w, _ty, seed, _st, _ev in rand_specs:
             seed64 = int(seed) & ((1 << 64) - 1)
             lines.append(f"    rng_{sn} = 64'h{seed64:016x};\n")
     lines.append("\n")
@@ -1028,12 +1255,11 @@ def _render_tb_sv(iface: _TopIface, t: Tb, *, trace_plan: TracePlan | None = Non
 
     if rand_specs:
         lines.append("      // Random drives for this cycle (applied before explicit drives).\n")
-        for sn, w, _seed, st, ev in rand_specs:
-            hi = 63 if w >= 64 else (w - 1)
+        for sn, _w, ty, _seed, st, ev in rand_specs:
             lines.append(f"      if (cyc >= {int(st)} && (((cyc - {int(st)}) % {int(ev)}) == 0)) begin\n")
             lines.append("        // LCG: state = state * 6364136223846793005 + 1.\n")
             lines.append(f"        rng_{sn} = (rng_{sn} * 64'd6364136223846793005) + 64'd1;\n")
-            lines.append(f"        {sn} = rng_{sn}[{hi}:0];\n")
+            lines.extend(sv_drive_expr_lines(sn, f"rng_{sn}", ty, indent="        "))
             lines.append("      end\n")
         lines.append("\n")
 
@@ -1043,8 +1269,7 @@ def _render_tb_sv(iface: _TopIface, t: Tb, *, trace_plan: TracePlan | None = Non
         for cyc in sorted(drives_by.keys()):
             lines.append(f"        {cyc}: begin\n")
             for sn, val, ty in drives_by[cyc]:
-                w = _as_int_width(ty)
-                lines.append(f"          {sn} = {sv_lit(w, val)};\n")
+                lines.extend(sv_drive_const_lines(sn, val, ty, indent="          "))
             lines.append("        end\n")
         lines.append("        default: begin end\n")
         lines.append("      endcase\n")
@@ -1059,9 +1284,8 @@ def _render_tb_sv(iface: _TopIface, t: Tb, *, trace_plan: TracePlan | None = Non
         for cyc in sorted(expects_pre_by.keys()):
             lines.append(f"        {cyc}: begin\n")
             for sn, val, msg, ty in expects_pre_by[cyc]:
-                w = _as_int_width(ty)
                 m = msg if msg is not None else f"{sn} mismatch"
-                lines.append(f"          if ({sn} !== {sv_lit(w, val)}) $fatal(1, \"PRE: {m}\");\n")
+                lines.extend(sv_expect_lines(sn, val, m, ty, indent="          ", phase="pre"))
             lines.append("        end\n")
         lines.append("        default: begin end\n")
         lines.append("      endcase\n")
@@ -1079,9 +1303,8 @@ def _render_tb_sv(iface: _TopIface, t: Tb, *, trace_plan: TracePlan | None = Non
         for cyc in sorted(expects_post_by.keys()):
             lines.append(f"        {cyc}: begin\n")
             for sn, val, msg, ty in expects_post_by[cyc]:
-                w = _as_int_width(ty)
                 m = msg if msg is not None else f"{sn} mismatch"
-                lines.append(f"          if ({sn} !== {sv_lit(w, val)}) $fatal(1, \"{m}\");\n")
+                lines.extend(sv_expect_lines(sn, val, m, ty, indent="          ", phase="post"))
             lines.append("        end\n")
         lines.append("        default: begin end\n")
         lines.append("      endcase\n")
@@ -1094,8 +1317,8 @@ def _render_tb_sv(iface: _TopIface, t: Tb, *, trace_plan: TracePlan | None = Non
             for fmt, ports in prints_at[cyc]:
                 esc = str(fmt).replace("\\", "\\\\").replace("\"", "\\\"")
                 if ports:
-                    suffix = "".join(f" {p}=%0h" for p in ports)
-                    args = ", ".join(["cyc", *ports])
+                    suffix = "".join(f" {raw}=%0h" for raw, _sn, _ty in ports)
+                    args = ", ".join(["cyc", *(sv_packed_expr(sn, ty) for _raw, sn, ty in ports)])
                     lines.append(f"          $display(\"[tb] cyc=%0d {esc}{suffix}\", {args});\n")
                 else:
                     lines.append(f"          $display(\"[tb] cyc=%0d {esc}\", cyc);\n")
@@ -1109,8 +1332,8 @@ def _render_tb_sv(iface: _TopIface, t: Tb, *, trace_plan: TracePlan | None = Non
             esc = str(fmt).replace("\\", "\\\\").replace("\"", "\\\"")
             lines.append(f"      if (cyc >= {st} && (((cyc - {st}) % {ev}) == 0)) begin\n")
             if ports:
-                suffix = "".join(f" {p}=%0h" for p in ports)
-                args = ", ".join(["cyc", *ports])
+                suffix = "".join(f" {raw}=%0h" for raw, _sn, _ty in ports)
+                args = ", ".join(["cyc", *(sv_packed_expr(sn, ty) for _raw, sn, ty in ports)])
                 lines.append(f"        $display(\"[tb] cyc=%0d {esc}{suffix}\", {args});\n")
             else:
                 lines.append(f"        $display(\"[tb] cyc=%0d {esc}\", cyc);\n")

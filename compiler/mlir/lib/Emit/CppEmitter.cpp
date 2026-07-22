@@ -154,6 +154,37 @@ struct NameTable {
   }
 };
 
+static std::string treeReduceExpr(llvm::SmallVectorImpl<std::string> &terms,
+                                  llvm::StringRef op) {
+  while (terms.size() > 1) {
+    llvm::SmallVector<std::string> next;
+    for (size_t i = 0; i < terms.size(); i += 2) {
+      if (i + 1 < terms.size())
+        next.push_back("(" + terms[i] + " " + op.str() + " " + terms[i + 1] + ")");
+      else
+        next.push_back(terms[i]);
+    }
+    terms = std::move(next);
+  }
+  return terms.empty() ? "" : terms[0];
+}
+
+static std::string chainReduceExpr(llvm::SmallVectorImpl<std::string> &terms,
+                                   llvm::StringRef op) {
+  if (terms.empty())
+    return "";
+  std::string out = terms[0];
+  for (size_t i = 1; i < terms.size(); ++i)
+    out = "(" + out + " " + op.str() + " " + terms[i] + ")";
+  return out;
+}
+
+static bool isTreeReduceMode(Operation *op) {
+  if (auto mode = op->getAttrOfType<StringAttr>("mode"))
+    return mode.getValue() == "tree";
+  return false;
+}
+
 static std::string getPortName(func::FuncOp f, unsigned idx, bool isResult) {
   if (!isResult) {
     if (auto names = f->getAttrOfType<ArrayAttr>("arg_names")) {
@@ -648,6 +679,43 @@ static LogicalResult emitCombAssign(Operation &op, llvm::raw_ostream &os, NameTa
                );
     return success();
   }
+  if (auto vbd = dyn_cast<pyc::VBroadcastDimOp>(op)) {
+    auto srcVT = dyn_cast<VectorType>(vbd.getVec().getType());
+    auto dstVT = dyn_cast<VectorType>(vbd.getResult().getType());
+    if (!srcVT || !dstVT)
+      return vbd.emitError("C++ emitter expects vector types for v_broadcast_dim");
+    std::int64_t dim = vbd.getDimAttr().getInt();
+    assignExpr(vbd.getResult(), vbd.getType(), os, nt,
+               [&](llvm::raw_ostream &e) {
+                 e << cppType(dstVT) << "{{";
+                 // Walk all result lanes, mapping to source.
+                 std::function<void(unsigned, std::vector<int64_t> &)> walk;
+                 bool emittedAny = false;
+                 walk = [&](unsigned depth, std::vector<int64_t> &idx) {
+                   if (depth == static_cast<unsigned>(dstVT.getRank())) {
+                     if (emittedAny)
+                       e << ", ";
+                     emittedAny = true;
+                     // Build source index by dropping the broadcast dim.
+                     std::string srcIdx;
+                     for (unsigned d = 0; d < dstVT.getRank(); ++d)
+                       if (static_cast<int64_t>(d) != dim)
+                         srcIdx += "[" + std::to_string(idx[d]) + "]";
+                     e << nt.get(vbd.getVec()) << srcIdx;
+                     return;
+                   }
+                   for (int64_t i = 0; i < dstVT.getDimSize(depth); ++i) {
+                     idx.push_back(i);
+                     walk(depth + 1, idx);
+                     idx.pop_back();
+                   }
+                 };
+                 std::vector<int64_t> idx;
+                 walk(0, idx);
+                 e << "}}";
+               });
+    return success();
+  }
   auto emitVectorReduce = [&](auto vr, const char *opName, const char *opToken) -> LogicalResult {
     auto vt = dyn_cast<VectorType>(vr.getVec().getType());
     if (!vt)
@@ -663,18 +731,18 @@ static LogicalResult emitCombAssign(Operation &op, llvm::raw_ostream &os, NameTa
       return vr.emitError("pyc.") << opName << " dim out of range";
     if (!vr.getDim() && vt.getRank() != 1)
       return vr.emitError("pyc.") << opName << " requires explicit dim for rank > 1";
+    bool useTree = isTreeReduceMode(vr.getOperation());
 
     std::int64_t lanes = vt.getShape()[0];
     if (vt.getRank() == 1) {
       assignExpr(vr.getResult(), vr.getType(), os, nt,
                  [&](llvm::raw_ostream &e) {
-                   e << "(";
+                   llvm::SmallVector<std::string> terms;
                    for (std::int64_t i = 0; i < lanes; ++i) {
-                     if (i)
-                       e << " " << opToken << " ";
-                     e << nt.get(vr.getVec()) << "[" << i << "]";
+                     terms.push_back(nt.get(vr.getVec()) + "[" +
+                                     std::to_string(static_cast<long long>(i)) + "]");
                    }
-                   e << ")";
+                   e << (useTree ? treeReduceExpr(terms, opToken) : chainReduceExpr(terms, opToken));
                  }
                  );
       return success();
@@ -692,16 +760,18 @@ static LogicalResult emitCombAssign(Operation &op, llvm::raw_ostream &os, NameTa
                  for (std::int64_t i = 0; i < outLanes; ++i) {
                    if (i)
                      e << ", ";
-                   e << "(";
+                   llvm::SmallVector<std::string> terms;
                    for (std::int64_t j = 0; j < reduceLanes; ++j) {
-                     if (j)
-                       e << " " << opToken << " ";
                      if (dim == 0)
-                       e << nt.get(vr.getVec()) << "[" << j << "][" << i << "]";
+                       terms.push_back(nt.get(vr.getVec()) + "[" +
+                                       std::to_string(static_cast<long long>(j)) + "][" +
+                                       std::to_string(static_cast<long long>(i)) + "]");
                      else
-                       e << nt.get(vr.getVec()) << "[" << i << "][" << j << "]";
+                       terms.push_back(nt.get(vr.getVec()) + "[" +
+                                       std::to_string(static_cast<long long>(i)) + "][" +
+                                       std::to_string(static_cast<long long>(j)) + "]");
                    }
-                   e << ")";
+                   e << (useTree ? treeReduceExpr(terms, opToken) : chainReduceExpr(terms, opToken));
                  }
                  e << "}}";
                }
@@ -1716,6 +1786,7 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
             pyc::VGetOp,
             pyc::VCreateOp,
             pyc::VBroadcastOp,
+            pyc::VBroadcastDimOp,
             pyc::VOrReduceOp,
             pyc::VAndReduceOp,
             pyc::VAddReduceOp,
@@ -2137,6 +2208,7 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
             pyc::VGetOp,
             pyc::VCreateOp,
             pyc::VBroadcastOp,
+            pyc::VBroadcastDimOp,
             pyc::VOrReduceOp,
             pyc::VAndReduceOp,
             pyc::VAddReduceOp,

@@ -433,12 +433,20 @@ def PYC_VBroadcastOp : PYC_Op<"v_broadcast", [Pure]> {
   let assemblyFormat = "$scalar `to` $size attr-dict `:` type($scalar) `->` type($result)";
 }
 
+def PYC_VBroadcastDimOp : PYC_Op<"v_broadcast_dim", [Pure]> {
+  let summary = "Broadcast a vector by repeating along a new dimension";
+  let arguments = (ins AnyIntegerOrV:$vec, I64Attr:$size, I64Attr:$dim);
+  let results = (outs AnyIntegerOrV:$result);
+  let hasVerifier = 1;
+  let assemblyFormat = "$vec `to` $size `,` $dim attr-dict `:` type($vec) `->` type($result)";
+}
+
 // Reduce a vector with bitwise OR over a selected dimension.
 // v_or_reduce vector<16xi1> -> i1
 // v_or_reduce vector<2x16xi1> {dim = 0} -> vector<16xi1>
 def PYC_VOrReduceOp : PYC_Op<"v_or_reduce", [Pure]> {
   let summary = "Bitwise OR reduction over vector lanes";
-  let arguments = (ins AnyIntegerOrV:$vec, OptionalAttr<I64Attr>:$dim);
+  let arguments = (ins AnyIntegerOrV:$vec, OptionalAttr<I64Attr>:$dim, OptionalAttr<StrAttr>:$mode);
   let results = (outs AnyIntegerOrV:$result);
   let hasVerifier = 1;
   let hasFolder = 1;
@@ -450,7 +458,7 @@ def PYC_VOrReduceOp : PYC_Op<"v_or_reduce", [Pure]> {
 // v_and_reduce vector<2x16xi1> {dim = 0} -> vector<16xi1>
 def PYC_VAndReduceOp : PYC_Op<"v_and_reduce", [Pure]> {
   let summary = "Bitwise AND reduction over vector lanes";
-  let arguments = (ins AnyIntegerOrV:$vec, OptionalAttr<I64Attr>:$dim);
+  let arguments = (ins AnyIntegerOrV:$vec, OptionalAttr<I64Attr>:$dim, OptionalAttr<StrAttr>:$mode);
   let results = (outs AnyIntegerOrV:$result);
   let hasVerifier = 1;
   let hasFolder = 1;
@@ -464,7 +472,7 @@ def PYC_VAndReduceOp : PYC_Op<"v_and_reduce", [Pure]> {
 // v_add_reduce vector<2x16xi8> {dim = 0} -> vector<16xi8>
 def PYC_VAddReduceOp : PYC_Op<"v_add_reduce", [Pure]> {
   let summary = "Integer add reduction over vector lanes";
-  let arguments = (ins AnyIntegerOrV:$vec, OptionalAttr<I64Attr>:$dim);
+  let arguments = (ins AnyIntegerOrV:$vec, OptionalAttr<I64Attr>:$dim, OptionalAttr<StrAttr>:$mode);
   let results = (outs AnyIntegerOrV:$result);
   let hasVerifier = 1;
   let hasFolder = 1;

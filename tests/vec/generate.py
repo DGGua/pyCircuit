@@ -89,9 +89,9 @@ def _case_expr(case: VecCase) -> tuple[list[str], str, bool]:
     if case.kind in {"zext", "sext", "trunc", "slice", "shl_imm", "lshr_imm", "ashr_imm"}:
         lines = [_vec_input("a", w, n, signed=signed)]
         exprs = {
-            "zext": "a.zext(width=6)",
-            "sext": "a.sext(width=6)",
-            "trunc": "a.slice(lsb=0, width=3)",
+            "zext": "zext(a, width=6)",
+            "sext": "sext(a, width=6)",
+            "trunc": "trunc(a, width=3)",
             "slice": "a.slice(lsb=1, width=2)",
             "shl_imm": "a << 1",
             "lshr_imm": "a >> 1",
@@ -124,7 +124,7 @@ def render_case_source(case: VecCase) -> str:
     lines: list[str] = [
         "from __future__ import annotations",
         "",
-        "from pycircuit import Circuit, Tb, Vec, module, testbench",
+        "from pycircuit import Circuit, Tb, Vec, module, sext, testbench, trunc, zext",
         "",
         "",
         "@module",

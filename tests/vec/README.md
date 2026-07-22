@@ -42,23 +42,23 @@ Some cases are intentionally frontend-only in the default matrix:
 
 - `select_vv`: current JIT supports scalar conditional expressions, but does
   not yet have a contract-approved Vec condition select syntax.
-- `zext`, `sext`, `trunc`: the methods still exist on `Vec`, but current API
-  contract blocks method-style cast calls in canonical build inputs.
 - `slice`: currently scalarizes to per-lane `pyc.extract`; it remains tracked
   as an optimization target rather than a vector-IR gate.
 
-Signed div/rem run as C++ backend cases only by default because the generated
-Verilator behavior currently disagrees with the bit-accurate signed oracle. The
-case remains in the matrix so the gap is visible.
+Vector cast cases (`zext`, `sext`, `trunc`) use the contract-approved
+function-style API (`zext(a, width=...)`, etc.) and run as full backend cases.
+Method-style calls such as `a.zext(width=...)` remain rejected by `PYC415`.
+
+Signed div/rem are full backend cases. The Verilog emitter keeps the divide/rem
+ternary signed by casting the zero branch, avoiding Verilator treating the
+protected expression as unsigned.
 
 Scalar-arm Vec select cases (`select_vs` and `select_sv`) are full backend
 cases. They guard the broadcast-to-vector fast path used by issue-queue style
 masked muxes.
 
-Vector-shaped IO and 2D dim-reduce have standalone emit+pycc checks. Ordinary
-JIT `Circuit.instance` still does not accept `Vec` as an instance port binding;
-hierarchical Vec IO should be covered through the cycle-aware `domain.call`
-path or after `Circuit.instance` grows equivalent vector-port support.
+Vector-shaped IO, ordinary JIT `Circuit.instance` Vec port binding, and 2D
+dim-reduce have standalone emit+pycc checks.
 
 ## Add A Case
 
