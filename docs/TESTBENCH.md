@@ -43,3 +43,15 @@ def tb(t: Tb):
 - `t.print(fmt, at=cycle, ports=[...])`
 - `t.print_every(fmt, start=0, every=1, ports=[...])`
 - `t.sva_assert(expr, clock=..., reset=..., name=..., msg=...)`
+
+## Sidecar schedule mode
+
+The default testbench path keeps the existing inline C++ schedule behavior.
+For long or dense schedules, `--tb-schedule-mode sidecar` can externalize the drive/expect schedule into a sidecar container and keep the generated C++ runner shape stable.
+
+```bash
+pycc <design.py> --tb-schedule-mode sidecar
+```
+
+The current sidecar PR scope is limited to drive frames, expect events, port metadata, string metadata, and compact periodic drive patterns.
+It does not include any generated workload API.
