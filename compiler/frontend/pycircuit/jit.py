@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import copy
 import inspect
+import operator as _pyop
 from dataclasses import dataclass
 from typing import Any, Hashable, Mapping, get_args, get_origin
 
@@ -39,6 +40,53 @@ class _InlineReturn(RuntimeError):
 
 
 _HAS_AST_MATCH = hasattr(ast, "Match")
+
+# ── Cycle-aware signal interop ─────────────────────────────────────────────
+# V5 cycle-aware wrappers (CycleAwareSignal / StateSignal / ForwardSignal)
+# carry their own cycle metadata and emit balancing registers through the
+# same Circuit builder the JIT compiles into.  The JIT treats them as opaque
+# Python values and delegates operators to their native implementations, so
+# `domain.next()` / auto cycle balancing work identically to eager mode.
+# Elaboration is still fully static: params are compile-time constants and
+# every distinct specialization is a separate re-JIT.
+
+_CAS_TYPES: tuple[type, ...] | None = None
+
+
+def _cas_types() -> tuple[type, ...]:
+    global _CAS_TYPES
+    if _CAS_TYPES is None:
+        from .v5 import CycleAwareSignal, ForwardSignal, StateSignal
+
+        _CAS_TYPES = (CycleAwareSignal, StateSignal, ForwardSignal)
+    return _CAS_TYPES
+
+
+def _is_cas(v: Any) -> bool:
+    return isinstance(v, _cas_types())
+
+
+_PY_BINOPS: dict[type, Any] = {
+    ast.Add: _pyop.add,
+    ast.Sub: _pyop.sub,
+    ast.Mult: _pyop.mul,
+    ast.FloorDiv: _pyop.floordiv,
+    ast.Mod: _pyop.mod,
+    ast.LShift: _pyop.lshift,
+    ast.RShift: _pyop.rshift,
+    ast.BitAnd: _pyop.and_,
+    ast.BitOr: _pyop.or_,
+    ast.BitXor: _pyop.xor,
+}
+
+_PY_CMPOPS: dict[type, Any] = {
+    ast.Eq: _pyop.eq,
+    ast.NotEq: _pyop.ne,
+    ast.Lt: _pyop.lt,
+    ast.LtE: _pyop.le,
+    ast.Gt: _pyop.gt,
+    ast.GtE: _pyop.ge,
+}
 
 
 def _check_removed_api_call(node: ast.Call, *, compiler: "_Compiler") -> None:
@@ -847,6 +895,14 @@ class _Compiler:
         if isinstance(node, ast.Subscript):
             base = self.eval_expr(node.value)
             sl = node.slice
+            if _is_cas(base):
+                if isinstance(sl, ast.Slice):
+                    if sl.step is not None:
+                        raise JitError("cycle-aware signal slicing does not support step")
+                    lo = None if sl.lower is None else self.eval_const(sl.lower)
+                    hi = None if sl.upper is None else self.eval_const(sl.upper)
+                    return base[slice(lo, hi)]
+                return base[int(self.eval_const(sl))]
             if isinstance(base, Vec):
                 if isinstance(sl, ast.Tuple):
                     idx_parts: list[int | slice] = []
@@ -934,6 +990,14 @@ class _Compiler:
                 lhs = lhs.read()
             if isinstance(rhs, Connector):
                 rhs = rhs.read()
+
+            if _is_cas(lhs) or _is_cas(rhs):
+                fn = _PY_BINOPS.get(type(node.op))
+                if fn is None:
+                    raise JitError(
+                        f"unsupported operator on cycle-aware signal: {node.op.__class__.__name__}"
+                    )
+                return fn(lhs, rhs)
 
             def _as_py_int(v: Any) -> int:
                 if isinstance(v, LiteralValue):
@@ -1048,6 +1112,16 @@ class _Compiler:
             v = self.eval_expr(node.operand)
             if isinstance(v, Connector):
                 v = v.read()
+            if _is_cas(v):
+                if isinstance(node.op, ast.Invert):
+                    return ~v
+                if isinstance(node.op, ast.USub):
+                    return -v
+                if isinstance(node.op, ast.UAdd):
+                    return v
+                raise JitError(
+                    "`not` on a cycle-aware signal is not supported; use mux/select for conditional logic"
+                )
             if isinstance(node.op, ast.Invert):
                 if isinstance(v, Vec):
                     return ~v
@@ -1122,6 +1196,24 @@ class _Compiler:
                     return lhs is rhs
                 if isinstance(op, ast.IsNot):
                     return lhs is not rhs
+                if _is_cas(lhs) or _is_cas(rhs):
+                    fn = _PY_CMPOPS.get(type(op))
+                    if fn is None:
+                        raise JitError(
+                            f"unsupported comparison on cycle-aware signal: {op.__class__.__name__}"
+                        )
+                    return fn(lhs, rhs)
+                if isinstance(op, (ast.In, ast.NotIn)):
+                    # Compile-time membership test (e.g. `if "decode" in cut_after:`).
+                    # Operands must be static Python values; the branch is folded
+                    # during elaboration and the emitted netlist stays fully static.
+                    if isinstance(lhs, (Wire, Reg, Vec)) or isinstance(rhs, (Wire, Reg, Vec)):
+                        raise JitError(
+                            "`in` is a compile-time membership test on Python values; "
+                            "hardware values are not supported (use ==/mux instead)"
+                        )
+                    contained = _py_cmp_value(lhs) in rhs
+                    return contained if isinstance(op, ast.In) else (not contained)
                 if isinstance(op, ast.Eq):
                     if isinstance(lhs, Vec):
                         return lhs == rhs
@@ -1507,6 +1599,19 @@ class _Compiler:
             if cur is None:
                 raise JitError(f"augassign to unknown name {name!r}")
             rhs = self.eval_expr(node.value)
+            if _is_cas(cur):
+                if isinstance(node.op, ast.LShift):
+                    # StateSignal feedback assignment (`sig <<= value`).
+                    cur <<= rhs
+                    self.env[name] = cur
+                    return
+                fn = _PY_BINOPS.get(type(node.op))
+                if fn is None:
+                    raise JitError(
+                        f"unsupported augmented assignment on cycle-aware signal: {node.op.__class__.__name__}"
+                    )
+                self.env[name] = fn(cur, rhs)
+                return
             if isinstance(node.op, ast.Add):
                 self.env[name] = self._alias_if_wire(_expect_wire(cur, ctx="+=") + rhs, base_name=name, node=node)
                 return
