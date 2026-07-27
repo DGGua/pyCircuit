@@ -45,6 +45,10 @@ class Signal:
     ref: str
     ty: Data
 
+    def __post_init__(self) -> None:
+        if not isinstance(self.ty, (Bits, Vector, Opaque)):
+            raise TypeError(f"Signal.ty must be Bits/Vector/Opaque, got {type(self.ty).__name__}")
+
     def __str__(self) -> str:
         return self.ref
 

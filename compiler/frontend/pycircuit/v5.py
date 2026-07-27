@@ -244,13 +244,7 @@ class CycleAwareDomain:
                 input_sigs.append(self._cd.rst)
             elif port_name in input_map:
                 actual = input_map[port_name]
-                if isinstance(actual, Vec):
-                    info = actual._as_vector_signal()
-                    if info is None:
-                        raise TypeError(f"input {port_name!r} Vec cannot be converted to a vector signal")
-                    _actual_m, actual_sig, _actual_signs = info
-                else:
-                    actual_sig = _to_wire(actual).sig
+                actual_sig = _to_wire(actual).sig
 
                 if actual_sig.ty != port_sig.ty and isinstance(actual_sig.ty, Bits) and isinstance(port_sig.ty, Bits):
                     actual_w = actual_sig.ty.width
@@ -266,7 +260,8 @@ class CycleAwareDomain:
                 input_sigs.append(actual_sig)
             else:
                 if isinstance(port_sig.ty, Vector):
-                    shape, elem_ty = Vec._vector_shape_elem_type(port_sig.ty)
+                    shape = port_sig.ty.shape()
+                    elem_ty = port_sig.ty.datatype()
                     width = elem_ty.width if isinstance(elem_ty, Bits) else 1
                 elif isinstance(port_sig.ty, Bits):
                     shape = None
@@ -280,14 +275,7 @@ class CycleAwareDomain:
                 else:
                     parent_port_name = f"{prefix}_{port_name}"
                 parent_value = self._m.input(parent_port_name, width=width, shape=shape)
-                if isinstance(parent_value, Vec):
-                    info = parent_value._as_vector_signal()
-                    if info is None:
-                        raise TypeError(f"input {port_name!r} parent Vec cannot be converted to a vector signal")
-                    _parent_m, parent_sig, _parent_signs = info
-                    input_sigs.append(parent_sig)
-                else:
-                    input_sigs.append(parent_value.sig)
+                input_sigs.append(parent_value.sig)
 
         result_types = [sig.ty for _, sig in sub_m._results]
         out_sigs = self._m.instance_op(
@@ -300,8 +288,7 @@ class CycleAwareDomain:
         out_values: list[Any] = []
         for sig in out_sigs:
             if isinstance(sig.ty, Vector):
-                shape, _elem_ty = Vec._vector_shape_elem_type(sig.ty)
-                out_values.append(Vec._from_vector_signal(self._m, sig, signs=[False for _ in range(shape[0])]))
+                out_values.append(Vec._from_vector_signal(self._m, sig, signs=[False for _ in range(sig.ty.length)]))
             else:
                 out_values.append(Wire(self._m, sig))
         return _reconstruct_output_dict(out_entries, out_values, self)
@@ -360,7 +347,10 @@ def _record_output_structure(
 
     entries: list[tuple[str, str, int, list[int], list[int]]] = []
     for key, val in outs_dict.items():
-        if isinstance(val, Vec):
+        if isinstance(val, Wire) and isinstance(val.sig.ty, Vector):
+            idx = ref_to_idx.get(val.sig.ref, -1) if ref_to_idx else -1
+            entries.append((key, "vec", len(val), [0], [idx]))
+        elif isinstance(val, Vec):
             info = val._as_vector_signal()
             if info is None:
                 raise TypeError(f"output {key!r} Vec cannot be converted to a vector signal")

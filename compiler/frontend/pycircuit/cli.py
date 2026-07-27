@@ -301,7 +301,11 @@ def _runtime_manifest_for_toolchain(toolchain_root: Path | None) -> dict[str, ob
         )
 
     include_dir = (toolchain_root / "include").resolve()
-    lib_dir = (toolchain_root / "lib").resolve()
+    # Prefer lib/, fall back to lib64/ (common on RHEL/Fedora 64-bit multilib).
+    lib_dir = (toolchain_root / "lib")
+    if not (lib_dir / _runtime_lib_filename()).is_file():
+        lib_dir = toolchain_root / "lib64"
+    lib_dir = lib_dir.resolve()
     cmake_config_dir = (toolchain_root / "share" / "pycircuit" / "cmake").resolve()
     runtime_lib = (lib_dir / _runtime_lib_filename()).resolve()
 

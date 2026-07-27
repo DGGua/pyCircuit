@@ -104,9 +104,6 @@ class Wire:
     # defined by `pyc.wire`.
     assignable: bool = False
 
-    def __post_init__(self) -> None:
-        _int_width(self.sig.ty)
-
     @property
     def ref(self) -> str:
         return self.sig.ref
@@ -132,6 +129,72 @@ class Wire:
         """Stage-friendly sugar: a Wire's value is itself."""
         return self
 
+    # -- vector operations ----------------------------------------------------
+
+    def __len__(self) -> int:
+        if not isinstance(self.sig.ty, Vector):
+            raise TypeError(f"len(Wire) requires Vector type, got {self.sig.ty!r}")
+        return self.sig.ty.length
+
+    def __iter__(self) -> Iterator["Wire"]:
+        if not isinstance(self.sig.ty, Vector):
+            raise TypeError(f"iter(Wire) requires Vector type, got {self.sig.ty!r}")
+        for i in range(self.sig.ty.length):
+            yield self[i]
+
+    def or_reduce(self, *, dim: int | None = None, mode: str = "chain") -> "Wire":
+        if not isinstance(self.sig.ty, Vector):
+            raise TypeError(f"or_reduce requires Vector type, got {self.sig.ty!r}")
+        return Wire(self.m, self.m.v_or_reduce(self.sig, dim=dim, mode=mode))
+
+    def and_reduce(self, *, dim: int | None = None, mode: str = "chain") -> "Wire":
+        if not isinstance(self.sig.ty, Vector):
+            raise TypeError(f"and_reduce requires Vector type, got {self.sig.ty!r}")
+        return Wire(self.m, self.m.v_and_reduce(self.sig, dim=dim, mode=mode))
+
+    def reduce_sum(
+        self,
+        *,
+        width: int | None = None,
+        dim: int | None = None,
+        signed: bool = False,
+        mode: str = "chain",
+    ) -> "Wire":
+        """Sum reduction via ``pyc.v_add_reduce``.
+
+        - ``width=None`` chooses ``max_input_width + ceil_log2(reduce_len)``.
+        - ``dim=None`` requires a 1-D Vector and returns one scalar Wire.
+        - ``dim=int`` reduces along that axis, returning a lowered-rank Vector Wire.
+        """
+        if not isinstance(self.sig.ty, Vector):
+            raise TypeError(f"reduce_sum requires Vector type, got {self.sig.ty!r}")
+        shape = self.sig.ty.shape()
+        reduce_dim = 0 if dim is None else int(dim)
+        if reduce_dim < 0 or reduce_dim >= len(shape):
+            raise ValueError(f"reduce_sum dim out of range: {reduce_dim} for Vector rank {len(shape)}")
+        if dim is None and len(shape) != 1:
+            raise ValueError("reduce_sum(dim=None) requires a 1-D Vector")
+        elem_ty = self.sig.ty.datatype()
+        elem_width = elem_ty.width if isinstance(elem_ty, Bits) else 0
+        # output width: explicit or input_width + ceil_log2(reduce_len)
+        if width is None:
+            carry_width = max(0, shape[reduce_dim] - 1).bit_length()
+            out_width = elem_width + carry_width
+        else:
+            out_width = int(width)
+            if out_width < elem_width:
+                raise ValueError(f"reduce_sum width {out_width} < input width {elem_width}")
+        sig = self.sig
+        if elem_width < out_width:
+            sig = self.m.sext(self.sig, width=out_width) if signed else self.m.zext(self.sig, width=out_width)
+        red_sig = self.m.v_add_reduce(sig, dim=None if dim is None else reduce_dim, mode=mode)
+        return Wire(self.m, red_sig, signed=bool(signed))
+
+    def broadcast(self, *, size: int, dim: int) -> "Wire":
+        if not isinstance(self.sig.ty, Vector):
+            raise TypeError(f"broadcast requires Vector type, got {self.sig.ty!r}")
+        return Wire(self.m, self.m.v_broadcast_dim(self.sig, size=size, dim=dim))
+
     def _as_wire(self, v: Union["Wire", "Reg", Signal, int, LiteralValue], *, width: int | None) -> "Wire":
         if isinstance(v, Connector):
             v = v.read()
@@ -149,7 +212,12 @@ class Wire:
             return Wire(self.m, const_sig, signed=lit_signed)
         if isinstance(v, int):
             if width is None:
-                width = self.width
+                # For Vector wires, default to leaf elem width (scalar broadcast).
+                if isinstance(self.sig.ty, Vector):
+                    elem = self.sig.ty.datatype()
+                    width = elem.width if isinstance(elem, Bits) else 8
+                else:
+                    width = self.width
             # Call the base `Module.const` even if `Circuit.const` is overridden
             # to return a `Wire`.
             const_sig = Module.const(self.m, int(v), width=int(width))
@@ -157,12 +225,31 @@ class Wire:
         raise TypeError(f"unsupported operand type: {type(v).__name__}")
 
     def _promote2(self, other: Union["Wire", "Reg", Signal, int, LiteralValue]) -> tuple["Wire", "Wire"]:
-        """Promote operands to a common width (extend smaller operand)."""
+        """Promote operands to a common width (extend smaller operand).
+
+        For Vector types no width promotion is performed: vector-vector ops
+        require matching shape and element datatype (validated here), and
+        scalar operands are broadcast to the vector's leaf element width.
+        """
         a = self._as_wire(self, width=None)
         if isinstance(other, int):
-            b = self._as_wire(int(other), width=a.width)
+            b = self._as_wire(int(other), width=a.width if isinstance(a.sig.ty, Bits) else None)
         else:
             b = self._as_wire(other, width=None)
+        a_vec = isinstance(a.sig.ty, Vector)
+        b_vec = isinstance(b.sig.ty, Vector)
+        if a_vec and b_vec:
+            if a.sig.ty.shape() != b.sig.ty.shape():
+                raise TypeError(
+                    f"vector shape mismatch: {a.sig.ty} vs {b.sig.ty}"
+                )
+            if a.sig.ty.datatype() != b.sig.ty.datatype():
+                raise TypeError(
+                    f"vector element datatype mismatch: {a.sig.ty.datatype()} vs {b.sig.ty.datatype()}"
+                )
+            return a, b
+        if a_vec or b_vec:
+            return a, b
         out_w = max(a.width, b.width)
         if a.width != out_w:
             a = a._sext(width=out_w) if a.signed else a._zext(width=out_w)
@@ -187,7 +274,7 @@ class Wire:
     def __rsub__(self, other: Union["Wire", "Reg", Signal, int, LiteralValue, "Vec"]) -> "Wire":
         if isinstance(other, Vec): return NotImplemented
         b = self._as_wire(self, width=None)
-        a = self._as_wire(other, width=b.width)
+        a = self._as_wire(other, width=b.width if isinstance(b.sig.ty, Bits) else None)
         aa, bb = a._promote2(b) if isinstance(a, Wire) else (a, b)
         return Wire(self.m, self.m.sub(aa.sig, bb.sig), signed=(aa.signed or bb.signed))
 
@@ -310,11 +397,9 @@ class Wire:
         return ~(self == other)
 
     def eq(self, other: Union["Wire", "Reg", Signal, int, LiteralValue, "Vec"]) -> "Wire":
-        if isinstance(other, Vec): return NotImplemented
         return self == other
 
     def ne(self, other: Union["Wire", "Reg", Signal, int, LiteralValue, "Vec"]) -> "Wire":
-        if isinstance(other, Vec): return NotImplemented
         return self != other
 
     def ult(self, other: Union["Wire", "Reg", Signal, int, LiteralValue, "Vec"]) -> "Wire":
@@ -432,6 +517,14 @@ class Wire:
         return Wire(self.m, self.m.shl(self.sig, amt.sig), signed=self.signed)
 
     def __getitem__(self, idx: int | slice) -> "Wire":
+        if isinstance(self.sig.ty, Vector):
+            if isinstance(idx, slice):
+                raise TypeError("Vector Wire indexing does not support slice (use v_get)")
+            if not isinstance(idx, int):
+                raise TypeError(f"Vector Wire index must be int, got {type(idx).__name__}")
+            if idx < 0 or idx >= self.sig.ty.length:
+                raise IndexError(f"Vector Wire index {idx} out of range for {self.sig.ty}")
+            return Wire(self.m, self.m.v_get(self.sig, index=idx))
         if isinstance(idx, slice):
             if idx.step is not None:
                 raise TypeError("wire slicing does not support step")
@@ -834,17 +927,17 @@ class Circuit(Module):
         width: int,
         signed: bool = False,
         shape: int | tuple[int, ...] | list[int] | None = None,
-    ) -> Union[Wire, "Vec"]:
+    ) -> Wire:
         """Declare a module input port.
 
-        Scalar inputs return ``Wire``. Shaped inputs return a vector-backed
-        ``Vec`` whose lanes are extracted lazily with ``pyc.v_get``.
+        Scalar and shaped inputs both return ``Wire``. For shaped inputs
+        ``Wire.ty`` is a ``Vector`` and ``Wire[i]`` extracts lane ``i``.
         """
         if shape is None:
             return Wire(self, super().input(name, width=width), signed=bool(signed))
         dims = _normalize_shape_arg(shape)
         sig = super().input(name, shape=list(dims), width=width)
-        return Vec._from_vector_signal(self, sig, signs=[bool(signed) for _ in range(dims[0])])
+        return Wire(self, sig, signed=bool(signed))
 
     def const(self, value: int, *, width: int) -> Wire:  # type: ignore[override]
         """Create an integer constant `Wire` (two's complement at `width`)."""
@@ -1829,7 +1922,7 @@ class Circuit(Module):
         out_fields: dict[str, Connector] = {}
         for oname, sig in zip(cm.result_names, outs):
             if isinstance(sig.ty, Vector):
-                shape, _elem_ty = Vec._vector_shape_elem_type(sig.ty)
+                shape = sig.ty.shape()
                 vec = Vec._from_vector_signal(self, sig, signs=[False for _ in range(shape[0])])
                 out_fields[oname] = VecConnector(owner=self, name=oname, vec=vec)
             else:
@@ -2227,8 +2320,8 @@ class Vec:
                 raise ValueError("Vec with sig requires a module")
             if self.signed is None:
                 raise ValueError("Vec with sig requires lane signedness")
-            shape, _ = self._vector_shape_elem_type(self.sig.ty)
-            if shape[0] != len(self.signed):
+            assert isinstance(self.sig.ty, Vector)
+            if self.sig.ty.length != len(self.signed):
                 raise ValueError("Vec lane count must match vector type")
             if not self.elems:
                 object.__setattr__(
@@ -2242,7 +2335,7 @@ class Vec:
                         cycle=self.cycle,
                     ),
                 )
-            elif len(self.elems) != shape[0]:
+            elif len(self.elems) != self.sig.ty.length:
                 raise ValueError("Vec elems length must match vector outer dimension")
             for e in self.elems:
                 if self._module_of(e) is not self.m:
@@ -2374,30 +2467,6 @@ class Vec:
     # -- internal helpers -------------------------------------------------------
 
     @classmethod
-    def _vector_shape_elem_type(cls, ty: Data) -> tuple[list[int], Data]:
-        """从 MLIR 向量类型解析 shape 和元素类型。
-        如 ``vector<4xi8>`` → ``([4], Bits(8))``；``vector<4x3xi8>`` → ``([4, 3], Bits(8))``。
-        维度是纯数字，从左边连续取；遇非数字段时剩余部分即元素类型。
-        """
-        raw = str(ty).strip()
-        if not (raw.startswith("vector<") and raw.endswith(">")):
-            raise ValueError(f"expected vector type, got {ty!r}")
-        body = raw[len("vector<") : -1]
-        parts = body.split("x")
-        dims: list[int] = []
-        i = 0
-        while i < len(parts) and parts[i].strip().isdigit():
-            d = int(parts[i])
-            if d <= 0:
-                raise ValueError(f"vector lanes must be > 0, got {d}")
-            dims.append(d)
-            i += 1
-        if i == 0 or i == len(parts):
-            raise ValueError(f"invalid vector type: {ty!r}")
-        elem_str = "x".join(parts[i:])
-        return dims, Data.from_str(elem_str)
-
-    @classmethod
     def _from_vector_signal(
         cls,
         m: Module,
@@ -2422,15 +2491,15 @@ class Vec:
         domain: _CycleAwareDomainLike | None = None,
         cycle: int | None = None,
     ) -> list[Union[Wire, "Vec"]]:
-        shape, _elem_ty = cls._vector_shape_elem_type(sig.ty)
-        if shape[0] != len(signs):
+        if not isinstance(sig.ty, Vector):
+            raise TypeError(f"expected vector type, got {sig.ty!r}")
+        if sig.ty.length != len(signs):
             raise ValueError("vector lane signs must match outer dimension")
         elems: list[Union[Wire, Vec]] = []
-        for lane in range(shape[0]):
+        for lane in range(sig.ty.length):
             lane_sig = m.v_get(sig, index=lane)
             if isinstance(lane_sig.ty, Vector):
-                sub_shape, _ = cls._vector_shape_elem_type(lane_sig.ty)
-                sub_signs = [bool(signs[lane]) for _ in range(sub_shape[0])]
+                sub_signs = [bool(signs[lane]) for _ in range(lane_sig.ty.length)]
                 sub_elems = cls._elems_from_vector_signal(
                     m,
                     lane_sig,
@@ -2626,11 +2695,12 @@ class Vec:
             if info is None:
                 return None
             value_m, value_sig, value_signs = info
-            value_shape, _value_elem_ty = self._vector_shape_elem_type(value_sig.ty)
+            if not isinstance(value_sig.ty, Vector):
+                return None
             if (
                 value_m is not module
                 or value_sig.ty != vector_ty
-                or value_shape != shape
+                or value_sig.ty.shape() != shape
                 or len(value_signs) != lanes
             ):
                 return None
@@ -2665,8 +2735,10 @@ class Vec:
         if lhs_info is None or method_name is None:
             return None
         m, lhs_sig, lhs_signs = lhs_info
-        shape, elem_ty = self._vector_shape_elem_type(lhs_sig.ty)
-        width = _int_width(elem_ty)
+        if not isinstance(lhs_sig.ty, Vector):
+            return None
+        shape = lhs_sig.ty.shape()
+        width = _int_width(lhs_sig.ty.datatype())
 
         rhs_info = lhs._vector_operand_info(
             rhs,
@@ -2737,8 +2809,10 @@ class Vec:
         if sel_info is None:
             return None
         m, sel_sig, _sel_signs = sel_info
-        sel_shape, sel_elem_ty = self._vector_shape_elem_type(sel_sig.ty)
-        if sel_elem_ty != "i1":
+        if not isinstance(sel_sig.ty, Vector):
+            return None
+        sel_shape = sel_sig.ty.shape()
+        if sel_sig.ty.datatype() != "i1":
             return None
 
         a_vec_info = a._as_vector_signal() if isinstance(a, Vec) else None
@@ -2751,9 +2825,11 @@ class Vec:
         vec_m, vec_sig, vec_signs = vec_info
         if vec_m is not m:
             return None
-        value_shape, value_elem_ty = self._vector_shape_elem_type(vec_sig.ty)
-        if value_shape != sel_shape:
+        if not isinstance(vec_sig.ty, Vector):
             return None
+        if vec_sig.ty.shape() != sel_shape:
+            return None
+        value_elem_ty = vec_sig.ty.datatype()
 
         def arm_signal(value: Any, info: tuple[Module, Signal, list[bool]] | None) -> tuple[Signal, list[bool]] | None:
             if info is not None:
@@ -2917,8 +2993,8 @@ class Vec:
     def _is_leaf_1d(self) -> bool:
         """判断是否为 1-D 叶子 Vec（所有元素为 Wire/Reg，无嵌套 Vec）。"""
         if self.sig is not None:
-            shape, _ = self._vector_shape_elem_type(self.sig.ty)
-            return len(shape) == 1
+            assert isinstance(self.sig.ty, Vector)
+            return len(self.sig.ty.shape()) == 1
         return all(not isinstance(e, Vec) for e in self.elems)
 
     @staticmethod
@@ -2941,7 +3017,8 @@ class Vec:
             return None
         assert self.m is not None
         assert self.signed is not None
-        shape, _elem_ty = self._vector_shape_elem_type(self.sig.ty)
+        assert isinstance(self.sig.ty, Vector)
+        shape = self.sig.ty.shape()
         if dim is None:
             if len(shape) != 1:
                 raise ValueError("reduce(dim=None) requires a 1-D Vec (leaf elements are Wire/Reg)")
@@ -3010,13 +3087,16 @@ class Vec:
         if info is None:
             return None
         m, sig, signs = info
-        shape, elem_ty = self._vector_shape_elem_type(sig.ty)
+        if not isinstance(sig.ty, Vector):
+            return None
+        shape = sig.ty.shape()
+        elem_ty = sig.ty.datatype()
         reduce_dim = 0 if dim is None else int(dim)
         if reduce_dim < 0 or reduce_dim >= len(shape):
             raise ValueError(f"reduce_sum dim out of range: {reduce_dim} for Vec rank {len(shape)}")
         if dim is None and len(shape) != 1:
             raise ValueError("reduce_sum(dim=None) requires a 1-D Vec (leaf elements are Wire/Reg)")
-        elem_width = _int_width(elem_ty)
+        elem_width = _int_width(elem_ty) if isinstance(elem_ty, Bits) else 0
         out_width = self._sum_output_width_from_input_width(elem_width, shape[reduce_dim], width)
         if elem_width < out_width:
             sig = m.sext(sig, width=out_width) if signed else m.zext(sig, width=out_width)
@@ -3460,7 +3540,9 @@ class Vec:
         if info is None:
             raise ValueError("broadcast requires a vectorizable Vec")
         m, sig, signs = info
-        shape, _elem_ty = self._vector_shape_elem_type(sig.ty)
+        if not isinstance(sig.ty, Vector):
+            raise ValueError("broadcast requires a vector signal")
+        shape = sig.ty.shape()
         d = int(dim)
         if d < 0 or d > len(shape):
             raise ValueError(f"broadcast dim {d} out of range for shape {shape}")
