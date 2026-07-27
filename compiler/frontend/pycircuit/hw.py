@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 import hashlib
 import inspect
 import json
-from typing import Any, Generic, Iterable, Iterator, Literal, Mapping, Protocol, TypeVar, Union, overload
+from typing import Any, Generic, Iterable, Iterator, Literal, Mapping, Union, overload
 
 from .connectors import (
     Connector,
@@ -16,11 +16,10 @@ from .connectors import (
     ModuleInstanceHandle,
     RegConnector,
     WireConnector,
-    is_connector,
     is_connector_bundle,
     is_connector_struct,
 )
-from .data import Bits, DT, Data, Opaque, Vector
+from .data import Bits, DT, Data, Vector
 from .design import DesignError
 from .dsl import Module, Signal
 from .literals import LiteralValue, infer_literal_width
@@ -39,10 +38,6 @@ def _int_width(ty: Data) -> int:
     if not isinstance(ty, Bits):
         raise TypeError(f"expected integer type iN, got {ty!r}")
     return ty.width
-
-
-def _removed_design_api(name: str, replacement: str) -> TypeError:
-    return TypeError(f"{name} was removed from pyCircuit; use {replacement}")
 
 
 def _coerce_literal_width(
@@ -2132,37 +2127,6 @@ def _scalar_to_wire(m: Module, value: Any, *, width: int) -> Wire:
     if isinstance(value, int):
         return Wire(m, Module.const(m, int(value), width=int(width)), signed=(int(value) < 0))
     raise TypeError(f"unsupported operand type: {type(value).__name__}")
-
-
-def _scalar_signed(value: Any) -> bool | None:
-    """判断标量值是否有符号；无法识别则返回 None。"""
-    if isinstance(value, Connector):
-        value = value.read()
-    if isinstance(value, Reg):
-        return bool(value.signed)
-    if isinstance(value, Wire):
-        return bool(value.signed)
-    if isinstance(value, LiteralValue):
-        return bool(value.signed)
-    if isinstance(value, int):
-        return int(value) < 0
-    if isinstance(value, Signal):
-        return False
-    return None
-
-
-def _shift_amount_wire(m: Module, amount: Any) -> Wire | None:
-    """将移位量转为 Wire；失败返回 None（由调用方回退到逐元素路径）。"""
-    try:
-        return _scalar_to_wire(m, amount, width=32)
-    except TypeError:
-        return None
-
-
-
-class _CycleAwareDomainLike(Protocol):
-    def delay_to(self, w: Wire, *, from_cycle: int, to_cycle: int, width: int) -> Wire:
-        ...
 
 
 @dataclass(frozen=True)
