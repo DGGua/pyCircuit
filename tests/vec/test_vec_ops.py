@@ -87,11 +87,11 @@ def test_true_division_is_rejected(repo_root: Path) -> None:
     if str(frontend) not in sys.path:
         sys.path.insert(0, str(frontend))
 
-    from pycircuit import Circuit, Vec, compile, module
+    from pycircuit import Circuit
 
     m = Circuit("vec_true_division_rejected")
-    a = Vec([m.input(f"a{i}", width=4) for i in range(4)])
-    b = Vec([m.input(f"b{i}", width=4) for i in range(4)])
+    a = m.vec([m.input(f"a{i}", width=4) for i in range(4)])
+    b = m.vec([m.input(f"b{i}", width=4) for i in range(4)])
 
     with pytest.raises(TypeError, match="use `//`"):
         _ = a / b
@@ -101,16 +101,6 @@ def test_true_division_is_rejected(repo_root: Path) -> None:
         _ = 12 / a
     with pytest.raises(TypeError, match="use `//`"):
         _ = a[0] / b[0]
-
-    @module
-    def build(m: Circuit) -> None:
-        lhs = Vec([m.input(f"lhs{i}", width=4) for i in range(4)])
-        rhs = Vec([m.input(f"rhs{i}", width=4) for i in range(4)])
-        out = lhs / rhs
-        m.output("out0", out[0])
-
-    build.__globals__["Vec"] = Vec
-    with pytest.raises(Exception, match="use `//`"):
         compile(build, name="vec_true_division_jit_rejected")
 
 
@@ -118,7 +108,7 @@ def test_true_division_is_rejected(repo_root: Path) -> None:
 @pytest.mark.parametrize("case", FRONTEND_ONLY_CASES, ids=[case.name for case in FRONTEND_ONLY_CASES])
 def test_frontend_only_case_generation(case: VecCase) -> None:
     source = render_case_source(case)
-    assert "Vec([" in source
+    assert "m.vec([" in source
     assert case.kind in source or case.name in source
 
 
@@ -330,12 +320,12 @@ def test_eager_vec_broadcast_emit_and_pycc(
             [
                 "from __future__ import annotations",
                 "",
-                "from pycircuit import Circuit, Vec, module",
+                "from pycircuit import Circuit, module",
                 "",
                 "",
                 "@module",
                 "def build(m: Circuit) -> None:",
-                '    a = Vec([m.input(f"a{i}", width=4) for i in range(4)])',
+                '    a = m.vec([m.input(f"a{i}", width=4) for i in range(4)])',
                 "    out = a.broadcast(dim=1, size=2)",
                 '    m.output("out", out)',
                 "",
@@ -377,7 +367,7 @@ def test_jit_instance_vec_port_emit_and_pycc(
             [
                 "from __future__ import annotations",
                 "",
-                "from pycircuit import Circuit, Vec, module",
+                "from pycircuit import Circuit, module",
                 "",
                 "",
                 "@module",
@@ -387,7 +377,7 @@ def test_jit_instance_vec_port_emit_and_pycc(
                 "",
                 "@module",
                 "def build(m: Circuit) -> None:",
-                '    a = Vec([m.input(f"a{i}", width=4) for i in range(4)])',
+                '    a = m.vec([m.input(f"a{i}", width=4) for i in range(4)])',
                 '    y = m.instance(child, name="u_child", a=a).read()',
                 '    m.output("out", y)',
                 "",
@@ -417,213 +407,6 @@ def test_jit_instance_vec_port_emit_and_pycc(
     assert "input [3:0] a [0:3]" not in verilog_text
     _run_yosys_smoke(verilog, top="JitInstanceVecPort", repo_root=repo_root)
     check_cpp_manifest_syntax(out_dir, repo_root=repo_root)
-
-
-@pytest.mark.vec
-def test_eager_vec_caches_sig(repo_root: Path) -> None:
-    import sys
-
-    frontend = repo_root / "compiler" / "frontend"
-    if str(frontend) not in sys.path:
-        sys.path.insert(0, str(frontend))
-
-    from pycircuit import Circuit, Vec
-
-    m = Circuit("vec_cached_signal")
-    a = Vec([m.input(f"a{i}", width=4) for i in range(4)])
-    first = a._as_vector_signal()
-    second = a._as_vector_signal()
-
-    assert first is not None
-    assert second is not None
-    assert a.sig is not None
-    assert first[1].ref == second[1].ref
-    assert first[1].ref == a.sig.ref
-    assert len(a.elems) == 4
-    assert m.emit_mlir().count("pyc.v_create") == 1
-
-
-@pytest.mark.vec
-def test_vec_cycle_aware_lanes_require_matching_cycle(repo_root: Path) -> None:
-    import sys
-
-    frontend = repo_root / "compiler" / "frontend"
-    if str(frontend) not in sys.path:
-        sys.path.insert(0, str(frontend))
-
-    from pycircuit import CycleAwareCircuit, Vec, cas
-
-    m = CycleAwareCircuit("vec_cas_cycles")
-    domain = m.create_domain("main")
-    same_cycle = Vec([cas(domain, m.input(f"a{i}", width=4), cycle=2) for i in range(2)])
-
-    assert same_cycle.sig is not None
-    assert same_cycle.sig.ty == "vector<2xi4>"
-    assert same_cycle.domain is domain
-    assert same_cycle.cycle == 2
-
-    with pytest.raises(ValueError, match="same cycle"):
-        Vec(
-            [
-                cas(domain, m.input("b0", width=4), cycle=1),
-                cas(domain, m.input("b1", width=4), cycle=2),
-            ]
-        )
-
-    with pytest.raises(ValueError, match="cannot mix cycle-aware"):
-        Vec(
-            [
-                cas(domain, m.input("c0", width=4), cycle=2),
-                m.input("c1", width=4),
-            ]
-        )
-
-
-@pytest.mark.vec
-def test_cycle_aware_vec_binary_ops_align_to_latest_cycle(repo_root: Path) -> None:
-    import sys
-
-    frontend = repo_root / "compiler" / "frontend"
-    if str(frontend) not in sys.path:
-        sys.path.insert(0, str(frontend))
-
-    from pycircuit import CycleAwareCircuit, Vec, cas
-
-    m = CycleAwareCircuit("vec_cas_binary_align")
-    domain = m.create_domain("main")
-    a = Vec([cas(domain, m.input(f"a{i}", width=4), cycle=0) for i in range(2)])
-    b = Vec([cas(domain, m.input(f"b{i}", width=4), cycle=2) for i in range(2)])
-
-    out = a + b
-
-    assert out.domain is domain
-    assert out.cycle == 2
-    assert "_v5_bal_" in m.emit_mlir()
-
-
-@pytest.mark.vec
-def test_cycle_aware_vec_select_aligns_selector_and_arms(repo_root: Path) -> None:
-    import sys
-
-    frontend = repo_root / "compiler" / "frontend"
-    if str(frontend) not in sys.path:
-        sys.path.insert(0, str(frontend))
-
-    from pycircuit import CycleAwareCircuit, Vec, cas
-
-    m = CycleAwareCircuit("vec_cas_select_align")
-    domain = m.create_domain("main")
-    sel = Vec([cas(domain, m.input(f"sel{i}", width=1), cycle=1) for i in range(2)])
-    a = Vec([cas(domain, m.input(f"a{i}", width=4), cycle=0) for i in range(2)])
-    b = Vec([cas(domain, m.input(f"b{i}", width=4), cycle=2) for i in range(2)])
-
-    out = sel.select(a, b)
-
-    assert out.domain is domain
-    assert out.cycle == 2
-    assert "_v5_bal_" in m.emit_mlir()
-
-
-@pytest.mark.vec
-def test_cycle_aware_vec_assign_lanes(repo_root: Path) -> None:
-    import sys
-
-    frontend = repo_root / "compiler" / "frontend"
-    if str(frontend) not in sys.path:
-        sys.path.insert(0, str(frontend))
-
-    from pycircuit import CycleAwareCircuit, Vec, cas, wire_of
-
-    m = CycleAwareCircuit("vec_assign_lanes")
-    domain = m.create_domain("main")
-    states = Vec([domain.signal(width=4, reset_value=0, name=f"q{i}") for i in range(2)])
-    data = Vec([cas(domain, m.input(f"d{i}", width=4), cycle=0) for i in range(2)])
-    mask = Vec([cas(domain, m.input(f"en{i}", width=1), cycle=0) for i in range(2)])
-
-    m.output("q0", wire_of(states[0]))
-    m.output("q1", wire_of(states[1]))
-    domain.next()
-    states.assign(data, when=mask)
-
-    mlir = m.emit_mlir()
-    assert "q0" in mlir
-    assert "q1" in mlir
-
-
-@pytest.mark.vec
-def test_vector_op_result_reuses_vec_sig(repo_root: Path) -> None:
-    import sys
-
-    frontend = repo_root / "compiler" / "frontend"
-    if str(frontend) not in sys.path:
-        sys.path.insert(0, str(frontend))
-
-    from pycircuit import Circuit, Vec
-
-    m = Circuit("vec_result_reuses_sig")
-    a = Vec([m.input(f"a{i}", width=4) for i in range(4)])
-    b = a + a
-    c = b & b
-
-    assert b.sig is not None
-    assert c.sig is not None
-    assert len(b.elems) == 4
-    assert m.emit_mlir().count("pyc.v_create") == 1
-
-
-@pytest.mark.vec
-def test_function_style_casts_cover_wire_reg_and_vec(repo_root: Path) -> None:
-    import sys
-
-    frontend = repo_root / "compiler" / "frontend"
-    if str(frontend) not in sys.path:
-        sys.path.insert(0, str(frontend))
-
-    from pycircuit import Circuit, Reg, Vec, sext, trunc, zext
-
-    m = Circuit("function_style_casts")
-    domain = m.domain("main")
-    en = m.const(1, width=1)
-    w = m.input("w", width=4)
-    r = m.reg_domain(domain, en, w, init=0)
-    v = Vec([m.input(f"a{i}", width=4) for i in range(4)])
-
-    assert zext(w, width=6).ty == "i6"
-    assert sext(r, width=6).ty == "i6"
-    tv = trunc(v, width=3)
-
-    assert isinstance(r, Reg)
-    assert isinstance(tv, Vec)
-    assert tv.sig is not None
-    assert tv.sig.ty == "vector<4xi3>"
-
-
-@pytest.mark.vec
-def test_vec_reg_lane_view_uses_reg_q_for_sig(repo_root: Path) -> None:
-    import sys
-
-    frontend = repo_root / "compiler" / "frontend"
-    if str(frontend) not in sys.path:
-        sys.path.insert(0, str(frontend))
-
-    from pycircuit import Circuit, Reg, Vec
-
-    m = Circuit("vec_reg_lane_view")
-    domain = m.domain("main")
-    en = m.const(1, width=1)
-    regs = [
-        m.reg_domain(domain, en, m.input(f"d{i}", width=4), init=0)
-        for i in range(2)
-    ]
-    v = Vec(regs)
-    info = v._as_vector_signal()
-
-    assert isinstance(v[0], Reg)
-    assert info is not None
-    assert v.sig is not None
-    assert info[1].ty == "vector<2xi4>"
-    assert v.sig.ty == "vector<2xi4>"
-    assert "pyc.v_create" in m.emit_mlir()
 
 
 @pytest.mark.vec
@@ -693,10 +476,10 @@ def test_reduce_mode_attr_and_pycc(
     if str(frontend) not in sys.path:
         sys.path.insert(0, str(frontend))
 
-    from pycircuit import Circuit, Vec
+    from pycircuit import Circuit
 
     m = Circuit("reduce_mode_invalid")
-    bad = Vec([m.input(f"bad{i}", width=1) for i in range(2)])
+    bad = m.vec([m.input(f"bad{i}", width=1) for i in range(2)])
     with pytest.raises(ValueError, match="reduce mode"):
         bad.or_reduce(mode="flat")
 

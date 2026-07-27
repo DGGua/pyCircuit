@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+from compiler.frontend.pycircuit.data import Vector
 from pycircuit import (
     CycleAwareCircuit,
     CycleAwareDomain,
     Tb,
-    Vec,
+    Wire,
     cas,
     compile_cycle_aware,
     testbench,
@@ -21,29 +22,29 @@ CYCLE_EX  = 2   # w1: execute stage — newest result, available last
 CYCLE_ISS = 0   # source operands: issue stage
 
 
-def _const_vec(m: CycleAwareCircuit, value: int, *, width: int, lanes: int) -> Vec:
-    return Vec([m.const(int(value), width=int(width)) for _ in range(int(lanes))])
+def _const_vec(m: CycleAwareCircuit, value: int, *, width: int, lanes: int) -> Wire:
+    return m.vec([m.const(int(value), width=int(width)) for _ in range(int(lanes))])
 
 
 def _select_stage_batch(
     m: CycleAwareCircuit,
     domain: CycleAwareDomain,
     *,
-    src_valid: Vec,
-    src_ptag: Vec,
-    src_ptype: Vec,
-    lane_valid: Vec,
-    lane_ptag: Vec,
-    lane_ptype: Vec,
-    lane_data: Vec,
-    lane_nums: Vec,
+    src_valid: Wire,
+    src_ptag: Wire,
+    src_ptype: Wire,
+    lane_valid: Wire,
+    lane_ptag: Wire,
+    lane_ptype: Wire,
+    lane_data: Wire,
+    lane_nums: Wire,
     zero_lane,
     zero_data,
     lanes: int,
-) -> tuple[Vec, Vec, Vec]:
+) -> tuple[Wire, Wire, Wire]:
     """Pick the first matching write-back lane for every source lane.
 
-    Cycle-aware Vec operations align source and write-back lanes automatically.
+    Cycle-aware Wire operations align source and write-back lanes automatically.
     """
     _ = (m, domain)
     n = int(lanes)
@@ -58,10 +59,10 @@ def _select_stage_batch(
 
     match = sv_bc & lv_bc & (lp_bc == sp_bc) & (lt_bc == st_bc)
     has = match.or_reduce(dim=1)
-    sel_lane = Vec([match[i].priority_mux(lane_nums, zero=zero_lane) for i in range(n)])
+    sel_lane = m.vec([match[i].priority_mux(lane_nums, zero=zero_lane) for i in range(n)])
 
     ld_bc = lane_data.broadcast(dim=0, size=n)
-    sel_data = Vec([match[i].priority_mux(ld_bc[i], zero=zero_data) for i in range(n)])
+    sel_data = m.vec([match[i].priority_mux(ld_bc[i], zero=zero_data) for i in range(n)])
 
     return has, sel_lane, sel_data
 
@@ -70,26 +71,26 @@ def _resolve_src_batch(
     m: CycleAwareCircuit,
     domain: CycleAwareDomain,
     *,
-    src_valid: Vec,
-    src_ptag: Vec,
-    src_ptype: Vec,
-    src_rf_data: Vec,
-    w1_valid: Vec,
-    w1_ptag: Vec,
-    w1_ptype: Vec,
-    w1_data: Vec,
-    w2_valid: Vec,
-    w2_ptag: Vec,
-    w2_ptype: Vec,
-    w2_data: Vec,
-    w3_valid: Vec,
-    w3_ptag: Vec,
-    w3_ptype: Vec,
-    w3_data: Vec,
+    src_valid: Wire,
+    src_ptag: Wire,
+    src_ptype: Wire,
+    src_rf_data: Wire,
+    w1_valid: Wire,
+    w1_ptag: Wire,
+    w1_ptype: Wire,
+    w1_data: Wire,
+    w2_valid: Wire,
+    w2_ptag: Wire,
+    w2_ptype: Wire,
+    w2_data: Wire,
+    w3_valid: Wire,
+    w3_ptag: Wire,
+    w3_ptype: Wire,
+    w3_data: Wire,
     lanes: int,
     lane_w: int,
     data_w: int,
-) -> tuple[Vec, Vec, Vec, Vec]:
+) -> tuple[Wire, Wire, Wire, Wire]:
     """Resolve all source lanes across 3 pipelined write-back stages.
 
     Pipeline model (auto-cycle-balanced):
@@ -104,7 +105,7 @@ def _resolve_src_batch(
     Output @ cycle 2.
     """
     n = int(lanes)
-    lane_nums = Vec([m.const(j, width=lane_w) for j in range(n)])
+    lane_nums = m.vec([m.const(j, width=lane_w) for j in range(n)])
     zero_data = m.const(0, width=data_w)
     zero_lane = m.const(0, width=lane_w)
 
@@ -193,9 +194,9 @@ def bypass_unit(
     data_width: int = 64,
     ptag_count: int = 256,
     ptype_count: int = 4,
-    inputs: dict[str, Vec] | None = None,
+    inputs: dict[str, Wire] | None = None,
     emit_outputs: bool = True,
-) -> dict[str, Vec]:
+) -> dict[str, Wire]:
     """Pipelined bypass / forwarding network with cycle-aware pipeline stages.
 
     Each write-back stage is annotated at its pipeline cycle:
@@ -209,7 +210,7 @@ def bypass_unit(
       w3 result@0 → DFF → w2 mux@1 → DFF → w1 mux@2 → output@2
     """
     _in = inputs or {}
-    _out: dict[str, Vec] = {}
+    _out: dict[str, Wire] = {}
 
     if lanes <= 0:
         raise ValueError("bypass_unit lanes must be > 0")
@@ -224,19 +225,19 @@ def bypass_unit(
     ptype_w = max(1, (ptype_count - 1).bit_length())
     lane_w  = max(1, (lanes - 1).bit_length())
 
-    def vec_input(key: str, *, width: int, cycle: int) -> Vec:
+    def vec_input(key: str, *, width: int, cycle: int) -> Wire:
         if key in _in:
             vec = _in[key]
-            if not isinstance(vec, Vec):
-                raise TypeError(f"{key} override must be a Vec")
+            if not isinstance(vec.ty, Vector):
+                raise TypeError(f"{key} override must be a Vector, got {type(vec.ty).__name__}")
             return vec
         port = f"{prefix}_{key}"
         raw = m.input(port, width=int(width), shape=int(lanes))
-        if not isinstance(raw, Vec):
-            raise TypeError(f"{port} shaped input did not produce Vec")
-        return Vec([cas(domain, wire, cycle=int(cycle)) for wire in raw])
+        if not isinstance(raw.ty, Vector):
+            raise TypeError(f"{port} shaped input did not produce Vector, got {type(raw.ty).__name__}")
+        return m.vec([cas(domain, wire, cycle=int(cycle)) for wire in raw])
 
-    def stage_inputs(stage: str, cycle: int) -> dict[str, Vec]:
+    def stage_inputs(stage: str, cycle: int) -> dict[str, Wire[Vector]]:
         return {
             "valid": vec_input(f"{stage}_valid", width=1, cycle=cycle),
             "ptag": vec_input(f"{stage}_ptag", width=ptag_w, cycle=cycle),
@@ -244,7 +245,7 @@ def bypass_unit(
             "data": vec_input(f"{stage}_data", width=data_width, cycle=cycle),
         }
 
-    def source_inputs(src: str) -> dict[str, Vec]:
+    def source_inputs(src: str) -> dict[str, Wire[Vector]]:
         return {
             "valid": vec_input(f"i2_{src}_valid", width=1, cycle=CYCLE_ISS),
             "ptag": vec_input(f"i2_{src}_ptag", width=ptag_w, cycle=CYCLE_ISS),
@@ -252,7 +253,7 @@ def bypass_unit(
             "rf_data": vec_input(f"i2_{src}_rf_data", width=data_width, cycle=CYCLE_ISS),
         }
 
-    # ── Write-back stage inputs: each stage is one shaped Vec port. ──
+    # ── Write-back stage inputs: each stage is one shaped Wire port. ──
     w = {
         "w3": stage_inputs("w3", CYCLE_WB),
         "w2": stage_inputs("w2", CYCLE_MEM),

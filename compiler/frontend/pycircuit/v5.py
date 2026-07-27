@@ -17,7 +17,7 @@ from typing import Any, Callable, Iterable, Iterator, Mapping, TypeVar, Union
 
 from .data import Bits, Data, Vector
 from .dsl import Signal
-from .hw import Circuit, ClockDomain, Reg, Vec, Wire
+from .hw import Circuit, ClockDomain, Reg, Wire
 from .literals import LiteralValue, infer_literal_width
 from .tb import Tb as _Tb
 
@@ -287,10 +287,7 @@ class CycleAwareDomain:
 
         out_values: list[Any] = []
         for sig in out_sigs:
-            if isinstance(sig.ty, Vector):
-                out_values.append(Vec._from_vector_signal(self._m, sig, signs=[False for _ in range(sig.ty.length)]))
-            else:
-                out_values.append(Wire(self._m, sig))
+            out_values.append(Wire(self._m, sig))
         return _reconstruct_output_dict(out_entries, out_values, self)
 
     def delay_to(self, w: Wire, *, from_cycle: int, to_cycle: int, width: int) -> Wire:
@@ -349,13 +346,6 @@ def _record_output_structure(
     for key, val in outs_dict.items():
         if isinstance(val, Wire) and isinstance(val.sig.ty, Vector):
             idx = ref_to_idx.get(val.sig.ref, -1) if ref_to_idx else -1
-            entries.append((key, "vec", len(val), [0], [idx]))
-        elif isinstance(val, Vec):
-            info = val._as_vector_signal()
-            if info is None:
-                raise TypeError(f"output {key!r} Vec cannot be converted to a vector signal")
-            _m, sig, _signs = info
-            idx = ref_to_idx.get(sig.ref, -1) if ref_to_idx else -1
             entries.append((key, "vec", len(val), [0], [idx]))
         elif isinstance(val, list):
             cycles: list[int] = []
@@ -951,16 +941,10 @@ def _is_cas(v: object) -> bool:
 
 
 def mux(
-    cond: Union[Wire, Reg, Vec, CycleAwareSignal, StateSignal, ForwardSignal],
-    a: Union[Wire, Reg, Vec, CycleAwareSignal, StateSignal, ForwardSignal, int, LiteralValue],
-    b: Union[Wire, Reg, Vec, CycleAwareSignal, StateSignal, ForwardSignal, int, LiteralValue],
-) -> Union[Wire, Vec, CycleAwareSignal]:
-    # Vec-level mux: delegate to Vec._try_vector_select.
-    if isinstance(cond, Vec):
-        result = cond._try_vector_select(a, b)
-        if result is not None:
-            return result
-        raise TypeError(f"mux(Vec, ...) requires compatible Vec a/b arms")
+    cond: Union[Wire, Reg, CycleAwareSignal, StateSignal, ForwardSignal],
+    a: Union[Wire, Reg, CycleAwareSignal, StateSignal, ForwardSignal, int, LiteralValue],
+    b: Union[Wire, Reg, CycleAwareSignal, StateSignal, ForwardSignal, int, LiteralValue],
+) -> Union[Wire, CycleAwareSignal]:
     if _is_cas(cond) or _is_cas(a) or _is_cas(b):
         def _unwrap(v: object) -> object:
             if isinstance(v, ForwardSignal):

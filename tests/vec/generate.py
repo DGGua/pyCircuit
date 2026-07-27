@@ -28,7 +28,7 @@ BINARY_EXPR: dict[str, str] = {
 
 def _vec_input(name: str, width: int, lanes: int, *, signed: bool = False) -> str:
     signed_arg = ", signed=True" if signed else ""
-    return f'{name} = Vec([m.input(f"{name}{{i}}", width={width}{signed_arg}) for i in range({lanes})])'
+    return f'{name} = m.vec([m.input(f"{name}{{i}}", width={width}{signed_arg}) for i in range({lanes})])'
 
 
 def _binary_case_expr(case: VecCase, *, width: int, lanes: int, signed: bool) -> tuple[list[str], str, bool] | None:
@@ -124,7 +124,7 @@ def render_case_source(case: VecCase) -> str:
     lines: list[str] = [
         "from __future__ import annotations",
         "",
-        "from pycircuit import Circuit, Tb, Vec, module, sext, testbench, trunc, zext",
+        "from pycircuit import Circuit, Tb, module, sext, testbench, trunc, zext",
         "",
         "",
         "@module",
