@@ -3,9 +3,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 import re
-from typing import Callable
+from typing import Callable, Generic
 
-from .data import Bits, Data, Opaque, Vector
+from .data import Bits, DT, Data, Opaque, Vector
 
 _IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
@@ -41,9 +41,9 @@ def _elementwise_compare_result_type(a_ty: Data, b_ty: Data, op: str) -> Data:
 
 
 @dataclass(frozen=True)
-class Signal:
+class Signal(Generic[DT]):
     ref: str
-    ty: Data
+    ty: DT
 
     def __post_init__(self) -> None:
         if not isinstance(self.ty, (Bits, Vector, Opaque)):

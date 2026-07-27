@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Generic, TypeVar
+
+
+DT = TypeVar("DT", bound="Data")
 
 
 @dataclass(frozen=True, eq=False)
@@ -62,9 +66,9 @@ class Bits(Data):
 
 
 @dataclass(frozen=True, eq=False)
-class Vector(Data):
+class Vector(Data, Generic[DT]):
     length: int
-    elem: Data
+    elem: DT
 
     def __post_init__(self) -> None:
         if not isinstance(self.length, int) or self.length <= 0:
@@ -97,7 +101,7 @@ class Vector(Data):
         return e
 
     @classmethod
-    def from_str(cls, s: str) -> "Vector":
+    def from_str(cls, s: str) -> "Vector[Data]":
         raw = str(s).strip()
         if not (raw.startswith("vector<") and raw.endswith(">")):
             raise ValueError(f"expected vector type, got {raw!r}")
@@ -125,7 +129,7 @@ class Vector(Data):
         return cls.from_shape(dims, Data.from_str(parts[-1]))
 
     @classmethod
-    def from_shape(cls, shape: list[int], leaf: Data) -> "Vector":
+    def from_shape(cls, shape: list[int], leaf: Data) -> "Vector[Data]":
         """Wrap ``leaf`` in nested ``Vector`` from outer to inner.
 
         ``cls.from_shape([4, 3], Bits(8))`` → ``Vector(4, Vector(3, Bits(8)))``.

@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 import hashlib
 import inspect
 import json
-from typing import Any, Iterable, Iterator, Literal, Mapping, Protocol, Union, overload
+from typing import Any, Generic, Iterable, Iterator, Literal, Mapping, Protocol, TypeVar, Union, overload
 
 from .connectors import (
     Connector,
@@ -20,7 +20,7 @@ from .connectors import (
     is_connector_bundle,
     is_connector_struct,
 )
-from .data import Bits, Data, Opaque, Vector
+from .data import Bits, DT, Data, Opaque, Vector
 from .design import DesignError
 from .dsl import Module, Signal
 from .literals import LiteralValue, infer_literal_width
@@ -77,9 +77,9 @@ def _normalize_shape_arg(shape: int | tuple[int, ...] | list[int]) -> tuple[int,
 
 
 @dataclass(frozen=True, eq=False)
-class Wire:
+class Wire(Generic[DT]):
     m: Module
-    sig: Signal
+    sig: Signal[DT]
     signed: bool = False
     # True if this Wire originates from `pyc.wire` and is intended to be driven
     # by `pyc.assign` (SSA backedge placeholder). JIT debug aliasing must not
@@ -92,7 +92,7 @@ class Wire:
         return self.sig.ref
 
     @property
-    def ty(self) -> Data:
+    def ty(self) -> DT:
         return self.sig.ty
 
     @property
@@ -108,7 +108,7 @@ class Wire:
             "Use `if` inside a JIT-compiled design function, or compare explicitly and return an i1 Wire."
         )
 
-    def out(self) -> "Wire":
+    def out(self) -> "Wire[DT]":
         """Stage-friendly sugar: a Wire's value is itself."""
         return self
 
@@ -119,18 +119,18 @@ class Wire:
             raise TypeError(f"len(Wire) requires Vector type, got {self.sig.ty!r}")
         return self.sig.ty.length
 
-    def __iter__(self) -> Iterator["Wire"]:
+    def __iter__(self) -> Iterator["Wire[Data]"]:
         if not isinstance(self.sig.ty, Vector):
             raise TypeError(f"iter(Wire) requires Vector type, got {self.sig.ty!r}")
         for i in range(self.sig.ty.length):
             yield self[i]
 
-    def or_reduce(self, *, dim: int | None = None, mode: str = "chain") -> "Wire":
+    def or_reduce(self, *, dim: int | None = None, mode: str = "chain") -> "Wire[Bits]":
         if not isinstance(self.sig.ty, Vector):
             raise TypeError(f"or_reduce requires Vector type, got {self.sig.ty!r}")
         return Wire(self.m, self.m.v_or_reduce(self.sig, dim=dim, mode=mode))
 
-    def and_reduce(self, *, dim: int | None = None, mode: str = "chain") -> "Wire":
+    def and_reduce(self, *, dim: int | None = None, mode: str = "chain") -> "Wire[Bits]":
         if not isinstance(self.sig.ty, Vector):
             raise TypeError(f"and_reduce requires Vector type, got {self.sig.ty!r}")
         return Wire(self.m, self.m.v_and_reduce(self.sig, dim=dim, mode=mode))
@@ -173,7 +173,7 @@ class Wire:
         red_sig = self.m.v_add_reduce(sig, dim=None if dim is None else reduce_dim, mode=mode)
         return Wire(self.m, red_sig, signed=bool(signed))
 
-    def broadcast(self, *, size: int, dim: int) -> "Wire":
+    def broadcast(self, *, size: int, dim: int) -> "Wire[Vector]":
         if not isinstance(self.sig.ty, Vector):
             raise TypeError(f"broadcast requires Vector type, got {self.sig.ty!r}")
         return Wire(self.m, self.m.v_broadcast_dim(self.sig, size=size, dim=dim))
@@ -467,7 +467,7 @@ class Wire:
         amt = self._as_wire(amount, width=None)
         return Wire(self.m, self.m.shl(self.sig, amt.sig), signed=self.signed)
 
-    def __getitem__(self, idx: int | slice) -> "Wire":
+    def __getitem__(self, idx: int | slice) -> "Wire[Data]":
         if isinstance(self.sig.ty, Vector):
             if isinstance(idx, slice):
                 raise TypeError("Vector Wire indexing does not support slice (use v_get)")
@@ -523,8 +523,8 @@ class ClockDomain:
 
 
 @dataclass(frozen=True, eq=False)
-class Reg:
-    q: Wire
+class Reg(Generic[DT]):
+    q: Wire[DT]
     clk: Signal
     rst: Signal
     en: Wire
@@ -536,7 +536,7 @@ class Reg:
         return self.q.ref
 
     @property
-    def ty(self) -> Data:
+    def ty(self) -> DT:
         return self.q.ty
 
     @property
@@ -552,7 +552,7 @@ class Reg:
             "Use `if` inside a JIT-compiled design function, or compare explicitly and return an i1 Wire."
         )
 
-    def out(self) -> Wire:
+    def out(self) -> Wire[DT]:
         """Read the current value of the register (q) as a Wire."""
         return self.q
 
@@ -878,11 +878,11 @@ class Circuit(Module):
         width: int,
         signed: bool = False,
         shape: int | tuple[int, ...] | list[int] | None = None,
-    ) -> Wire:
+    ) -> Wire[Bits] | Wire[Vector]:
         """Declare a module input port.
 
-        Scalar and shaped inputs both return ``Wire``. For shaped inputs
-        ``Wire.ty`` is a ``Vector`` and ``Wire[i]`` extracts lane ``i``.
+        Scalar inputs return ``Wire[Bits]``. Shaped inputs return
+        ``Wire[Vector]`` whose ``Wire[i]`` extracts lane ``i``.
         """
         if shape is None:
             return Wire(self, super().input(name, width=width), signed=bool(signed))
@@ -890,7 +890,7 @@ class Circuit(Module):
         sig = super().input(name, shape=list(dims), width=width)
         return Wire(self, sig, signed=bool(signed))
 
-    def const(self, value: int, *, width: int) -> Wire:  # type: ignore[override]
+    def const(self, value: int, *, width: int) -> Wire[Bits]:  # type: ignore[override]
         """Create an integer constant `Wire` (two's complement at `width`)."""
         return Wire(self, super().const(int(value), width=width), signed=(int(value) < 0))
 
@@ -916,7 +916,7 @@ class Circuit(Module):
             return
         raise TypeError(f"output() expects Wire/Reg/Signal/Connector/int/literal, got {type(value).__name__}")
 
-    def new_wire(self, *, width: int) -> Wire:
+    def new_wire(self, *, width: int) -> Wire[Bits]:
         return Wire(self, super().new_wire(width=width), assignable=True)
 
     def named_wire(self, name: str, *, width: int) -> Wire:
@@ -1194,7 +1194,7 @@ class Circuit(Module):
             en_w = en
         return self.reg_wire(clk, rst, en_w, next_w, init)
 
-    def vec(self, *elems: Union["Wire", "Reg", list, tuple]) -> Wire:
+    def vec(self, *elems: Union["Wire", "Reg", list, tuple]) -> Wire[Vector]:
         """Build a vector Wire from scalar wires/regs (via ``pyc.v_create``).
 
         Accepts both ``m.vec(w1, w2, w3)`` and ``m.vec([w1, w2, w3])``.
