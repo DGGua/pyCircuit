@@ -821,6 +821,7 @@ designs/my_soc/
 ## 下一步
 
 - 完整语言定义（Vec/Record/MLIR 映射的权威语义）：`docs/v6_PyCircuit_Specification.md`
+- 3D 堆叠分层标注（`tier=` / `jump_tier`，Proposed）：`docs/v6_PyCircuit_Specification.md` §14 与 `docs/rfcs/tier_annotation.md`
 - 工具链内部（pyc 方言、pass 流水线、双发射器、sidecar 运行时）：`docs/v6_PyCircuit_Software_Architecture.md`
 - 仓库内可运行示例：`designs/examples/`（counter、calculator、fifo_loopback…）、`designs/BypassUnit`（Vec 实战）、`designs/IssueQueue`（Vec + 复杂状态）
 

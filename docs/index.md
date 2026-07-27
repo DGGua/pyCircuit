@@ -46,6 +46,7 @@ def build(m: Circuit) -> None:
 - `docs/tutorial/index.md` (tutorial hub)
 - `designs/examples/README.md`
 - `docs/rfcs/pyc4.0-decisions.md` and `docs/updatePLAN.md` (contracts + execution plan)
+- **RFC — 3D tier annotation (`tier=` / `jump_tier`)**: `docs/rfcs/tier_annotation.md`
 
 
 ## Sidecar testbench schedule

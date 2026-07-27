@@ -30,7 +30,8 @@
 11. [仿真与测试（Tb / CycleAwareTb / Sidecar）](#11-仿真与测试tb--cycleawaretb--sidecar)
 12. [编译入口](#12-编译入口)
 13. [MLIR 映射参考](#13-mlir-映射参考)
-14. [附录：API 参考表](#14-附录api-参考表)
+14. [Tier 分层标注（3D 堆叠扩展，Proposed）](#14-tier-分层标注3d-堆叠扩展proposed)
+15. [附录：API 参考表](#15-附录api-参考表)
 
 ---
 
@@ -711,7 +712,52 @@ pycircuit sidecar verify FILE
 
 ---
 
-## 14. 附录：API 参考表
+## 14. Tier 分层标注（3D 堆叠扩展，Proposed）
+
+> **状态:Proposed**(尚未实现;完整提案与实现草图见 `docs/rfcs/tier_annotation.md`)。本节先行纳入规范,冻结语法形态与语义边界。
+
+面向 3D 堆叠(细粒度逻辑折叠:设计折叠到 2–3 层垂直堆叠的裸片)的源码级层指派。信号携带第二种元数据 **`.tier`**(裸片层号),与 `.cycle` 并列。
+
+**术语纪律:分层维度一律用 tier(裸片层),不用 layer**(后者指金属布线层)。
+
+### 14.1 与 `.cycle` 的语义对照(理解本扩展的钥匙)
+
+| | `.cycle` | `.tier` |
+|---|---|---|
+| 语义地位 | **行为语义**,切错位置行为就变 | **物理提示**,不产生/不修改任何硬件 |
+| 传播规则 | max 规则 + 自动周期平衡(插 DFF) | 继承规则,零电路效应 |
+| 验证影响 | 必须过功能等价验证 | 逻辑恒等,功能验证无感 |
+
+两套传播机制共存于同一次 elaboration,互不干扰。
+
+### 14.2 语法
+
+```python
+a  = cas(domain, m.input("a", width=8), tier=0)          # 定义处显式
+pc = domain.signal(width=64, name="pc", tier=0)           # 前向声明处显式
+s1 = a + 1                                                # 隐式:继承输入的 tier
+s2 = jump_tier(s1 * 3, to=1)                              # 强制跳层(声明一个键合点)
+hot = cas(domain, m.input("b", width=8), tier=1,
+          tier_lock=True)                                 # 锁定:下游 EDA 不得改写
+tmp = cas(domain, m.input("c", width=8))                  # 未指派:tier=None,EDA 全权
+outs = domain.call(alu, inputs={...}, tier=1)             # 模块级缺省 tier
+```
+
+### 14.3 语义规则
+
+1. **传播:** 运算结果的 tier 由输入继承(全部/多数同层继承之;混层取主导方向),强度记为推断;
+2. **反馈信号:** `domain.signal()` 的 tier 在声明处确定,`<<=` 赋值不改变它;跨层反馈须用 `jump_tier` 显式表达;
+3. **自动周期平衡插入的对齐 DFF 继承驱动信号的 tier**(平衡不引入额外跨层);
+4. **`jump_tier(expr, to=k)`:** 返回新 CAS,`.tier == k`、`.cycle` 不变、零硬件效应;`to` 须为编译期常量;
+5. **强度三态与 EDA 契约:** free(未指派,分割器全权)/ hint(显式与推断,可改写但必须输出结构化 diff)/ locked(必须服从,不可满足报错)。分割器结果写入以稳定 ID 为键的 sidecar tier 表,不回写源码。
+
+### 14.4 IR 与发射
+
+- MLIR 可选属性:`pyc.tier`(int)、`pyc.tier_strength`(`"hint"|"locked"`)、模块级 `pyc.tier_default`;无标注即无属性,**完全向后兼容**;
+- Verilog 三条冗余通道:`(* pyc_tier = 1 *)` 属性、层次化命名编码、sidecar tier 指派表(主通道);三者不一致构成流程告警;
+- C++ 仿真后端忽略 tier(功能无关),可选地在 DFX 元数据中携带以便按层聚合统计。
+
+## 15. 附录：API 参考表
 
 ### CycleAwareCircuit
 
