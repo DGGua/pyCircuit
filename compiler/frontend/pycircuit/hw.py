@@ -1058,17 +1058,7 @@ class Circuit(Module):
 
         if init is None:
             init = 0
-        if isinstance(init, int):
-            init = Wire(self, super().const(init, width=width))
-        elif isinstance(init, list):
-            init = self.const(init, width=width)
-        elif isinstance(init, Reg):
-            init = init.q
-        elif isinstance(init, Signal):
-            init_w = Wire(self, init)
-        else:
-            init_w = init
-
+        init = Wire.as_wire(init, m=self, width=width)
         if shape and isinstance(init_w.sig.ty, Bits):
             init_sig = cast(Signal[Bits], init_w.sig) 
             init_sig = super().v_broadcast(init_sig, size=shape[0])
