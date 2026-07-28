@@ -5,6 +5,10 @@ import json
 import re
 from typing import Any, Callable, Generic, Union, overload
 
+from pycircuit import Connector, Wire
+
+from compiler.frontend.pycircuit.hw import Reg
+
 from .data import Bits, Clock, DT, Data, Reset, Vector
 
 _IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -25,7 +29,18 @@ class Signal(Generic[DT]):
     @property
     def width(self) -> int:
         return self.ty.width
-
+    
+    @classmethod
+    def as_sig(cls, v: Union[Connector, Wire, Reg, Signal]) -> Signal:
+        if isinstance(v, Connector):
+            v = v.read().sig
+        if isinstance(v, Reg):
+            v = v.q.sig
+        if isinstance(v, Wire):
+            return v.sig
+        if isinstance(v, Signal):
+            return v
+        raise TypeError(f"cannot convert {type(v).__name__} to Signal")
 
 class Module:
     def __init__(self, name: str) -> None:
