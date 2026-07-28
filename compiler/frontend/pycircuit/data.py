@@ -1,22 +1,23 @@
 from __future__ import annotations
 
+from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Generic, TypeVar
+from typing import Generic, TypeVar, cast
 
 
-DT = TypeVar("DT", bound="Data")
+DT = TypeVar("DT", bound="Data", covariant=True)
 
 
 @dataclass(frozen=True, eq=False)
-class Data:
+class Data(ABC):
     """Structured signal type carried by ``Signal.ty``.
 
     ``str(Data)`` yields the canonical MLIR type literal so that f-string
     interpolation (``f"{sig.ty}"``) emits the same text as before.
-    """
 
-    def __str__(self) -> str:  # pragma: no cover - overridden by subclasses
-        raise NotImplementedError
+    All concrete subclasses expose ``.width`` as the integer bit-width
+    (vectors: leaf/element width; ``Clock``/``Reset``: 1).
+    """
 
     def __eq__(self, other: object) -> bool:
         if isinstance(other, str):
@@ -28,6 +29,11 @@ class Data:
     def __hash__(self) -> int:
         return hash(str(self))
 
+    @property
+    @abstractmethod
+    def width(self) -> int:
+        """Integer bit-width (vectors: leaf/element width; clock/reset: 1)."""
+    
     @classmethod
     def from_str(cls, s: str) -> "Data":
         raw = str(s).strip()
@@ -35,21 +41,31 @@ class Data:
             return Vector.from_str(raw)
         if raw.startswith("i"):
             return Bits.from_str(raw)
-        if raw in ("!pyc.clock", "!pyc.reset"):
-            return Opaque(raw)
+        if raw == "!pyc.clock":
+            return Clock()
+        if raw == "!pyc.reset":
+            return Reset()
         raise ValueError(f"unsupported type literal: {s!r}")
+
+    @abstractmethod
+    def __str__(self) -> str:  # pragma: no cover - overridden by subclasses
+        raise NotImplementedError
 
 
 @dataclass(frozen=True, eq=False)
 class Bits(Data):
-    width: int
+    bitwidth: int
 
     def __post_init__(self) -> None:
-        if not isinstance(self.width, int) or self.width <= 0:
-            raise ValueError(f"Bits.width must be a positive int, got {self.width!r}")
+        if not isinstance(self.bitwidth, int) or self.bitwidth <= 0:
+            raise ValueError(f"Bits.bitwidth must be a positive int, got {self.bitwidth!r}")
 
+    @property
+    def width(self) -> int:
+        return self.bitwidth
+    
     def __str__(self) -> str:
-        return f"i{self.width}"
+        return f"i{self.bitwidth}"
 
     @classmethod
     def from_str(cls, s: str) -> "Bits":
@@ -84,6 +100,11 @@ class Vector(Data, Generic[DT]):
             e = e.elem
         return "vector<" + "x".join(str(d) for d in shape) + "x" + str(e) + ">"
 
+    @property
+    def width(self) -> int:
+        """Integer width of the element (leaf) type."""
+        return self.datatype().width
+    
     def shape(self) -> list[int]:
         """All dimensions flattened, outer-to-inner. ``Vector(4, Vector(3, Bits(8)))`` → ``[4, 3]``."""
         s: list[int] = [self.length]
@@ -145,12 +166,20 @@ class Vector(Data, Generic[DT]):
 
 
 @dataclass(frozen=True, eq=False)
-class Opaque(Data):
-    raw: str
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.raw, str) or not self.raw:
-            raise ValueError(f"Opaque.raw must be a non-empty str, got {self.raw!r}")
-
+class Clock(Data):
     def __str__(self) -> str:
-        return self.raw
+        return "!pyc.clock"
+
+    @property
+    def width(self) -> int:
+        return 1
+
+
+@dataclass(frozen=True, eq=False)
+class Reset(Data):
+    def __str__(self) -> str:
+        return "!pyc.reset"
+
+    @property
+    def width(self) -> int:
+        return 1

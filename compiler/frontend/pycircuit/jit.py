@@ -134,7 +134,7 @@ def _expect_wire(v: Any, *, ctx: str) -> Wire:
 
 
 def _wire_ifexpr(cond: Wire, true_v: Any, false_v: Any) -> Wire:
-    if cond.ty != "i1":
+    if cond.ty != Bits(1):
         raise JitError("if-expression condition must be an i1 wire")
     if isinstance(true_v, Connector):
         true_v = true_v.read()
@@ -376,9 +376,9 @@ class _Compiler:
         if isinstance(w.ty, Bits) and isinstance(expected_ty, Bits):
             ew = expected_ty.width
             if w.width < ew:
-                return w._sext(width=ew) if w.signed else w._zext(width=ew)
+                return w.sext(width=ew) if w.signed else w.zext(width=ew)
             if w.width > ew:
-                return w._trunc(width=ew)
+                return w.trunc(width=ew)
             return w
 
         raise JitError(f"{ctx}: type mismatch, got {w.ty} expected {expected_ty}")
@@ -1008,7 +1008,7 @@ class _Compiler:
             if isinstance(node.op, ast.Not):
                 if isinstance(v, (Wire, Reg)):
                     w = _expect_wire(v, ctx="not")
-                    if w.ty != "i1":
+                    if w.ty != Bits(1):
                         raise JitError("not only supports i1 wires")
                     return ~w
                 return not bool(v)
@@ -1027,7 +1027,7 @@ class _Compiler:
                         else:
                             out = _expect_wire(b, ctx="and") & out
                     else:
-                        out = bool(out) and bool(b)
+                        out = bool(out) and bool(o=b)
                 return out
             if isinstance(node.op, ast.Or):
                 out = self.eval_expr(node.values[0])
@@ -1283,7 +1283,7 @@ class _Compiler:
     def _snapshot_template_purity_state(self) -> dict[str, Any]:
         snap: dict[str, Any] = {
             "lines": list(self.m._lines),  # noqa: SLF001
-            "next_tmp": int(self.m._next_tmp),  # noqa: SLF001
+            "next_tmp": int(self.m._temp_var_index),  # noqa: SLF001
             "args": list(self.m._args),  # noqa: SLF001
             "results": list(self.m._results),  # noqa: SLF001
             "finalizers": list(getattr(self.m, "_finalizers", [])),  # noqa: SLF001
@@ -1298,7 +1298,7 @@ class _Compiler:
 
     def _restore_template_purity_state(self, snap: Mapping[str, Any]) -> None:
         self.m._lines = list(snap["lines"])  # noqa: SLF001
-        self.m._next_tmp = int(snap["next_tmp"])  # noqa: SLF001
+        self.m._temp_var_index = int(snap["next_tmp"])  # noqa: SLF001
         self.m._args = list(snap["args"])  # noqa: SLF001
         self.m._results = list(snap["results"])  # noqa: SLF001
         if hasattr(self.m, "_finalizers"):
@@ -1316,7 +1316,7 @@ class _Compiler:
         changed: list[str] = []
         if list(self.m._lines) != list(snap["lines"]):  # noqa: SLF001
             changed.append("_lines")
-        if int(self.m._next_tmp) != int(snap["next_tmp"]):  # noqa: SLF001
+        if int(self.m._temp_var_index) != int(snap["next_tmp"]):  # noqa: SLF001
             changed.append("_next_tmp")
         if list(self.m._args) != list(snap["args"]):  # noqa: SLF001
             changed.append("_args")
@@ -1453,7 +1453,7 @@ class _Compiler:
                 return
 
             w = _expect_wire(test_v, ctx="assert")
-            if w.ty != "i1":
+            if w.ty != Bits(1):
                 raise JitError("assert condition must be an i1 Wire")
             self.m.assert_(w, msg=msg)
             return
@@ -1509,7 +1509,7 @@ class _Compiler:
             return
 
         cond = _expect_wire(cond_v, ctx="if condition")
-        if cond.ty != "i1":
+        if cond.ty != Bits(1):
             raise JitError("if condition must be an i1 wire or a python bool")
 
         pre_env = dict(self.env)
@@ -1641,7 +1641,7 @@ class _Compiler:
 
         results: list[str] = []
         if phi_vars:
-            results = [self.m._tmp() for _ in phi_vars]  # noqa: SLF001
+            results = [self.m._get_next_temp_var() for _ in phi_vars]  # noqa: SLF001
 
         _emit_scf_if_header(self.m, results, cond, expected_types)
 

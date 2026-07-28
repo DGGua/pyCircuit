@@ -251,9 +251,9 @@ class CycleAwareDomain:
                     expect_w = port_sig.ty.width
                     w = Wire(self._m, actual_sig)
                     if actual_w < expect_w:
-                        w = w._zext(width=expect_w)
+                        w = w.zext(width=expect_w)
                     else:
-                        w = w._trunc(width=expect_w)
+                        w = w.trunc(width=expect_w)
                     actual_sig = w.sig
                 if actual_sig.ty != port_sig.ty:
                     raise TypeError(f"input {port_name!r} type mismatch: actual {actual_sig.ty} != expected {port_sig.ty}")
@@ -264,10 +264,10 @@ class CycleAwareDomain:
                     elem_ty = port_sig.ty.datatype()
                     width = elem_ty.width if isinstance(elem_ty, Bits) else 1
                 elif isinstance(port_sig.ty, Bits):
-                    shape = None
+                    shape = []
                     width = port_sig.ty.width
                 else:
-                    shape = None
+                    shape = []
                     width = 1
                 if port_name.startswith(canonical_prefix + "_"):
                     suffix = port_name[len(canonical_prefix) + 1:]
@@ -930,9 +930,9 @@ def _promote_pair(m: Circuit, a: Wire, b: Wire) -> tuple[Wire, Wire]:
         return a, b
     out_w = max(a.width, b.width)
     if a.width < out_w:
-        a = a._sext(width=out_w) if a.signed else a._zext(width=out_w)
+        a = a.sext(width=out_w) if a.signed else a.zext(width=out_w)
     if b.width < out_w:
-        b = b._sext(width=out_w) if b.signed else b._zext(width=out_w)
+        b = b.sext(width=out_w) if b.signed else b.zext(width=out_w)
     return a, b
 
 
@@ -988,7 +988,7 @@ def _mux_wire(
     aw = as_wire(a, ctx_w=c.width)
     bw = as_wire(b, ctx_w=c.width)
     aw, bw = _promote_pair(m, aw, bw)
-    if c.ty != "i1":
+    if c.ty != Bits(1):
         raise TypeError("mux condition must be i1")
     return c._select_internal(aw, bw)
 
@@ -1033,7 +1033,7 @@ def _mux_cycle_aware(
     aw = dom.delay_to(ca._w, from_cycle=ca._cycle, to_cycle=mx, width=ca._w.width)
     bw = dom.delay_to(cb._w, from_cycle=cb._cycle, to_cycle=mx, width=cb._w.width)
     aw, bw = _promote_pair(m, aw, bw)
-    if cw2.ty != "i1":
+    if cw2.ty != Bits(1):
         raise TypeError("mux condition must be i1")
     out_w = cw2._select_internal(aw, bw)
     return CycleAwareSignal(dom, out_w, mx)
