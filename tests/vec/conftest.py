@@ -11,6 +11,11 @@ def pytest_configure(config: pytest.Config) -> None:
     config.addinivalue_line("markers", "vec: Vec operator generated tests")
     config.addinivalue_line("markers", "verilator: tests that build/run generated Verilog with Verilator")
     config.addinivalue_line("markers", "slow: slower backend integration tests")
+    # Each xdist worker already builds an independent pycc case. Avoid nested
+    # parallel builds exhausting CPU and memory; callers may override this.
+    is_xdist_worker = hasattr(config, "workerinput")
+    if is_xdist_worker:
+        os.environ.setdefault("PYC_VEC_TEST_JOBS", "1")
 
 
 @pytest.fixture(scope="session")

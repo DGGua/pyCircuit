@@ -586,12 +586,29 @@ static std::optional<LogicalResult> emitScalarOpAssign(Operation &op, raw_ostrea
       if (lanes <= 0)
         return vr.emitError("pyc.") << opName << " requires non-empty vector dimensions for verilog emission";
     }
-    std::int64_t dim = vr.getDim().value_or(0);
+    bool useTree = isTreeReduceMode(vr.getOperation());
+
+    if (!vr.getDim()) {
+      llvm::SmallVector<std::string> terms;
+      if (vt.getRank() == 1) {
+        for (std::int64_t i = 0; i < vt.getShape()[0]; ++i)
+          terms.push_back(nt.get(vr.getVec()) + "[" +
+                          std::to_string(static_cast<long long>(i)) + "]");
+      } else {
+        for (std::int64_t i = 0; i < vt.getShape()[0]; ++i)
+          for (std::int64_t j = 0; j < vt.getShape()[1]; ++j)
+            terms.push_back(nt.get(vr.getVec()) + "[" +
+                            std::to_string(static_cast<long long>(i)) + "][" +
+                            std::to_string(static_cast<long long>(j)) + "]");
+      }
+      std::string expr = useTree ? treeReduceExpr(terms, opToken) : chainReduceExpr(terms, opToken);
+      emitConnectAssign(nt.get(vr.getResult()), expr, vr.getResult().getType(), os);
+      return success();
+    }
+
+    std::int64_t dim = *vr.getDim();
     if (dim < 0 || dim >= vt.getRank())
       return vr.emitError("pyc.") << opName << " dim out of range for verilog emission";
-    if (!vr.getDim() && vt.getRank() != 1)
-      return vr.emitError("pyc.") << opName << " requires explicit dim for rank > 1";
-    bool useTree = isTreeReduceMode(vr.getOperation());
 
     if (vt.getRank() == 1) {
       std::int64_t lanes = vt.getShape()[0];

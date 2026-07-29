@@ -182,7 +182,11 @@ def _expect_wire(v: Any, *, ctx: str) -> Wire:
 
 
 def _wire_ifexpr(cond: Wire, true_v: Any, false_v: Any) -> Wire:
-    if cond.ty != Bits(1):
+    cond_is_vec = isinstance(cond.ty, Vector)
+    if cond_is_vec:
+        if cond.width != 1:
+            raise JitError("if-expression vector condition must be vector<...xi1>")
+    elif cond.ty != Bits(1):
         raise JitError("if-expression condition must be an i1 wire")
     if isinstance(true_v, Connector):
         true_v = true_v.read()

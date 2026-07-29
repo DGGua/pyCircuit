@@ -4,11 +4,13 @@ from compiler.frontend.pycircuit.data import Vector
 from pycircuit import (
     CycleAwareCircuit,
     CycleAwareDomain,
+    CycleAwareSignal,
     Tb,
     Wire,
     cas,
     compile_cycle_aware,
     testbench,
+    wire_of,
 )
 
 PTYPE_C = 0
@@ -30,18 +32,18 @@ def _select_stage_batch(
     m: CycleAwareCircuit,
     domain: CycleAwareDomain,
     *,
-    src_valid: Wire,
-    src_ptag: Wire,
-    src_ptype: Wire,
-    lane_valid: Wire,
-    lane_ptag: Wire,
-    lane_ptype: Wire,
-    lane_data: Wire,
+    src_valid: CycleAwareSignal,
+    src_ptag: CycleAwareSignal,
+    src_ptype: CycleAwareSignal,
+    lane_valid: CycleAwareSignal,
+    lane_ptag: CycleAwareSignal,
+    lane_ptype: CycleAwareSignal,
+    lane_data: CycleAwareSignal,
     lane_nums: Wire,
     zero_lane,
     zero_data,
     lanes: int,
-) -> tuple[Wire, Wire, Wire]:
+) -> tuple[CycleAwareSignal, CycleAwareSignal, CycleAwareSignal]:
     """Pick the first matching write-back lane for every source lane.
 
     Cycle-aware Wire operations align source and write-back lanes automatically.
@@ -58,11 +60,17 @@ def _select_stage_batch(
     lt_bc = lane_ptype.broadcast(dim=0, size=n)
 
     match = sv_bc & lv_bc & (lp_bc == sp_bc) & (lt_bc == st_bc)
-    has = match.or_reduce(dim=1)
-    sel_lane = m.vec([match[i].priority_mux(lane_nums, zero=zero_lane) for i in range(n)])
+    has = match.reduce_or(dim=1)
+    sel_lane = domain.vec([
+        match[i].priority_mux(lane_nums, default=zero_lane)
+        for i in range(n)
+    ])
 
     ld_bc = lane_data.broadcast(dim=0, size=n)
-    sel_data = m.vec([match[i].priority_mux(ld_bc[i], zero=zero_data) for i in range(n)])
+    sel_data = domain.vec([
+        match[i].priority_mux(ld_bc[i], default=zero_data)
+        for i in range(n)
+    ])
 
     return has, sel_lane, sel_data
 
@@ -71,26 +79,26 @@ def _resolve_src_batch(
     m: CycleAwareCircuit,
     domain: CycleAwareDomain,
     *,
-    src_valid: Wire,
-    src_ptag: Wire,
-    src_ptype: Wire,
-    src_rf_data: Wire,
-    w1_valid: Wire,
-    w1_ptag: Wire,
-    w1_ptype: Wire,
-    w1_data: Wire,
-    w2_valid: Wire,
-    w2_ptag: Wire,
-    w2_ptype: Wire,
-    w2_data: Wire,
-    w3_valid: Wire,
-    w3_ptag: Wire,
-    w3_ptype: Wire,
-    w3_data: Wire,
+    src_valid: CycleAwareSignal,
+    src_ptag: CycleAwareSignal,
+    src_ptype: CycleAwareSignal,
+    src_rf_data: CycleAwareSignal,
+    w1_valid: CycleAwareSignal,
+    w1_ptag: CycleAwareSignal,
+    w1_ptype: CycleAwareSignal,
+    w1_data: CycleAwareSignal,
+    w2_valid: CycleAwareSignal,
+    w2_ptag: CycleAwareSignal,
+    w2_ptype: CycleAwareSignal,
+    w2_data: CycleAwareSignal,
+    w3_valid: CycleAwareSignal,
+    w3_ptag: CycleAwareSignal,
+    w3_ptype: CycleAwareSignal,
+    w3_data: CycleAwareSignal,
     lanes: int,
     lane_w: int,
     data_w: int,
-) -> tuple[Wire, Wire, Wire, Wire]:
+) -> tuple[CycleAwareSignal, CycleAwareSignal, CycleAwareSignal, CycleAwareSignal]:
     """Resolve all source lanes across 3 pipelined write-back stages.
 
     Pipeline model (auto-cycle-balanced):
@@ -194,9 +202,9 @@ def bypass_unit(
     data_width: int = 64,
     ptag_count: int = 256,
     ptype_count: int = 4,
-    inputs: dict[str, Wire] | None = None,
+    inputs: dict[str, Wire | CycleAwareSignal] | None = None,
     emit_outputs: bool = True,
-) -> dict[str, Wire]:
+) -> dict[str, CycleAwareSignal]:
     """Pipelined bypass / forwarding network with cycle-aware pipeline stages.
 
     Each write-back stage is annotated at its pipeline cycle:
@@ -210,7 +218,7 @@ def bypass_unit(
       w3 result@0 → DFF → w2 mux@1 → DFF → w1 mux@2 → output@2
     """
     _in = inputs or {}
-    _out: dict[str, Wire] = {}
+    _out: dict[str, CycleAwareSignal] = {}
 
     if lanes <= 0:
         raise ValueError("bypass_unit lanes must be > 0")
@@ -225,19 +233,23 @@ def bypass_unit(
     ptype_w = max(1, (ptype_count - 1).bit_length())
     lane_w  = max(1, (lanes - 1).bit_length())
 
-    def vec_input(key: str, *, width: int, cycle: int) -> Wire:
+    def vec_input(key: str, *, width: int, cycle: int) -> CycleAwareSignal:
         if key in _in:
             vec = _in[key]
-            if not isinstance(vec.ty, Vector):
-                raise TypeError(f"{key} override must be a Vector, got {type(vec.ty).__name__}")
-            return vec
+            if isinstance(vec, CycleAwareSignal):
+                if vec.domain is not domain:
+                    raise ValueError(f"{key} override must share the supplied domain")
+                return vec
+            if isinstance(vec, Wire):
+                return cas(domain, vec, cycle=int(cycle))
+            raise TypeError(f"{key} override must be a Wire or CycleAwareSignal")
         port = f"{prefix}_{key}"
-        raw = m.input(port, width=int(width), shape=int(lanes))
-        if not isinstance(raw.ty, Vector):
-            raise TypeError(f"{port} shaped input did not produce Vector, got {type(raw.ty).__name__}")
-        return m.vec([cas(domain, wire, cycle=int(cycle)) for wire in raw])
+        raw = m.input(port, width=int(width), shape=[int(lanes)])
+        if not isinstance(raw, Wire):
+            raise TypeError(f"{port} shaped input did not produce Wire")
+        return cas(domain, raw, cycle=int(cycle))
 
-    def stage_inputs(stage: str, cycle: int) -> dict[str, Wire[Vector]]:
+    def stage_inputs(stage: str, cycle: int) -> dict[str, CycleAwareSignal]:
         return {
             "valid": vec_input(f"{stage}_valid", width=1, cycle=cycle),
             "ptag": vec_input(f"{stage}_ptag", width=ptag_w, cycle=cycle),
@@ -245,7 +257,7 @@ def bypass_unit(
             "data": vec_input(f"{stage}_data", width=data_width, cycle=cycle),
         }
 
-    def source_inputs(src: str) -> dict[str, Wire[Vector]]:
+    def source_inputs(src: str) -> dict[str, CycleAwareSignal]:
         return {
             "valid": vec_input(f"i2_{src}_valid", width=1, cycle=CYCLE_ISS),
             "ptag": vec_input(f"i2_{src}_ptag", width=ptag_w, cycle=CYCLE_ISS),
@@ -276,10 +288,10 @@ def bypass_unit(
         )
 
         if emit_outputs:
-            m.output(f"{prefix}_i2_{src}_data", out_data)
-            m.output(f"{prefix}_i2_{src}_hit", out_hit)
-            m.output(f"{prefix}_i2_{src}_sel_stage", out_stage)
-            m.output(f"{prefix}_i2_{src}_sel_lane", out_lane)
+            m.output(f"{prefix}_i2_{src}_data", wire_of(out_data))
+            m.output(f"{prefix}_i2_{src}_hit", wire_of(out_hit))
+            m.output(f"{prefix}_i2_{src}_sel_stage", wire_of(out_stage))
+            m.output(f"{prefix}_i2_{src}_sel_lane", wire_of(out_lane))
 
         _out.update({
             f"i2_{src}_data": out_data,

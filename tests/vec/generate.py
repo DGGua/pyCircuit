@@ -102,10 +102,10 @@ def _case_expr(case: VecCase) -> tuple[list[str], str, bool]:
     if case.kind in {"or_reduce", "and_reduce", "reduce_sum", "reduce_sum_signed"}:
         lines = [_vec_input("a", w, n, signed=signed)]
         exprs = {
-            "or_reduce": "a.or_reduce()",
-            "and_reduce": "a.and_reduce()",
+            "or_reduce": "a.reduce_or()",
+            "and_reduce": "a.reduce_and()",
             "reduce_sum": "a.reduce_sum()",
-            "reduce_sum_signed": "a.reduce_sum(width=6, signed=True)",
+            "reduce_sum_signed": "a.reduce_sum()",
         }
         return lines, exprs[case.kind], False
 
@@ -177,10 +177,10 @@ def render_vector_ir_source(case: VecCase) -> str:
         raise ValueError(f"{case.name} does not have a vector-IR-only source")
     signed_arg = ", signed=True" if case.signed else ""
     exprs = {
-        "or_reduce": "a.or_reduce()",
-        "and_reduce": "a.and_reduce()",
+        "or_reduce": "a.reduce_or()",
+        "and_reduce": "a.reduce_and()",
         "reduce_sum": "a.reduce_sum()",
-        "reduce_sum_signed": "a.reduce_sum(width=6, signed=True)",
+        "reduce_sum_signed": "a.reduce_sum()",
     }
     return "\n".join(
         [
@@ -191,7 +191,7 @@ def render_vector_ir_source(case: VecCase) -> str:
             "",
             "@module",
             "def build(m: Circuit) -> None:",
-            f'    a = m.input("a", width={case.width}{signed_arg}, shape={case.lanes})',
+            f'    a = m.input("a", width={case.width}{signed_arg}, shape=[{case.lanes}])',
             f"    out = {exprs[case.kind]}",
             '    m.output("out", out)',
             "",

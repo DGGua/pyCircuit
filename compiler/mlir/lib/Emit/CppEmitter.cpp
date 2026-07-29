@@ -726,12 +726,31 @@ static LogicalResult emitCombAssign(Operation &op, llvm::raw_ostream &os, NameTa
       if (lanes <= 0)
         return vr.emitError("pyc.") << opName << " requires non-empty vector dimensions";
     }
-    std::int64_t dim = vr.getDim().value_or(0);
+    bool useTree = isTreeReduceMode(vr.getOperation());
+
+    if (!vr.getDim()) {
+      assignExpr(vr.getResult(), vr.getType(), os, nt,
+                 [&](llvm::raw_ostream &e) {
+                   llvm::SmallVector<std::string> terms;
+                   if (vt.getRank() == 1) {
+                     for (std::int64_t i = 0; i < vt.getShape()[0]; ++i)
+                       terms.push_back(nt.get(vr.getVec()) + "[" +
+                                       std::to_string(static_cast<long long>(i)) + "]");
+                   } else {
+                     for (std::int64_t i = 0; i < vt.getShape()[0]; ++i)
+                       for (std::int64_t j = 0; j < vt.getShape()[1]; ++j)
+                         terms.push_back(nt.get(vr.getVec()) + "[" +
+                                         std::to_string(static_cast<long long>(i)) + "][" +
+                                         std::to_string(static_cast<long long>(j)) + "]");
+                   }
+                   e << (useTree ? treeReduceExpr(terms, opToken) : chainReduceExpr(terms, opToken));
+                 });
+      return success();
+    }
+
+    std::int64_t dim = *vr.getDim();
     if (dim < 0 || dim >= vt.getRank())
       return vr.emitError("pyc.") << opName << " dim out of range";
-    if (!vr.getDim() && vt.getRank() != 1)
-      return vr.emitError("pyc.") << opName << " requires explicit dim for rank > 1";
-    bool useTree = isTreeReduceMode(vr.getOperation());
 
     std::int64_t lanes = vt.getShape()[0];
     if (vt.getRank() == 1) {

@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 import re
-from typing import Any, Callable, Generic, Union, overload
+from typing import Any, Callable, Generic, TypeGuard, Union, overload
 
 from pycircuit import Connector, Wire
 
@@ -41,6 +41,16 @@ class Signal(Generic[DT]):
         if isinstance(v, Signal):
             return v
         raise TypeError(f"cannot convert {type(v).__name__} to Signal")
+
+def is_bits_signal(signal: Signal[Data]) -> TypeGuard[Signal[Bits]]:
+    """Return whether ``signal`` carries a scalar ``Bits`` type."""
+    return isinstance(signal.ty, Bits)
+
+
+def is_vector_signal(signal: Signal[Data]) -> TypeGuard[Signal[Vector[Data]]]:
+    """Return whether ``signal`` carries a ``Vector`` type."""
+    return isinstance(signal.ty, Vector)
+
 
 class Module:
     def __init__(self, name: str) -> None:
@@ -178,7 +188,8 @@ class Module:
         any_is_vec = a_is_vec or b_is_vec
         a_leaf = a_ty.datatype() if a_is_vec else a_ty
         b_leaf = b_ty.datatype() if b_is_vec else b_ty
-        if any_is_vec and a_leaf != b_leaf:
+        # Signedness is a frontend intent bit; MLIR leaf types are width-only (`iN`).
+        if any_is_vec and str(a_leaf) != str(b_leaf):
             raise TypeError(f"{op} operand leaf types must match: {a_ty} vs {b_ty}")
         if a_is_vec and b_is_vec and a_ty.shape() != b_ty.shape():
             raise TypeError(f"{op} vector shapes must match: {a_ty} vs {b_ty}")
@@ -215,6 +226,12 @@ class Module:
     def srem(self, a: Signal, b: Signal) -> Signal:
         return self._emit_elementwise_binary("srem", a, b)
 
+    @overload
+    def mux(self, sel: Signal[Bits], a: Signal[DT], b: Signal[DT]) -> Signal[DT]: ...
+
+    @overload
+    def mux(self, sel: Signal, a: Signal, b: Signal) -> Signal: ...
+
     def mux(self, sel: Signal, a: Signal, b: Signal) -> Signal:
         sel_is_vec = isinstance(sel.ty, Vector)
         a_is_vec = isinstance(a.ty, Vector)
@@ -245,7 +262,7 @@ class Module:
     def and_(self, a: Signal, b: Signal) -> Signal:
         return self._emit_elementwise_binary("and", a, b)
 
-    def or_(self, a: Signal, b: Signal) -> Signal:
+    def or_(self, a: Signal[DT], b: Signal[DT]) -> Signal[DT]:
         return self._emit_elementwise_binary("or", a, b)
 
     def xor(self, a: Signal, b: Signal) -> Signal:
@@ -367,25 +384,25 @@ class Module:
         self._emit(f"{tmp} = pyc.concat ({op_list}) : ({ty_list}) -> {out_ty}")
         return Signal(ref=tmp, ty=out_ty)
 
-    def v_create(self, elements: list[Signal]) -> Signal:
+    def v_create(self, elements: list[Signal[DT]]) -> Signal[Vector[DT]]:
         if not elements:
             raise ValueError("v_create requires at least one element")
         first_ty = elements[0].ty
         for e in elements[1:]:
             if e.ty != first_ty:
                 raise TypeError(f"v_create requires same element type, got {first_ty} vs {e.ty}")
-        out_ty: Data = Vector(len(elements), first_ty)
+        out_ty = Vector(len(elements), first_ty)
         tmp = self._get_next_temp_var()
         op_list = ", ".join(s.ref for s in elements)
         ty_list = ", ".join(str(s.ty) for s in elements)
         self._emit(f"{tmp} = pyc.v_create ({op_list}) : ({ty_list}) -> {out_ty}")
         return Signal(ref=tmp, ty=out_ty)
 
-    def v_broadcast(self, scalar: Signal[Bits], *, size: int) -> Signal[Vector]:
+    def v_broadcast(self, scalar: Signal[Bits], *, size: int) -> Signal[Vector[Bits]]:
         lanes = int(size)
         if lanes <= 0:
             raise ValueError("v_broadcast size must be > 0")
-        out_ty: Data = Vector(lanes, scalar.ty)
+        out_ty = Vector(lanes, scalar.ty)
         tmp = self._get_next_temp_var()
         self._emit(f"{tmp} = pyc.v_broadcast {scalar.ref} to {lanes} : {scalar.ty} -> {out_ty}")
         return Signal(ref=tmp, ty=out_ty)
@@ -409,7 +426,7 @@ class Module:
         self._emit(f"{tmp} = pyc.v_broadcast_dim {vec.ref} to {lanes}, {d} : {vec.ty} -> {out_ty}")
         return Signal(ref=tmp, ty=out_ty)
 
-    def v_get(self, vec: Signal, *, index: int) -> Signal:
+    def v_get(self, vec: Signal[Vector[DT]], *, index: int) -> Signal[DT]:
         if not isinstance(vec.ty, Vector):
             raise TypeError(f"v_get expects a vector, got {vec.ty}")
         idx = int(index)
@@ -420,6 +437,86 @@ class Module:
         self._vec_get_map[tmp] = (str(vec.ref), idx)
         return Signal(ref=tmp, ty=vec.ty.elem)
 
+    @overload
+    def priority_mux(
+        self,
+        sels: Signal[Vector[Bits]],
+        vals: Signal[Vector[DT]],
+        *,
+        mode: str = "chain",
+        default: Signal[DT] | None = None,
+    ) -> Signal[DT]: ...
+
+    @overload
+    def priority_mux(
+        self,
+        sels: Signal[Vector[Data]],
+        vals: Signal[Vector[Data]],
+        *,
+        mode: str = "chain",
+        default: Signal[Data] | None = None,
+    ) -> Signal[Data]: ...
+
+    def priority_mux(
+        self,
+        sels: Signal[Vector[Data]],
+        vals: Signal[Vector[Data]],
+        *,
+        mode: str = "chain",
+        default: Signal[Data] | None = None,
+    ) -> Signal[Data]:
+        """Select the first asserted lane from a rank-1 selector vector.
+
+        ``sels`` must be ``vector<Nxi1>``. ``vals`` must have shape
+        ``[N, ...]``; the result and optional ``default`` have shape ``[...]``.
+        When ``default`` is omitted, the final value lane is used.
+        """
+        if not isinstance(sels, Signal) or not isinstance(sels.ty, Vector):
+            raise TypeError("priority_mux sels must be a vector Signal")
+        if len(sels.ty.shape()) != 1 or sels.width != 1:
+            raise TypeError(f"priority_mux sels must be vector<Nxi1>, got {sels.ty}")
+        if not isinstance(vals, Signal) or not isinstance(vals.ty, Vector):
+            raise TypeError("priority_mux vals must be a vector Signal")
+        if vals.ty.shape()[0] != sels.ty.shape()[0]:
+            raise TypeError(
+                "priority_mux sels length must equal vals.shape[0]: "
+                f"{sels.ty.shape()[0]} vs {vals.ty.shape()[0]}"
+            )
+        if mode not in {"chain", "tree"}:
+            raise ValueError(f"priority_mux mode must be 'chain' or 'tree', got {mode!r}")
+
+        value_ty = vals.ty.elem
+        if default is None:
+            default = self.v_get(vals, index=sels.ty.shape()[0] - 1)
+        elif not isinstance(default, Signal):
+            raise TypeError("priority_mux default must be a Signal or None")
+        if default.ty != value_ty:
+            raise TypeError(
+                "priority_mux default shape/type must match vals[1:]: "
+                f"expected {value_ty}, got {default.ty}"
+            )
+
+        if mode == "chain":
+            selected = default
+            for i in range(sels.ty.shape()[0] - 1, -1, -1):
+                selected = self.mux(
+                    self.v_get(sels, index=i),
+                    self.v_get(vals, index=i),
+                    selected,
+                )
+            return selected
+
+        def select_tree(begin: int, end: int) -> tuple[Signal[Data], Signal[Data]]:
+            if end - begin == 1:
+                return self.v_get(sels, index=begin), self.v_get(vals, index=begin)
+            mid = begin + (end - begin) // 2
+            left_any, left_value = select_tree(begin, mid)
+            right_any, right_value = select_tree(mid, end)
+            return self.or_(left_any, right_any), self.mux(left_any, left_value, right_value)
+
+        any_selected, selected = select_tree(0, sels.ty.shape()[0])
+        return self.mux(any_selected, selected, default)
+
     def _v_reduce(self, op: str, vec: Signal, *, dim: int | None = None, mode: str = "chain") -> Signal:
         if mode not in ("chain", "tree"):
             raise ValueError(f"reduce mode must be 'chain' or 'tree', got {mode!r}")
@@ -427,18 +524,19 @@ class Module:
             raise TypeError(f"{op} expects a vector, got {vec.ty}")
         shape = vec.ty.shape()
         elem_ty = vec.ty.datatype()
-        reduce_dim = 0 if dim is None else int(dim)
-        if reduce_dim < 0 or reduce_dim >= len(shape):
-            raise ValueError(f"{op} dim out of range: {reduce_dim} for {vec.ty}")
-        out_shape = [d for i, d in enumerate(shape) if i != reduce_dim]
-        out_ty = elem_ty if not out_shape else Vector.from_shape(out_shape, elem_ty)
+        if dim is None:
+            out_ty = elem_ty
+        else:
+            reduce_dim = int(dim)
+            if reduce_dim < 0 or reduce_dim >= len(shape):
+                raise ValueError(f"{op} dim out of range: {reduce_dim} for {vec.ty}")
+            out_shape = [d for i, d in enumerate(shape) if i != reduce_dim]
+            out_ty = elem_ty if not out_shape else Vector.from_shape(out_shape, elem_ty)
         tmp = self._get_next_temp_var()
-        attr_parts: list[str] = []
+        attr_parts = [f'mode = "{mode}"']
         if dim is not None:
-            attr_parts.append(f"dim = {reduce_dim}")
-        if mode == "tree":
-            attr_parts.append('mode = "tree"')
-        attrs = " {" + ", ".join(attr_parts) + "}" if attr_parts else ""
+            attr_parts.append(f"dim = {int(dim)}")
+        attrs = " {" + ", ".join(attr_parts) + "}"
         self._emit(f"{tmp} = pyc.{op} {vec.ref}{attrs} : {vec.ty} -> {out_ty}")
         return Signal(ref=tmp, ty=out_ty)
 

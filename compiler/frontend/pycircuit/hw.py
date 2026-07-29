@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import builtins
 from contextlib import contextmanager
 from dataclasses import dataclass
 import hashlib
 import inspect
 import json
-from typing import Any, Generator, Generic, Iterable, Iterator, Literal, Mapping, Union, cast, overload
+from typing import Any, Generator, Generic, Iterable, Iterator, Literal, Mapping, TypeVar, Union, cast, overload
 
 from .connectors import (
     Connector,
@@ -21,8 +22,9 @@ from .connectors import (
 )
 from .data import Bits, DT, Clock, Data, Reset, Vector
 from .design import DesignError
-from .dsl import Module, Signal
+from .dsl import Module, Signal, is_bits_signal, is_vector_signal
 from .literals import LiteralValue, infer_literal_width
+VT = TypeVar("VT", bound=Data)
 
 
 def _coerce_literal_width(
@@ -83,49 +85,77 @@ class Wire(Generic[DT]):
         return self.sig.ty.length
 
     def __iter__(self) -> Iterator[Wire]:
-        if not isinstance(self.sig.ty, Vector):
+        if not is_vector_signal(self.sig):
             raise TypeError(f"iter(Wire) requires Vector type, got {self.sig.ty!r}")
         for i in range(self.sig.ty.length):
-            yield self[i]
+            yield Wire(self.m, self.m.v_get(self.sig, index=i))
 
-    def or_reduce(self, *, dim: int | None = None, mode: str = "chain") -> "Wire[Bits]":
-        if not isinstance(self.sig.ty, Vector):
-            raise TypeError(f"or_reduce requires Vector type, got {self.sig.ty!r}")
+    @overload
+    def reduce_or(self: "Wire[Vector[Data]]", *, dim: None = None, mode: str = "chain") -> "Wire[Bits]": ...
+
+    @overload
+    def reduce_or(self: "Wire[Vector[Data]]", *, dim: int, mode: str = "chain") -> "Wire[Data]": ...
+
+    def reduce_or(self, *, dim: int | None = None, mode: str = "chain") -> "Wire[Data]":
+        if not is_vector_signal(self.sig):
+            raise TypeError(f"reduce_or requires Vector type, got {self.sig.ty!r}")
         return Wire(self.m, self.m.v_or_reduce(self.sig, dim=dim, mode=mode))
-    
-    def and_reduce(self, *, dim: int | None = None, mode: str = "chain") -> "Wire[Bits]":
-        if not isinstance(self.sig.ty, Vector):
-            raise TypeError(f"and_reduce requires Vector type, got {self.sig.ty!r}")
+
+    @overload
+    def reduce_and(self: "Wire[Vector[Data]]", *, dim: None = None, mode: str = "chain") -> "Wire[Bits]": ...
+
+    @overload
+    def reduce_and(self: "Wire[Vector[Data]]", *, dim: int, mode: str = "chain") -> "Wire[Data]": ...
+
+    def reduce_and(self, *, dim: int | None = None, mode: str = "chain") -> "Wire[Data]":
+        if not is_vector_signal(self.sig):
+            raise TypeError(f"reduce_and requires Vector type, got {self.sig.ty!r}")
         return Wire(self.m, self.m.v_and_reduce(self.sig, dim=dim, mode=mode))
+
+    @overload
+    def reduce_sum(
+        self: "Wire[Vector[Data]]",
+        *,
+        dim: None = None,
+        mode: str = "chain",
+    ) -> "Wire[Bits]": ...
+
+    @overload
+    def reduce_sum(
+        self: "Wire[Vector[Data]]",
+        *,
+        dim: int,
+        mode: str = "chain",
+    ) -> "Wire[Data]": ...
 
     def reduce_sum(
         self,
         *,
         dim: int | None = None,
         mode: str = "chain",
-    ) -> "Wire":
+    ) -> "Wire[Data]":
         """Sum reduction via ``pyc.v_add_reduce``.
 
-        - ``width=None`` chooses ``max_input_width + ceil_log2(reduce_len)``.
-        - ``dim=None`` requires a 1-D Vector and returns one scalar Wire.
+        The result preserves the vector element width; overflow wraps at that
+        width.
+        - ``dim=None`` reduces across every vector dimension and returns one scalar Wire.
         - ``dim=int`` reduces along that axis, returning a lowered-rank Vector Wire.
         """
-        if not isinstance(self.sig.ty, Vector):
+        if not is_vector_signal(self.sig):
             raise TypeError(f"reduce_sum requires Vector type, got {self.sig.ty!r}")
         shape = self.sig.ty.shape()
-        if dim is None and len(shape) != 1:
-            raise ValueError("reduce_sum(dim=None) requires a 1-D Vector")
-        dim = 0 if dim is None else int(dim)
-        if dim < 0 or dim >= len(shape):
+        if dim is not None and (dim < 0 or dim >= len(shape)):
             raise ValueError(f"reduce_sum dim out of range: {dim} for Vector rank {len(shape)}")
         if not isinstance(self.sig.ty.datatype(), Bits):
             raise TypeError(f"reduce_sum requires Bits element type, got {self.sig.ty.datatype()!r}")
-        
+
         red_sig = self.m.v_add_reduce(self.sig, dim=dim, mode=mode)
         return Wire(self.m, red_sig)
 
-    def broadcast(self, *, size: int, dim: int) -> "Wire[Vector]":
-        if not isinstance(self.sig.ty, Vector):
+    def broadcast(
+        self: "Wire[Vector[VT]]", *, size: int, dim: int
+    ) -> "Wire[Vector[Vector[VT]]]":
+        if not is_vector_signal(self.sig):
             raise TypeError(f"broadcast requires Vector type, got {self.sig.ty!r}")
         return Wire(self.m, self.m.v_broadcast_dim(self.sig, size=size, dim=dim))
 
@@ -255,15 +285,13 @@ class Wire(Generic[DT]):
     def __invert__(self) -> "Wire":
         return Wire(self.m, self.m.not_(self.sig), signed=self.signed)
 
-    def __lshift__(self, other: int) -> "Wire":
-        if not isinstance(other, int):
-            raise TypeError("<< only supports constant integer shift amounts")
+    def __lshift__(self, other: Union[int, "Wire"]) -> "Wire":
         return self.shl(amount=other)
 
     def lshr(self, *, amount: Union[int, "Wire", "Reg", Signal, LiteralValue]) -> "Wire":
         """Logical shift right by an immediate or dynamic amount (zero-fill)."""
-        if isinstance(amount, int):
-            amt = int(amount)
+        if isinstance(amount, (int, LiteralValue)):
+            amt = int(amount) if isinstance(amount , int) else int(amount.value)
             if amt < 0:
                 raise ValueError("lshr amount must be >= 0")
             return Wire(self.m, self.m.lshri(self.sig, amount=amt), signed=False)
@@ -272,17 +300,15 @@ class Wire(Generic[DT]):
 
     def ashr(self, *, amount: Union[int, "Wire", "Reg", Signal, LiteralValue]) -> "Wire":
         """Arithmetic shift right by an immediate or dynamic amount (sign-fill)."""
-        if isinstance(amount, int):
-            amt = int(amount)
+        if isinstance(amount, (int, LiteralValue)):
+            amt = int(amount) if isinstance(amount, int) else int(amount.value)
             if amt < 0:
                 raise ValueError("ashr amount must be >= 0")
             return Wire(self.m, self.m.ashri(self.sig, amount=amt), signed=True)
         amt = self._as_wire(amount, width=None)
         return Wire(self.m, self.m.ashr(self.sig, amt.sig), signed=True)
 
-    def __rshift__(self, other: int) -> "Wire":
-        if not isinstance(other, int):
-            raise TypeError(">> only supports constant integer shift amounts")
+    def __rshift__(self, other: Union[int, "Wire"]) -> "Wire":
         if self.signed:
             return self.ashr(amount=other)
         return self.lshr(amount=other)
@@ -391,8 +417,14 @@ class Wire(Generic[DT]):
         amt = self._as_wire(amount, width=None)
         return Wire(self.m, self.m.shl(self.sig, amt.sig), signed=self.signed)
 
+    @overload
+    def __getitem__(self: "Wire[Vector[VT]]", idx: int) -> "Wire[VT]": ...
+
+    @overload
+    def __getitem__(self: "Wire[DT]", idx: int | builtins.slice) -> "Wire[DT]": ...
+
     def __getitem__(self, idx: int | slice) -> "Wire[Data]":
-        if isinstance(self.sig.ty, Vector):
+        if is_vector_signal(self.sig):
             if isinstance(idx, slice):
                 raise TypeError("Vector Wire indexing does not support slice (use v_get)")
             if not isinstance(idx, int):
@@ -561,7 +593,7 @@ class Reg(Generic[DT]):
     def shl(self, *, amount: int) -> Wire:
         return self.q.shl(amount=amount)
 
-    def __getitem__(self, idx: int | slice) -> Wire:
+    def __getitem__(self, idx: int | builtins.slice) -> Wire:
         return self.q[idx]
 
     def set(
@@ -773,9 +805,11 @@ class Circuit(Module):
 
     @overload
     def input(self, name:str, *, width: int, signed: bool = False) -> Wire[Bits]: ...
-    
+
     @overload
-    def input(self, name:str, *, width: int, shape: list[int]) -> Wire[Vector]: ...     
+    def input(
+        self, name: str, *, width: int, shape: list[int], signed: bool = False
+    ) -> Wire[Vector[Data]]: ...
 
     def input(  # type: ignore[override]
         self,
@@ -784,7 +818,7 @@ class Circuit(Module):
         width: int,
         signed: bool = False,
         shape: list[int] = [],
-    ) -> Wire[Bits] | Wire[Vector]:
+    ) -> Wire[Bits] | Wire[Vector[Data]]:
         """Declare a module input port.
 
         Scalar inputs return ``Wire[Bits]``. Shaped inputs return
@@ -951,8 +985,8 @@ class Circuit(Module):
         rst: Signal[Reset] | None = None,
         domain: ClockDomain | None = None,
         width: int,
-        init: Union[Wire, Reg, Signal, int, list] | None = None,
-        en: Union[Wire, Signal, int] = 1,
+        init: Union[Wire, Reg, Signal, int, list, LiteralValue] | None = None,
+        en: Union[Wire, Signal, int, LiteralValue] = 1,
         shape: list[int] | None = None,
         stage: str | None = None,
         signed: bool | None = None,  # reserved for future type inference / lowering
@@ -990,14 +1024,8 @@ class Circuit(Module):
         )
 
         # ``pyc.reg`` enable is scalar i1 (shared across vector lanes).
-        if isinstance(en, int):
-            en_w = self.const(int(en), width=1)
-        elif isinstance(en, Reg):
-            en_w = en.q
-        elif isinstance(en, Signal):
-            en_w = Wire(self, en)
-        else:
-            en_w = en
+        en_w = Wire.as_wire(en, width=1, m=self)
+        
         if en_w.ty != Bits(1):
             raise TypeError(f"out() en must be i1, got {en_w.ty}")
 
@@ -1010,7 +1038,7 @@ class Circuit(Module):
         if init is None:
             init = 0
         init = Wire.as_wire(init, m=self, width=width)
-        if shape and isinstance(init_w.sig.ty, Bits):
+        if shape and is_bits_signal(init_w.sig):
             init_sig = cast(Signal[Bits], init_w.sig) 
             init_sig = super().v_broadcast(init_sig, size=shape[0])
             for dim in shape[1:]:
@@ -1093,6 +1121,53 @@ class Circuit(Module):
                 raise TypeError(f"assert all types are same, but got {sig.ty} and {sigs[0].ty}")
         
         return Wire(self, self.v_create(sigs))
+
+    @overload
+    def priority_mux(
+        self,
+        sels: Wire[Vector[Bits]],
+        vals: Wire[Vector[VT]],
+        *,
+        mode: str = "chain",
+        default: Wire[VT] | None = None,
+    ) -> Wire[VT]: ...
+
+    @overload
+    def priority_mux(
+        self,
+        sels: Wire[Vector[Data]],
+        vals: Wire[Vector[Data]],
+        *,
+        mode: str = "chain",
+        default: Wire[Data] | None = None,
+    ) -> Wire[Data]: ...
+
+    def priority_mux(
+        self,
+        sels: Wire[Vector[Data]],
+        vals: Wire[Vector[Data]],
+        *,
+        mode: str = "chain",
+        default: Wire[Data] | None = None,
+    ) -> Wire[Data]:  # type: ignore[override]
+        """Wire-level wrapper for :meth:`Module.priority_mux`."""
+        if not isinstance(sels, Wire) or not isinstance(vals, Wire):
+            raise TypeError("priority_mux sels and vals must be Wire values")
+        if sels.m is not self or vals.m is not self:
+            raise ValueError("priority_mux sels and vals must belong to this Circuit")
+        if default is not None and not isinstance(default, Wire):
+            raise TypeError("priority_mux default must be a Wire or None")
+        if default is not None and default.m is not self:
+            raise ValueError("priority_mux default must belong to this Circuit")
+        return Wire(
+            self,
+            super().priority_mux(
+                sels.sig,
+                vals.sig,
+                mode=mode,
+                default=None if default is None else default.sig,
+            ),
+        )
 
     def cat(self, *elems: Union["Wire", "Reg", int, LiteralValue]) -> Wire:
         """Concatenate values into a packed bus (MSB-first)."""
@@ -1641,15 +1716,36 @@ class Circuit(Module):
             if isinstance(rv, Wire):
                 if rv.m is not self:
                     raise DesignError(f"instance port {pname!r}: cannot connect a wire from a different module")
-                sig_port_specs[pname] = {"kind": "wire", "ty": rv.ty, "signed": bool(getattr(rv, "signed", False))}
+                if isinstance(rv.ty, Vector):
+                    sig_port_specs[pname] = {
+                        "kind": "vec",
+                        "ty": str(rv.ty),
+                        "signed": bool(rv.signed),
+                    }
+                else:
+                    sig_port_specs[pname] = {
+                        "kind": "wire",
+                        "ty": str(rv.ty),
+                        "signed": bool(rv.signed),
+                    }
                 continue
             if isinstance(rv, Signal):
-                if rv.ty == "!pyc.clock":
+                if isinstance(rv.ty, Clock):
                     sig_port_specs[pname] = {"kind": "clock"}
-                elif rv.ty == "!pyc.reset":
+                elif isinstance(rv.ty, Reset):
                     sig_port_specs[pname] = {"kind": "reset"}
+                elif isinstance(rv.ty, Vector):
+                    sig_port_specs[pname] = {
+                        "kind": "vec",
+                        "ty": str(rv.ty),
+                        "signed": bool(getattr(c, "signed", False)),
+                    }
                 elif isinstance(rv.ty, Bits):
-                    sig_port_specs[pname] = {"kind": "wire", "ty": rv.ty, "signed": bool(getattr(c, "signed", False))}
+                    sig_port_specs[pname] = {
+                        "kind": "wire",
+                        "ty": str(rv.ty),
+                        "signed": bool(getattr(c, "signed", False)),
+                    }
                 else:
                     raise DesignError(f"instance port {pname!r}: unsupported signal type {rv.ty!r}")
                 continue
@@ -2165,9 +2261,6 @@ def sext(value: Any, *, width: int) -> Wire:
 def trunc(value: Any, *, width: int) -> Wire:
     """Truncate a Wire/Reg using the canonical function-style API."""
     return _cast_value(value, width=int(width), op="trunc")
-
-
-
 
 def mux(*_args: Any, **_kwargs: Any) -> Wire:
     raise TypeError("mux() was removed from pyCircuit; use `true_v if cond else false_v` in JIT-compiled design code")

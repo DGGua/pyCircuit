@@ -1363,16 +1363,22 @@ static LogicalResult verifyVectorReduce(
     if (d <= 0)
       return op->emitOpError("vec must have non-empty dimensions");
   }
-  int64_t dim = dimAttr.value_or(0);
-  if (dim < 0 || dim >= vecTy.getRank())
-    return op->emitOpError("dim out of range: ") << dim << " for rank " << vecTy.getRank();
-  if (!dimAttr && vecTy.getRank() != 1)
-    return op->emitOpError("omitted dim is only valid for rank-1 vectors");
   if (modeAttr) {
     StringRef mode = modeAttr.getValue();
     if (mode != "chain" && mode != "tree")
       return op->emitOpError("mode must be \"chain\" or \"tree\"");
   }
+
+  if (!dimAttr) {
+    if (resultTy != elemTy)
+      return op->emitOpError("result type must be ") << elemTy
+                            << " when dim is omitted (all dimensions are reduced)";
+    return success();
+  }
+
+  int64_t dim = *dimAttr;
+  if (dim < 0 || dim >= vecTy.getRank())
+    return op->emitOpError("dim out of range: ") << dim << " for rank " << vecTy.getRank();
 
   SmallVector<int64_t> outShape;
   for (auto [i, d] : llvm::enumerate(vecTy.getShape())) {

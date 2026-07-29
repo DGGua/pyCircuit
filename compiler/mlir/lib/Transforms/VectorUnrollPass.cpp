@@ -114,9 +114,7 @@ static Value unrollReduceOp(Operation &op, OpBuilder &builder) {
   Location loc = op.getLoc();
   Value vec = op.getOperand(0);
   auto vt = cast<VectorType>(vec.getType());
-  int64_t dim = 0;
-  if (auto dimAttr = op.getAttrOfType<IntegerAttr>("dim"))
-    dim = dimAttr.getInt();
+  auto dimAttr = op.getAttrOfType<IntegerAttr>("dim");
   Type leafTy = vt.getElementType();
 
   std::function<Value(Value, Value)> reducePair;
@@ -161,6 +159,16 @@ static Value unrollReduceOp(Operation &op, OpBuilder &builder) {
   }
 
   int64_t rows = vt.getShape()[0], cols = vt.getShape()[1];
+  if (!dimAttr) {
+    llvm::SmallVector<Value> values;
+    values.reserve(rows * cols);
+    for (int64_t i = 0; i < rows; ++i)
+      for (int64_t j = 0; j < cols; ++j)
+        values.push_back(extractLane(builder, loc, vec, {i, j}));
+    return reduceValues(values);
+  }
+
+  int64_t dim = dimAttr.getInt();
   if (dim == 0) {
     llvm::SmallVector<Value> resultLanes;
     for (int64_t j = 0; j < cols; ++j) {

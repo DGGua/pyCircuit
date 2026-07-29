@@ -40,10 +40,10 @@ dunder dispatch regressions such as `Vec.__add__` versus `Wire.__radd__` paths.
 
 Some cases are intentionally frontend-only in the default matrix:
 
-- `select_vv`: current JIT supports scalar conditional expressions, but does
-  not yet have a contract-approved Vec condition select syntax.
 - `slice`: currently scalarizes to per-lane `pyc.extract`; it remains tracked
   as an optimization target rather than a vector-IR gate.
+
+`select_vv` (`Vec` condition with two `Vec` arms) is a full backend case.
 
 Vector cast cases (`zext`, `sext`, `trunc`) use the contract-approved
 function-style API (`zext(a, width=...)`, etc.) and run as full backend cases.

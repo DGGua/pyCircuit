@@ -13,15 +13,16 @@ from dataclasses import dataclass, field
 import inspect
 import textwrap
 import threading
-from typing import Any, Callable, Iterable, Iterator, Mapping, TypeVar, Union
+from typing import Any, Callable, Generic, Iterable, Iterator, Mapping, TypeVar, Union
 
-from .data import Bits, Data, Vector
+from .data import DT, Bits, Data, Vector
 from .dsl import Signal
 from .hw import Circuit, ClockDomain, Reg, Wire
 from .literals import LiteralValue, infer_literal_width
 from .tb import Tb as _Tb
 
 F = TypeVar("F", bound=Callable[..., Any])
+VT = TypeVar("VT", bound=Data)
 
 _tls = threading.local()
 
@@ -299,10 +300,29 @@ class CycleAwareDomain:
         for _ in range(d):
             self._delay_serial += 1
             nm = f"_v5_bal_{self._delay_serial}"
-            r = self._m.out(self._m.scoped_name(nm), domain=self._cd, width=width, init=0)
+            shape = w.ty.shape() if isinstance(w.ty, Vector) else []
+            r = self._m.out(
+                self._m.scoped_name(nm),
+                domain=self._cd,
+                width=width,
+                shape=shape,
+                init=0,
+            )
             r.set(cur)
             cur = r.q
         return cur
+
+    def vec(self, values: list["CycleAwareSignal[VT]"]) -> "CycleAwareSignal[Vector[VT]]":
+        """Build a vector while preserving one shared logical cycle."""
+        if not values:
+            raise ValueError("CycleAwareDomain.vec requires at least one value")
+        cycle = values[0].cycle
+        for value in values:
+            if value.domain is not self:
+                raise ValueError("CycleAwareDomain.vec values must share this domain")
+            if value.cycle != cycle:
+                raise ValueError("CycleAwareDomain.vec values must share one logical cycle")
+        return CycleAwareSignal(self, self._m.vec([value.w for value in values]), cycle)
 
 
 # ── Hierarchical compilation helpers ──────────────────────────────────────
@@ -766,12 +786,12 @@ def wire_of(
     raise TypeError(f"wire_of: unsupported type {type(sig).__name__}")
 
 
-class CycleAwareSignal:
+class CycleAwareSignal(Generic[DT]):
     """Value with logical cycle tag; operators align by delaying earlier operands."""
 
     __slots__ = ("_domain", "_w", "_cycle")
 
-    def __init__(self, domain: CycleAwareDomain, wire: Wire, cycle: int) -> None:
+    def __init__(self, domain: CycleAwareDomain, wire: Wire[DT], cycle: int) -> None:
         if wire.m is not domain._m:
             raise ValueError("Wire must belong to the same circuit as the domain")
         self._domain = domain
@@ -915,6 +935,108 @@ class CycleAwareSignal:
     def select(self, true_val: object, false_val: object) -> "CycleAwareSignal":
         return mux(self, true_val, false_val)
 
+    def broadcast(self: "CycleAwareSignal[Vector[VT]]", *, size: int, dim: int) -> "CycleAwareSignal[Vector[Data]]":
+        return CycleAwareSignal(
+            self.domain,
+            self._w.broadcast(size=int(size), dim=int(dim)),
+            self.cycle,
+        )
+
+    def reduce_or(
+        self: "CycleAwareSignal[Vector[Data]]",
+        *,
+        dim: int | None = 0,
+        mode: str = "chain",
+    ) -> "CycleAwareSignal":
+        return CycleAwareSignal(
+            self.domain,
+            self._w.reduce_or(dim=dim, mode=mode),
+            self.cycle,
+        )
+
+    def reduce_and(
+        self: "CycleAwareSignal[Vector[Data]]",
+        *,
+        dim: int | None = 0,
+        mode: str = "chain",
+    ) -> "CycleAwareSignal":
+        return CycleAwareSignal(
+            self.domain,
+            self._w.reduce_and(dim=dim, mode=mode),
+            self.cycle,
+        )
+
+    def reduce_sum(
+        self: "CycleAwareSignal[Vector[Data]]",
+        *,
+        dim: int | None = None,
+        mode: str = "chain",
+    ) -> "CycleAwareSignal":
+        return CycleAwareSignal(
+            self.domain,
+            self._w.reduce_sum(dim=dim, mode=mode),
+            self.cycle,
+        )
+
+    def priority_mux(
+        self: "CycleAwareSignal[Vector[Data]]",
+        vals: "Wire | CycleAwareSignal",
+        *,
+        mode: str = "chain",
+        default: "Wire | CycleAwareSignal | None" = None,
+    ) -> "CycleAwareSignal":
+        """Select a vector lane after aligning selector, values, and default."""
+        if isinstance(vals, CycleAwareSignal):
+            if vals.domain is not self.domain:
+                raise ValueError("priority_mux values must share the selector domain")
+            vals_w = vals._w
+            vals_cycle = vals.cycle
+        elif isinstance(vals, Wire):
+            vals_w = vals
+            vals_cycle = self.domain.cycle_index
+        else:
+            raise TypeError("priority_mux vals must be Wire or CycleAwareSignal")
+
+        if default is None:
+            default_w = None
+            default_cycle = self.cycle
+        elif isinstance(default, CycleAwareSignal):
+            if default.domain is not self.domain:
+                raise ValueError("priority_mux default must share the selector domain")
+            default_w = default._w
+            default_cycle = default.cycle
+        elif isinstance(default, Wire):
+            default_w = default
+            default_cycle = self.domain.cycle_index
+        else:
+            raise TypeError("priority_mux default must be Wire, CycleAwareSignal, or None")
+
+        target_cycle = max(self.cycle, vals_cycle, default_cycle)
+        sels_w = self.domain.delay_to(
+            self._w,
+            from_cycle=self.cycle,
+            to_cycle=target_cycle,
+            width=self._w.width,
+        )
+        vals_w = self.domain.delay_to(
+            vals_w,
+            from_cycle=vals_cycle,
+            to_cycle=target_cycle,
+            width=vals_w.width,
+        )
+        if default_w is not None:
+            default_w = self.domain.delay_to(
+                default_w,
+                from_cycle=default_cycle,
+                to_cycle=target_cycle,
+                width=default_w.width,
+            )
+        return CycleAwareSignal(
+            self.domain,
+            self._domain._m.priority_mux(sels_w, vals_w, mode=mode, default=default_w),
+            target_cycle,
+        )
+
     def as_signed(self) -> "CycleAwareSignal":
         return CycleAwareSignal(self._domain, Wire(self._domain._m, self._w.sig, signed=True), self._cycle)
 
@@ -1033,7 +1155,7 @@ def _mux_cycle_aware(
     aw = dom.delay_to(ca._w, from_cycle=ca._cycle, to_cycle=mx, width=ca._w.width)
     bw = dom.delay_to(cb._w, from_cycle=cb._cycle, to_cycle=mx, width=cb._w.width)
     aw, bw = _promote_pair(m, aw, bw)
-    if cw2.ty != Bits(1):
+    if cw2.width != 1:
         raise TypeError("mux condition must be i1")
     out_w = cw2._select_internal(aw, bw)
     return CycleAwareSignal(dom, out_w, mx)

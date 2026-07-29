@@ -5,7 +5,7 @@ import inspect
 import json
 import re
 from dataclasses import dataclass, fields, is_dataclass
-from typing import Any, Callable, Iterable, Mapping, TYPE_CHECKING
+from typing import Any, Callable, Iterable, Mapping, ParamSpec, TYPE_CHECKING, TypeVar, overload
 
 from .api_contract import FRONTEND_CONTRACT
 from .data import Data
@@ -18,6 +18,10 @@ if TYPE_CHECKING:
 
 class DesignError(RuntimeError):
     pass
+
+
+P = ParamSpec("P")
+R = TypeVar("R")
 
 
 _CANON_PATH_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -129,13 +133,25 @@ def module(
     return deco(_fn)
 
 
-def function(_fn: Any | None = None, *, name: str | None = None) -> Callable[[Any], Any] | Any:
+@overload
+def function(_fn: Callable[P, R], *, name: str | None = None) -> Callable[P, R]: ...
+
+
+@overload
+def function(
+    _fn: None = None, *, name: str | None = None
+) -> Callable[[Callable[P, R]], Callable[P, R]]: ...
+
+
+def function(
+    _fn: Callable[P, R] | None = None, *, name: str | None = None
+) -> Callable[P, R] | Callable[[Callable[P, R]], Callable[P, R]]:
     """Mark a function as an inline hardware helper.
 
     Function callsites are lowered inline into the caller.
     """
 
-    def deco(fn: Any) -> Any:
+    def deco(fn: Callable[P, R]) -> Callable[P, R]:
         if isinstance(name, str) and name.strip():
             setattr(fn, "__pycircuit_module_name__", str(name).strip())
         setattr(fn, "__pycircuit_kind__", "function")

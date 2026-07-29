@@ -47,20 +47,20 @@ def _snapshot_entries(m: Circuit, entry_state: list, entries: int) -> list[dict[
 @function
 def _ready_lookup_vec(m: Circuit, ready_v: Wire[Vector], ptag_wire: Wire[Vector], ptag_w: int, ptag_count: int):
     tags = m.vec([m.const(t, width=int(ptag_w)) for t in range(int(ptag_count))])
-    return ((tags == ptag_wire) & ready_v).or_reduce()
+    return ((tags == ptag_wire) & ready_v).reduce_or()
 
 
 @function
 def _wake_hit_vec(m: Circuit, wake_valid_v: Wire[Vector], wake_ptag_v: Wire[Vector], ptag_wire: Wire[Vector]):
     _ = m
-    return (wake_valid_v & (wake_ptag_v == ptag_wire)).or_reduce()
+    return (wake_valid_v & (wake_ptag_v == ptag_wire)).reduce_or()
 
 
 @function
 def _alloc_field_vec(m: Circuit, enq_uops: list, alloc_lane: list[Wire[Vector]], slot: int, path: str, width: int, enq_ports: int):
     sels = m.vec([alloc_lane[k][int(slot)] for k in range(int(enq_ports))])
     vals = m.vec([enq_uops[k][path].read() for k in range(int(enq_ports))])
-    return sels.priority_mux(vals, zero=u(int(width), 0), assume_onehot=True)
+    return m.priority_mux(sels, vals, default=m.const(0, width=int(width)), mode="tree")
 
 
 @function
@@ -81,14 +81,14 @@ def _select_oldest_ready_vec(
     for k in range(int(issue_ports)):
         oldest = []
         for i in range(int(entries)):
-            older_exists = (remaining & age_v[:, i]).or_reduce()
+            older_exists = (remaining & age_v[:, i]).reduce_or()
             oldest.append(remaining[i] & _not1(m, older_exists))
         oldest_v = m.vec(oldest)
         issue_sel.append(oldest_v)
-        issue_valid[k] = oldest_v.or_reduce()
+        issue_valid[k] = oldest_v.reduce_or()
         remaining = remaining & ~oldest_v
 
-    issue_win = m.vec(issue_sel).or_reduce(dim=0)
+    issue_win = m.vec(issue_sel).reduce_or(dim=0)
     keep_valid = fields["valid"] & ~issue_win
     return entry_ready, issue_sel, issue_valid, issue_win, keep_valid
 
@@ -107,7 +107,7 @@ def _allocate_enqueue_lanes_vec(
     enq_ready = []
 
     for k in range(int(enq_ports)):
-        any_free = free_avail.or_reduce()
+        any_free = free_avail.reduce_or()
         enq_ready.append(any_free)
 
         first = []
@@ -122,7 +122,7 @@ def _allocate_enqueue_lanes_vec(
         alloc_lane.append(lane_v)
         free_avail = free_avail & ~lane_v
 
-    new_alloc = m.vec(alloc_lane).or_reduce(dim=0)
+    new_alloc = m.vec(alloc_lane).reduce_or(dim=0)
     next_valid = keep_valid | new_alloc
     return alloc_lane, enq_ready, new_alloc, next_valid
 
@@ -312,8 +312,8 @@ def _emit_debug_and_ready_vec(
     issue_count_width: int,
     issued_total_width: int,
 ) -> None:
-    occupancy = fields["valid"].reduce_sum(width=int(occupancy_width))
-    issued_this = m.vec(issue_valid).reduce_sum(width=int(issue_count_width))
+    occupancy = fields["valid"].reduce_sum()
+    issued_this = m.vec(issue_valid).reduce_sum()
     issued_total_q.set((issued_total_q.out() + issued_this)[0 : int(issued_total_width)])
 
     for k in range(int(enq_ports)):

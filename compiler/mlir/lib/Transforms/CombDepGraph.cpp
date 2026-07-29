@@ -35,10 +35,15 @@ static int64_t vectorReduceCost(ReduceOp op) {
   auto vecTy = dyn_cast<VectorType>(op.getVec().getType());
   if (!vecTy)
     return 1;
-  int64_t dim = op.getDim().value_or(0);
-  if (dim < 0 || dim >= vecTy.getRank())
-    return 1;
-  int64_t lanes = vecTy.getDimSize(dim);
+  int64_t lanes = 1;
+  if (auto dim = op.getDim()) {
+    if (*dim < 0 || *dim >= vecTy.getRank())
+      return 1;
+    lanes = vecTy.getDimSize(*dim);
+  } else {
+    for (int64_t extent : vecTy.getShape())
+      lanes *= extent;
+  }
   if (auto mode = op->template getAttrOfType<StringAttr>("mode")) {
     if (mode.getValue() == "tree")
       return std::max<int64_t>(1, ceilLog2(lanes));

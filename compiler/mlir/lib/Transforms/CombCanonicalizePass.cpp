@@ -386,6 +386,21 @@ struct VReduceSingleLaneDim : public OpRewritePattern<ReduceOp> {
     auto vecTy = dyn_cast<VectorType>(op.getVec().getType());
     if (!vecTy)
       return failure();
+    if (!op.getDim()) {
+      for (int64_t extent : vecTy.getShape())
+        if (extent != 1)
+          return failure();
+      if (vecTy.getRank() == 1) {
+        rewriter.replaceOpWithNewOp<pyc::VGetOp>(op, op.getResult().getType(), op.getVec(), 0);
+        return success();
+      }
+      auto rowTy = dyn_cast<VectorType>(vecTy.getElementType());
+      if (!rowTy)
+        return failure();
+      auto row = rewriter.create<pyc::VGetOp>(op.getLoc(), rowTy, op.getVec(), 0);
+      rewriter.replaceOpWithNewOp<pyc::VGetOp>(op, op.getResult().getType(), row, 0);
+      return success();
+    }
     std::int64_t dim = op.getDim().value_or(0);
     if (dim < 0 || dim >= vecTy.getRank() || vecTy.getDimSize(dim) != 1)
       return failure();
