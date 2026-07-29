@@ -200,6 +200,21 @@ constexpr auto sext_vec(const Vec<T, N> &a) {
 }
 #undef PYC_VEC_WIDTH_UNFN
 
+// Element-wise bit extraction. The recursive call also supports nested Vecs.
+template <unsigned OutW, unsigned InW, typename T, std::size_t N>
+constexpr auto extract(const Vec<T, N> &a, unsigned lsb) {
+  using Elem = decltype(extract<OutW, InW>(a[0], lsb));
+  Vec<Elem, N> out{};
+  for (std::size_t i = 0; i < N; ++i)
+    out[i] = extract<OutW, InW>(a[i], lsb);
+  return out;
+}
+
+template <unsigned OutW, unsigned InW, typename T, std::size_t N>
+constexpr auto extract_vec(const Vec<T, N> &a, unsigned lsb) {
+  return extract<OutW, InW>(a, lsb);
+}
+
 // slt needs special bool→Wire<1> conversion; kept manual (not macro-generated).
 template <unsigned W, typename T, std::size_t N>
 constexpr auto slt(const Vec<T, N> &a, const Vec<T, N> &b) {

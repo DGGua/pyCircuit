@@ -81,14 +81,14 @@ def _select_oldest_ready_vec(
     for k in range(int(issue_ports)):
         oldest = []
         for i in range(int(entries)):
-            older_exists = (remaining & age_v[:, i]).reduce_or()
+            older_exists = (remaining & older_than_i).reduce_or()
             oldest.append(remaining[i] & _not1(m, older_exists))
-        oldest_v = m.vec(oldest)
+        oldest_v = m.vec(*oldest)
         issue_sel.append(oldest_v)
         issue_valid[k] = oldest_v.reduce_or()
         remaining = remaining & ~oldest_v
 
-    issue_win = m.vec(issue_sel).reduce_or(dim=0)
+    issue_win = m.vec(*issue_sel).reduce_or(dim=0)
     keep_valid = fields["valid"] & ~issue_win
     return entry_ready, issue_sel, issue_valid, issue_win, keep_valid
 
@@ -263,7 +263,7 @@ def _write_entry_next_state_vec(
 def _update_age_state_vec(
     m: Circuit,
     *,
-    age_state: Wire,
+    age_state: list[list[Any]],
     age_v: Wire,
     keep_valid: Wire,
     new_alloc: Wire,
@@ -277,7 +277,7 @@ def _update_age_state_vec(
             if i == j:
                 age_state[i][j].set(u(1, 0))
             else:
-                keep_keep = keep_valid[i] & keep_valid[j] & age_v[i, j]
+                keep_keep = keep_valid[i] & keep_valid[j] & age_v[i][j]
                 keep_new = keep_valid[i] & new_alloc[j]
                 new_new = new_alloc[i] & new_alloc[j] & _lane_lt(m, alloc_lane, i, j, int(enq_ports))
                 rel = keep_keep | keep_new | new_new
@@ -482,6 +482,8 @@ if __name__ == "__main__":
         compile_cycle_aware(
             build,
             name="issq",
+            eager=True,
+            hierarchical=True,
             entries=16,
             ptag_count=64,
             payload_width=32,

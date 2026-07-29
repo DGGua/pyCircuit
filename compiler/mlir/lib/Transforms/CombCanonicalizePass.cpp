@@ -8,6 +8,8 @@
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 
+#include <type_traits>
+
 using namespace mlir;
 
 namespace pyc {
@@ -84,6 +86,152 @@ static bool isI1OrI1Vector(Type ty) {
       return et.getWidth() == 1;
   return false;
 }
+
+static Type vectorLaneType(VectorType vt) {
+  Type elementTy = vt.getElementType();
+  if (isa<VectorType>(elementTy))
+    return elementTy;
+  if (vt.getRank() == 1)
+    return elementTy;
+  return VectorType::get(vt.getShape().drop_front(), elementTy);
+}
+
+static std::optional<SmallVector<Value>> knownVectorLanes(Value value) {
+  if (auto create = value.getDefiningOp<pyc::VCreateOp>())
+    return SmallVector<Value>(create.getElements().begin(), create.getElements().end());
+  if (auto broadcast = value.getDefiningOp<pyc::VBroadcastOp>()) {
+    auto vt = dyn_cast<VectorType>(value.getType());
+    if (!vt || vt.getRank() != 1)
+      return std::nullopt;
+    return SmallVector<Value>(static_cast<size_t>(vt.getDimSize(0)),
+                              broadcast.getScalar());
+  }
+  return std::nullopt;
+}
+
+static bool hasFoldableVectorLane(Value lhs, Value rhs) {
+  const auto lhsVT = dyn_cast<VectorType>(lhs.getType());
+  const auto rhsVT = dyn_cast<VectorType>(rhs.getType());
+  if (!lhsVT && !rhsVT)
+    return getConstUInt(lhs).has_value() && getConstUInt(rhs).has_value();
+
+  auto lhsLanes = lhsVT ? knownVectorLanes(lhs) : std::nullopt;
+  auto rhsLanes = rhsVT ? knownVectorLanes(rhs) : std::nullopt;
+  if ((lhsVT && !lhsLanes) || (rhsVT && !rhsLanes))
+    return false;
+
+  const size_t count = lhsLanes ? lhsLanes->size() : rhsLanes->size();
+  for (size_t i = 0; i < count; ++i) {
+    Value lhsLane = lhsLanes ? (*lhsLanes)[i] : lhs;
+    Value rhsLane = rhsLanes ? (*rhsLanes)[i] : rhs;
+    if (hasFoldableVectorLane(lhsLane, rhsLane))
+      return true;
+  }
+  return false;
+}
+
+template <typename OpT>
+struct FoldVectorConstantLanes : public OpRewritePattern<OpT> {
+  using OpRewritePattern<OpT>::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(OpT op, PatternRewriter &rewriter) const override {
+    auto resultVT = dyn_cast<VectorType>(op.getResult().getType());
+    if (!resultVT || !hasFoldableVectorLane(op.getLhs(), op.getRhs()))
+      return failure();
+
+    auto lhsLanes = dyn_cast<VectorType>(op.getLhs().getType())
+                        ? knownVectorLanes(op.getLhs())
+                        : std::nullopt;
+    auto rhsLanes = dyn_cast<VectorType>(op.getRhs().getType())
+                        ? knownVectorLanes(op.getRhs())
+                        : std::nullopt;
+    if ((isa<VectorType>(op.getLhs().getType()) && !lhsLanes) ||
+        (isa<VectorType>(op.getRhs().getType()) && !rhsLanes))
+      return failure();
+
+    const size_t count = static_cast<size_t>(resultVT.getDimSize(0));
+    if ((lhsLanes && lhsLanes->size() != count) ||
+        (rhsLanes && rhsLanes->size() != count))
+      return failure();
+
+    Type laneTy = vectorLaneType(resultVT);
+    SmallVector<Value> lanes;
+    lanes.reserve(count);
+    for (size_t i = 0; i < count; ++i) {
+      Value lhs = lhsLanes ? (*lhsLanes)[i] : op.getLhs();
+      Value rhs = rhsLanes ? (*rhsLanes)[i] : op.getRhs();
+      lanes.push_back(rewriter.create<OpT>(op.getLoc(), laneTy, lhs, rhs));
+    }
+    rewriter.replaceOpWithNewOp<pyc::VCreateOp>(op, op.getResult().getType(), lanes);
+    return success();
+  }
+};
+
+template <typename ReduceOp>
+struct FoldRank2ReduceLanes : public OpRewritePattern<ReduceOp> {
+  using OpRewritePattern<ReduceOp>::OpRewritePattern;
+
+  Value combine(ReduceOp op, Type laneTy, Value lhs, Value rhs,
+                PatternRewriter &rewriter) const {
+    if constexpr (std::is_same_v<ReduceOp, pyc::VOrReduceOp>)
+      return rewriter.create<pyc::OrOp>(op.getLoc(), laneTy, lhs, rhs);
+    if constexpr (std::is_same_v<ReduceOp, pyc::VAndReduceOp>)
+      return rewriter.create<pyc::AndOp>(op.getLoc(), laneTy, lhs, rhs);
+    return rewriter.create<pyc::AddOp>(op.getLoc(), laneTy, lhs, rhs);
+  }
+
+  LogicalResult matchAndRewrite(ReduceOp op, PatternRewriter &rewriter) const override {
+    if (!op.getDim())
+      return failure();
+    auto inputTy = dyn_cast<VectorType>(op.getVec().getType());
+    auto resultTy = dyn_cast<VectorType>(op.getResult().getType());
+    auto rows = knownVectorLanes(op.getVec());
+    if (!inputTy || inputTy.getRank() != 2 || !resultTy || resultTy.getRank() != 1 ||
+        !rows)
+      return failure();
+
+    const int64_t dim = *op.getDim();
+    const size_t rowCount = static_cast<size_t>(inputTy.getShape()[0]);
+    const size_t colCount = static_cast<size_t>(inputTy.getShape()[1]);
+    if (rows->size() != rowCount || (dim != 0 && dim != 1))
+      return failure();
+
+    SmallVector<SmallVector<Value>> matrix;
+    matrix.reserve(rowCount);
+    for (Value row : *rows) {
+      auto columns = knownVectorLanes(row);
+      if (!columns || columns->size() != colCount)
+        return failure();
+      matrix.push_back(std::move(*columns));
+    }
+
+    const size_t outputCount = dim == 0 ? colCount : rowCount;
+    if (resultTy.getDimSize(0) != static_cast<int64_t>(outputCount))
+      return failure();
+    bool hasConstantGroup = false;
+    SmallVector<SmallVector<Value>> groups(outputCount);
+    for (size_t output = 0; output < outputCount; ++output) {
+      for (size_t input = 0; input < (dim == 0 ? rowCount : colCount); ++input)
+        groups[output].push_back(dim == 0 ? matrix[input][output] : matrix[output][input]);
+      hasConstantGroup |= llvm::all_of(groups[output],
+                                       [](Value value) { return getConstUInt(value).has_value(); });
+    }
+    if (!hasConstantGroup)
+      return failure();
+
+    Type laneTy = vectorLaneType(resultTy);
+    SmallVector<Value> lanes;
+    lanes.reserve(outputCount);
+    for (ArrayRef<Value> group : groups) {
+      Value accumulator = group.front();
+      for (Value value : group.drop_front())
+        accumulator = combine(op, laneTy, accumulator, value, rewriter);
+      lanes.push_back(accumulator);
+    }
+    rewriter.replaceOpWithNewOp<pyc::VCreateOp>(op, op.getResult().getType(), lanes);
+    return success();
+  }
+};
 
 struct MuxSameSelSimplify : public OpRewritePattern<pyc::MuxOp> {
   using OpRewritePattern::OpRewritePattern;
@@ -320,9 +468,13 @@ struct VGetOfVectorMux : public OpRewritePattern<pyc::VGetOp> {
 
     Value sel = mux.getSel();
     if (auto selVT = dyn_cast<VectorType>(sel.getType())) {
-      Type selLaneTy = selVT.getRank() == 1
+      Type selLaneTy = isa<VectorType>(selVT.getElementType())
                            ? Type(selVT.getElementType())
-                           : Type(VectorType::get(selVT.getShape().drop_front(), selVT.getElementType()));
+                           : (selVT.getRank() == 1
+                                  ? Type(selVT.getElementType())
+                                  : Type(VectorType::get(
+                                        selVT.getShape().drop_front(),
+                                        selVT.getElementType())));
       sel = rewriter.create<pyc::VGetOp>(op.getLoc(), selLaneTy, sel, idx);
     }
 
@@ -448,6 +600,22 @@ struct CombCanonicalizePass : public PassWrapper<CombCanonicalizePass, Operation
                  VGetOfVBroadcast,
                  VGetOfVectorMux,
                  VCreateOfConsecutiveVGets,
+                 FoldVectorConstantLanes<pyc::AddOp>,
+                 FoldVectorConstantLanes<pyc::SubOp>,
+                 FoldVectorConstantLanes<pyc::MulOp>,
+                 FoldVectorConstantLanes<pyc::UdivOp>,
+                 FoldVectorConstantLanes<pyc::UremOp>,
+                 FoldVectorConstantLanes<pyc::SdivOp>,
+                 FoldVectorConstantLanes<pyc::SremOp>,
+                 FoldVectorConstantLanes<pyc::AndOp>,
+                 FoldVectorConstantLanes<pyc::OrOp>,
+                 FoldVectorConstantLanes<pyc::XorOp>,
+                 FoldVectorConstantLanes<pyc::EqOp>,
+                 FoldVectorConstantLanes<pyc::UltOp>,
+                 FoldVectorConstantLanes<pyc::SltOp>,
+                 FoldRank2ReduceLanes<pyc::VOrReduceOp>,
+                 FoldRank2ReduceLanes<pyc::VAndReduceOp>,
+                 FoldRank2ReduceLanes<pyc::VAddReduceOp>,
                  VReduceOfVBroadcast<pyc::VOrReduceOp>,
                  VReduceOfVBroadcast<pyc::VAndReduceOp>,
                  VReduceSingleLaneDim<pyc::VOrReduceOp>,

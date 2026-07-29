@@ -572,8 +572,13 @@ static LogicalResult emitCombAssign(Operation &op, llvm::raw_ostream &os, NameTa
     unsigned ow = bitWidth(ex.getResult().getType());
     if (iw == 0 || ow == 0)
       return ex.emitError("invalid extract width");
-    os << "    " << nt.get(ex.getResult()) << " = pyc::cpp::extract<" << ow << ", " << iw << ">("
-       << nt.get(ex.getIn()) << ", " << ex.getLsbAttr().getInt() << "u);\n";
+    bool inIsVec = isa<VectorType>(ex.getIn().getType());
+    assignExpr(ex.getResult(), ex.getType(), os, nt,
+               [&](llvm::raw_ostream &e) {
+                 e << "pyc::cpp::" << (inIsVec ? "extract_vec<" : "extract<")
+                   << ow << ", " << iw << ">(" << nt.get(ex.getIn()) << ", "
+                   << ex.getLsbAttr().getInt() << "u)";
+               });
     return success();
   }
   if (auto sh = dyn_cast<pyc::ShliOp>(op)) {

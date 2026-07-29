@@ -122,6 +122,38 @@ def test_vec_accepts_wire_list_only(repo_root: Path) -> None:
 
 
 @pytest.mark.vec
+def test_constant_vector_elementwise_and_reductions_emit(repo_root: Path) -> None:
+    """Exercise rank-1/rank-2 constant Vec forms accepted by dialect folders."""
+    import sys
+
+    frontend = repo_root / "compiler" / "frontend"
+    if str(frontend) not in sys.path:
+        sys.path.insert(0, str(frontend))
+
+    from pycircuit import Circuit
+
+    m = Circuit("constant_vector_folds")
+    known = m.const([1, 2, 3, 4], width=4)
+    mixed = m.vec(
+        [m.const(1, width=4), m.input("unknown", width=4), m.const(3, width=4), m.const(4, width=4)]
+    )
+    matrix = m.const([[1, 2], [3, 4]], width=4)
+
+    m.output("add_known", known + known)
+    m.output("add_mixed", mixed + known)
+    m.output("get_known", (known + known)[2])
+    m.output("sum_all", matrix.reduce_sum())
+    m.output("or_dim0", matrix.reduce_or(dim=0))
+    m.output("and_dim1", matrix.reduce_and(dim=1))
+
+    mlir = m.emit_mlir()
+    assert mlir.count("pyc.v_create") >= 3
+    assert "pyc.v_add_reduce" in mlir
+    assert "pyc.v_or_reduce" in mlir
+    assert "pyc.v_and_reduce" in mlir
+
+
+@pytest.mark.vec
 def test_circuit_priority_mux_lowers_chain_and_tree_forms(repo_root: Path) -> None:
     import sys
 
@@ -173,6 +205,8 @@ def test_vector_api_functional_gaps_run_cpp(
                 '    m.output("bcast1", a.broadcast(size=2, dim=1))',
                 '    m.output("index", a[1])',
                 '    m.output("cat", m.cat(a[0], a[1]))',
+                '    rank2 = m.input("rank2", width=4, shape=[2, 2])',
+                '    m.output("slice_rank2", rank2.slice(lsb=1, width=2))',
                 '    shift = m.input("shift", width=2)',
                 '    m.output("shifted", a << shift)',
                 '    m.output("shifted_right", a >> shift)',
@@ -300,6 +334,19 @@ def test_vector_api_rejects_invalid_shapes_and_priority_inputs(repo_root: Path) 
     assert mlir.count("pyc.v_and_reduce") == 1
     assert mlir.count("pyc.v_add_reduce") == 1
     assert mlir.count("-> i1") >= 3
+
+
+@pytest.mark.vec
+def test_unroll_vector_precedes_wire_and_state_cleanup(repo_root: Path) -> None:
+    """Keep scalar cleanup after the optional Vector-to-lane expansion."""
+    pipeline = (repo_root / "compiler" / "mlir" / "tools" / "pycc.cpp").read_text(encoding="utf-8")
+    lower_scf = pipeline.index("pm.addNestedPass<func::FuncOp>(pyc::createLowerSCFToPYCStaticPass());")
+    unroll = pipeline.index("pm.addNestedPass<func::FuncOp>(pyc::createVectorUnrollPass());")
+    eliminate_wires = pipeline.index("pm.addNestedPass<func::FuncOp>(pyc::createEliminateWiresPass());")
+    eliminate_state = pipeline.index("pm.addNestedPass<func::FuncOp>(pyc::createEliminateDeadStatePass());")
+    slp_pack = pipeline.index("pm.addNestedPass<func::FuncOp>(pyc::createSLPPackWiresPass());")
+
+    assert lower_scf < unroll < eliminate_wires < eliminate_state < slp_pack
 
 
 @pytest.mark.vec

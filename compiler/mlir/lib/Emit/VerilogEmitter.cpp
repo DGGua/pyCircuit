@@ -55,6 +55,16 @@ static std::optional<unsigned> leafWidth(Type ty) {
   return intTy.getWidth();
 }
 
+/// Flatten recursively nested vector dimensions from outermost to innermost.
+static SmallVector<int64_t> vectorShape(Type ty) {
+  SmallVector<int64_t> shape;
+  while (auto vt = dyn_cast<VectorType>(ty)) {
+    llvm::append_range(shape, vt.getShape());
+    ty = vt.getElementType();
+  }
+  return shape;
+}
+
 static int64_t vectorLaneCount(ArrayRef<int64_t> shape) {
   int64_t lanes = 1;
   for (int64_t d : shape)
@@ -67,7 +77,7 @@ static std::optional<int64_t> flatBitWidth(Type ty) {
   if (!width)
     return std::nullopt;
   if (auto vt = dyn_cast<VectorType>(ty))
-    return vectorLaneCount(vt.getShape()) * static_cast<int64_t>(*width);
+    return vectorLaneCount(vectorShape(vt)) * static_cast<int64_t>(*width);
   return static_cast<int64_t>(*width);
 }
 
@@ -85,7 +95,7 @@ static std::string vPortRange(Type ty) {
 static std::string vUnpacked(Type ty) {
   if (auto vt = dyn_cast<VectorType>(ty)) {
     std::string dims;
-    for (int64_t d : vt.getShape())
+    for (int64_t d : vectorShape(vt))
       dims += " [0:" + std::to_string(d - 1) + "]";
     return dims;
   }
@@ -140,7 +150,7 @@ static void emitUnpackFromPacked(llvm::StringRef arrayBase, llvm::StringRef pack
   auto width = leafWidth(ty);
   if (!width)
     return;
-  ArrayRef<int64_t> shape = vt.getShape();
+  SmallVector<int64_t> shape = vectorShape(vt);
   walkVectorIndices(shape, [&](ArrayRef<int64_t> indices) {
     os << "assign " << arrayBase << indexSuffix(indices) << " = "
        << packedSlice(packedBase, shape, indices, *width) << ";\n";
@@ -156,7 +166,7 @@ static void emitPackToPacked(llvm::StringRef packedBase, llvm::StringRef arrayBa
   auto width = leafWidth(ty);
   if (!width)
     return;
-  ArrayRef<int64_t> shape = vt.getShape();
+  SmallVector<int64_t> shape = vectorShape(vt);
   walkVectorIndices(shape, [&](ArrayRef<int64_t> indices) {
     os << "assign " << packedSlice(packedBase, shape, indices, *width)
        << " = " << arrayBase << indexSuffix(indices) << ";\n";
@@ -661,7 +671,7 @@ static std::optional<LogicalResult> emitScalarOpAssign(Operation &op, raw_ostrea
 
 // Unroll element-wise vector ops into per-lane scalar assigns.
 static LogicalResult emitVectorElementwise(Operation &op, VectorType vt, raw_ostream &os, NameTable &nt) {
-  ArrayRef<int64_t> shape = vt.getShape();
+  SmallVector<int64_t> shape = vectorShape(vt);
   unsigned rank = static_cast<unsigned>(shape.size());
   Value res = op.getResult(0);
 
@@ -682,7 +692,7 @@ static LogicalResult emitVectorElementwise(Operation &op, VectorType vt, raw_ost
       rebind(res);
       for (Value operand : op.getOperands()) {
         if (auto ovt = dyn_cast<VectorType>(operand.getType()))
-          if (ovt.getShape() == shape)
+          if (vectorShape(ovt) == shape)
             rebind(operand);
       }
       auto handled = emitScalarOpAssign(op, os, nt);
@@ -731,17 +741,11 @@ static void emitConnectAssign(llvm::StringRef lhs, llvm::StringRef rhs, Type ty,
     os << "assign " << lhs << " = " << rhs << ";\n";
     return;
   }
-  ArrayRef<int64_t> shape = vt.getShape();
-  if (shape.size() == 1) {
-    for (int64_t i = 0; i < shape[0]; ++i)
-      os << "assign " << lhs << "[" << i << "] = " << rhs << "[" << i << "];\n";
-  } else {
-    for (int64_t i = 0; i < shape[0]; ++i) {
-      std::string is = "[" + std::to_string(i) + "]";
-      for (int64_t j = 0; j < shape[1]; ++j)
-        os << "assign " << lhs << is << "[" << j << "] = " << rhs << is << "[" << j << "];\n";
-    }
-  }
+  SmallVector<int64_t> shape = vectorShape(vt);
+  walkVectorIndices(shape, [&](ArrayRef<int64_t> indices) {
+    std::string suffix = indexSuffix(indices);
+    os << "assign " << lhs << suffix << " = " << rhs << suffix << ";\n";
+  });
 }
 
 static LogicalResult emitComb(pyc::CombOp comb, raw_ostream &os, NameTable &nt) {

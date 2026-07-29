@@ -283,7 +283,7 @@ static bool isElementWiseVectorOp(Operation &op) {
              pyc::UdivOp, pyc::UremOp, pyc::SdivOp, pyc::SremOp,
              pyc::AndOp, pyc::OrOp, pyc::XorOp, pyc::NotOp,
              pyc::EqOp, pyc::UltOp, pyc::SltOp,
-             pyc::TruncOp, pyc::ZextOp, pyc::SextOp,
+             pyc::TruncOp, pyc::ZextOp, pyc::SextOp, pyc::ExtractOp,
              pyc::ShlOp, pyc::LshrOp, pyc::AshrOp,
              pyc::ShliOp, pyc::LshriOp, pyc::AshriOp,
              pyc::MuxOp>(op);

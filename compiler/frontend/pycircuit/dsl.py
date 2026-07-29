@@ -308,12 +308,21 @@ class Module:
         self._emit(f"{tmp} = pyc.sext {a.ref} : {a.ty} -> {out_ty}")
         return Signal(ref=tmp, ty=out_ty)
 
+    @overload
+    def extract(self, a: Signal[Bits], *, lsb: int, width: int) -> Signal[Bits]: ...
+    
+    @overload
+    def extract(self, a: Signal[Vector], *, lsb: int, width: int) -> Signal[Vector]: ...
+    
     def extract(self, a: Signal, *, lsb: int, width: int) -> Signal:
-        if not isinstance(a.ty, Bits):
-            raise TypeError("extract requires an integer input")
         if lsb < 0:
             raise ValueError("extract lsb must be >= 0")
-        out_ty = Bits(width)
+        if width <= 0:
+            raise ValueError("extract width must be > 0")
+        in_width = a.ty.width
+        if lsb + width > in_width:
+            raise ValueError("extract slice out of range for input width")
+        out_ty = Vector.from_shape(a.ty.shape(), Bits(width)) if isinstance(a.ty, Vector) else Bits(width)
         tmp = self._get_next_temp_var()
         self._emit(f"{tmp} = pyc.extract {a.ref} {{lsb = {int(lsb)}}} : {a.ty} -> {out_ty}")
         return Signal(ref=tmp, ty=out_ty)

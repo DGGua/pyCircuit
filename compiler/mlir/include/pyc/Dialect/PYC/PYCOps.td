@@ -196,9 +196,9 @@ def PYC_SextOp : PYC_Op<"sext", [Pure]> {
 }
 
 def PYC_ExtractOp : PYC_Op<"extract", [Pure]> {
-  let summary = "Bit-slice extraction (scalar only)";
-  let arguments = (ins AnyInteger:$in, I64Attr:$lsb);
-  let results = (outs AnyInteger:$result);
+  let summary = "Bit-slice extraction (element-wise for vectors)";
+  let arguments = (ins AnyIntegerOrV:$in, I64Attr:$lsb);
+  let results = (outs AnyIntegerOrV:$result);
   let hasVerifier = 1;
   let assemblyFormat = "$in attr-dict `:` type($in) `->` type($result)";
   let hasFolder = 1;
@@ -409,6 +409,7 @@ def PYC_VGetOp : PYC_Op<"v_get", [Pure]> {
   let arguments = (ins AnyIntegerOrV:$vec, I64Attr:$index);
   let results = (outs AnyIntegerOrV:$result);
   let hasVerifier = 1;
+  let hasFolder = 1;
   let assemblyFormat = "$vec `[` $index `]` attr-dict `:` type($vec) `->` type($result)";
 }
 
@@ -420,6 +421,7 @@ def PYC_VCreateOp : PYC_Op<"v_create", [Pure]> {
   let arguments = (ins Variadic<AnyIntegerOrV>:$elements);
   let results = (outs AnyIntegerOrV:$result);
   let hasVerifier = 1;
+  let hasFolder = 1;
   let assemblyFormat = "`(` $elements `)` attr-dict `:` `(` type($elements) `)` `->` type($result)";
 }
 
@@ -430,6 +432,7 @@ def PYC_VBroadcastOp : PYC_Op<"v_broadcast", [Pure]> {
   let arguments = (ins AnyInteger:$scalar, I64Attr:$size);
   let results = (outs AnyIntegerOrV:$result);
   let hasVerifier = 1;
+  let hasFolder = 1;
   let assemblyFormat = "$scalar `to` $size attr-dict `:` type($scalar) `->` type($result)";
 }
 
@@ -438,6 +441,7 @@ def PYC_VBroadcastDimOp : PYC_Op<"v_broadcast_dim", [Pure]> {
   let arguments = (ins AnyIntegerOrV:$vec, I64Attr:$size, I64Attr:$dim);
   let results = (outs AnyIntegerOrV:$result);
   let hasVerifier = 1;
+  let hasFolder = 1;
   let assemblyFormat = "$vec `to` $size `,` $dim attr-dict `:` type($vec) `->` type($result)";
 }
 

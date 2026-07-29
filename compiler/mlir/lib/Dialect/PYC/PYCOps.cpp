@@ -490,9 +490,10 @@ OpFoldResult SextOp::fold(FoldAdaptor adaptor) {
 }
 
 OpFoldResult ExtractOp::fold(FoldAdaptor adaptor) {
-  auto inTy = cast<IntegerType>(getIn().getType());
+  auto inTy = dyn_cast<IntegerType>(getIn().getType());
   auto outTy = dyn_cast<IntegerType>(getResult().getType());
-  if (!outTy) return {};
+  if (!inTy || !outTy)
+    return {};
   std::int64_t lsb = getLsbAttr().getInt();
   if (lsb == 0 && outTy.getWidth() == inTy.getWidth())
     return getIn();
@@ -597,6 +598,30 @@ OpFoldResult ConcatOp::fold(FoldAdaptor adaptor) {
 
 enum class VectorReduceKind { Or, And, Add };
 
+static bool collectVectorConstantLeaves(Value value, unsigned width, SmallVectorImpl<APInt> &leaves) {
+  if (auto constant = intConstOfValue(value, width)) {
+    leaves.push_back(*constant);
+    return true;
+  }
+  if (auto broadcast = value.getDefiningOp<VBroadcastOp>()) {
+    auto vectorTy = dyn_cast<VectorType>(value.getType());
+    if (!vectorTy)
+      return false;
+    auto scalar = intConstOfValue(broadcast.getScalar(), width);
+    if (!scalar)
+      return false;
+    leaves.append(static_cast<size_t>(vectorTy.getNumElements()), *scalar);
+    return true;
+  }
+  if (auto create = value.getDefiningOp<VCreateOp>()) {
+    for (Value element : create.getElements())
+      if (!collectVectorConstantLeaves(element, width, leaves))
+        return false;
+    return true;
+  }
+  return false;
+}
+
 template <typename ReduceOp>
 static OpFoldResult foldVectorReduce(ReduceOp op, Attribute adaptedVec, VectorReduceKind kind) {
   auto vecTy = dyn_cast<VectorType>(op.getVec().getType());
@@ -605,6 +630,7 @@ static OpFoldResult foldVectorReduce(ReduceOp op, Attribute adaptedVec, VectorRe
   auto elemTy = dyn_cast<IntegerType>(vecTy.getElementType());
   if (!elemTy)
     return {};
+  const bool reduceAllDimensions = !op.getDim().has_value();
   int64_t dim = op.getDim().value_or(0);
   if (dim < 0 || dim >= vecTy.getRank())
     return {};
@@ -625,6 +651,22 @@ static OpFoldResult foldVectorReduce(ReduceOp op, Attribute adaptedVec, VectorRe
       acc = (acc + e.zextOrTrunc(acc.getBitWidth())).trunc(acc.getBitWidth());
     return acc;
   };
+
+  if (reduceAllDimensions) {
+    auto outTy = dyn_cast<IntegerType>(op.getResult().getType());
+    if (!outTy)
+      return {};
+    SmallVector<APInt> leaves;
+    if (collectVectorConstantLeaves(op.getVec(), outTy.getWidth(), leaves) &&
+        leaves.size() == static_cast<size_t>(vecTy.getNumElements())) {
+      llvm::APInt acc = kind == VectorReduceKind::And
+                             ? llvm::APInt::getAllOnes(outTy.getWidth())
+                             : llvm::APInt(outTy.getWidth(), 0);
+      for (const APInt &leaf : leaves)
+        acc = reduceAPInt(acc, leaf);
+      return intAttrFor(outTy, acc);
+    }
+  }
 
   if (auto dense = dyn_cast_or_null<DenseIntElementsAttr>(adaptedVec)) {
     unsigned width = elemTy.getWidth();
@@ -726,11 +768,40 @@ OpFoldResult AliasOp::fold(FoldAdaptor) {
   return getIn();
 }
 
+OpFoldResult VGetOp::fold(FoldAdaptor) {
+  if (auto create = getVec().getDefiningOp<VCreateOp>()) {
+    const int64_t index = getIndexAttr().getInt();
+    if (index >= 0 && index < static_cast<int64_t>(create.getElements().size()))
+      return create.getElements()[index];
+  }
+  if (auto broadcast = getVec().getDefiningOp<VBroadcastOp>())
+    if (broadcast.getScalar().getType() == getResult().getType())
+      return broadcast.getScalar();
+  return {};
+}
+
+OpFoldResult VCreateOp::fold(FoldAdaptor) {
+  return {};
+}
+
+OpFoldResult VBroadcastOp::fold(FoldAdaptor) {
+  return {};
+}
+
+OpFoldResult VBroadcastDimOp::fold(FoldAdaptor) {
+  return {};
+}
+
 LogicalResult MuxOp::verify() {
   auto selTy = getSel().getType();
   auto aTy = getA().getType();
   auto bTy = getB().getType();
   auto rTy = getResult().getType();
+  auto leafInteger = [](Type ty) {
+    while (auto vt = dyn_cast<VectorType>(ty))
+      ty = vt.getElementType();
+    return dyn_cast<IntegerType>(ty);
+  };
 
   // Determine the value type (the vector when mixing scalar+vector, or the
   // common type when both arms are the same).
@@ -744,7 +815,7 @@ LogicalResult MuxOp::verify() {
     valueTy = aTy;
     if (rTy != aTy)
       return emitOpError("result type must match vector arm when mixing scalar+vector");
-    auto aElem = dyn_cast<IntegerType>(aVT.getElementType());
+    auto aElem = leafInteger(aTy);
     auto bInt = dyn_cast<IntegerType>(bTy);
     if (!aElem || !bInt || aElem.getWidth() != bInt.getWidth())
       return emitOpError("scalar arm width must match vector element width for mixed mux");
@@ -753,7 +824,7 @@ LogicalResult MuxOp::verify() {
     valueTy = bTy;
     if (rTy != bTy)
       return emitOpError("result type must match vector arm when mixing scalar+vector");
-    auto bElem = dyn_cast<IntegerType>(bVT.getElementType());
+    auto bElem = leafInteger(bTy);
     auto aInt = dyn_cast<IntegerType>(aTy);
     if (!bElem || !aInt || bElem.getWidth() != aInt.getWidth())
       return emitOpError("scalar arm width must match vector element width for mixed mux");
@@ -771,9 +842,9 @@ LogicalResult MuxOp::verify() {
   auto valueVT = dyn_cast<VectorType>(valueTy);
   if (!selVT || !valueVT)
     return emitOpError("requires i1 select or same-shape vector-of-i1 select for vector a/b");
-  auto selElemTy = dyn_cast<IntegerType>(selVT.getElementType());
+  auto selElemTy = leafInteger(selTy);
   if (!selElemTy || selElemTy.getWidth() != 1)
-    return emitOpError("vector select element type must be i1");
+    return emitOpError("vector select element type must be i1, got ") << selTy;
   if (selVT.getShape() != valueVT.getShape())
     return emitOpError("vector select shape must match a/b shape: ") << selVT << " vs " << valueVT;
   return success();
@@ -827,10 +898,12 @@ LogicalResult ZextOp::verify() { return verifyIntCast(*this, getIn().getType(), 
 LogicalResult SextOp::verify() { return verifyIntCast(*this, getIn().getType(), getResult().getType(), /*requireWiden=*/true, /*signExtend=*/true); }
 
 LogicalResult ExtractOp::verify() {
-  auto inTy = dyn_cast<IntegerType>(getIn().getType());
-  auto outTy = dyn_cast<IntegerType>(getResult().getType());
+  Type scalarIn = matchVectorShape(getIn().getType(), getResult().getType());
+  auto inTy = dyn_cast<IntegerType>(scalarIn);
+  auto outTy = dyn_cast<IntegerType>(
+      matchVectorShape(getResult().getType(), getIn().getType()));
   if (!inTy || !outTy)
-    return emitOpError("only supports integer types");
+    return emitOpError("only supports integer or vector-of-integer types with matching shapes");
   if (outTy.getWidth() == 0)
     return emitOpError("result width must be > 0");
   std::int64_t lsb = getLsbAttr().getInt();
@@ -1167,10 +1240,10 @@ LogicalResult CombOp::verify() {
 //===----------------------------------------------------------------------===//
 
 static IntegerType leafIntegerType(Type ty) {
+  while (auto vt = dyn_cast<VectorType>(ty))
+    ty = vt.getElementType();
   if (auto intTy = dyn_cast<IntegerType>(ty))
     return intTy;
-  if (auto vt = dyn_cast<VectorType>(ty))
-    return dyn_cast<IntegerType>(vt.getElementType());
   return {};
 }
 
@@ -1186,6 +1259,34 @@ static Type elementwiseCompareResultType(MLIRContext *ctx, Type lhsTy, Type rhsT
   if (auto vt = dyn_cast<VectorType>(shapeTy))
     return VectorType::get(vt.getShape(), IntegerType::get(ctx, 1));
   return IntegerType::get(ctx, 1);
+}
+
+static bool hasSamePrintedType(Type lhs, Type rhs) {
+  if (lhs == rhs)
+    return true;
+  std::string lhsText;
+  std::string rhsText;
+  llvm::raw_string_ostream lhsStream(lhsText);
+  llvm::raw_string_ostream rhsStream(rhsText);
+  lhsStream << lhs;
+  rhsStream << rhs;
+  return lhsStream.str() == rhsStream.str();
+}
+
+static bool hasEquivalentVectorShapeAndLeaf(Type lhs, Type rhs) {
+  SmallVector<int64_t> lhsShape;
+  SmallVector<int64_t> rhsShape;
+  Type lhsLeaf = lhs;
+  Type rhsLeaf = rhs;
+  while (auto vt = dyn_cast<VectorType>(lhsLeaf)) {
+    llvm::append_range(lhsShape, vt.getShape());
+    lhsLeaf = vt.getElementType();
+  }
+  while (auto vt = dyn_cast<VectorType>(rhsLeaf)) {
+    llvm::append_range(rhsShape, vt.getShape());
+    rhsLeaf = vt.getElementType();
+  }
+  return lhsShape == rhsShape && lhsLeaf == rhsLeaf;
 }
 
 static LogicalResult verifyElementwiseBinary(Operation *op,
@@ -1210,8 +1311,11 @@ static LogicalResult verifyElementwiseBinary(Operation *op,
   Type expected = compareResult
                       ? elementwiseCompareResultType(op->getContext(), lhsTy, rhsTy)
                       : elementwiseValueResultType(op->getContext(), lhsTy, rhsTy);
-  if (resultTy != expected)
-    return op->emitOpError("result type must be ") << expected;
+  if (!hasSamePrintedType(resultTy, expected) &&
+      !hasEquivalentVectorShapeAndLeaf(resultTy, expected))
+    return op->emitOpError("result type must be ") << expected
+           << " (lhs " << lhsTy << ", rhs " << rhsTy
+           << ", actual " << resultTy << ")";
   return success();
 }
 
@@ -1258,13 +1362,18 @@ LogicalResult VGetOp::verify() {
   if (idx < 0 || idx >= vecTy.getDimSize(0))
     return emitOpError("index out of range: ") << idx
       << " (outer dim size is " << vecTy.getDimSize(0) << ")";
-  // Result: drop outermost dimension. vector<4x8xi32>[2] → vector<8xi32>.
-  auto shape = vecTy.getShape().drop_front();
+  // Builtin vectors use a flattened shape, while some rewrites may carry an
+  // already-nested element vector. Handle both representations without
+  // duplicating inner dimensions.
   Type expectedResult;
-  if (shape.empty())
+  if (isa<VectorType>(vecTy.getElementType())) {
     expectedResult = vecTy.getElementType();
-  else
-    expectedResult = VectorType::get(shape, vecTy.getElementType());
+  } else {
+    auto shape = vecTy.getShape().drop_front();
+    expectedResult = shape.empty()
+                         ? vecTy.getElementType()
+                         : Type(VectorType::get(shape, vecTy.getElementType()));
+  }
   if (getResult().getType() != expectedResult)
     return emitOpError("result type must be ") << expectedResult;
   return success();
@@ -1282,20 +1391,6 @@ LogicalResult VCreateOp::verify() {
   Type firstTy = getElements().front().getType();
   if (!isa<IntegerType, VectorType>(firstTy))
     return emitOpError("elements must be integer or vector-of-integer");
-  Type expectedResult;
-  if (auto elemVT = dyn_cast<VectorType>(firstTy)) {
-    auto elemTy = dyn_cast<IntegerType>(elemVT.getElementType());
-    if (!elemTy)
-      return emitOpError("vector element leaf type must be integer");
-    SmallVector<int64_t> shape;
-    shape.push_back(static_cast<int64_t>(getElements().size()));
-    llvm::append_range(shape, elemVT.getShape());
-    expectedResult = VectorType::get(shape, elemTy);
-  } else {
-    expectedResult = VectorType::get({static_cast<int64_t>(getElements().size())}, firstTy);
-  }
-  if (getResult().getType() != expectedResult)
-    return emitOpError("result type must be ") << expectedResult;
   for (auto [i, el] : llvm::enumerate(getElements())) {
     if (el.getType() != firstTy)
       return emitOpError("element #") << i << " type must match first element type: "

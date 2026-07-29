@@ -373,7 +373,7 @@ class Wire(Generic[DT]):
         """Unsigned greater-than-or-equal compare (result is i1)."""
         return ~self.ult(other)
 
-    def _select_internal(self, a: Union["Wire", "Reg", Signal, int, LiteralValue], b: Union["Wire", "Reg", Signal, int, LiteralValue]) -> "Wire":
+    def _select_internal(self, a: Union["Wire", "Reg", Signal, int, LiteralValue, Connector], b: Union["Wire", "Reg", Signal, int, LiteralValue, Connector]) -> "Wire":
         if self.ty != Bits(1):
             raise TypeError("conditional selection requires a 1-bit selector wire (i1)")
 
@@ -620,7 +620,9 @@ class Reg(Generic[DT]):
         cond = Wire.as_wire(when, m=m, width=1)
         if cond.width != 1:
             raise TypeError("when width must be 1")
-        m.assign(self.next, cond._select_internal(next_w, self))
+        when_w = Wire.as_wire(when, m=m)
+
+        m.assign(self.next, when_w._select_internal(value, self.q))
 
 class Circuit(Module):
     """High-level wrapper over `Module` that returns `Wire`/`Reg` objects."""

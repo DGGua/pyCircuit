@@ -1058,61 +1058,22 @@ def _promote_pair(m: Circuit, a: Wire, b: Wire) -> tuple[Wire, Wire]:
     return a, b
 
 
-def _is_cas(v: object) -> bool:
-    return isinstance(v, (CycleAwareSignal, StateSignal, ForwardSignal))
-
-
 def mux(
-    cond: Union[Wire, Reg, CycleAwareSignal, StateSignal, ForwardSignal],
-    a: Union[Wire, Reg, CycleAwareSignal, StateSignal, ForwardSignal, int, LiteralValue],
-    b: Union[Wire, Reg, CycleAwareSignal, StateSignal, ForwardSignal, int, LiteralValue],
-) -> Union[Wire, CycleAwareSignal]:
-    if _is_cas(cond) or _is_cas(a) or _is_cas(b):
-        def _unwrap(v: object) -> object:
-            if isinstance(v, ForwardSignal):
-                return v._state._cas
-            if isinstance(v, StateSignal):
-                return v._cas
-            return v
-        return _mux_cycle_aware(_unwrap(cond), _unwrap(a), _unwrap(b))
-    return _mux_wire(cond, a, b)
-
-
-def _mux_wire(
-    cond: Union[Wire, Reg],
-    a: Union[Wire, Reg, int, LiteralValue],
-    b: Union[Wire, Reg, int, LiteralValue],
-) -> Wire:
-    c = cond.q if isinstance(cond, Reg) else cond
-    m = c.m
-    if not isinstance(m, Circuit):
-        raise TypeError("mux(cond, ...) requires wires from a Circuit")
-
-    def as_wire(v: Union[Wire, Reg, int, LiteralValue], *, ctx_w: int | None) -> Wire:
-        if isinstance(v, Reg):
-            return v.q
-        if isinstance(v, Wire):
-            return v
-        if isinstance(v, LiteralValue):
-            if v.width is not None:
-                lit_w = int(v.width)
-            else:
-                lit_w = infer_literal_width(
-                    int(v.value),
-                    signed=(bool(v.signed) if v.signed is not None else int(v.value) < 0),
-                )
-            return m.const(int(v.value), width=int(lit_w))
-        if isinstance(v, int):
-            w = ctx_w if ctx_w is not None else max(1, infer_literal_width(int(v), signed=(int(v) < 0)))
-            return m.const(int(v), width=int(w))
-        raise TypeError(f"mux: unsupported branch type {type(v).__name__}")
-
-    aw = as_wire(a, ctx_w=c.width)
-    bw = as_wire(b, ctx_w=c.width)
-    aw, bw = _promote_pair(m, aw, bw)
-    if c.ty != Bits(1):
-        raise TypeError("mux condition must be i1")
-    return c._select_internal(aw, bw)
+    cond: Union[Wire, CycleAwareSignal, StateSignal, ForwardSignal],
+    a: Union[Wire, CycleAwareSignal, StateSignal, ForwardSignal, int],
+    b: Union[Wire, CycleAwareSignal, StateSignal, ForwardSignal, int],
+) -> CycleAwareSignal:
+    def _unwrap(v: Union[Wire, CycleAwareSignal, StateSignal, ForwardSignal]) -> Union[Wire, CycleAwareSignal]:
+        if isinstance(v, ForwardSignal):
+            return v._state._cas
+        if isinstance(v, StateSignal):
+            return v._cas
+        return v
+    return _mux_cycle_aware(
+        _unwrap(cond),
+        a if isinstance(a, int) else _unwrap(a),
+        b if isinstance(b, int) else _unwrap(b),
+    )
 
 
 def _mux_cycle_aware(

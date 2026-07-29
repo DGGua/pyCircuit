@@ -208,7 +208,7 @@ VEC_CASES: tuple[VecCase, ...] = (
     VecCase("zext", "zext", out_width=6, samples=({"a": SIGNED_A},), expected=_zext, ir_tokens=("vector<", "pyc.zext")),
     VecCase("sext", "sext", signed=True, out_width=6, samples=({"a": SIGNED_A},), expected=_sext, ir_tokens=("vector<", "pyc.sext")),
     VecCase("trunc", "trunc", out_width=3, samples=({"a": BASE_A},), expected=_trunc, ir_tokens=("vector<", "pyc.trunc")),
-    VecCase("slice", "slice", out_width=2, samples=({"a": BASE_A},), expected=_slice, ir_tokens=("pyc.extract",), allow_scalarized=True, full_backend=False),
+    VecCase("slice", "slice", out_width=2, samples=({"a": BASE_A},), expected=_slice, ir_tokens=("vector<", "pyc.extract")),
     VecCase("shl_imm", "shl_imm", samples=({"a": BASE_A},), expected=_shl, ir_tokens=("vector<", "pyc.shli")),
     VecCase("lshr_imm", "lshr_imm", samples=({"a": BASE_A},), expected=_lshr, ir_tokens=("vector<", "pyc.lshri")),
     VecCase("ashr_imm", "ashr_imm", signed=True, samples=({"a": SIGNED_A},), expected=_ashr, ir_tokens=("vector<", "pyc.ashri")),

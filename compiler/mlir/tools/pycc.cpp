@@ -2267,10 +2267,10 @@ int main(int argc, char **argv) {
   pm.addPass(createSymbolDCEPass());
 
   pm.addNestedPass<func::FuncOp>(pyc::createLowerSCFToPYCStaticPass());
-  pm.addNestedPass<func::FuncOp>(pyc::createEliminateWiresPass());
-  pm.addNestedPass<func::FuncOp>(pyc::createEliminateDeadStatePass());
   if (unrollVector)
     pm.addNestedPass<func::FuncOp>(pyc::createVectorUnrollPass());
+  pm.addNestedPass<func::FuncOp>(pyc::createEliminateWiresPass());
+  pm.addNestedPass<func::FuncOp>(pyc::createEliminateDeadStatePass());
   if (!unrollVector)
     pm.addNestedPass<func::FuncOp>(pyc::createSLPPackWiresPass());
   pm.addNestedPass<func::FuncOp>(pyc::createCombCanonicalizePass());

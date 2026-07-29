@@ -13,6 +13,8 @@ namespace pyc {
 namespace {
 
 static VectorType vectorTypeLike(VectorType resultVT, Type laneTy) {
+  if (isa<VectorType>(laneTy))
+    return VectorType::get({resultVT.getDimSize(0)}, laneTy);
   return VectorType::get(resultVT.getShape(), laneTy);
 }
 
