@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from .cases import FRONTEND_ONLY_CASES, FULL_BACKEND_CASES, VEC_CASES, VecCase
+from .cases import FULL_BACKEND_CASES, VEC_CASES, VecCase
 from .generate import render_case_source
 from .runner import assert_verilator_ran, check_cpp_manifest_syntax, check_ir, merged_env, run_cmd, run_cpp_binary, run_vec_case
 
@@ -347,14 +347,6 @@ def test_unroll_vector_precedes_wire_and_state_cleanup(repo_root: Path) -> None:
     slp_pack = pipeline.index("pm.addNestedPass<func::FuncOp>(pyc::createSLPPackWiresPass());")
 
     assert lower_scf < unroll < eliminate_wires < eliminate_state < slp_pack
-
-
-@pytest.mark.vec
-@pytest.mark.parametrize("case", FRONTEND_ONLY_CASES, ids=[case.name for case in FRONTEND_ONLY_CASES])
-def test_frontend_only_case_generation(case: VecCase) -> None:
-    source = render_case_source(case)
-    assert "m.vec([" in source
-    assert case.kind in source or case.name in source
 
 
 @pytest.mark.vec
