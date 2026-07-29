@@ -228,6 +228,12 @@ def _canon_param(v: Any, *, path: str) -> Any:
         return v
     if isinstance(v, (tuple, list)):
         return [_canon_param(x, path=_canon_path_index(path, i)) for i, x in enumerate(v)]
+    if isinstance(v, (set, frozenset)):
+        # Sets are compile-time specialization data (e.g. cut_after in pipeline
+        # cut-point search); canonicalize to a deterministically sorted list so
+        # each distinct value yields a distinct, stable cache key.
+        items = [_canon_param(x, path=_canon_path_index(path, i)) for i, x in enumerate(sorted(v, key=repr))]
+        return {"kind": "set", "items": items}
     if isinstance(v, dict):
         out: dict[str, Any] = {}
         for k in sorted(v.keys(), key=lambda x: str(x)):
@@ -263,7 +269,7 @@ def _canon_param(v: Any, *, path: str) -> Any:
         }
     raise DesignError(
         f"{path}: unsupported param type for specialization/caching: {type(v).__name__} "
-        "(allowed: bool/int/str/None, list/tuple, dict[str,...], frozen dataclass, __pyc_template_value__())"
+        "(allowed: bool/int/str/None, list/tuple, set/frozenset, dict[str,...], frozen dataclass, __pyc_template_value__())"
     )
 
 
