@@ -6,7 +6,7 @@ from dataclasses import dataclass
 import hashlib
 import inspect
 import json
-from typing import Any, Generator, Generic, Iterable, Iterator, Literal, Mapping, TypeVar, Union, cast, overload
+from typing import Any, Generator, Generic, Iterable, Iterator, Literal, Mapping, Sequence, TypeVar, Union, cast, overload
 
 from .connectors import (
     Connector,
@@ -88,7 +88,7 @@ class Wire(Generic[DT]):
         if not is_vector_signal(self.sig):
             raise TypeError(f"iter(Wire) requires Vector type, got {self.sig.ty!r}")
         for i in range(self.sig.ty.length):
-            yield Wire(self.m, self.m.v_get(self.sig, index=i))
+            yield Wire(self.m, self.m.v_get(self.sig, index=i), signed=self.signed)
 
     @overload
     def reduce_or(self: "Wire[Vector[Data]]", *, dim: None = None, mode: str = "chain") -> "Wire[Bits]": ...
@@ -374,8 +374,10 @@ class Wire(Generic[DT]):
         return ~self.ult(other)
 
     def _select_internal(self, a: Union["Wire", "Reg", Signal, int, LiteralValue, Connector], b: Union["Wire", "Reg", Signal, int, LiteralValue, Connector]) -> "Wire":
-        if self.ty != Bits(1):
-            raise TypeError("conditional selection requires a 1-bit selector wire (i1)")
+        scalar_selector = self.ty == Bits(1)
+        vector_selector = isinstance(self.ty, Vector) and self.ty.datatype() == Bits(1)
+        if not scalar_selector and not vector_selector:
+            raise TypeError("conditional selection requires an i1 or vector<...xi1> selector wire")
 
         # At least one operand must provide width.
         if isinstance(a, int) and isinstance(b, int):
@@ -393,6 +395,20 @@ class Wire(Generic[DT]):
             aw = aw.sext(width=out_w) if aw.signed else aw.zext(width=out_w)
         if bw.width != out_w:
             bw = bw.sext(width=out_w) if bw.signed else bw.zext(width=out_w)
+        if vector_selector:
+            def broadcast_scalar(value: Wire) -> Wire:
+                if isinstance(value.ty, Vector):
+                    return value
+                return Wire(
+                    self.m,
+                    self.m.v_broadcast(value.sig, size=self.ty.length),
+                    signed=value.signed,
+                )
+
+            aw = broadcast_scalar(aw)
+            bw = broadcast_scalar(bw)
+            if not isinstance(aw.ty, Vector) or aw.ty.shape() != self.ty.shape():
+                raise TypeError("vector conditional selection requires selector and values with matching vector shapes")
         return Wire(self.m, self.m.mux(self.sig, aw.sig, bw.sig), signed=(aw.signed or bw.signed))
 
     def select(self, a: Union["Wire", "Reg", Signal, int, LiteralValue], b: Union["Wire", "Reg", Signal, int, LiteralValue]) -> "Wire":
@@ -431,7 +447,7 @@ class Wire(Generic[DT]):
                 raise TypeError(f"Vector Wire index must be int, got {type(idx).__name__}")
             if idx < 0 or idx >= self.sig.ty.length:
                 raise IndexError(f"Vector Wire index {idx} out of range for {self.sig.ty}")
-            return Wire(self.m, self.m.v_get(self.sig, index=idx))
+            return Wire(self.m, self.m.v_get(self.sig, index=idx), signed=self.signed)
         if isinstance(idx, slice):
             if idx.step is not None:
                 raise TypeError("wire slicing does not support step")
@@ -979,6 +995,38 @@ class Circuit(Module):
         sig = c.sig if isinstance(c, Wire) else c
         super().assert_(sig, msg=msg)
 
+
+    @overload
+    def out(
+        self, 
+        name: str, 
+        *, 
+        clk: Signal[Clock] | None = None,
+        rst: Signal[Reset] | None = None,
+        domain: ClockDomain | None = None,
+        width: int,
+        init: Union[Wire, Reg, Signal, int, list, LiteralValue] | None = None,
+        en: Union[Wire, Signal, int, LiteralValue] = 1,
+        shape: list[int],
+        stage: str | None = None,
+        signed: bool | None = None
+    ) -> Reg[Vector]: ...
+    
+    @overload
+    def out(
+        self, 
+        name: str, 
+        *, 
+        clk: Signal[Clock] | None = None,
+        rst: Signal[Reset] | None = None,
+        domain: ClockDomain | None = None,
+        width: int,
+        init: Union[Wire, Reg, Signal, int, list, LiteralValue] | None = None,
+        en: Union[Wire, Signal, int, LiteralValue] = 1,
+        stage: str | None = None,
+        signed: bool | None = None
+    ) -> Reg: ...
+    
     def out(
         self,
         name: str,
@@ -1031,15 +1079,9 @@ class Circuit(Module):
         if en_w.ty != Bits(1):
             raise TypeError(f"out() en must be i1, got {en_w.ty}")
 
-        if isinstance(init, LiteralValue):
-            lit_w, lit_signed = _coerce_literal_width(init, ctx_width=width, ctx_signed=init.signed)
-            init_w = Wire(self, super().const(int(init.value), width=lit_w), signed=lit_signed)
-        elif isinstance(init, int):
-            init_w: Union[Wire, Signal] = self.const(int(init), width=width)
-
         if init is None:
             init = 0
-        init = Wire.as_wire(init, m=self, width=width)
+        init_w = Wire.as_wire(init, m=self, width=width)
         if shape and is_bits_signal(init_w.sig):
             init_sig = cast(Signal[Bits], init_w.sig) 
             init_sig = super().v_broadcast(init_sig, size=shape[0])
@@ -1111,18 +1153,28 @@ class Circuit(Module):
         
         return self.reg(clk, rst, en_w, next_w, init_w)
 
-    def vec(self, *elems: Union[Wire, Reg]) -> Wire[Vector]:
+    def vec(self, *elems: Union[Wire[DT], Reg[DT], Sequence[Union[Wire[DT], Reg[DT]]]]) -> Wire[Vector[DT]]:
         """Build a vector Wire from scalar wires/regs (via ``pyc.v_create``).
-        Accepts both ``m.vec(w1, w2, w3)``.
+        Accepts both ``m.vec(w1, w2, w3)`` and ``m.vec([w1, w2, w3])``.
         """
+        if len(elems) == 1 and isinstance(elems[0], list):
+            elems = tuple(elems[0])
+        elif len(elems) == 1 and isinstance(elems[0], tuple):
+            raise TypeError("vec() expects list[Wire], got tuple")
+        elif any(isinstance(e, (list, tuple)) for e in elems):
+            raise TypeError("vec() expects list[Wire] as its sole sequence argument")
         if not elems:
             raise ValueError("vec() requires at least one element")
-        sigs: list[Signal] = [Signal.as_sig(e) for e in elems]
+        flat_elems = cast(tuple[Union[Wire, Reg], ...], elems)
+        sigs: list[Signal] = [Signal.as_sig(e) for e in flat_elems]
         for sig in sigs:
             if not sig.ty == sigs[0].ty:
                 raise TypeError(f"assert all types are same, but got {sig.ty} and {sigs[0].ty}")
         
-        return Wire(self, self.v_create(sigs))
+        signed_lanes = [(e.q if isinstance(e, Reg) else e).signed for e in flat_elems]
+        if any(signed != signed_lanes[0] for signed in signed_lanes[1:]):
+            raise TypeError("vec() requires uniform lane signedness")
+        return Wire(self, self.v_create(sigs), signed=signed_lanes[0])
 
     @overload
     def priority_mux(
@@ -2263,10 +2315,6 @@ def sext(value: Any, *, width: int) -> Wire:
 def trunc(value: Any, *, width: int) -> Wire:
     """Truncate a Wire/Reg using the canonical function-style API."""
     return _cast_value(value, width=int(width), op="trunc")
-
-def mux(*_args: Any, **_kwargs: Any) -> Wire:
-    raise TypeError("mux() was removed from pyCircuit; use `true_v if cond else false_v` in JIT-compiled design code")
-
 
 @overload
 def unsigned(v: Wire) -> Wire:

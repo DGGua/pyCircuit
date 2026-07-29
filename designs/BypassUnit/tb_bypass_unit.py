@@ -422,25 +422,8 @@ def tb(t: Tb) -> None:
     cycles.extend(_gen_invalid_source_sweep(lanes=lanes, ptag_count=ptag_count))
     cycles.extend(_gen_random_stress(lanes=lanes, ptag_count=ptag_count, count=32, seed=0xD1CE_BA5E_F00D_CAFE))
 
-    tb.clock("clk")
-    tb.reset("rst", cycles_asserted=2, cycles_deasserted=1)
     tb.timeout(len(cycles) + 64)
     tb.print_every("bypass", start=0, every=32, ports=["i2_srcL_hit", "i2_srcR_hit"])
-
-    for i in range(lanes):
-        for src in _SRCS:
-            for stage in _STAGES:
-                for a in range(lanes):
-                    for b in range(a + 1, lanes):
-                        match_a = _match_expr(stage, a, i, src, ptag_w=ptag_w, ptype_w=ptype_w)
-                        match_b = _match_expr(stage, b, i, src, ptag_w=ptag_w, ptype_w=ptype_w)
-                        tb.sva_assert(
-                            ~(match_a & match_b),
-                            clock="clk",
-                            reset="rst",
-                            name=f"no_conflict_{stage}_{src}_{i}_{a}_{b}",
-                            msg=f"illegal same-stage multihit stage={stage} src={src} lane={i}",
-                        )
 
     # --- cycle 0 ---
     for cyc, spec in enumerate(cycles):

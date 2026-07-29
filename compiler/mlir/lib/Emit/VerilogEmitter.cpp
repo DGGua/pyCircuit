@@ -1202,17 +1202,34 @@ static LogicalResult emitFunc(func::FuncOp f, raw_ostream &os, const VerilogEmit
     os << "// --- Sequential primitives\n";
     for (Operation *op : seqInstOps) {
       if (auto r = dyn_cast<pyc::RegOp>(op)) {
-        auto qTy = dyn_cast<IntegerType>(r.getQ().getType());
-        if (!qTy)
+        auto qTy = r.getQ().getType();
+        auto width = leafWidth(qTy);
+        if (!width)
           return r.emitError("verilog emitter only supports integer reg data type");
-        os << "pyc_reg #(.WIDTH(" << qTy.getWidth() << ")) " << nt.get(r.getQ()) << "_inst (\n";
-        os << "  .clk(" << nt.get(r.getClk()) << "),\n";
-        os << "  .rst(" << nt.get(r.getRst()) << "),\n";
-        os << "  .en(" << nt.get(r.getEn()) << "),\n";
-        os << "  .d(" << nt.get(r.getNext()) << "),\n";
-        os << "  .init(" << nt.get(r.getInit()) << "),\n";
-        os << "  .q(" << nt.get(r.getQ()) << ")\n";
-        os << ");\n";
+
+        auto emitReg = [&](llvm::StringRef suffix, llvm::StringRef instanceSuffix) {
+          os << "pyc_reg #(.WIDTH(" << *width << ")) " << nt.get(r.getQ()) << "_inst" << instanceSuffix << " (\n";
+          os << "  .clk(" << nt.get(r.getClk()) << "),\n";
+          os << "  .rst(" << nt.get(r.getRst()) << "),\n";
+          os << "  .en(" << nt.get(r.getEn()) << "),\n";
+          os << "  .d(" << nt.get(r.getNext()) << suffix << "),\n";
+          os << "  .init(" << nt.get(r.getInit()) << suffix << "),\n";
+          os << "  .q(" << nt.get(r.getQ()) << suffix << ")\n";
+          os << ");\n";
+        };
+
+        if (auto vt = dyn_cast<VectorType>(qTy)) {
+          SmallVector<int64_t> shape = vectorShape(vt);
+          walkVectorIndices(shape, [&](ArrayRef<int64_t> indices) {
+            std::string suffix = indexSuffix(indices);
+            std::string instanceSuffix;
+            for (int64_t index : indices)
+              instanceSuffix += "_" + std::to_string(index);
+            emitReg(suffix, instanceSuffix);
+          });
+        } else {
+          emitReg("", "");
+        }
         continue;
       }
       if (auto fifo = dyn_cast<pyc::FifoOp>(op)) {

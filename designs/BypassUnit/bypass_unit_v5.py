@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from compiler.frontend.pycircuit.data import Vector
 from pycircuit import (
     CycleAwareCircuit,
     CycleAwareDomain,
@@ -12,6 +11,7 @@ from pycircuit import (
     testbench,
     wire_of,
 )
+from pycircuit.data import Vector
 
 PTYPE_C = 0
 PTYPE_P = 1

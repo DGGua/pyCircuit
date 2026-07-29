@@ -2,10 +2,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from pycircuit import Circuit, Tb, compile, const, ct, function, module, mux, spec, testbench, u
+from pycircuit import Circuit, Tb, compile, const, ct, function, module, spec, testbench, u
+from pycircuit.v5 import mux
 
 
-@spec.valueclass
+@dataclass
 class IqCfg:
     entries: int
     ptag_count: int

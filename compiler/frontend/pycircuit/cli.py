@@ -118,10 +118,14 @@ def _collect_jit_params(build: Any, *, overrides: list[str]) -> dict[str, object
         raise SystemExit("build must use JIT entry semantics: `@module def build(m: Circuit, ...)`")
     value_param_names = set(value_params_of(build).keys())
 
+    # Cycle-aware entrypoints use ``build(m, domain, *, ...)``.  The domain is
+    # supplied by ``compile_cycle_aware`` rather than being a JIT parameter.
+    param_start = 2 if len(params) >= 2 and params[1].name == "domain" else 1
+
     # Collect JIT-time parameters from defaults.
     jit_params: dict[str, object] = {}
     missing: list[str] = []
-    for p in params[1:]:
+    for p in params[param_start:]:
         if p.name in value_param_names:
             continue
         if p.default is inspect._empty:
@@ -431,6 +435,11 @@ def _collect_build(mod: object, src: Path, args: argparse.Namespace) -> Module |
     jit_params = _collect_jit_params(build, overrides=list(getattr(args, "param", []) or []))
     top_name = _top_name_for_build(src, build)
     try:
+        params = list(inspect.signature(build).parameters.values())
+        if len(params) >= 2 and params[1].name == "domain":
+            from .v5 import compile_cycle_aware
+
+            return compile_cycle_aware(build, name=top_name, **jit_params)
         return compile(build, name=top_name, **jit_params)
     except (DesignError, JitError) as e:
         raise SystemExit(f"design compile failed: {e}") from e
@@ -1474,7 +1483,8 @@ def _render_tb_sv(iface: _TopIface, t: Tb, *, trace_plan: TracePlan | None = Non
     def decl(name: str, ty: str) -> str:
         info = _port_info(ty)
         # Match VerilogEmitter packed vector ports (flat bus), not unpacked arrays.
-        if w == info.total_width:
+        w = info.total_width
+        if w == 1:
             return f"  logic {name};\n"
         return f"  logic [{w - 1}:0] {name};\n"
 
@@ -2197,7 +2207,20 @@ def _cmd_build(args: argparse.Namespace) -> int:
 
     if not cache_hit:
         try:
-            design_obj = compile(build, name=top_name, **jit_params)
+            params = list(inspect.signature(build).parameters.values())
+            if len(params) >= 2 and params[1].name == "domain":
+                from .v5 import compile_cycle_aware
+
+                cycle_circuit = compile_cycle_aware(
+                    build,
+                    name=top_name,
+                    eager=True,
+                    hierarchical=True,
+                    **jit_params,
+                )
+                design_obj = getattr(cycle_circuit, "_v5_design", None)
+            else:
+                design_obj = compile(build, name=top_name, **jit_params)
         except (DesignError, JitError) as e:
             raise SystemExit(f"design compile failed: {e}") from e
         if not isinstance(design_obj, Design):

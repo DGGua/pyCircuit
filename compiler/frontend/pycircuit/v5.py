@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 import inspect
 import textwrap
 import threading
-from typing import Any, Callable, Generic, Iterable, Iterator, Mapping, TypeVar, Union
+from typing import Any, Callable, Generic, Iterable, Iterator, Mapping, TypeVar, Union, cast, overload
 
 from .data import DT, Bits, Data, Vector
 from .dsl import Signal
@@ -611,7 +611,7 @@ class ForwardSignal:
 
     # ── assignment operators ──────────────────────────────────────────
 
-    def __ilshift__(self, next_val: object) -> "ForwardSignal":
+    def __ilshift__(self, next_val: Union[Wire, CycleAwareSignal, StateSignal]) -> "ForwardSignal":
         """``signal <<= expr`` → unconditional register drive."""
         self._state.set(next_val)
         return self
@@ -640,56 +640,63 @@ class ForwardSignal:
         return str(self._state._cas._w)
 
     # ── arithmetic / logic operators (forward to inner CAS) ──────────
+    def as_cas(self) -> "CycleAwareSignal":
+        """Read the register at the domain's current logical cycle."""
+        return CycleAwareSignal(
+            self._state.domain,
+            self._state._cas._w,
+            self._state.domain.cycle_index,
+        )
 
     def __add__(self, other: object) -> "CycleAwareSignal":
-        return self._state._cas.__add__(other)
+        return self.as_cas().__add__(other)
 
     def __radd__(self, other: object) -> "CycleAwareSignal":
-        return self._state._cas.__radd__(other)
+        return self.as_cas().__radd__(other)
 
     def __sub__(self, other: object) -> "CycleAwareSignal":
-        return self._state._cas.__sub__(other)
+        return self.as_cas().__sub__(other)
 
     def __mul__(self, other: object) -> "CycleAwareSignal":
-        return self._state._cas.__mul__(other)
+        return self.as_cas().__mul__(other)
 
     def __and__(self, other: object) -> "CycleAwareSignal":
-        return self._state._cas.__and__(other)
+        return self.as_cas().__and__(other)
 
     def __or__(self, other: object) -> "CycleAwareSignal":
         if isinstance(other, str):
-            return self._state._cas
-        return self._state._cas.__or__(other)
+            return self.as_cas()
+        return self.as_cas().__or__(other)
 
     def __xor__(self, other: object) -> "CycleAwareSignal":
-        return self._state._cas.__xor__(other)
+        return self.as_cas().__xor__(other)
 
     def __invert__(self) -> "CycleAwareSignal":
-        return self._state._cas.__invert__()
+        return self.as_cas().__invert__()
 
     def __eq__(self, other: object) -> "CycleAwareSignal":  # type: ignore[override]
-        return self._state._cas.__eq__(other)
+        return self.as_cas().__eq__(other)
 
     def __ne__(self, other: object) -> "CycleAwareSignal":  # type: ignore[override]
-        return self._state._cas.__ne__(other)
+        return self.as_cas().__ne__(other)
 
     def __lt__(self, other: object) -> "CycleAwareSignal":
-        return self._state._cas.__lt__(other)
+        return self.as_cas().__lt__(other)
 
     def __gt__(self, other: object) -> "CycleAwareSignal":
-        return self._state._cas.__gt__(other)
+        return self.as_cas().__gt__(other)
 
     def __le__(self, other: object) -> "CycleAwareSignal":
-        return self._state._cas.__le__(other)
+        return self.as_cas().__le__(other)
 
     def __ge__(self, other: object) -> "CycleAwareSignal":
-        return self._state._cas.__ge__(other)
+        return self.as_cas().__ge__(other)
 
     def __getitem__(self, idx: int | slice) -> "CycleAwareSignal":
-        return self._state._cas.__getitem__(idx)
+        return self.as_cas().__getitem__(idx)
 
     def __getattr__(self, name: str) -> object:
-        return getattr(self._state._cas, name)
+        return getattr(self.as_cas(), name)
 
     def __repr__(self) -> str:
         return f"ForwardSignal({self._state._cas._w}, cycle={self._state.cycle})"
@@ -1058,22 +1065,45 @@ def _promote_pair(m: Circuit, a: Wire, b: Wire) -> tuple[Wire, Wire]:
     return a, b
 
 
+@overload
+def mux(cond: Wire, a: Union[Wire, int], b: Union[Wire, int]) -> Wire: ...
+
+
+@overload
+def mux(cond: Union[CycleAwareSignal, StateSignal, ForwardSignal], a: Union[Wire, int, CycleAwareSignal, StateSignal, ForwardSignal], b: Union[Wire, int, CycleAwareSignal, StateSignal, ForwardSignal]) -> CycleAwareSignal: ...
+
+
+@overload
+def mux(cond: Wire, a: Union[CycleAwareSignal, StateSignal, ForwardSignal], b: Union[Wire, int, CycleAwareSignal, StateSignal, ForwardSignal]) -> CycleAwareSignal: ...
+
+
+@overload
+def mux(cond: Wire, a: Union[Wire, int, CycleAwareSignal, StateSignal, ForwardSignal], b: Union[CycleAwareSignal, StateSignal, ForwardSignal]) -> CycleAwareSignal: ...
+
+
 def mux(
     cond: Union[Wire, CycleAwareSignal, StateSignal, ForwardSignal],
     a: Union[Wire, CycleAwareSignal, StateSignal, ForwardSignal, int],
     b: Union[Wire, CycleAwareSignal, StateSignal, ForwardSignal, int],
-) -> CycleAwareSignal:
+) -> Wire | CycleAwareSignal:
     def _unwrap(v: Union[Wire, CycleAwareSignal, StateSignal, ForwardSignal]) -> Union[Wire, CycleAwareSignal]:
         if isinstance(v, ForwardSignal):
             return v._state._cas
         if isinstance(v, StateSignal):
             return v._cas
         return v
-    return _mux_cycle_aware(
-        _unwrap(cond),
-        a if isinstance(a, int) else _unwrap(a),
-        b if isinstance(b, int) else _unwrap(b),
-    )
+    raw_cond = _unwrap(cond)
+    raw_a = a if isinstance(a, int) else _unwrap(a)
+    raw_b = b if isinstance(b, int) else _unwrap(b)
+    if not any(isinstance(value, CycleAwareSignal) for value in (raw_cond, raw_a, raw_b)):
+        raw_cond = cast(Wire, raw_cond)
+        if raw_cond.width != 1:
+            raise TypeError(f"mux() condition must be i1, got {raw_cond.ty}")
+        return raw_cond._select_internal(
+            cast(Wire | int, raw_a),
+            cast(Wire | int, raw_b),
+        )
+    return _mux_cycle_aware(raw_cond, raw_a, raw_b)
 
 
 def _mux_cycle_aware(
@@ -1122,7 +1152,21 @@ def _mux_cycle_aware(
     return CycleAwareSignal(dom, out_w, mx)
 
 
-def cas(domain: CycleAwareDomain, w: Wire, *, cycle: int | None = None) -> CycleAwareSignal:
+def cas(
+    domain: CycleAwareDomain,
+    w: Wire | Reg | int | LiteralValue,
+    *,
+    cycle: int | None = None,
+) -> CycleAwareSignal:
+    if isinstance(w, Reg):
+        w = w.q
+    elif isinstance(w, LiteralValue):
+        width = w.width if w.width is not None else infer_literal_width(int(w.value), signed=bool(w.signed))
+        w = domain._m.const(int(w.value), width=int(width), signed=bool(w.signed))
+    elif isinstance(w, int):
+        w = domain._m.const(w, width=max(1, infer_literal_width(w, signed=w < 0)), signed=w < 0)
+    if not isinstance(w, Wire):
+        raise TypeError(f"cas() expects Wire, Reg, int, or LiteralValue; got {type(w).__name__}")
     c = domain.cycle_index if cycle is None else int(cycle)
     return CycleAwareSignal(domain, w, c)
 

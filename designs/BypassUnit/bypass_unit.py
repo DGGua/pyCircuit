@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from typing import cast
 
-from compiler.frontend.pycircuit.data import Vector
 from pycircuit import (
     Circuit,
     Tb,
@@ -13,6 +12,7 @@ from pycircuit import (
     testbench,
 )
 from pycircuit.data import Bits, Data, Vector
+from pycircuit.v5 import mux
 
 PTYPE_C = 0
 PTYPE_P = 1

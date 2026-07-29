@@ -437,7 +437,16 @@ def compile_module(spec: dict[str, Any], *, small: bool, out_dir: Path) -> Path:
         sys.path.insert(0, str(XS_ROOT))
     spec_mod.loader.exec_module(mod)
 
-    build_fn = getattr(mod, fn_name)
+    # XiangShan design sources expose their cycle-aware builders using their
+    # module names (for example, ``alu``), while the registry historically
+    # recorded the obsolete ``build_alu`` spelling. Prefer an explicitly
+    # exported registry name, but retain the module-name fallback so the
+    # registry can compile both naming conventions during the migration.
+    build_fn = getattr(mod, fn_name, None)
+    if build_fn is None and fn_name.startswith("build_"):
+        build_fn = getattr(mod, fn_name.removeprefix("build_"), None)
+    if build_fn is None or not callable(build_fn):
+        raise RuntimeError(f"{file_path} does not export a callable {fn_name!r}")
     from pycircuit import compile_cycle_aware
 
     params_json = json.dumps(kwargs, sort_keys=True, separators=(",", ":"))

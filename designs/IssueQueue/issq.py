@@ -3,8 +3,9 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 from typing import Any
-from compiler.frontend.pycircuit.data import Vector
 from pycircuit import Circuit, CycleAwareCircuit, CycleAwareDomain, compile_cycle_aware, function, u, Wire
+from pycircuit.data import Bits, Data, Vector
+from pycircuit.hw import Reg
 
 _THIS_DIR = Path(__file__).resolve().parent
 if str(_THIS_DIR) not in sys.path:
@@ -21,37 +22,30 @@ from issq_config import (  # noqa: E402
 
 
 @function
-def _snapshot_entries(m: Circuit, entry_state: list, entries: int) -> list[dict[str, Any]]:
-    _ = m
-    cur: list[dict[str, Any]] = []
-    for i in range(int(entries)):
-        s = entry_state[i]
-        cur.append(
-            {
-                "valid": s["valid"].read(),
-                "src0_valid": s["uop.src0.valid"].read(),
-                "src0_ptag": s["uop.src0.ptag"].read(),
-                "src0_ready": s["uop.src0.ready"].read(),
-                "src1_valid": s["uop.src1.valid"].read(),
-                "src1_ptag": s["uop.src1.ptag"].read(),
-                "src1_ready": s["uop.src1.ready"].read(),
-                "dst_valid": s["uop.dst.valid"].read(),
-                "dst_ptag": s["uop.dst.ptag"].read(),
-                "dst_ready": s["uop.dst.ready"].read(),
-                "payload": s["uop.payload"].read(),
-            }
-        )
+def _snapshot_entries(m: Circuit, entry_state: list, entries: int) :
+    cur: dict[str, Wire[Vector[Bits]]] = {}
+    cur["valid"] = m.vec([entry_state[i]["valid"].read() for i in range(entries)])
+    cur["src0.valid"] = m.vec([entry_state[i]["uop.src0.valid"].read() for i in range(entries)])
+    cur["src0.ptag"] = m.vec([entry_state[i]["uop.src0.ptag"].read() for i in range(entries)])
+    cur["src0.ready"] = m.vec([entry_state[i]["uop.src0.ready"].read() for i in range(entries)])
+    cur["src1.valid"] = m.vec([entry_state[i]["uop.src1.valid"].read() for i in range(entries)])
+    cur["src1.ptag"] = m.vec([entry_state[i]["uop.src1.ptag"].read() for i in range(entries)])
+    cur["src1.ready"] = m.vec([entry_state[i]["uop.src1.ready"].read() for i in range(entries)])
+    cur["dst.valid"] = m.vec([entry_state[i]["uop.dst.valid"].read() for i in range(entries)])
+    cur["dst.ptag"] = m.vec([entry_state[i]["uop.dst.ptag"].read() for i in range(entries)])
+    cur["dst.ready"] = m.vec([entry_state[i]["uop.dst.ready"].read() for i in range(entries)])
+    cur["payload"] = m.vec([entry_state[i]["uop.payload"].read() for i in range(entries)])
     return cur
 
 
 @function
-def _ready_lookup_vec(m: Circuit, ready_v: Wire[Vector], ptag_wire: Wire[Vector], ptag_w: int, ptag_count: int):
+def _ready_lookup_vec(m: Circuit, ready_v: Wire[Vector], ptag_wire: Wire[Bits], ptag_w: int, ptag_count: int):
     tags = m.vec([m.const(t, width=int(ptag_w)) for t in range(int(ptag_count))])
     return ((tags == ptag_wire) & ready_v).reduce_or()
 
 
 @function
-def _wake_hit_vec(m: Circuit, wake_valid_v: Wire[Vector], wake_ptag_v: Wire[Vector], ptag_wire: Wire[Vector]):
+def _wake_hit_vec(m: Circuit, wake_valid_v: Wire[Vector], wake_ptag_v: Wire[Vector], ptag_wire: Wire[Bits]):
     _ = m
     return (wake_valid_v & (wake_ptag_v == ptag_wire)).reduce_or()
 
@@ -67,28 +61,30 @@ def _alloc_field_vec(m: Circuit, enq_uops: list, alloc_lane: list[Wire[Vector]],
 def _select_oldest_ready_vec(
     m: Circuit,
     *,
-    fields: dict[str],
+    fields: dict[str, Wire],
     age_v: Wire,
     entries: int,
     issue_ports: int,
-) -> tuple[list[Wire], list]:
+):
     _ = m
     entry_ready = fields["valid"] & fields["src0.ready"] & fields["src1.ready"]
 
     issue_sel: list[Wire] = []
-    issue_valid = [u(1, 0) for _ in range(int(issue_ports))]
+    issue_valid = []
     remaining = entry_ready
     for k in range(int(issue_ports)):
         oldest = []
         for i in range(int(entries)):
+            # age_v[j][i] is set when live entry j is older than candidate i.
+            older_than_i = m.vec([age_v[j][i] for j in range(int(entries))])
             older_exists = (remaining & older_than_i).reduce_or()
             oldest.append(remaining[i] & _not1(m, older_exists))
-        oldest_v = m.vec(*oldest)
+        oldest_v = m.vec(oldest)
         issue_sel.append(oldest_v)
-        issue_valid[k] = oldest_v.reduce_or()
+        issue_valid.append(oldest_v.reduce_or())
         remaining = remaining & ~oldest_v
 
-    issue_win = m.vec(*issue_sel).reduce_or(dim=0)
+    issue_win = m.vec(issue_sel).reduce_or(dim=0)
     keep_valid = fields["valid"] & ~issue_win
     return entry_ready, issue_sel, issue_valid, issue_win, keep_valid
 
@@ -101,7 +97,7 @@ def _allocate_enqueue_lanes_vec(
     keep_valid: Wire,
     entries: int,
     enq_ports: int,
-) -> tuple[list[Wire], list]:
+):
     free_avail = ~keep_valid
     alloc_lane: list[Wire] = []
     enq_ready = []
@@ -134,7 +130,7 @@ def _emit_issue_ports_vec(
     uop_spec,
     issue_sel: list[Wire],
     issue_valid: list,
-    fields: dict[str],
+    fields: dict[str, Wire[Vector[Bits]]],
     ptag_width: int,
     payload_width: int,
     issue_ports: int,
@@ -143,16 +139,16 @@ def _emit_issue_ports_vec(
     for k in range(int(issue_ports)):
         sel = issue_sel[k]
         vals = {
-            "src0.valid": sel.priority_mux(fields["src0.valid"], zero=u(1, 0), assume_onehot=True),
-            "src0.ptag": sel.priority_mux(fields["src0.ptag"], zero=u(int(ptag_width), 0), assume_onehot=True),
-            "src0.ready": sel.priority_mux(fields["src0.ready"], zero=u(1, 0), assume_onehot=True),
-            "src1.valid": sel.priority_mux(fields["src1.valid"], zero=u(1, 0), assume_onehot=True),
-            "src1.ptag": sel.priority_mux(fields["src1.ptag"], zero=u(int(ptag_width), 0), assume_onehot=True),
-            "src1.ready": sel.priority_mux(fields["src1.ready"], zero=u(1, 0), assume_onehot=True),
-            "dst.valid": sel.priority_mux(fields["dst.valid"], zero=u(1, 0), assume_onehot=True),
-            "dst.ptag": sel.priority_mux(fields["dst.ptag"], zero=u(int(ptag_width), 0), assume_onehot=True),
-            "dst.ready": sel.priority_mux(fields["dst.ready"], zero=u(1, 0), assume_onehot=True),
-            "payload": sel.priority_mux(fields["payload"], zero=u(int(payload_width), 0), assume_onehot=True),
+            "src0.valid": m.priority_mux(sel, fields["src0.valid"], default=m.const(0, width=1)),
+            "src0.ptag": m.priority_mux(sel, fields["src0.ptag"], default=m.const(0, width=int(ptag_width))),
+            "src0.ready": m.priority_mux(sel, fields["src0.ready"], default=m.const(0, width=1)),
+            "src1.valid": m.priority_mux(sel, fields["src1.valid"], default=m.const(0, width=1)),
+            "src1.ptag": m.priority_mux(sel, fields["src1.ptag"], default=m.const(0, width=int(ptag_width))),
+            "src1.ready": m.priority_mux(sel, fields["src1.ready"], default=m.const(0, width=1)),
+            "dst.valid": m.priority_mux(sel, fields["dst.valid"], default=m.const(0, width=1)),
+            "dst.ptag": m.priority_mux(sel, fields["dst.ptag"], default=m.const(0, width=int(ptag_width))),
+            "dst.ready": m.priority_mux(sel, fields["dst.ready"], default=m.const(0, width=1)),
+            "payload": m.priority_mux(sel, fields["payload"], default=m.const(0, width=int(payload_width))),
         }
         issue_uops.append(vals)
         m.output(f"iss{k}_valid", issue_valid[k])
@@ -161,7 +157,7 @@ def _emit_issue_ports_vec(
 
 
 @function
-def _issue_wake_vectors_vec(m: Circuit, issue_valid: list, issue_uops: list[dict[str, Any]], issue_ports: int) -> tuple[Wire]:
+def _issue_wake_vectors_vec(m: Circuit, issue_valid: list, issue_uops: list[dict[str, Any]], issue_ports: int):
     _ = m
     wake_valid = m.vec([issue_valid[k] & issue_uops[k]["dst.valid"] for k in range(int(issue_ports))])
     wake_ptag = m.vec([issue_uops[k]["dst.ptag"] for k in range(int(issue_ports))])
@@ -173,7 +169,7 @@ def _write_entry_next_state_vec(
     m: Circuit,
     *,
     entry_state: list,
-    fields: dict[str],
+    fields: dict[str, Wire[Vector[Bits]]],
     enq_uops: list,
     alloc_lane: list[Wire],
     keep_valid: Wire,
@@ -263,7 +259,7 @@ def _write_entry_next_state_vec(
 def _update_age_state_vec(
     m: Circuit,
     *,
-    age_state: list[list[Any]],
+    age_state: Reg[Vector[Vector]],
     age_v: Wire,
     keep_valid: Wire,
     new_alloc: Wire,
@@ -272,16 +268,20 @@ def _update_age_state_vec(
     entries: int,
     enq_ports: int,
 ) -> None:
+    next: list[Wire[Vector[Bits]]] = []
     for i in range(int(entries)):
+        next_line: list[Wire[Bits]] = []
         for j in range(int(entries)):
             if i == j:
-                age_state[i][j].set(u(1, 0))
+                next_line.append(Wire.as_wire(u(1, 0), m=m))
             else:
                 keep_keep = keep_valid[i] & keep_valid[j] & age_v[i][j]
                 keep_new = keep_valid[i] & new_alloc[j]
                 new_new = new_alloc[i] & new_alloc[j] & _lane_lt(m, alloc_lane, i, j, int(enq_ports))
                 rel = keep_keep | keep_new | new_new
-                age_state[i][j].set(next_valid[i] & next_valid[j] & rel)
+                next_line.append(next_valid[i] & next_valid[j] & rel)
+        next.append(m.vec(next_line))
+    age_state.set(m.vec(next))
 
 
 @function
@@ -295,7 +295,7 @@ def _update_ready_table_vec(
     ptag_width: int,
 ) -> None:
     for t in range(int(ptag_count)):
-        wake_t = _wake_hit_vec(m, wake_valid_v, wake_ptag_v, u(int(ptag_width), t))
+        wake_t = _wake_hit_vec(m, wake_valid_v, wake_ptag_v, m.const(t, width=ptag_width))
         ready_state[t].set(ready_state[t].out() | wake_t)
 
 
@@ -303,7 +303,7 @@ def _update_ready_table_vec(
 def _emit_debug_and_ready_vec(
     m: Circuit,
     *,
-    fields: dict[str],
+    fields: dict[str, Wire[Vector[Bits]]],
     enq_ready: list,
     issue_valid: list,
     issued_total_q,
@@ -366,7 +366,7 @@ def build(
         for i in range(e)
     ]
 
-    age_state = m.out("age", domain=cd, width=1, init=u(1, 0), shape=(e, e))
+    age_state: Reg[Vector[Vector[Bits]]] = m.out("age", domain=cd, width=1, init=u(1, 0), shape=[e, e])
 
     ready_state = [
         m.out(
@@ -381,21 +381,8 @@ def build(
 
     issued_total_q = m.out("issued_total_q", domain=cd, width=issued_total_w, init=u(issued_total_w, 0))
 
-    cur = _snapshot_entries(m, entry_state, e)
-    fields = {
-        "valid": m.vec([cur[i]["valid"] for i in range(e)]),
-        "src0.valid": m.vec([cur[i]["src0_valid"] for i in range(e)]),
-        "src0.ptag": m.vec([cur[i]["src0_ptag"] for i in range(e)]),
-        "src0.ready": m.vec([cur[i]["src0_ready"] for i in range(e)]),
-        "src1.valid": m.vec([cur[i]["src1_valid"] for i in range(e)]),
-        "src1.ptag": m.vec([cur[i]["src1_ptag"] for i in range(e)]),
-        "src1.ready": m.vec([cur[i]["src1_ready"] for i in range(e)]),
-        "dst.valid": m.vec([cur[i]["dst_valid"] for i in range(e)]),
-        "dst.ptag": m.vec([cur[i]["dst_ptag"] for i in range(e)]),
-        "dst.ready": m.vec([cur[i]["dst_ready"] for i in range(e)]),
-        "payload": m.vec([cur[i]["payload"] for i in range(e)]),
-    }
-    age_v = m.vec([m.vec([age_state[i][j].out() for j in range(e)]) for i in range(e)])
+    fields = _snapshot_entries(m, entry_state, e)
+    age_v = age_state.out()
 
     _entry_ready, issue_sel, issue_valid, _issue_win, keep_valid = _select_oldest_ready_vec(
         m,

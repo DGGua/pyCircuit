@@ -3,13 +3,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 import re
-from typing import Any, Callable, Generic, TypeGuard, Union, overload
+from typing import TYPE_CHECKING, Any, Callable, Generic, TypeGuard, Union, overload
 
-from pycircuit import Connector, Wire
-
-from compiler.frontend.pycircuit.hw import Reg
-
+from .connectors import Connector
 from .data import Bits, Clock, DT, Data, Reset, Vector
+
+if TYPE_CHECKING:
+    from .hw import Module, Reg, Wire
 
 _IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
@@ -32,6 +32,7 @@ class Signal(Generic[DT]):
     
     @classmethod
     def as_sig(cls, v: Union[Connector, Wire, Reg, Signal]) -> Signal:
+        from .hw import Reg, Wire
         if isinstance(v, Connector):
             v = v.read().sig
         if isinstance(v, Reg):
@@ -313,6 +314,9 @@ class Module:
     
     @overload
     def extract(self, a: Signal[Vector], *, lsb: int, width: int) -> Signal[Vector]: ...
+    
+    @overload
+    def extract(self, a: Signal[Data], *, lsb: int, width: int) -> Signal[Data]: ...
     
     def extract(self, a: Signal, *, lsb: int, width: int) -> Signal:
         if lsb < 0:

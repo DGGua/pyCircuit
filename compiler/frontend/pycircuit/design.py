@@ -165,14 +165,26 @@ def function(
     return deco(_fn)
 
 
-def const(_fn: Any | None = None, *, name: str | None = None) -> Callable[[Any], Any] | Any:
+@overload
+def const(_fn: Callable[P, R], *, name: str | None = None) -> Callable[P, R]: ...
+
+
+@overload
+def const(
+    _fn: None = None, *, name: str | None = None
+) -> Callable[[Callable[P, R]], Callable[P, R]]: ...
+
+
+def const(
+    _fn: Callable[P, R] | None = None, *, name: str | None = None
+) -> Callable[P, R] | Callable[[Callable[P, R]], Callable[P, R]]:
     """Mark a function as compile-time metaprogramming logic.
 
     `@const` calls execute in Python during JIT and must be pure: they may not
     emit IR or mutate module interfaces.
     """
 
-    def deco(fn: Any) -> Any:
+    def deco(fn: Callable[P, R]) -> Callable[P, R]:
         if isinstance(name, str) and name.strip():
             setattr(fn, "__pycircuit_module_name__", str(name).strip())
         setattr(fn, "__pycircuit_kind__", "const")

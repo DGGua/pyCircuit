@@ -1228,7 +1228,7 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
 		    unsigned w = bitWidth(f.getResultTypes()[i]);
 		    if (w == 0)
 		      return f.emitError("invalid output port width for ProbeRegistry: ") << getPortCanonicalFieldPath(f, i, /*isResult=*/true);
-		    if (outIsReg[i]) {
+		    if (outIsReg[i] && !isa<VectorType>(f.getResultTypes()[i])) {
 		      os << "    reg.addReg<" << w << ">(reg_path(" << cppStringLiteral(outCanon[i]) << "), &" << outNames[i]
 		         << ", &" << nt.get(outRegQ[i]) << "_inst->pending, &" << nt.get(outRegQ[i]) << "_inst->qNext);\n";
 		    } else {
@@ -1236,7 +1236,7 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
 		    }
 		  }
       for (const auto &named : namedProbes) {
-        if (named.isReg) {
+        if (named.isReg && !isa<VectorType>(named.type)) {
           os << "    reg.addReg<" << named.width << ">(reg_path(" << cppStringLiteral(named.fieldPath) << "), &"
              << named.cppValue << ", &" << named.cppRegInst << "->pending, &" << named.cppRegInst << "->qNext);\n";
         } else {
@@ -1290,7 +1290,10 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
 	    unsigned w = bitWidth(r.getQ().getType());
 	    if (w == 0)
 	      return r.emitError("invalid reg width");
-    os << "  pyc::cpp::pyc_reg<" << w << "> *" << nt.get(r.getQ()) << "_inst = nullptr;\n";
+    if (isa<VectorType>(r.getQ().getType()))
+      os << "  pyc::cpp::pyc_vec_reg<" << cppType(r.getQ().getType()) << "> *" << nt.get(r.getQ()) << "_inst = nullptr;\n";
+    else
+      os << "  pyc::cpp::pyc_reg<" << w << "> *" << nt.get(r.getQ()) << "_inst = nullptr;\n";
   }
   for (auto fifo : fifos) {
     unsigned w = bitWidth(fifo.getOutData().getType());
@@ -1569,9 +1572,13 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
     unsigned w = bitWidth(r.getQ().getType());
     if (w == 0)
       return r.emitError("invalid reg width");
-    os << "    " << nt.get(r.getQ()) << "_inst = new pyc::cpp::pyc_reg<" << w << ">("
-       << nt.get(r.getClk()) << ", " << nt.get(r.getRst()) << ", " << nt.get(r.getEn()) << ", " << nt.get(r.getNext())
-       << ", " << nt.get(r.getInit()) << ", " << nt.get(r.getQ()) << ");\n";
+    if (isa<VectorType>(r.getQ().getType()))
+      os << "    " << nt.get(r.getQ()) << "_inst = new pyc::cpp::pyc_vec_reg<"
+         << cppType(r.getQ().getType()) << ">(";
+    else
+      os << "    " << nt.get(r.getQ()) << "_inst = new pyc::cpp::pyc_reg<" << w << ">(";
+    os << nt.get(r.getClk()) << ", " << nt.get(r.getRst()) << ", " << nt.get(r.getEn()) << ", "
+       << nt.get(r.getNext()) << ", " << nt.get(r.getInit()) << ", " << nt.get(r.getQ()) << ");\n";
   }
   for (auto mem : syncMems) {
     auto addrTy = dyn_cast<IntegerType>(mem.getRaddr().getType());

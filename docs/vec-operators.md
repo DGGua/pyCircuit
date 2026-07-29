@@ -22,7 +22,7 @@
 | 位运算 | `&`、`\|`、`^`、`~` | 逐元素 Vector |  |
 | 比较 | `==`、`!=`、`<`、`>`、`<=`、`>=` | 叶宽为 1 的 Vector | |
 | 显式比较 | `.ult()`、`.ugt()`、`.ule()`、`.uge()`、`.slt()` | 叶宽为 1 的 Vector |  |
-| 条件选择 | `a if cond else b`、`cond.select(a, b)` | 逐元素或广播后的 Vector | 
+| 条件选择 | `a if cond else b`、`mux(cond, a, b)` | 逐元素或广播后的 Vector | 
 | 优先级选择 | `m.priority_mux(sels, vals, ...)` | `vals[i]` 类型 | `sels` 是一维 `Vector<Nxi1>`；最小索引优先 |
 | 左移 | `a << n`、`.shl(amount=...)` | 逐元素 Vector | 移位量可为常量或 `Wire` |
 | 右移 | `a >> n`、`.lshr()`、`.ashr()` | 逐元素 Vector | 移位量可为常量或 `Wire`；`>>` 按 signed 属性选择右移类型 |
@@ -147,7 +147,7 @@ out = a if cond else b
 选择；标量分支会自动广播到 Vector 形状。也可以显式使用：
 
 ```python
-out = cond.select(a, b)
+out = mux(cond, a, b)
 ```
 
 Vec 条件与 Vec 分支、Vec 条件与标量分支的选择路径均有端到端 C++ 回归
@@ -208,9 +208,9 @@ signed_wide = sext(a, width=16)
 - `sext` 以符号扩展。
 - 对 Vector 时逐元素转换，形状保持不变。
 - 推荐使用函数式 API；JIT API contract 不接受方法式
-  `a.zext(...)`、`a.sext(...)`、`a.trunc(...)`。
+  `width inference and slicing`。
 
-可用 `.as_signed()` / `.as_unsigned()` 标记后续的除法、比较和右移语义；
+可用 `signed-intent annotations` 标记后续的除法、比较和右移语义；
 它们不改变位宽或比特模式。
 
 ## 归约
