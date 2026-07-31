@@ -142,6 +142,13 @@ jobs:
           name: pyc-toolchain-linux
           path: .pycircuit_out/toolchain/install
 
+      # Artifact zip round-trip drops execute bits; restore them before invoking pycc.
+      - name: Restore toolchain execute bits
+        shell: bash
+        run: |
+          set -euxo pipefail
+          chmod +x .pycircuit_out/toolchain/install/bin/*
+
       - name: Run G1 gates (examples + semantic regressions)
         id: g1
         shell: bash
@@ -202,6 +209,13 @@ jobs:
         with:
           name: pyc-toolchain-linux
           path: .pycircuit_out/toolchain/install
+
+      # Artifact zip round-trip drops execute bits; restore them before invoking pycc.
+      - name: Restore toolchain execute bits
+        shell: bash
+        run: |
+          set -euxo pipefail
+          chmod +x .pycircuit_out/toolchain/install/bin/*
 
       - name: Run G2 gates (run_sims)
         id: g2
