@@ -62,8 +62,9 @@ def build(m: CycleAwareCircuit, domain: CycleAwareDomain, *, N_PORTS: int = 4, V
 
     for j in range(N_PORTS):
         rr_cur = rr_states[j]
-        wrap = rr_cur == u(PORT_BITS, N_PORTS - 1)
-        next_rr = mux(wrap, u(PORT_BITS, 0), rr_cur + 1)
+        # Constants after next() need cycle=0 cas to avoid unintended _v5_bal.
+        wrap = rr_cur == cas(domain, u(PORT_BITS, N_PORTS - 1), cycle=0)
+        next_rr = mux(wrap, cas(domain, u(PORT_BITS, 0), cycle=0), rr_cur + 1)
         rr_states[j].assign(next_rr, when=cas(domain, out_vals[j], cycle=0))
 
     for j in range(N_PORTS):

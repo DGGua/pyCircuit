@@ -49,7 +49,7 @@ For decision-complete closure, run strict mode:
 - CI sets `PYC_GATE_RUN_ID=${{ github.run_id }}-${{ github.run_attempt }}` (nightly prefix: `nightly-...`).
 - Gate logs are uploaded as Actions artifacts: `gate-logs-g1-*` / `gate-logs-g2-*` (7 days), `gate-logs-g3-*` (14 days).
 - Job Summary matrix is produced by `flows/tools/summarize_gate_run.py`.
-- macOS toolchain job is **not** required on ordinary PRs; it runs on `main`/`develop` push, `workflow_dispatch`, or PR label `ci-macos`.
+- macOS toolchain job is **not** required on ordinary PRs; it lives in `.github/workflows/ci-macos.yml` and runs on `main`/`develop` push, `workflow_dispatch`, or PR label `ci-macos` (separate from Linux `CI` so labeling does not skip required G1/G2).
 
 ## Notes
 

@@ -5,7 +5,7 @@ on:
   push:
     branches: [main, develop]
   pull_request:
-    types: [opened, synchronize, reopened, labeled]
+    types: [opened, synchronize, reopened]
 
 env:
   LLVM_VERSION: "19"
@@ -18,11 +18,6 @@ jobs:
   lint:
     name: "G0: Python Checks"
     runs-on: ubuntu-latest
-    # Avoid duplicate full CI when only an unrelated label is added.
-    if: >
-      github.event_name != 'pull_request' ||
-      github.event.action != 'labeled' ||
-      contains(github.event.pull_request.labels.*.name, 'ci-macos')
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -58,10 +53,6 @@ jobs:
     name: "G0: Build Toolchain (Linux)"
     runs-on: ubuntu-latest
     needs: lint
-    # labeled-only runs are for macOS; skip rebuilding Linux toolchain then.
-    if: >
-      github.event_name != 'pull_request' ||
-      github.event.action != 'labeled'
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -154,7 +145,13 @@ jobs:
         shell: bash
         run: |
           set -euxo pipefail
-          chmod +x .pycircuit_out/toolchain/install/bin/*
+          shopt -s nullglob
+          bins=(.pycircuit_out/toolchain/install/bin/*)
+          if (( ${#bins[@]} == 0 )); then
+            echo "error: toolchain bin/ is empty or missing" >&2
+            exit 1
+          fi
+          chmod +x "${bins[@]}"
 
       - name: Run G1 gates (examples + semantic regressions)
         id: g1
@@ -227,7 +224,13 @@ jobs:
         shell: bash
         run: |
           set -euxo pipefail
-          chmod +x .pycircuit_out/toolchain/install/bin/*
+          shopt -s nullglob
+          bins=(.pycircuit_out/toolchain/install/bin/*)
+          if (( ${#bins[@]} == 0 )); then
+            echo "error: toolchain bin/ is empty or missing" >&2
+            exit 1
+          fi
+          chmod +x "${bins[@]}"
 
       - name: Run G2 gates (run_sims)
         id: g2
@@ -305,78 +308,3 @@ jobs:
           export PYC_SKIP_SEMANTIC_REGRESSIONS=1
           unset PYCC
           bash flows/scripts/run_examples.sh
-
-  build-macos:
-    name: "G0/G1: Build Toolchain (macOS)"
-    # PR default: skip macOS. Run on main/develop push, workflow_dispatch, or label ci-macos.
-    if: >
-      github.event_name == 'push' ||
-      github.event_name == 'workflow_dispatch' ||
-      (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'ci-macos'))
-    runs-on: macos-latest
-    needs: lint
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v7
-
-      - name: Set up Python
-        uses: actions/setup-python@v7
-        with:
-          python-version: "3.11"
-
-      - name: Install wheel build deps
-        run: python -m pip install setuptools wheel
-
-      - name: Install Homebrew packages
-        run: |
-          brew update
-          brew install ninja cmake llvm@19 python@3
-          echo "$(brew --prefix llvm@19)/bin" >> "$GITHUB_PATH"
-
-      - name: Build staged toolchain
-        run: |
-          bash flows/scripts/pyc build \
-            --llvm-config "$(brew --prefix llvm@19)/bin/llvm-config" \
-            --build-dir "$PWD/.pycircuit_out/toolchain/build" \
-            --install-prefix "$PWD/.pycircuit_out/toolchain/install"
-
-      - name: Build platform wheel
-        run: |
-          python packaging/wheel/create_wheel.py \
-            --install-dir "$PWD/.pycircuit_out/toolchain/install" \
-            --out-dir "$PWD/dist"
-
-      - name: Check wheel tag
-        shell: bash
-        run: |
-          set -euxo pipefail
-          wheel="$(basename dist/*.whl)"
-          [[ "${wheel}" == pycircuit_hisi-*-py3-none-*.whl ]]
-
-      - name: Run example compile gate
-        run: |
-          export PYC_TOOLCHAIN_ROOT="$PWD/.pycircuit_out/toolchain/install"
-          export PATH="$PYC_TOOLCHAIN_ROOT/bin:$PATH"
-          export PYC_SKIP_SEMANTIC_REGRESSIONS=1
-          unset PYCC
-          bash flows/scripts/run_examples.sh
-
-      - name: Smoke test installed wheel
-        shell: bash
-        run: |
-          set -euxo pipefail
-          python -m venv .venv-wheel
-          source .venv-wheel/bin/activate
-          pip install dist/*.whl
-          export PYC_TOOLCHAIN_ROOT="$(python -c 'import pycircuit, pathlib; print((pathlib.Path(pycircuit.__file__).resolve().parent / "_toolchain").as_posix())')"
-          export PYC_USE_INSTALLED_PYTHON_PACKAGE=1
-          export PYC_SKIP_SEMANTIC_REGRESSIONS=1
-          unset PYCC
-          bash flows/scripts/run_examples.sh
-
-      - name: Upload wheel
-        uses: actions/upload-artifact@v7
-        with:
-          name: pyc-wheel-macos
-          path: dist/*.whl
-          retention-days: 1

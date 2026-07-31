@@ -62,6 +62,8 @@ jobs:
 
       - name: Run Linx CPU C++ smoke (G3)
         id: linx_cpp
+        # Still attempt Linx when sims fail so the matrix reports real status, not skip→fail.
+        if: always() && steps.sims_nightly.outcome != 'cancelled'
         shell: bash
         run: |
           set -euxo pipefail
@@ -84,14 +86,16 @@ jobs:
         shell: bash
         run: |
           set -euxo pipefail
-          sims_status="pass"
-          linx_status="pass"
-          if [[ "${{ steps.sims_nightly.outcome }}" != "success" ]]; then
-            sims_status="fail"
-          fi
-          if [[ "${{ steps.linx_cpp.outcome }}" != "success" ]]; then
-            linx_status="fail"
-          fi
+          map_outcome() {
+            case "$1" in
+              success) echo pass ;;
+              failure) echo fail ;;
+              skipped|cancelled) echo skip ;;
+              *) echo unknown ;;
+            esac
+          }
+          sims_status="$(map_outcome "${{ steps.sims_nightly.outcome }}")"
+          linx_status="$(map_outcome "${{ steps.linx_cpp.outcome }}")"
           python3 flows/tools/summarize_gate_run.py \
             --run-id "${PYC_GATE_RUN_ID}" \
             --row "run_sims_nightly:G3:${sims_status}" \
