@@ -35,28 +35,36 @@ def _status_from_json(path: Path) -> tuple[str, str]:
     note = str(data.get("note") or "")
     if "results" in data and isinstance(data["results"], dict):
         # Aggregate matrix-style summary.json used by closure runs.
-        parts = []
-        for name, info in data["results"].items():
-            if isinstance(info, dict):
-                parts.append(f"{name}={info.get('status', 'unknown')}")
+        results = data["results"]
+        if not results:
+            # Empty matrix must not collapse to an unconditional pass.
+            status = "unknown"
+            note = note or "empty results"
+        else:
+            parts = []
+            for name, info in results.items():
+                if isinstance(info, dict):
+                    parts.append(f"{name}={info.get('status', 'unknown')}")
+                else:
+                    parts.append(f"{name}={info}")
+            note = "; ".join(parts)
+            if any(
+                isinstance(info, dict) and str(info.get("status", "")).startswith("fail")
+                for info in results.values()
+            ):
+                status = "fail"
+            elif any(
+                isinstance(info, dict) and "partial" in str(info.get("status", ""))
+                for info in results.values()
+            ):
+                status = "partial"
+            elif all(
+                isinstance(info, dict) and str(info.get("status", "")) == "pass"
+                for info in results.values()
+            ):
+                status = "pass"
             else:
-                parts.append(f"{name}={info}")
-        note = "; ".join(parts)
-        if any(
-            isinstance(info, dict) and str(info.get("status", "")).startswith("fail")
-            for info in data["results"].values()
-        ):
-            status = "fail"
-        elif any(
-            isinstance(info, dict) and "partial" in str(info.get("status", ""))
-            for info in data["results"].values()
-        ):
-            status = "partial"
-        elif all(
-            isinstance(info, dict) and str(info.get("status", "")) == "pass"
-            for info in data["results"].values()
-        ):
-            status = "pass"
+                status = "unknown"
     return status, note
 
 
@@ -104,7 +112,11 @@ def collect_rows(
         seen.add(gate)
 
     for gate, level, status, note in extra_rows:
+        # Prefer file-derived rows (richer notes); skip CLI duplicates.
+        if gate in seen:
+            continue
         rows.append((gate, level, status, note))
+        seen.add(gate)
 
     return rows
 

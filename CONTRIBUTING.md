@@ -114,7 +114,7 @@ mypy .
 | `G1: Examples + Semantic Gates` | G1 | `run_examples.sh` (no semantic skip) |
 | `G2: Cross-backend Sims` | G2 | `run_sims.sh` (merge blocker; timeout = fail) |
 | `G0: Wheel Smoke` | G0 | installed-wheel smoke (semantic skip OK) |
-| macOS toolchain | optional | only with label `ci-macos`, or on `main`/`develop` |
+| macOS toolchain (`CI (macOS)` workflow) | optional | only with label `ci-macos`, or on `main`/`develop` |
 
 Nightly G3 (`gates-nightly.yml`): `run_sims_nightly.sh` + Linx CPU C++ smoke.
 
