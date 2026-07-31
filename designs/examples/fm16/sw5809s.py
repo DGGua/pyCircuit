@@ -8,6 +8,7 @@ from pycircuit import (
     cas,
     compile_cycle_aware,
     mux,
+    u,
 )
 
 PKT_W = 32
@@ -32,7 +33,7 @@ def build(m: CycleAwareCircuit, domain: CycleAwareDomain, *, N_PORTS: int = 4, V
     for i in range(N_PORTS):
         pkt_dst = in_pkts[i][24:28][0:PORT_BITS]
         for j in range(N_PORTS):
-            dst_match = (pkt_dst == m.const(j, width=PORT_BITS)) & in_vals[i]
+            dst_match = (pkt_dst == u(PORT_BITS, j)) & in_vals[i]
             voqs[i][j].push(in_pkts[i], when=dst_match)
 
     rr_states = [domain.signal(width=PORT_BITS, reset_value=0, name=f"rr_{j}") for j in range(N_PORTS)]
@@ -43,11 +44,11 @@ def build(m: CycleAwareCircuit, domain: CycleAwareDomain, *, N_PORTS: int = 4, V
     for j in range(N_PORTS):
         peeks = []
         for i in range(N_PORTS):
-            peek = voqs[i][j].pop(when=m.const(0, width=1))
+            peek = voqs[i][j].pop(when=u(1, 0))
             peeks.append(peek)
 
-        sel_pkt = m.const(0, width=PKT_W)
-        sel_val = m.const(0, width=1)
+        sel_pkt = u(PKT_W, 0)
+        sel_val = u(1, 0)
 
         for i in range(N_PORTS):
             has_data = peeks[i].valid
@@ -61,8 +62,8 @@ def build(m: CycleAwareCircuit, domain: CycleAwareDomain, *, N_PORTS: int = 4, V
 
     for j in range(N_PORTS):
         rr_cur = rr_states[j]
-        wrap = rr_cur == cas(domain, m.const(N_PORTS - 1, width=PORT_BITS), cycle=0)
-        next_rr = mux(wrap, cas(domain, m.const(0, width=PORT_BITS), cycle=0), rr_cur + 1)
+        wrap = rr_cur == u(PORT_BITS, N_PORTS - 1)
+        next_rr = mux(wrap, u(PORT_BITS, 0), rr_cur + 1)
         rr_states[j].assign(next_rr, when=cas(domain, out_vals[j], cycle=0))
 
     for j in range(N_PORTS):
