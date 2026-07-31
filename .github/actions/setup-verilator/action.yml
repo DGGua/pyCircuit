@@ -41,11 +41,8 @@ runs:
         fi
         [[ -x "${root}/bin/verilator" ]]
         echo "${root}/bin" >> "${GITHUB_PATH}"
-        if [[ -d "${root}/share/verilator" ]]; then
-          echo "VERILATOR_ROOT=${root}/share/verilator" >> "${GITHUB_ENV}"
-        elif [[ -d "${root}" ]]; then
-          echo "VERILATOR_ROOT=${root}" >> "${GITHUB_ENV}"
-        fi
+        # Prebuilt kit root contains bin/ + include/ (not share/verilator).
+        echo "VERILATOR_ROOT=${root}" >> "${GITHUB_ENV}"
         # Match veryl-lang/setup-verilator helper deps on Ubuntu 22.04.
         if [[ "${image}" == "ubuntu-22.04" ]]; then
           sudo apt-get update
