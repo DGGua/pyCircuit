@@ -10,10 +10,47 @@ inputs:
 runs:
   using: composite
   steps:
+    # Pure bash install (no Node action) so CI stays off deprecated Node.js 20 actions.
     - name: Install Verilator package
-      uses: veryl-lang/setup-verilator@v1
-      with:
-        version: ${{ inputs.version }}
+      shell: bash
+      env:
+        VERILATOR_VERSION: ${{ inputs.version }}
+      run: |
+        set -euxo pipefail
+        . /etc/os-release
+        case "${ID}-${VERSION_ID}" in
+          ubuntu-24.04) image="ubuntu-24.04" ;;
+          ubuntu-22.04) image="ubuntu-22.04" ;;
+          *)
+            echo "unsupported runner image for prebuilt Verilator: ${ID}-${VERSION_ID}" >&2
+            exit 1
+            ;;
+        esac
+        ver="${VERILATOR_VERSION#v}"
+        url="https://github.com/veryl-lang/verilator-package/releases/download/v${ver}/verilator-${image}.zip"
+        dest="${RUNNER_TEMP}/verilator-${ver}"
+        rm -rf "${dest}"
+        mkdir -p "${dest}"
+        curl -fsSL "${url}" -o "${RUNNER_TEMP}/verilator.zip"
+        unzip -o -q "${RUNNER_TEMP}/verilator.zip" -d "${dest}"
+        # Package layout is either dest/bin or dest/<single-dir>/bin.
+        if [[ -d "${dest}/bin" ]]; then
+          root="${dest}"
+        else
+          root="$(find "${dest}" -mindepth 1 -maxdepth 1 -type d | head -n 1)"
+        fi
+        [[ -x "${root}/bin/verilator" ]]
+        echo "${root}/bin" >> "${GITHUB_PATH}"
+        if [[ -d "${root}/share/verilator" ]]; then
+          echo "VERILATOR_ROOT=${root}/share/verilator" >> "${GITHUB_ENV}"
+        elif [[ -d "${root}" ]]; then
+          echo "VERILATOR_ROOT=${root}" >> "${GITHUB_ENV}"
+        fi
+        # Match veryl-lang/setup-verilator helper deps on Ubuntu 22.04.
+        if [[ "${image}" == "ubuntu-22.04" ]]; then
+          sudo apt-get update
+          sudo apt-get install -y ccache mold
+        fi
 
     - name: Verify Verilator
       shell: bash
