@@ -76,6 +76,7 @@ def build(m: CycleAwareCircuit, domain: CycleAwareDomain, clk_freq: int = 50_000
     hr_n_tick = mux(tick_run, hr_next_run, hour)
 
     mode_next = mux(mode == mode_set_sec_2, mode_run_2, mode + one2)
+    blink_next = mux(tick_1hz, ~blink, blink)
 
     hour_p = mux(btn_plus & is_set_hour, mux(hour == twenty_three5, zero5, hour + one5), hr_n_tick)
     min_p = mux(btn_plus & is_set_min, mux(minute == fifty_nine6, zero6, minute + one6), min_n_tick)
@@ -98,7 +99,7 @@ def build(m: CycleAwareCircuit, domain: CycleAwareDomain, clk_freq: int = 50_000
     minute <<= min_n
     hour <<= hour_n
     mode.assign(mode_next, when=btn_set)
-    blink.assign(~blink, when=tick_1hz)
+    blink <<= blink_next
 
 
 build.__pycircuit_name__ = "digital_clock"
