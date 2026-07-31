@@ -8,6 +8,7 @@ on:
 
 env:
   LLVM_VERSION: "19"
+  VERILATOR_VERSION: "5.048"
   CMAKE_BUILD_TYPE: Release
   PYC_GATE_RUN_ID: nightly-${{ github.run_id }}-${{ github.run_attempt }}
 
@@ -29,12 +30,17 @@ jobs:
         run: |
           set -euxo pipefail
           sudo apt-get update
-          sudo apt-get install -y wget gnupg software-properties-common cmake ninja-build clang verilator iverilog
+          sudo apt-get install -y wget gnupg software-properties-common cmake ninja-build clang iverilog
           wget https://apt.llvm.org/llvm.sh
           chmod +x llvm.sh
           sudo ./llvm.sh ${LLVM_VERSION}
           sudo apt-get install -y llvm-${LLVM_VERSION}-dev mlir-${LLVM_VERSION}-tools libmlir-${LLVM_VERSION}-dev
           echo "/usr/lib/llvm-${LLVM_VERSION}/bin" >> "$GITHUB_PATH"
+
+      - name: Setup Verilator
+        uses: ./.github/actions/setup-verilator
+        with:
+          version: ${{ env.VERILATOR_VERSION }}
 
       - name: Build staged toolchain
         run: |
