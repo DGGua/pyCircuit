@@ -1067,8 +1067,9 @@ def counter(m: CycleAwareCircuit, domain: CycleAwareDomain):
     enable = cas(domain, m.input("enable", width=1), cycle=0)
     count = domain.signal(width=8, reset_value=0, name="count")
     m.output("count", wire_of(count))
+    count_next = mux(enable, count + 1, count)
     domain.next()
-    count <<= mux(enable, count + 1, count)
+    count <<= count_next
 
 counter.__pycircuit_name__ = "counter"
 
