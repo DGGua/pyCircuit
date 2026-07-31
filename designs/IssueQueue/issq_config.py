@@ -2,7 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from pycircuit import Circuit, Tb, compile, const, ct, function, module, spec, testbench, u
+from pycircuit import Circuit, Tb, compile, const, ct, function, module, mux, spec, testbench, u
+from pycircuit.literals import LiteralValue
 
 
 @spec.valueclass
@@ -96,7 +97,7 @@ def _onehot_mux(m: Circuit, sel: list, vals: list, width: int):
     _ = m
     out = u(int(width), 0)
     for s, v in zip(sel, vals):
-        out = v if s else out
+        out = mux(s, v, out)
     return out
 
 
@@ -107,13 +108,21 @@ def _count_ones(m: Circuit, bits: list, width: int):
     one = u(int(width), 1)
     zero = u(int(width), 0)
     for b in bits:
-        out = out + (one if b else zero)
+        out = out + mux(b, one, zero)
     return out
 
 
 @function
 def _not1(m: Circuit, x):
     _ = m
+    # Eager V5 can keep free-list scan state as LiteralValue; fold constants
+    # because LiteralValue does not implement bitwise operators.
+    if isinstance(x, LiteralValue):
+        w = int(x.width) if x.width is not None else 1
+        mask = (1 << w) - 1
+        return u(w, (~int(x.value)) & mask)
+    if isinstance(x, int):
+        return u(1, 1 ^ (int(x) & 1))
     return u(1, 1) ^ x
 
 
@@ -146,8 +155,8 @@ def _alloc_field(m: Circuit, enq_uops: list, alloc_lane: list, slot: int, path: 
 def _slot_select(m: Circuit, keep_bit, new_bit, keep_val, new_val, width: int):
     _ = m
     zero = u(int(width), 0)
-    keep_or_zero = keep_val if keep_bit else zero
-    return new_val if new_bit else keep_or_zero
+    keep_or_zero = mux(keep_bit, keep_val, zero)
+    return mux(new_bit, new_val, keep_or_zero)
 
 
 @function
