@@ -25,10 +25,10 @@ jobs:
       contains(github.event.pull_request.labels.*.name, 'ci-macos')
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: "3.11"
 
@@ -64,10 +64,10 @@ jobs:
       github.event.action != 'labeled'
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: "3.11"
 
@@ -106,14 +106,14 @@ jobs:
           [[ "${wheel}" == pycircuit_hisi-*-py3-none-*.whl ]]
 
       - name: Upload toolchain
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: pyc-toolchain-linux
           path: .pycircuit_out/toolchain/install/
           retention-days: 1
 
       - name: Upload wheel
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: pyc-wheel-linux
           path: dist/*.whl
@@ -126,10 +126,10 @@ jobs:
     timeout-minutes: 90
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: "3.11"
 
@@ -144,7 +144,7 @@ jobs:
           version: ${{ env.VERILATOR_VERSION }}
 
       - name: Download toolchain
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: pyc-toolchain-linux
           path: .pycircuit_out/toolchain/install
@@ -185,7 +185,7 @@ jobs:
 
       - name: Upload gate logs
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: gate-logs-g1-${{ env.PYC_GATE_RUN_ID }}
           path: docs/gates/logs/${{ env.PYC_GATE_RUN_ID }}/
@@ -199,10 +199,10 @@ jobs:
     timeout-minutes: 120
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: "3.11"
 
@@ -217,7 +217,7 @@ jobs:
           version: ${{ env.VERILATOR_VERSION }}
 
       - name: Download toolchain
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: pyc-toolchain-linux
           path: .pycircuit_out/toolchain/install
@@ -256,7 +256,7 @@ jobs:
 
       - name: Upload gate logs
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: gate-logs-g2-${{ env.PYC_GATE_RUN_ID }}
           path: docs/gates/logs/${{ env.PYC_GATE_RUN_ID }}/
@@ -269,10 +269,10 @@ jobs:
     needs: build-linux
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: "3.11"
 
@@ -287,7 +287,7 @@ jobs:
           version: ${{ env.VERILATOR_VERSION }}
 
       - name: Download wheel
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: pyc-wheel-linux
           path: dist
@@ -317,10 +317,10 @@ jobs:
     needs: lint
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: "3.11"
 
@@ -375,7 +375,7 @@ jobs:
           bash flows/scripts/run_examples.sh
 
       - name: Upload wheel
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: pyc-wheel-macos
           path: dist/*.whl

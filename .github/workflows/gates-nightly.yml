@@ -19,10 +19,10 @@ jobs:
     timeout-minutes: 240
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: "3.11"
 
@@ -100,7 +100,7 @@ jobs:
 
       - name: Upload gate logs
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: gate-logs-g3-${{ env.PYC_GATE_RUN_ID }}
           path: docs/gates/logs/${{ env.PYC_GATE_RUN_ID }}/
