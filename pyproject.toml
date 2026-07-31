@@ -27,17 +27,16 @@ classifiers = [
     "Topic :: Software Development :: Code Generators",
     "Topic :: Electronic Design Automation (EDA)",
 ]
+dependencies = [
+    "click>=8.0.0",
+    "pyyaml>=6.0",
+]
 
 [project.urls]
 Homepage = "https://github.com/LinxISA/pyCircuit"
 Repository = "https://github.com/LinxISA/pyCircuit"
 Issues = "https://github.com/LinxISA/pyCircuit/issues"
 Releases = "https://github.com/LinxISA/pyCircuit/releases"
-
-dependencies = [
-    "click>=8.0.0",
-    "pyyaml>=6.0",
-]
 
 [project.optional-dependencies]
 dev = [
