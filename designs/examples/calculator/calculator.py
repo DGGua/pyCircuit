@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pycircuit import (
+    u,
     CycleAwareCircuit,
     CycleAwareDomain,
     cas,
@@ -27,25 +28,25 @@ def build(m: CycleAwareCircuit, domain: CycleAwareDomain) -> None:
     key = cas(domain, m.input("key", width=5), cycle=0)
     key_press = cas(domain, m.input("key_press", width=1), cycle=0)
 
-    U5_9 = cas(domain, m.const(9, width=5), cycle=0)
-    U64_0 = cas(domain, m.const(0, width=64), cycle=0)
-    U64_1 = cas(domain, m.const(1, width=64), cycle=0)
-    U64_10 = cas(domain, m.const(10, width=64), cycle=0)
-    U1_0 = cas(domain, m.const(0, width=1), cycle=0)
-    U1_1 = cas(domain, m.const(1, width=1), cycle=0)
+    U5_9 = u(5, 9)
+    U64_0 = u(64, 0)
+    U64_1 = u(64, 1)
+    U64_10 = u(64, 10)
+    U1_0 = u(1, 0)
+    U1_1 = u(1, 1)
 
-    K_ADD = cas(domain, m.const(KEY_ADD, width=5), cycle=0)
-    K_SUB = cas(domain, m.const(KEY_SUB, width=5), cycle=0)
-    K_MUL = cas(domain, m.const(KEY_MUL, width=5), cycle=0)
-    K_DIV = cas(domain, m.const(KEY_DIV, width=5), cycle=0)
-    K_EQ = cas(domain, m.const(KEY_EQ, width=5), cycle=0)
-    K_AC = cas(domain, m.const(KEY_AC, width=5), cycle=0)
+    K_ADD = u(5, KEY_ADD)
+    K_SUB = u(5, KEY_SUB)
+    K_MUL = u(5, KEY_MUL)
+    K_DIV = u(5, KEY_DIV)
+    K_EQ = u(5, KEY_EQ)
+    K_AC = u(5, KEY_AC)
 
-    OP_ADD_CAS = cas(domain, m.const(OP_ADD, width=2), cycle=0)
-    OP_SUB_CAS = cas(domain, m.const(OP_SUB, width=2), cycle=0)
-    OP_MUL_CAS = cas(domain, m.const(OP_MUL, width=2), cycle=0)
-    OP_DIV_CAS = cas(domain, m.const(OP_DIV, width=2), cycle=0)
-    ZERO_OP = cas(domain, m.const(0, width=2), cycle=0)
+    OP_ADD_CAS = u(2, OP_ADD)
+    OP_SUB_CAS = u(2, OP_SUB)
+    OP_MUL_CAS = u(2, OP_MUL)
+    OP_DIV_CAS = u(2, OP_DIV)
+    ZERO_OP = u(2, 0)
 
     lhs = domain.signal(width=64, reset_value=0, name="lhs")
     rhs = domain.signal(width=64, reset_value=0, name="rhs")
@@ -54,7 +55,8 @@ def build(m: CycleAwareCircuit, domain: CycleAwareDomain) -> None:
     display = domain.signal(width=64, reset_value=0, name="display_r")
 
     digit_lo = unsigned(wire_of(key[0:4]))
-    digit = cas(domain, digit_lo.zext(width=64), cycle=0)
+    # Widen 4-bit digit to 64 via literal add (avoids removed .zext helper).
+    digit = cas(domain, digit_lo, cycle=0) + u(64, 0)
 
     is_digit = key_press & (key <= U5_9)
     is_add = key_press & (key == K_ADD)

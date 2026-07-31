@@ -7,6 +7,7 @@ Implements:
 from __future__ import annotations
 
 from pycircuit import (
+    u,
     CycleAwareCircuit,
     CycleAwareDomain,
     cas,
@@ -32,14 +33,13 @@ def build(m: CycleAwareCircuit, domain: CycleAwareDomain, *,
     delay_states = [domain.signal(width=DATA_W, reset_value=0, name=f"delay_{i}") for i in range(1, TAPS)]
 
     taps_wire = [wire_of(x_in)] + [wire_of(st) for st in delay_states]
+    coeffs = [u(ACC_W, cv) for cv in COEFFS]
 
-    coeff_wires = [m.const(cv, width=ACC_W) for cv in COEFFS]
-
-    acc_w = m.const(0, width=ACC_W)
+    acc_w = None
     for i in range(TAPS):
         tap_ext = taps_wire[i].as_signed()._sext(width=ACC_W)
-        product = tap_ext * coeff_wires[i]
-        acc_w = acc_w + product
+        product = tap_ext * coeffs[i]
+        acc_w = product if acc_w is None else acc_w + product
 
     y_comb = cas(domain, acc_w[0:ACC_W], cycle=0)
 

@@ -18,7 +18,6 @@ FRONTEND_CONTRACT = "pycircuit"
 _REMOVED_CALL_HINTS: dict[str, str] = {
     "eq": "use `lhs == rhs`",
     "lt": "use `lhs < rhs`",
-    "mux": "use `true_val if cond else false_val`",
     "cond": "use Python control flow (`if` / `a if cond else b`)",
     "select": "use `true_val if cond else false_val`",
     "trunc": "remove explicit cast and use slicing only when required",
@@ -141,12 +140,15 @@ TEXT_RULES: tuple[TextRule, ...] = (
         message="removed method-style wire API",
         hint="use operators/slicing/inference (`==`, `<`, `a if c else b`, slicing) instead",
     ),
-    TextRule(
-        code="PYC416",
-        pattern=_rx(r"\b(?:mux|cond)\s*\("),
-        message="removed helper API",
-        hint="use Python control flow and ternary expressions",
-    ),
+    # PYC416 (ban on mux/cond) intentionally omitted:
+    # eager=True / V5 cycle-aware authoring still requires mux(); JIT prefers
+    # `a if c else b`, but both styles coexist so hygiene must not forbid mux(.
+    # TextRule(
+    #     code="PYC416",
+    #     pattern=_rx(r"\b(?:mux|cond)\s*\("),
+    #     message="removed helper API",
+    #     hint="use Python control flow and ternary expressions",
+    # ),
     TextRule(
         code="PYC417",
         pattern=_rx(r"\bm\.const\s*\("),

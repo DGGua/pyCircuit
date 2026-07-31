@@ -1013,7 +1013,27 @@ def _mux_cycle_aware(
     return CycleAwareSignal(dom, out_w, mx)
 
 
-def cas(domain: CycleAwareDomain, w: Wire, *, cycle: int | None = None) -> CycleAwareSignal:
+def cas(
+    domain: CycleAwareDomain,
+    w: Union[Wire, Reg, LiteralValue, int],
+    *,
+    cycle: int | None = None,
+) -> CycleAwareSignal:
+    """Wrap a value as :class:`CycleAwareSignal` at ``cycle`` (default: domain cursor).
+
+    Accepts ``Wire``/``Reg``, or literals (``u(width, value)`` / ``int``) which are
+    lowered through ``m.const`` internally so call sites need not write ``m.const(...)``.
+    """
+    m = domain._m
+    if isinstance(w, Reg):
+        w = w.q
+    elif isinstance(w, LiteralValue):
+        lw = w.width if w.width is not None else infer_literal_width(int(w.value), signed=bool(w.signed))
+        w = m.const(int(w.value), width=int(lw))
+    elif isinstance(w, int):
+        w = m.const(int(w), width=max(1, infer_literal_width(int(w), signed=int(w) < 0)))
+    elif not isinstance(w, Wire):
+        raise TypeError(f"cas() expected Wire/Reg/LiteralValue/int, got {type(w).__name__}")
     c = domain.cycle_index if cycle is None else int(cycle)
     return CycleAwareSignal(domain, w, c)
 
