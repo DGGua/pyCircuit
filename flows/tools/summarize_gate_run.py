@@ -200,6 +200,15 @@ def main() -> int:
 
     if args.require_pass:
         bad = {"fail", "partial", "partial-timeout", "unknown"}
+        if not rows:
+            # Empty collected set means gate outputs are missing (wrong run-id
+            # or empty log root); treat as failure so the gate is not vacuous.
+            print(
+                f"error: --require-pass set but no gate rows collected "
+                f"(check run-id/log-root under {log_dir.as_posix()})",
+                file=sys.stderr,
+            )
+            return 1
         if any(status in bad for _, _, status, _ in rows):
             return 1
     return 0

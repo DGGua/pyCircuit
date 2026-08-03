@@ -11,14 +11,11 @@ RULES = [
 
 def build(m: CycleAwareCircuit, domain: CycleAwareDomain) -> None:
     insn = cas(domain, m.input("insn", width=8), cycle=0)
-    insn_w = wire_of(insn)
-    op = u(4, 0)
-    ln = u(3, 0)
+    op = cas(domain, u(4, 0), cycle=0)
+    ln = cas(domain, u(3, 0), cycle=0)
 
     for r in RULES:
-        mask = u(8, r["mask"])
-        match = u(8, r["match"])
-        hit = (insn_w & mask) == match
+        hit = (insn & u(8, r["mask"])) == u(8, r["match"])
         op = mux(hit, u(4, r["op"]), op)
         ln = mux(hit, u(3, r["len"]), ln)
 

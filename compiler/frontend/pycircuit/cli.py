@@ -183,7 +183,7 @@ def _compile_to_design(build: Any, *, top_name: str, jit_params: dict[str, objec
     if _is_cycle_aware_entrypoint(build):
         from .v5 import _make_compiled_module, compile_cycle_aware
 
-        circuit = compile_cycle_aware(build, name=top_name, eager=True, **jit_params)
+        circuit = compile_cycle_aware(build, name=top_name, eager=True, hierarchical=True, **jit_params)
         existing = getattr(circuit, "_v5_design", None)
         if isinstance(existing, Design):
             return existing
