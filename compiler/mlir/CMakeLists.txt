@@ -89,6 +89,7 @@ add_library(pyc_transforms
   lib/Transforms/LowerSCFToPYCStaticPass.cpp
   lib/Transforms/PrunePortsPass.cpp
   lib/Transforms/SLPPackWiresPass.cpp
+  lib/Transforms/VectorUnrollPass.cpp
 )
 llvm_update_compile_flags(pyc_transforms)
 target_include_directories(pyc_transforms PUBLIC
@@ -162,6 +163,7 @@ target_link_libraries(pycc PRIVATE
 
 # Install binaries for packaging / reuse.
 set(PYC_INSTALL_TARGETS pycc)
+
 if(PYC_OPT_BUILT)
   list(APPEND PYC_INSTALL_TARGETS pyc-opt)
 endif()

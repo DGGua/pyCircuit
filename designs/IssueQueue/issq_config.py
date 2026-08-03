@@ -2,11 +2,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from pycircuit import Circuit, Tb, compile, const, ct, function, module, mux, spec, testbench, u
-from pycircuit.literals import LiteralValue
+from pycircuit import Circuit, Tb, compile, const, ct, function, module, spec, testbench, u
+from pycircuit.v5 import mux
 
 
-@spec.valueclass
+@dataclass
 class IqCfg:
     entries: int
     ptag_count: int
@@ -94,8 +94,7 @@ def _entry_spec(m: Circuit, cfg: IqCfg):
 
 @function
 def _onehot_mux(m: Circuit, sel: list, vals: list, width: int):
-    _ = m
-    out = u(int(width), 0)
+    out = m.const(0, width=int(width))
     for s, v in zip(sel, vals):
         out = mux(s, v, out)
     return out
@@ -103,10 +102,9 @@ def _onehot_mux(m: Circuit, sel: list, vals: list, width: int):
 
 @function
 def _count_ones(m: Circuit, bits: list, width: int):
-    _ = m
-    out = u(int(width), 0)
-    one = u(int(width), 1)
-    zero = u(int(width), 0)
+    out = m.const(0, width=int(width))
+    one = m.const(1, width=int(width))
+    zero = m.const(0, width=int(width))
     for b in bits:
         out = out + mux(b, one, zero)
     return out
@@ -114,16 +112,7 @@ def _count_ones(m: Circuit, bits: list, width: int):
 
 @function
 def _not1(m: Circuit, x):
-    _ = m
-    # Eager V5 can keep free-list scan state as LiteralValue; fold constants
-    # because LiteralValue does not implement bitwise operators.
-    if isinstance(x, LiteralValue):
-        w = int(x.width) if x.width is not None else 1
-        mask = (1 << w) - 1
-        return u(w, (~int(x.value)) & mask)
-    if isinstance(x, int):
-        return u(1, 1 ^ (int(x) & 1))
-    return u(1, 1) ^ x
+    return m.const(1, width=1) ^ x
 
 
 @function
@@ -153,8 +142,7 @@ def _alloc_field(m: Circuit, enq_uops: list, alloc_lane: list, slot: int, path: 
 
 @function
 def _slot_select(m: Circuit, keep_bit, new_bit, keep_val, new_val, width: int):
-    _ = m
-    zero = u(int(width), 0)
+    zero = m.const(0, width=int(width))
     keep_or_zero = mux(keep_bit, keep_val, zero)
     return mux(new_bit, new_val, keep_or_zero)
 

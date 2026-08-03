@@ -875,10 +875,10 @@ module attributes {pyc.top = @top, pyc.frontend.contract = "pycircuit"} {
     %c2 = pyc.constant 37 : i8
     %c3 = pyc.constant 240 : i8
     %c4 = pyc.constant 85 : i8
-    %t0 = pyc.add %x, %c1 : i8
-    %t1 = pyc.xor %t0, %c2 : i8
-    %t2 = pyc.and %t1, %c3 : i8
-    %t3 = pyc.or %t2, %c4 : i8
+    %t0 = pyc.add %x, %c1 : i8, i8 -> i8
+    %t1 = pyc.xor %t0, %c2 : i8, i8 -> i8
+    %t2 = pyc.and %t1, %c3 : i8, i8 -> i8
+    %t3 = pyc.or %t2, %c4 : i8, i8 -> i8
     return %t3 : i8
   }
 
