@@ -7,6 +7,7 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Func/Extensions/InlinerExtension.h"
+#include "mlir/IR/AsmState.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/BuiltinOps.h"
@@ -2093,6 +2094,7 @@ int main(int argc, char **argv) {
   }
   sm.AddNewSourceBuffer(std::move(*fileOrErr), llvm::SMLoc());
 
+  SourceMgrDiagnosticHandler handler(sm, &ctx);
   OwningOpRef<ModuleOp> module = parseSourceFile<ModuleOp>(sm, &ctx);
   if (!module) {
     llvm::errs() << "error: failed to parse MLIR\n";

@@ -2,7 +2,7 @@
 
 **版本：6.0**
 
-本教程通过一系列由浅入深的完整示例，教你用 PyCircuit V6 设计数字电路：从一个计数器开始，逐步覆盖流水线、层次化组合、向量（SIMD）、Record 结构化总线、测试台编写与完整的构建/仿真流程。
+本教程通过一系列由浅入深的完整示例，教你用 PyCircuit V6 设计数字电路：从一个计数器开始，逐步覆盖流水线、层次化组合、向量（SIMD）、测试台编写与完整的构建/仿真流程。
 
 **配套文档**：
 - 语言定义 → `docs/v6_PyCircuit_Specification.md`
@@ -20,11 +20,10 @@
 5. [编写测试台](#第-5-章编写测试台)
 6. [标准模块模板与双模运行](#第-6-章标准模块模板与双模运行)
 7. [层次化组合：搭一个小 CPU](#第-7-章层次化组合搭一个小-cpu)
-8. [向量（Vec）与 SIMD 设计](#第-8-章向量vec与-simd-设计)
-9. [Record：结构化总线](#第-9-章record结构化总线)
-10. [存储与 FIFO](#第-10-章存储与-fifo)
-11. [从 Python 到 Verilog：完整构建流程](#第-11-章从-python-到-verilog完整构建流程)
-12. [大型项目组织与调试](#第-12-章大型项目组织与调试)
+8. [数据类型体系（`Data` / `Wire[DT]`）与向量 SIMD](#第-8-章数据类型体系data--wiredt-与向量-simd)
+9. [存储与 FIFO](#第-9-章存储与-fifo)
+10. [从 Python 到 Verilog：完整构建流程](#第-10-章从-python-到-verilog完整构建流程)
+11. [大型项目组织与调试](#第-11-章大型项目组织与调试)
 
 ---
 
@@ -435,25 +434,64 @@ mlir = circ.emit_mlir()
 
 ---
 
-## 第 8 章：向量（Vec）与 SIMD 设计
+## 第 8 章：数据类型体系（`Data` / `Wire[DT]`）与向量 SIMD
 
-当逻辑天然是「N 份同构 lane」时（旁路网络、唤醒逻辑、免维护的比较矩阵……），用 `Vec` 一次表达整组，代替手写 `for` 循环拼标量。
+前面所有例子用的都是标量 `Wire`（如 `m.input("x", width=8)`）。本章系统介绍 PyCircuit 的整个**数据类型体系**：`Data` 类型层级有哪几种、`Wire[DT]` 如何用泛型参数 `DT` 统一承载它们，以及其中「向量」这一支如何用于 SIMD 设计。
 
-### 8.1 向量端口与逐 lane 运算
+### 8.1 类型体系总览
+
+PyCircuit 的硬件对象建立在两个正交概念上：
+
+- **数据类型 `Data`**（`pycircuit.data`）：描述信号承载的「值的形状」——标量位宽、向量维度、时钟/复位语义；
+- **信号句柄 `Wire[DT]`**：描述信号在电路图里的「身份」。`DT` 是泛型参数，绑定到 `Data`，决定该 `Wire` 走哪种 MLIR 类型、哪些运算合法。
+
+`Data` 是一个冻结的类型层级，`str(Data)` 直接给出 MLIR 类型字面量：
+
+```
+Data (ABC)
+├── Bits(N)              → iN              标量位向量（算术/逻辑运算的操作数）
+├── Vector(len, elem)    → vector<Nx...xiW> 向量；elem 可再为 Vector → 多维
+├── Clock                → !pyc.clock      时钟（仅作 pyc.reg 的 clk 输入）
+└── Reset                → !pyc.reset      复位（仅作 pyc.reg 的 rst 输入）
+```
+
+| 声明 | Python 类型 | MLIR 类型 |
+|------|------------|----------|
+| `m.input("x", width=8)` | `Wire[Bits[8]]` | `i8` |
+| `m.input("v", width=8, shape=[4])` | `Wire[Vector[Bits[8]]]` | `vector<4xi8>` |
+| `m.input("m", width=8, shape=[4,16])` | `Wire[Vector[...]]` | `vector<4x16xi8>` |
+
+**关键点**：标量 `Wire[Bits]` 与向量 `Wire[Vector[...]]` **共享同一套运算符**——`+ - * & | ^ ~ == != < >` 都重载了，区别只在结果类型：
+
+```python
+a = m.input("a", width=8)                # Wire[Bits[8]]
+v = m.input("v", width=8, shape=[4])     # Wire[Vector[Bits[8]]]
+
+r   = a + a          # Wire[Bits[8]]     （标量 + 标量）
+s   = v + v          # Wire[Vector[...]] （逐 lane 加）
+bc  = v + a          # Wire[Vector[...]] （标量自动广播到每个 lane）
+eqv = v == v         # Wire[Vector[Bits[1]]]（逐 lane 比较）
+```
+
+> `Clock` / `Reset` 是特殊的「语义类型」——它们宽度都是 1，但**只能**作 `pyc.reg` 的时钟/复位输入，不能参与算术运算。一般设计者不直接声明它们，而是由 `create_domain()` / `create_reset()` 产生。
+
+本章剩余部分聚焦于 `Vector` 这一支——它是类型体系里最有表达力、最能替代手写 `for` 循环的部分。
+
+### 8.2 向量端口与逐 lane 运算
 
 ```python
 def simd_add(m: CycleAwareCircuit, domain: CycleAwareDomain,
              lanes: int = 8, width: int = 32) -> None:
-    va = m.input("va", width=width, shape=[lanes])    # Vec: 8 × i32
+    va = m.input("va", width=width, shape=[lanes])    # Wire[Vector[Bits[32]]]: 8 × i32
     vb = m.input("vb", width=width, shape=[lanes])
 
     vsum = va + vb              # 逐 lane 加法，一行顶 8 行
-    m.output("vsum", vsum)      # Vec 可直接作为输出
+    m.output("vsum", vsum)      # 向量 Wire 可直接作为输出
 ```
 
-生成的 MLIR 中这是**一条** `pyc.add : vector<8xi32>`；Verilog 端口是 packed bus（`[lanes*width-1:0]`），C++ 仿真器用嵌套 `Vec` 模板并可走 SIMD 加速。
+生成的 MLIR 中这是**一条** `pyc.add : vector<8xi32>`；Verilog 端口是 packed bus（`[lanes*width-1:0]`），C++ 仿真器用嵌套 `pyc::cpp::Vec` 模板并可走 SIMD 加速。
 
-### 8.2 归约与广播：旁路匹配的经典范式
+### 8.3 归约与广播：旁路匹配的经典范式
 
 场景：`n_src` 个源操作数 tag，要和 `n_wb` 个写回端口的 tag 全比较，命中的取数据。
 
@@ -472,11 +510,13 @@ def bypass(m, domain, *, n_src=2, n_wb=4, tag_w=6, data_w=64):
     hit_mat = (src_mat == wb_mat) & vld_mat         # 命中矩阵 [n_src × n_wb] × i1
 
     # 沿 wb 维归约：每个 src 是否命中（树形归约控制逻辑深度）
-    any_hit = hit_mat.or_reduce(dim=1, mode="tree")     # Vec: n_src × i1
+    any_hit = hit_mat.reduce_or(dim=1, mode="tree")     # Wire[Vector]: n_src × i1
 
-    # one-hot 选择数据
+    # 选数据：以 hit 行为选择器，在 wb_data 中按最小索引优先取值；
+    # 未命中时回退到 default（必须显式给出，否则按约定回退到 vals 的最后一个元素）。
+    zero_data = m.const(0, width=data_w)
     for s in range(n_src):
-        data_s = hit_mat[s].priority_mux(wb_data, assume_onehot=True)
+        data_s = priority_mux(hit_mat[s], wb_data, default=zero_data)
         m.output(f"fwd_data_{s}", data_s)
     m.output("fwd_hit", any_hit)
 ```
@@ -484,88 +524,31 @@ def bypass(m, domain, *, n_src=2, n_wb=4, tag_w=6, data_w=64):
 三个关键 API：
 
 - `broadcast(dim=, size=)`：把 1D 向量沿新维度复制成 2D 矩阵；
-- `or_reduce(dim=, mode=)` / `and_reduce` / `reduce_sum(*, width, ...)`：沿指定维度归约。`mode="tree"` 把逻辑深度从 `lanes-1` 降到 `⌈log₂ lanes⌉`——宽归约务必用 tree；
-- `priority_mux(values, assume_onehot=True)`：用 i1 向量在数据向量中选 lane。
+- `reduce_or(dim=, mode=)` / `reduce_and` / `reduce_sum(dim=, mode=)`：沿指定维度归约。`mode="tree"` 把逻辑深度从 `lanes-1` 降到 `⌈log₂ lanes⌉`——宽归约务必用 tree；
+- `priority_mux(sels, vals, *, mode=, default=None)`：以 `sels`（i1 向量）为选择器在 `vals` 中选 lane，**最小索引优先**；`default` 为所有 selector 都为 0 时的回退值，省略时回退到 `vals` 的最后一个元素。可作为模块级函数 `priority_mux(sels, vals, ...)` 或 CAS 实例方法 `sels.priority_mux(vals, ...)` 使用。
 
-### 8.3 计数类归约
+### 8.4 计数类归约
 
 ```python
-pop = valid_vec.reduce_sum(width=4, mode="tree")   # popcount：数有多少 lane 有效
+pop = valid_vec.reduce_sum(mode="tree")   # popcount：数有多少 lane 有效
 ```
 
-`reduce_sum` 建议显式给结果 `width`；省略时自动取 `max_lane_width + ⌈log₂ lanes⌉`（保证不溢出）。
+`reduce_sum` **保持叶元素宽度，溢出回绕**——即结果宽度等于输入 lane 的位宽，不会自动扩展。如果担心溢出，需要先用 `zext`/`sext` 把 lane 加宽再归约：
 
-### 8.4 何时不用 Vec
+```python
+wide = valid_vec.zext(width=4)     # 1-bit lane → 4-bit
+pop  = wide.reduce_sum(mode="tree")
+```
 
-lane 之间逻辑**不同构**时（比如每个表项有独立的复杂状态机），老实用 Python `for` 循环生成标量逻辑即可——那是元编程的领域，Vec 是同构 SIMD 的领域。两者可以混用。
+`dim` 参数与其他归约一致：`dim=None`（默认）全维归约成标量；`dim=int` 只归约指定维，返回低一维的 Vector。
+
+### 8.5 何时不用向量
+
+lane 之间逻辑**不同构**时（比如每个表项有独立的复杂状态机），老实用 Python `for` 循环生成标量逻辑即可——那是元编程的领域，`Wire[Vector]` 是同构 SIMD 的领域。两者可以混用。
 
 ---
 
-## 第 9 章：Record：结构化总线
-
-当模块间接口有几十个字段时，逐个 `submodule_input()` 又长又易错。`Record` 把接口定义为一份 Spec，端口自动展开。
-
-### 9.1 定义与使用
-
-```python
-from pycircuit import (
-    RecordSpec, RecordField, RecordArray,
-    record_input, record_output, record_state, record_next, record_mux,
-)
-
-# 一份「派发到保留站」的接口定义
-DISPATCH = RecordSpec(
-    name="Dispatch",
-    scalars=(
-        RecordField("valid", 1),
-        RecordField("op",    7),
-        RecordField("pdst",  6),
-    ),
-    arrays=(
-        RecordArray("src", lanes=2, fields=(
-            RecordField("tag",   6),
-            RecordField("ready", 1),
-        )),
-    ),
-)
-
-def rs_entry(m, domain, *, inputs=None, prefix="rs") -> dict:
-    # 一行声明全部输入端口（独立模式）或取全部父模块信号（组合模式）
-    din = record_input(m, domain, DISPATCH, f"{prefix}_in", inputs)
-
-    # 按字段访问：din["valid"], din["op"], din["src_tag_0"], din["src_ready_1"]
-    fire = din["valid"] & din["src_ready_0"] & din["src_ready_1"]
-    ...
-```
-
-端口命名规则：标量 `rs_in_valid`；数组 lane `rs_in_src_tag_0`、`rs_in_src_tag_1`。
-
-### 9.2 Record 状态与更新
-
-保留站条目这类「整组字段一起写入」的状态，用 `record_state` + `record_next`：
-
-```python
-N_ENTRIES = 4
-entries = [record_state(domain, DISPATCH, i, prefix=f"{prefix}_e")
-           for i in range(N_ENTRIES)]        # 每条目一组寄存器
-
-domain.next()
-for i in range(N_ENTRIES):
-    wr_i = alloc_valid & (alloc_idx == i)
-    nxt = record_next(DISPATCH, entries[i], din, wr_i, m, domain)
-    for key in DISPATCH.all_keys():
-        entries[i][key] <<= nxt[key]
-
-# 读出：按指针在条目间选择
-issued = record_mux(DISPATCH, entries, issue_idx, m, domain)
-record_output(m, DISPATCH, f"{prefix}_issue", issued)
-```
-
-一份 Spec 同时驱动：输入端口、状态寄存器组、写入 mux、读出 mux、输出端口——接口改字段时只改一处。
-
----
-
-## 第 10 章：存储与 FIFO
+## 第 9 章：存储与 FIFO
 
 寄存器堆 / RAM / 队列不要用 `domain.signal()` 数组硬堆（会展开成海量 mux），用内建原语：
 
@@ -592,7 +575,7 @@ sync_bit = m.cdc_sync(dst_clk, dst_rst, src_bit, stages=2)
 
 ---
 
-## 第 11 章：从 Python 到 Verilog：完整构建流程
+## 第 10 章：从 Python 到 Verilog：完整构建流程
 
 以下命令均在仓库根目录执行，假设已按第 0 章设置好环境：
 
@@ -772,7 +755,7 @@ C++ 仿真器支持 VCD：测试运行目录下生成 `.vcd`，用 GTKWave / Sur
 
 ---
 
-## 第 12 章：大型项目组织与调试
+## 第 11 章：大型项目组织与调试
 
 ### 12.1 目录布局
 
@@ -820,10 +803,10 @@ designs/my_soc/
 
 ## 下一步
 
-- 完整语言定义（Vec/Record/MLIR 映射的权威语义）：`docs/v6_PyCircuit_Specification.md`
-- 3D 堆叠分层标注（`tier=` / `jump_tier`，Proposed）：`docs/v6_PyCircuit_Specification.md` §14 与 `docs/rfcs/tier_annotation.md`
+- 完整语言定义（`Data` 类型体系 / `Wire[DT]` / MLIR 映射的权威语义）：`docs/v6_PyCircuit_Specification.md`
+- 3D 堆叠分层标注（`tier=` / `jump_tier`，Proposed）：`docs/v6_PyCircuit_Specification.md` §12 与 `docs/rfcs/tier_annotation.md`
 - 工具链内部（pyc 方言、pass 流水线、双发射器、sidecar 运行时）：`docs/v6_PyCircuit_Software_Architecture.md`
-- 仓库内可运行示例：`designs/examples/`（counter、calculator、fifo_loopback…）、`designs/BypassUnit`（Vec 实战）、`designs/IssueQueue`（Vec + 复杂状态）
+- 仓库内可运行示例：`designs/examples/`（counter、calculator、fifo_loopback…）、`designs/BypassUnit`（向量实战）、`designs/IssueQueue`（向量 + 复杂状态）
 
 ---
 

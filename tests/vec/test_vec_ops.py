@@ -350,6 +350,161 @@ def test_unroll_vector_precedes_wire_and_state_cleanup(repo_root: Path) -> None:
 
 
 @pytest.mark.vec
+def test_vector_state_assign_unroll_runs_cpp(
+    *,
+    repo_root: Path,
+    vec_test_root: Path,
+    pyc_pythonpath: str,
+    pycc: Path,
+) -> None:
+    """Vector wire→assign→reg must remain legal after --unroll-vector."""
+    case_root = vec_test_root / "vector_state_assign"
+    src_dir = case_root / "src"
+    out_dir = case_root / "build"
+    src_dir.mkdir(parents=True, exist_ok=True)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    src = src_dir / "vector_state_assign.py"
+    src.write_text(
+        "\n".join(
+            [
+                "from __future__ import annotations",
+                "",
+                "from pycircuit import Circuit, Tb, module, testbench",
+                "",
+                "",
+                "@module",
+                "def build(m: Circuit) -> None:",
+                '    clk = m.clock("clk")',
+                '    rst = m.reset("rst")',
+                '    r = m.out("cnt", clk=clk, rst=rst, width=4, shape=[2], init=0)',
+                "    r.set(r + 1)",
+                '    m.output("cnt", r)',
+                "",
+                "",
+                "@testbench",
+                "def tb(t: Tb) -> None:",
+                '    t.clock("clk")',
+                '    t.reset("rst", cycles_asserted=2, cycles_deasserted=1)',
+                "    t.timeout(8)",
+                "    t.finish(at=4)",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    env = merged_env(pythonpath=pyc_pythonpath, pycc=pycc)
+    pyc = out_dir / "vector_state_assign.pyc"
+    run_cmd(["python3", "-m", "pycircuit.cli", "emit", str(src), "-o", str(pyc)], cwd=repo_root, env=env)
+    mlir = pyc.read_text(encoding="utf-8")
+    assert "vector<" in mlir
+    assert "pyc.assign" in mlir
+    assert "pyc.reg" in mlir
+    cpp_dir = out_dir / "cpp_unroll"
+    run_cmd(
+        [
+            str(pycc),
+            str(pyc),
+            "--emit=cpp",
+            "--cpp-split=module",
+            "--out-dir",
+            str(cpp_dir),
+            "--build-profile=dev-fast",
+            "--unroll-vector",
+        ],
+        cwd=repo_root,
+        env=env,
+    )
+    # Unrolled vector state must become scalar regs/wires, not keep vector ops.
+    cpp_text = "\n".join(p.read_text(encoding="utf-8") for p in cpp_dir.rglob("*.cpp"))
+    assert "pyc_vec_reg" not in cpp_text
+    assert "pyc_reg" in cpp_text
+    verilog = out_dir / "vector_state_assign.v"
+    run_cmd(
+        [
+            str(pycc),
+            str(pyc),
+            "--emit=verilog",
+            "-o",
+            str(verilog),
+            "--build-profile=dev-fast",
+            "--unroll-vector",
+        ],
+        cwd=repo_root,
+        env=env,
+    )
+    verilog_text = verilog.read_text(encoding="utf-8")
+    assert "pyc_reg" in verilog_text or "reg " in verilog_text
+    # Keep-vector path should still compile and link a TB (smoke).
+    run_cmd(
+        [
+            "python3",
+            "-m",
+            "pycircuit.cli",
+            "build",
+            str(src),
+            "--out-dir",
+            str(out_dir / "sim"),
+            "--target",
+            "cpp",
+            "--jobs",
+            "2",
+            "--logic-depth",
+            "64",
+            "--profile",
+            "dev",
+        ],
+        cwd=repo_root,
+        env=env,
+    )
+    run_cpp_binary(out_dir / "sim")
+
+
+@pytest.mark.vec
+def test_assign_dst_must_be_wire_verifier(
+    *,
+    repo_root: Path,
+    vec_test_root: Path,
+    pyc_pythonpath: str,
+    pycc: Path,
+) -> None:
+    """AssignOp verifier must keep rejecting non-wire destinations."""
+    case_root = vec_test_root / "bad_assign_dst"
+    case_root.mkdir(parents=True, exist_ok=True)
+    pyc = case_root / "bad_assign_dst.pyc"
+    pyc.write_text(
+        "\n".join(
+            [
+                "module {",
+                'func.func @bad_assign_dst(%a: vector<2xi4>) -> (i4) attributes {arg_names = ["a"], result_names = ["o"]} {',
+                "  %v0 = pyc.v_get %a[0] : vector<2xi4> -> i4",
+                "  %v1 = pyc.constant 1 : i4",
+                "  pyc.assign %v0, %v1 : i4",
+                "  func.return %v0 : i4",
+                "}",
+                "}",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    import subprocess
+
+    env = merged_env(pythonpath=pyc_pythonpath, pycc=pycc)
+    proc = subprocess.run(
+        [str(pycc), str(pyc), "--emit=verilog", "-o", str(case_root / "out.v"), "--build-profile=dev-fast"],
+        cwd=str(repo_root),
+        env=env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    assert proc.returncode != 0
+    combined = proc.stdout + proc.stderr
+    assert "dst must be defined by pyc.wire" in combined
+
+
+@pytest.mark.vec
 def test_vector_io_emit_and_pycc(
     *,
     repo_root: Path,

@@ -29,7 +29,7 @@
 
 ```
 ┌────────────────────────  Python 前端  ────────────────────────┐
-│  设计函数 (CycleAwareCircuit / Vec / Record)                  │
+│  设计函数 (CycleAwareCircuit)                                 │
 │  测试台   (@testbench + Tb / CycleAwareTb)                    │
 │        │ compile_cycle_aware(eager/JIT)  或  @module JIT      │
 │        ▼                                                      │
@@ -72,11 +72,11 @@ pyCircuit/
 ├── compiler/
 │   ├── frontend/pycircuit/        # Python 前端包（pip 包 pycircuit）
 │   │   ├── dsl.py                 # 底层 MLIR 构图（Module/Signal）
-│   │   ├── hw.py                  # Circuit/Wire/Reg/Vec 硬件对象模型
+│   │   ├── hw.py                  # Circuit/Wire[DT]/Reg[DT] 硬件对象模型
+│   │   ├── data.py                # Data 类型层级（Bits/Vector/Clock/Reset）
 │   │   ├── v5.py                  # CycleAware* 周期感知层（V6 主路径）
 │   │   ├── design.py              # @module/@function/@const/@testbench
 │   │   ├── jit.py                 # AST JIT 追踪编译
-│   │   ├── record.py              # Record 结构化总线
 │   │   ├── connectors.py          # Connector/Bundle 跨模块连接
 │   │   ├── schedule_ir.py         # 测试调度 JSON IR
 │   │   ├── sidecar_sections.py    # SIDECAAR 二进制容器编解码
@@ -108,8 +108,7 @@ pyCircuit/
 ### 3.2 hw.py — 硬件对象模型
 
 - **`Circuit`**（继承 `dsl.Module`）：端口（`input`/`output`/`const`，支持 `shape=` 向量端口）、可赋值 wire、寄存器（`out`/`reg_wire`/`backedge_reg`）、原语（`fifo`/`byte_mem`/`sync_mem`/`sync_mem_dp`/`async_fifo`/`cdc_sync`/`rv_queue`）、层次实例化（`instance`/`array`）、命名作用域（`scope`）。
-- **`Wire`**：标量信号句柄，重载全部运算符 → 对应 `pyc.*` op；禁止作 Python bool。
-- **`Vec`**：嵌套向量容器。元素级运算优先发射向量 op（操作数同构时），否则退化为逐 lane 展开；归约方法（`or_reduce`/`and_reduce`/`reduce_sum`）与 `broadcast`/`priority_mux`/`pack`。
+- **`Wire[DT]`**：统一信号句柄，泛型参数 `DT` 绑定 `Data` 类型层级（`Bits` / `Vector` / `Clock` / `Reset`，定义在 `data.py`）。标量是 `Wire[Bits]`、向量是 `Wire[Vector[...]]`，共享全部运算符（`+ - * & \| ^ ~ == != < >` 等），逐 lane 并行、标量自动广播。向量形态额外提供归约（`reduce_or`/`reduce_and`/`reduce_sum`）、`broadcast`、`priority_mux`、`cat`、`v[i]`。禁止作 Python bool。
 - **`Reg`**：q/next/en 三元组，`set(value, when=...)` 驱动。
 
 ### 3.3 v5.py — 周期感知层（V6 设计主路径）

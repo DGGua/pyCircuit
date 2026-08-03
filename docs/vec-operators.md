@@ -166,6 +166,24 @@ selected = m.priority_mux(sels, vals, mode="chain", default=fallback)
 - `default=None` 时，所有 selector 为 0 的回退值是 `vals` 的最后一个元素。
 - `mode` 只能是 `"chain"`（默认）或 `"tree"`；两者逻辑等价，只影响组合结构。
 
+### `CycleAwareSignal.priority_mux`（V5 cycle-aware）
+
+V5 cycle-aware 前端的实例方法 `sels.priority_mux(vals, *, mode, default)` 在内部对齐
+`sels` / `vals` / `default` 三者的 cycle 标签后委托给上面的 `Circuit.priority_mux`。
+**`vals` 与 `default` 接受任何 cycle-aware 信号族**（`CycleAwareSignal` / `StateSignal` /
+`ForwardSignal`）或裸 `Wire`：
+
+```python
+sels = cas(domain, m.input("s", width=1, shape=[N]), cycle=0)
+vals = domain.signal(width=W, shape=[N], name="vals")   # ForwardSignal, 无需 .as_cas()
+out  = sels.priority_mux(vals, default=zero)             # 直接传 ForwardSignal
+```
+
+调用方**无需**手写 `vals.as_cas()` 把 `ForwardSignal` 解包成 `CycleAwareSignal`——实例方法
+内部通过 `CycleAwareSignal.as_cas` 统一 unwrap。非 cycle-aware 的标量（`Reg` / `int` /
+`LiteralValue`）仍按 `docs/v5_drop_to_cas_or_none_plan.md` 的方向抛 `TypeError`。跨域
+（unwrap 后 `domain is not self.domain`）抛 `ValueError`，与既有 CAS 路径一致。
+
 ## 移位、位域与类型转换
 
 ### 移位

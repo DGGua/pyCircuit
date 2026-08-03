@@ -122,14 +122,14 @@ def _modules() -> list[dict[str, Any]]:
         {
             "name": "dispatch",
             "file": "backend/dispatch/dispatch.py",
-            "fn": "build_dispatch",
+            "fn": "dispatch",
             "full": {"dispatch_width": DECODE_WIDTH, "fu_type_width": 3, "ptag_w": PTAG_WIDTH_INT, "pc_width": PC_WIDTH, "rob_idx_w": ROB_IDX_WIDTH},
             "small": {"dispatch_width": 2, "fu_type_width": 3, "ptag_w": 4, "pc_width": 16, "rob_idx_w": 4},
         },
         {
             "name": "issue_queue",
             "file": "backend/issue/issue_queue.py",
-            "fn": "build_issue_queue",
+            "fn": "issue_queue",
             "full": {"entries": ISSUE_QUEUE_SIZE, "enq_ports": DECODE_WIDTH, "issue_ports": 2, "wb_ports": 4, "ptag_w": PTAG_WIDTH_INT, "rob_idx_w": ROB_IDX_WIDTH, "fu_type_width": 3},
             "small": {"entries": 4, "enq_ports": 2, "issue_ports": 1, "wb_ports": 2, "ptag_w": 4, "rob_idx_w": 4, "fu_type_width": 3},
         },
@@ -272,14 +272,14 @@ def _modules() -> list[dict[str, Any]]:
         {
             "name": "load_queue",
             "file": "mem/lsqueue/load_queue.py",
-            "fn": "build_load_queue",
+            "fn": "load_queue",
             "full": {"size": VIRTUAL_LOAD_QUEUE_SIZE, "addr_width": PADDR_BITS_MAX},
             "small": {"size": 8, "addr_width": 16},
         },
         {
             "name": "store_queue",
             "file": "mem/lsqueue/store_queue.py",
-            "fn": "build_store_queue",
+            "fn": "store_queue",
             "full": {"size": STORE_QUEUE_SIZE, "addr_width": PADDR_BITS_MAX},
             "small": {"size": 8, "addr_width": 16},
         },
@@ -661,6 +661,7 @@ def run_pycc(pycc: Path, pyc_path: Path, verilog_dir: Path, *, name: str, logic_
         "--hierarchy-policy=strict",
         "--inline-policy=off",
         f"--logic-depth={logic_depth}",
+        "--unroll-vector", # todo: temp, remove it after bug fixed
     ]
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:

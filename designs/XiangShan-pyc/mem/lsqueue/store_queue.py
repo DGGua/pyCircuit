@@ -53,24 +53,20 @@ def store_queue(
     _in = inputs or {}
     _out: dict[str, CycleAwareSignal] = {}
 
-
     idx_w = max(1, math.ceil(math.log2(size)))
     ptr_w = idx_w + 1
 
     # ── Cycle 0: Inputs ──────────────────────────────────────────────
 
     flush = (_in["flush"] if "flush" in _in else
-
         cas(domain, m.input(f"{prefix}_flush", width=1), cycle=0))
 
     enq_valid = (_in["enq_valid"] if "enq_valid" in _in else
-
         cas(domain, m.input(f"{prefix}_enq_valid", width=1), cycle=0))
     enq_rob_idx = (_in["enq_rob_idx"] if "enq_rob_idx" in _in else
         cas(domain, m.input(f"{prefix}_enq_rob_idx", width=rob_idx_width), cycle=0))
 
     write_valid = (_in["write_valid"] if "write_valid" in _in else
-
         cas(domain, m.input(f"{prefix}_write_valid", width=1), cycle=0))
     write_idx = (_in["write_idx"] if "write_idx" in _in else
         cas(domain, m.input(f"{prefix}_write_idx", width=idx_w), cycle=0))
@@ -80,35 +76,36 @@ def store_queue(
         cas(domain, m.input(f"{prefix}_write_data", width=data_width), cycle=0))
 
     commit_valid = (_in["commit_valid"] if "commit_valid" in _in else
-
         cas(domain, m.input(f"{prefix}_commit_valid", width=1), cycle=0))
 
-    # Forwarding lookup from load pipeline
     fwd_valid = (_in["fwd_valid"] if "fwd_valid" in _in else
         cas(domain, m.input(f"{prefix}_fwd_valid", width=1), cycle=0))
     fwd_addr = (_in["fwd_addr"] if "fwd_addr" in _in else
         cas(domain, m.input(f"{prefix}_fwd_addr", width=addr_width), cycle=0))
 
-    # SBuffer drain handshake
     sbuf_ready = (_in["sbuf_ready"] if "sbuf_ready" in _in else
         cas(domain, m.input(f"{prefix}_sbuf_ready", width=1), cycle=0))
 
     redirect_valid = (_in["redirect_valid"] if "redirect_valid" in _in else
-
         cas(domain, m.input(f"{prefix}_redirect_valid", width=1), cycle=0))
 
     zero1 = cas(domain, m.const(0, width=1), cycle=0)
     one1 = cas(domain, m.const(1, width=1), cycle=0)
     zero_data = cas(domain, m.const(0, width=data_width), cycle=0)
+    zeros1 = domain.vec(*[zero1 for _ in range(size)])
+    ones1 = domain.vec(*[one1 for _ in range(size)])
+    lane_idx = domain.vec(
+        *[cas(domain, m.const(j, width=idx_w), cycle=0) for j in range(size)]
+    )
 
-    # ── Entry storage ─────────────────────────────────────────────────
+    # ── Entry storage (Vector state) ───────────────────────────────
 
-    e_valid = [domain.signal(width=1, reset_value=0, name=f"{prefix}_sq_v_{i}") for i in range(size)]
-    e_addr_valid = [domain.signal(width=1, reset_value=0, name=f"{prefix}_sq_av_{i}") for i in range(size)]
-    e_committed = [domain.signal(width=1, reset_value=0, name=f"{prefix}_sq_cm_{i}") for i in range(size)]
-    e_addr = [domain.signal(width=addr_width, reset_value=0, name=f"{prefix}_sq_a_{i}") for i in range(size)]
-    e_data = [domain.signal(width=data_width, reset_value=0, name=f"{prefix}_sq_d_{i}") for i in range(size)]
-    e_rob = [domain.signal(width=rob_idx_width, reset_value=0, name=f"{prefix}_sq_r_{i}") for i in range(size)]
+    e_valid = domain.signal(width=1, shape=[size], reset_value=0, name=f"{prefix}_sq_v")
+    e_addr_valid = domain.signal(width=1, shape=[size], reset_value=0, name=f"{prefix}_sq_av")
+    e_committed = domain.signal(width=1, shape=[size], reset_value=0, name=f"{prefix}_sq_cm")
+    e_addr = domain.signal(width=addr_width, shape=[size], reset_value=0, name=f"{prefix}_sq_a")
+    e_data = domain.signal(width=data_width, shape=[size], reset_value=0, name=f"{prefix}_sq_d")
+    e_rob = domain.signal(width=rob_idx_width, shape=[size], reset_value=0, name=f"{prefix}_sq_r")
 
     enq_ptr = domain.signal(width=ptr_w, reset_value=0, name=f"{prefix}_sq_enq")
     deq_ptr = domain.signal(width=ptr_w, reset_value=0, name=f"{prefix}_sq_deq")
@@ -120,47 +117,31 @@ def store_queue(
 
     count = cas(domain, (wire_of(enq_ptr) - wire_of(deq_ptr))[0:ptr_w], cycle=0)
     full = count == cas(domain, m.const(size, width=ptr_w), cycle=0)
-    empty = count == cas(domain, m.const(0, width=ptr_w), cycle=0)
 
     can_enq = enq_valid & (~full) & (~flush)
 
-    # ── Store-to-load forwarding ─────────────────────────────────────
-    # Search committed entries for matching address; forward data
-
+    # ── Store-to-load forwarding (max physical index wins) ────────
     line_bits = int(math.log2(CACHE_LINE_BYTES))
     fwd_tag = fwd_addr[line_bits:addr_width]
     tag_w = addr_width - line_bits
+    entry_tag = e_addr.slice(lsb=line_bits, width=tag_w)
+    tag_match = entry_tag == fwd_tag
 
-    fwd_hit = zero1
-    fwd_data_out = zero_data
-    for j in range(size):
-        ev = e_valid[j]
-        eav = e_addr_valid[j]
-        ea = e_addr[j]
-        ed = e_data[j]
-        entry_tag = ea[line_bits:addr_width]
-        tag_match = entry_tag == fwd_tag
-        entry_hit = fwd_valid & ev & eav & tag_match
-        fwd_hit = mux(entry_hit, one1, fwd_hit)
-        fwd_data_out = mux(entry_hit, ed, fwd_data_out)
+    hits = fwd_valid & e_valid & e_addr_valid & tag_match
+    fwd_hit = hits.reduce_or()
+    # Preserve prior scan order: later lane overwrites earlier → reverse then priority_mux.
+    rev_hits = domain.vec(*[hits[size - 1 - i] for i in range(size)])
+    rev_data = domain.vec(*[e_data[size - 1 - i] for i in range(size)])
+    fwd_data_out = rev_hits.priority_mux(rev_data, default=zero_data)
 
     # Drain: head committed entry → SBuffer
-    head_valid = e_valid[0]
-    head_committed = e_committed[0]
-
-    drain_head_valid = zero1
-    drain_head_addr = cas(domain, m.const(0, width=addr_width), cycle=0)
-    drain_head_data = zero_data
-    for j in range(size):
-        j_const = cas(domain, m.const(j, width=idx_w), cycle=0)
-        is_head = deq_idx == j_const
-        ev = e_valid[j]
-        ecm = e_committed[j]
-        eav = e_addr_valid[j]
-        can_drain = is_head & ev & ecm & eav
-        drain_head_valid = mux(can_drain, one1, drain_head_valid)
-        drain_head_addr = mux(can_drain, e_addr[j], drain_head_addr)
-        drain_head_data = mux(can_drain, e_data[j], drain_head_data)
+    is_head = deq_idx == lane_idx
+    can_drain = is_head & e_valid & e_committed & e_addr_valid
+    drain_head_valid = can_drain.reduce_or()
+    drain_head_addr = can_drain.priority_mux(
+        e_addr, default=cas(domain, m.const(0, width=addr_width), cycle=0)
+    )
+    drain_head_data = can_drain.priority_mux(e_data, default=zero_data)
 
     drain_fire = drain_head_valid & sbuf_ready
 
@@ -184,37 +165,28 @@ def store_queue(
     # ── domain.next() → Cycle 1: state updates ──────────────────────
     domain.next()
 
-    # Enqueue
-    for j in range(size):
-        j_const = cas(domain, m.const(j, width=idx_w), cycle=0)
-        is_enq_slot = enq_idx == j_const
-        we_enq = can_enq & is_enq_slot
-        e_valid[j].assign(mux(we_enq, one1, e_valid[j]), when=we_enq)
-        e_addr_valid[j].assign(mux(we_enq, zero1, e_addr_valid[j]), when=we_enq)
-        e_committed[j].assign(mux(we_enq, zero1, e_committed[j]), when=we_enq)
-        e_rob[j].assign(mux(we_enq, enq_rob_idx, e_rob[j]), when=we_enq)
+    we_enq = can_enq & (enq_idx == lane_idx)
+    is_write = write_valid & (write_idx == lane_idx)
+    is_cmt = commit_valid & (commit_idx == lane_idx)
+    is_deq = drain_fire & (deq_idx == lane_idx)
 
-    # Data/address fill from store unit
-    for j in range(size):
-        j_const = cas(domain, m.const(j, width=idx_w), cycle=0)
-        is_write = write_valid & (write_idx == j_const)
-        e_addr[j].assign(mux(is_write, write_addr, e_addr[j]), when=is_write)
-        e_data[j].assign(mux(is_write, write_data, e_data[j]), when=is_write)
-        e_addr_valid[j].assign(mux(is_write, one1, e_addr_valid[j]), when=is_write)
+    next_valid = mux(we_enq, ones1, e_valid)
+    next_valid = mux(is_deq, zeros1, next_valid)
+    next_valid = mux(flush, zeros1, next_valid)
+    e_valid <<= next_valid
 
-    # Commit
-    for j in range(size):
-        j_const = cas(domain, m.const(j, width=idx_w), cycle=0)
-        is_cmt = commit_valid & (commit_idx == j_const)
-        e_committed[j].assign(mux(is_cmt, one1, e_committed[j]), when=is_cmt)
+    next_av = mux(we_enq, zeros1, e_addr_valid)
+    next_av = mux(is_write, ones1, next_av)
+    e_addr_valid <<= next_av
 
-    # Drain (dequeue committed head to SBuffer)
-    for j in range(size):
-        j_const = cas(domain, m.const(j, width=idx_w), cycle=0)
-        is_deq = drain_fire & (deq_idx == j_const)
-        e_valid[j].assign(mux(is_deq, zero1, e_valid[j]), when=is_deq)
+    next_cm = mux(we_enq, zeros1, e_committed)
+    next_cm = mux(is_cmt, ones1, next_cm)
+    e_committed <<= next_cm
 
-    # Pointer updates
+    e_addr <<= mux(is_write, write_addr, e_addr)
+    e_data <<= mux(is_write, write_data, e_data)
+    e_rob <<= mux(we_enq, enq_rob_idx, e_rob)
+
     next_enq = mux(can_enq,
                     cas(domain, (wire_of(enq_ptr) + u(ptr_w, 1))[0:ptr_w], cycle=0),
                     enq_ptr)
@@ -230,10 +202,6 @@ def store_queue(
                     cas(domain, (wire_of(commit_ptr) + u(ptr_w, 1))[0:ptr_w], cycle=0),
                     commit_ptr)
     commit_ptr <<= next_cmt
-
-    # Flush
-    for j in range(size):
-        e_valid[j].assign(zero1, when=flush)
     return _out
 
 
