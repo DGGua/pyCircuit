@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pycircuit.data import Bits
 from pycircuit.dsl import Signal
 from pycircuit.hw import Circuit, ClockDomain, Wire
 
@@ -33,7 +34,7 @@ def SRAM(
     waddr_w = waddr
     wdata_w = wdata
     wstrb_w = wstrb
-    if ren_w.ty != "i1" or wvalid_w.ty != "i1":
+    if ren_w.ty != Bits(1) or wvalid_w.ty != Bits(1):
         raise SRAMError("SRAM ren/wvalid must be i1")
 
     rdata = m.sync_mem(

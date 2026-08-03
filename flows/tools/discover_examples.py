@@ -79,6 +79,10 @@ def _discover(root: Path) -> list[ExampleCase]:
         cfg = d / f"{name}_config.py"
 
         present = [design.exists(), tb.exists(), cfg.exists()]
+        # Cycle-aware examples use their own compile_cycle_aware entrypoint and
+        # are not consumable by the @module-based folderized-example runner.
+        if design.exists() and not _looks_like_design(design):
+            continue
         if any(present) and not all(present):
             errs.append(f"{d}: malformed example folder (requires {name}.py, tb_{name}.py, {name}_config.py)")
             continue

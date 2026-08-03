@@ -47,6 +47,19 @@ static void forceLinkPycPasses() {
   (void)pyc::createLowerSCFToPYCStaticPass();
   (void)pyc::createCheckFlatTypesPass();
   (void)pyc::createPrunePortsPass();
+  (void)pyc::createVectorUnrollPass();
+  (void)pyc::createSLPPackWiresPass();
+  (void)pyc::createFlattenInstancesPass();
+  (void)pyc::createEliminateDeadStatePass();
+  (void)pyc::createEliminateDeadInstancesPass();
+  (void)pyc::createCheckNoDynamicPass();
+  (void)pyc::createCheckCombCyclesPass();
+  (void)pyc::createCheckClockDomainsPass();
+  (void)pyc::createCheckLogicDepthPass(0);
+  (void)pyc::createCollectCompileStatsPass();
+  (void)pyc::createInlineFunctionsPass();
+  (void)pyc::createCheckFrontendContractPass();
+  (void)pyc::createCheckHierarchyDisciplinePass();
 }
 
 int main(int argc, char **argv) {

@@ -11,7 +11,9 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -28,6 +30,10 @@ from .probe import (
     collect_probe_functions,
     load_probe_catalog,
     resolve_probe_function,
+)
+from .sidecar_sections import (
+    inspect_sidecar_file,
+    render_sidecar_inspect_text,
 )
 from .tb import Tb, TbError, _sanitize_id
 from .testbench import emit_testbench_pyc, testbench_payload_from_tb
@@ -112,10 +118,14 @@ def _collect_jit_params(build: Any, *, overrides: list[str]) -> dict[str, object
         raise SystemExit("build must use JIT entry semantics: `@module def build(m: Circuit, ...)`")
     value_param_names = set(value_params_of(build).keys())
 
+    # Cycle-aware entrypoints use ``build(m, domain, *, ...)``.  The domain is
+    # supplied by ``compile_cycle_aware`` rather than being a JIT parameter.
+    param_start = 2 if len(params) >= 2 and params[1].name == "domain" else 1
+
     # Collect JIT-time parameters from defaults.
     jit_params: dict[str, object] = {}
     missing: list[str] = []
-    for p in params[1:]:
+    for p in params[param_start:]:
         if p.name in value_param_names:
             continue
         if p.default is inspect._empty:
@@ -300,7 +310,11 @@ def _runtime_manifest_for_toolchain(toolchain_root: Path | None) -> dict[str, ob
         )
 
     include_dir = (toolchain_root / "include").resolve()
-    lib_dir = (toolchain_root / "lib").resolve()
+    # Prefer lib/, fall back to lib64/ (common on RHEL/Fedora 64-bit multilib).
+    lib_dir = (toolchain_root / "lib")
+    if not (lib_dir / _runtime_lib_filename()).is_file():
+        lib_dir = toolchain_root / "lib64"
+    lib_dir = lib_dir.resolve()
     cmake_config_dir = (toolchain_root / "share" / "pycircuit" / "cmake").resolve()
     runtime_lib = (lib_dir / _runtime_lib_filename()).resolve()
 
@@ -322,12 +336,95 @@ def _runtime_manifest_for_toolchain(toolchain_root: Path | None) -> dict[str, ob
     }
 
 
+@dataclass(frozen=True)
+class _PortInfo:
+    ty: str
+    shape: tuple[int, ...]
+    leaf_width: int
+
+    @property
+    def is_vector(self) -> bool:
+        return bool(self.shape)
+
+    @property
+    def total_width(self) -> int:
+        n = int(self.leaf_width)
+        for d in self.shape:
+            n *= int(d)
+        return n
+
+
+def _int_width_from_ty(ty: str) -> int:
+    raw = str(ty).strip()
+    if not raw.startswith("i"):
+        raise SystemExit(f"unsupported port type for TB generation: {ty!r}")
+    try:
+        width = int(raw[1:])
+    except ValueError as e:
+        raise SystemExit(f"unsupported port type for TB generation: {ty!r}") from e
+    if width <= 0:
+        raise SystemExit(f"unsupported port type for TB generation: {ty!r}")
+    return width
+
+
+def _split_vector_type_parts(body: str) -> list[str]:
+    parts: list[str] = []
+    depth = 0
+    start = 0
+    for i, ch in enumerate(body):
+        if ch == "<":
+            depth += 1
+        elif ch == ">":
+            depth -= 1
+        elif ch == "x" and depth == 0:
+            parts.append(body[start:i])
+            start = i + 1
+    parts.append(body[start:])
+    return [p.strip() for p in parts]
+
+
+def _parse_vector_type_for_tb(ty: str) -> tuple[list[int], str]:
+    raw = str(ty).strip()
+    if not (raw.startswith("vector<") and raw.endswith(">")):
+        raise SystemExit(f"unsupported port type for TB generation: {ty!r}")
+    body = raw[len("vector<") : -1]
+    parts = _split_vector_type_parts(body)
+    if len(parts) < 2:
+        raise SystemExit(f"unsupported port type for TB generation: {ty!r}")
+    dims: list[int] = []
+    try:
+        for p in parts[:-1]:
+            lanes = int(p)
+            if lanes <= 0:
+                raise ValueError
+            dims.append(lanes)
+    except ValueError as e:
+        raise SystemExit(f"unsupported port type for TB generation: {ty!r}") from e
+    return dims, parts[-1]
+
+
+def _port_info(ty: str) -> _PortInfo:
+    raw = str(ty).strip()
+    if raw == "!pyc.clock" or raw == "!pyc.reset":
+        return _PortInfo(raw, (), 1)
+    if raw.startswith("i"):
+        return _PortInfo(raw, (), _int_width_from_ty(raw))
+    if raw.startswith("vector<"):
+        shape, elem_ty = _parse_vector_type_for_tb(raw)
+        dims = list(shape)
+        while elem_ty.startswith("vector<"):
+            sub_shape, elem_ty = _parse_vector_type_for_tb(elem_ty)
+            dims.extend(sub_shape)
+        if not dims or any(int(d) <= 0 for d in dims):
+            raise SystemExit(f"unsupported port type for TB generation: {ty!r}")
+        return _PortInfo(raw, tuple(int(d) for d in dims), _int_width_from_ty(elem_ty))
+    raise SystemExit(f"unsupported port type for TB generation: {ty!r}")
+
+
 def _as_int_width(ty: str) -> int:
     if ty == "!pyc.clock" or ty == "!pyc.reset":
         return 1
-    if not ty.startswith("i"):
-        raise SystemExit(f"unsupported port type for TB generation: {ty!r}")
-    return int(ty[1:])
+    return _port_info(ty).total_width
 
 
 def _collect_build(mod: object, src: Path, args: argparse.Namespace) -> Module | Design:
@@ -338,6 +435,11 @@ def _collect_build(mod: object, src: Path, args: argparse.Namespace) -> Module |
     jit_params = _collect_jit_params(build, overrides=list(getattr(args, "param", []) or []))
     top_name = _top_name_for_build(src, build)
     try:
+        params = list(inspect.signature(build).parameters.values())
+        if len(params) >= 2 and params[1].name == "domain":
+            from .v5 import compile_cycle_aware
+
+            return compile_cycle_aware(build, name=top_name, **jit_params)
         return compile(build, name=top_name, **jit_params)
     except (DesignError, JitError) as e:
         raise SystemExit(f"design compile failed: {e}") from e
@@ -434,7 +536,467 @@ def _module_paths_from_manifest(manifest: Mapping[str, Any], *, out_dir: Path) -
     return out
 
 
-def _render_tb_cpp(iface: _TopIface, t: Tb, *, trace_plan: TracePlan | None = None) -> str:
+def _render_tb_cpp_sidecar(
+    iface: _TopIface,
+    t: Tb,
+    *,
+    trace_plan: TracePlan | None = None,
+    schedule_path: Path | None = None,
+) -> str:
+    has_clocks = bool(t.clocks)
+    has_reset = t.reset_spec is not None
+    if has_reset and not has_clocks:
+        raise SystemExit("tb() with reset requires at least one clock via t.clock(...)")
+    if trace_plan and trace_plan.enabled_signals:
+        raise SystemExit("sidecar C++ TB currently does not support trace-config binary traces; use --tb-schedule-mode=inline")
+    if schedule_path is None:
+        raise SystemExit("sidecar C++ TB requires an external schedule path")
+    from .schedule_ir import (
+        build_sidecar_schedule_ir,
+        infer_port_protocol,
+        infer_port_role,
+        schedule_ir_to_sidecar_bytes,
+    )
+
+    top = _sanitize_id(iface.sym)
+    hdr = f"{iface.sym}.hpp"
+
+    def mask_value(v: int | bool, width: int) -> int:
+        if isinstance(v, bool):
+            vv = 1 if v else 0
+        else:
+            vv = int(v)
+        if width <= 0:
+            raise SystemExit("internal: invalid width")
+        return vv & ((1 << width) - 1)
+
+    def nwords(width: int) -> int:
+        return (int(width) + 63) // 64
+
+    def value_words(v: int | bool, width: int) -> list[int]:
+        vv = mask_value(v, width)
+        return [((vv >> (64 * i)) & ((1 << 64) - 1)) for i in range(nwords(width))]
+
+    def words_array_literal(words: list[int], max_words: int) -> str:
+        padded = list(words) + [0] * max(0, max_words - len(words))
+        return "{{" + ", ".join(f"0x{int(w) & ((1 << 64) - 1):x}ull" for w in padded[:max_words]) + "}}"
+
+    def wire_from_event_expr(width: int) -> str:
+        return f"pyc::cpp::Wire<{int(width)}>({{{', '.join(f'ev.words[{i}]' for i in range(nwords(width)))}}})"
+
+    def wire_from_frame_expr(width: int, slot: int) -> str:
+        return f"pyc::cpp::Wire<{int(width)}>({{{', '.join(f'frame.words[{int(slot)}][{i}]' for i in range(nwords(width)))}}})"
+
+    port_ids: dict[str, int] = {}
+    port_meta_by_sn: dict[str, dict[str, Any]] = {}
+
+    def get_port_id(sn: str) -> int:
+        key = str(sn)
+        if key not in port_ids:
+            port_ids[key] = len(port_ids)
+        return port_ids[key]
+
+    def register_port(raw: str, direction: str, ty: str) -> None:
+        _dir, sn, resolved_ty = iface.resolve(raw)
+        w = 1 if resolved_ty in {"!pyc.clock", "!pyc.reset"} else _as_int_width(resolved_ty)
+        pid = get_port_id(sn)
+        meta: dict[str, Any] = {
+            "id": int(pid),
+            "name": str(sn),
+            "direction": direction,
+            "bit_width": int(w),
+            "word_count": int(nwords(w)),
+            "role": infer_port_role(sn, resolved_ty),
+        }
+        protocol = infer_port_protocol(sn)
+        if protocol is not None:
+            meta["protocol"] = protocol
+        port_meta_by_sn[sn] = meta
+
+    for raw, ty in zip(iface.in_raw, iface.in_tys):
+        register_port(str(raw), "input", str(ty))
+    for raw, ty in zip(iface.out_raw, iface.out_tys):
+        register_port(str(raw), "output", str(ty))
+
+    drive_events: list[tuple[int, int, str, int, list[int]]] = []
+    pre_expect_events: list[tuple[int, int, str, int, list[int], str]] = []
+    post_expect_events: list[tuple[int, int, str, int, list[int], str]] = []
+
+    for d in t.drives:
+        dir_, sn, ty = iface.resolve(d.port)
+        if dir_ != "in":
+            raise SystemExit(f"drive() requires input port, got output: {d.port!r}")
+        w = _as_int_width(ty)
+        drive_events.append((int(d.at), get_port_id(sn), sn, w, value_words(d.value, w)))
+
+    for e in t.expects:
+        _dir, sn, ty = iface.resolve(e.port)
+        w = _as_int_width(ty)
+        msg = e.msg if e.msg is not None else f"{sn} mismatch"
+        row = (int(e.at), get_port_id(sn), sn, w, value_words(e.value, w), str(msg))
+        ph = str(getattr(e, "phase", "post")).strip().lower()
+        if ph == "pre":
+            pre_expect_events.append(row)
+        else:
+            post_expect_events.append(row)
+
+    prints_at: dict[int, list[tuple[str, list[tuple[str, str, int]]]]] = {}
+    prints_every: list[tuple[str, int, int, list[tuple[str, str, int]]]] = []
+    for p in getattr(t, "prints", []):
+        fmt = str(p.fmt)
+        port_specs: list[tuple[str, str, int]] = []
+        for raw in p.ports:
+            _dir, sn, ty = iface.resolve(raw)
+            w = _as_int_width(ty)
+            if w > 64:
+                raise SystemExit(f"print() for i{w} not supported in sidecar C++ TB generator")
+            port_specs.append((str(raw), sn, w))
+        if p.at is not None:
+            prints_at.setdefault(int(p.at), []).append((fmt, port_specs))
+        else:
+            st = 0 if p.start is None else int(p.start)
+            ev = 1 if p.every is None else int(p.every)
+            prints_every.append((fmt, st, ev, port_specs))
+
+    drive_events.sort(key=lambda x: (x[0], x[1]))
+    pre_expect_events.sort(key=lambda x: (x[0], x[1]))
+    post_expect_events.sort(key=lambda x: (x[0], x[1]))
+
+    rand_specs: list[tuple[str, int, int, int, int]] = []
+    if t.random_streams:
+        used_ports: set[str] = set()
+        for r in t.random_streams:
+            dir_, sn, ty = iface.resolve(r.port)
+            if dir_ != "in":
+                raise SystemExit(f"random() requires input port, got output: {r.port!r}")
+            if ty == "!pyc.clock" or ty == "!pyc.reset":
+                raise SystemExit(f"random() cannot target clock/reset ports: {r.port!r}")
+            if sn in used_ports:
+                raise SystemExit(f"duplicate random() stream for port: {r.port!r}")
+            used_ports.add(sn)
+            w = _as_int_width(ty)
+            if w > 64:
+                raise SystemExit(f"random() for i{w} not supported in sidecar C++ TB generator")
+            rand_specs.append((sn, w, int(r.seed), int(r.start), int(r.every)))
+
+    clk_sn = ""
+    rst_sn = ""
+    ca = 0
+    cd = 0
+    if has_clocks:
+        clk = t.clocks[0].port
+        _, clk_sn, _clk_ty = iface.resolve(clk)
+    if has_reset:
+        rst = t.reset_spec.port
+        _, rst_sn, _rst_ty = iface.resolve(rst)
+        ca = int(t.reset_spec.cycles_asserted)
+        cd = int(t.reset_spec.cycles_deasserted)
+
+    max_words = 1
+    for _cyc, _pid, _sn, _w, words in drive_events:
+        max_words = max(max_words, len(words))
+    for _cyc, _pid, _sn, _w, words, _msg in pre_expect_events:
+        max_words = max(max_words, len(words))
+    for _cyc, _pid, _sn, _w, words, _msg in post_expect_events:
+        max_words = max(max_words, len(words))
+
+    drive_ports = sorted({(pid, sn, w) for _cyc, pid, sn, w, _words in drive_events}, key=lambda x: x[0])
+    drive_slot_by_pid = {int(pid): slot for slot, (pid, _sn, _w) in enumerate(drive_ports)}
+    drive_frame_rows: list[tuple[int, list[int], list[list[int]]]] = []
+    if drive_events:
+        by_cycle: dict[int, list[tuple[int, list[int]]]] = {}
+        for cyc, pid, _sn, _w, words in drive_events:
+            by_cycle.setdefault(int(cyc), []).append((int(pid), list(words)))
+        mask_words = (len(drive_ports) + 63) // 64
+        for cyc in sorted(by_cycle.keys()):
+            masks = [0] * mask_words
+            values = [[0] * max_words for _ in drive_ports]
+            for pid, words in by_cycle[cyc]:
+                slot = drive_slot_by_pid[pid]
+                masks[slot // 64] |= 1 << (slot % 64)
+                for word_idx, word in enumerate(words[:max_words]):
+                    values[slot][word_idx] = int(word) & ((1 << 64) - 1)
+            drive_frame_rows.append((int(cyc), masks, values))
+    expect_ports = sorted(
+        {(pid, sn, w) for _cyc, pid, sn, w, _words, _msg in [*pre_expect_events, *post_expect_events]},
+        key=lambda x: x[0],
+    )
+
+    def emit_event_array(name: str, rows: list[tuple[int, int, str, int, list[int]]] | list[tuple[int, int, str, int, list[int], str]]) -> list[str]:
+        out: list[str] = []
+        if not rows:
+            out.append(f"static constexpr std::array<TbEvent, 0> {name} = {{}};\n\n")
+            return out
+        out.append(f"static constexpr std::array<TbEvent, {len(rows)}> {name} = {{\n")
+        out.append("  {\n")
+        for row in rows:
+            cyc = int(row[0])
+            pid = int(row[1])
+            words = list(row[4])
+            msg_lit = "nullptr"
+            if len(row) >= 6:
+                msg_lit = json.dumps(str(row[5]))
+            out.append(
+                f"    TbEvent{{{cyc}ull, {pid}u, {len(words)}u, {words_array_literal(words, max_words)}, {msg_lit}}},\n"
+            )
+        out.append("  }\n")
+        out.append("};\n\n")
+        return out
+
+    schedule_t0 = time.perf_counter()
+    schedule_path.parent.mkdir(parents=True, exist_ok=True)
+    schedule_generate_s = 0.0
+    schedule_ir = build_sidecar_schedule_ir(
+        top_symbol=iface.sym,
+        schedule_path=schedule_path,
+        ports=port_meta_by_sn.values(),
+        timeout_cycles=int(t.timeout_cycles),
+        reset_cycles=int(ca + cd) if has_reset else 0,
+        clocking="single_clock" if has_clocks else "none",
+        schedule_bytes=0,
+        max_event_words=int(max_words),
+        drive_events=drive_events,
+        drive_ports=drive_ports,
+        drive_frame_rows=drive_frame_rows,
+        pre_expect_events=pre_expect_events,
+        post_expect_events=post_expect_events,
+        generate_s=schedule_generate_s,
+    )
+    schedule_sidecar_blob = schedule_ir_to_sidecar_bytes(schedule_ir)
+    schedule_path.write_bytes(schedule_sidecar_blob)
+    schedule_generate_s = time.perf_counter() - schedule_t0
+    drive_port_ids_literal = "{" + ", ".join(f"{int(pid)}u" for pid, _sn, _w in drive_ports) + "}"
+
+    lines: list[str] = []
+    lines.append("// Generated by pycircuit (sidecar schedule TB)\n")
+    lines.append("#include <array>\n")
+    lines.append("#include <cstdint>\n")
+    lines.append("#include <cstdlib>\n")
+    lines.append("#include <filesystem>\n")
+    lines.append("#include <iostream>\n")
+    lines.append("#include <optional>\n")
+    lines.append("#include <string>\n\n")
+    lines.append("#include <cpp/pyc_tb.hpp>\n\n")
+    lines.append("#include <cpp/pyc_tb_sidecar_runtime.hpp>\n\n")
+    lines.append("#include <cpp/pyc_tb_sidecar.hpp>\n\n")
+    lines.append(f"#include \"{hdr}\"\n\n")
+    lines.append("using pyc::cpp::Testbench;\n\n")
+    lines.append("namespace {\n\n")
+    lines.append(f"static constexpr std::uint32_t kMaxEventWords = {int(max_words)}u;\n\n")
+    lines.append(f"static constexpr std::uint32_t kDrivePortCount = {len(drive_ports)}u;\n")
+    lines.append(f"static constexpr std::array<std::uint32_t, kDrivePortCount> kDrivePortIds = {drive_port_ids_literal};\n")
+    lines.append("using SidecarEvent = pyc::cpp::SidecarEvent<kMaxEventWords>;\n")
+    lines.append("using SidecarDriveFrame = pyc::cpp::SidecarDriveFrame<kMaxEventWords, kDrivePortCount>;\n\n")
+
+    lines.append("template <typename Dut>\n")
+    lines.append("void applyDriveFrame(Dut &dut, const SidecarDriveFrame &frame) {\n")
+    lines.append("  auto hasDrive = [&](std::uint32_t slot) -> bool {\n")
+    lines.append("    return ((frame.port_mask[slot / 64u] >> (slot % 64u)) & 1ull) != 0ull;\n")
+    lines.append("  };\n")
+    for slot, (_pid, sn, w) in enumerate(drive_ports):
+        lines.append(f"  if (hasDrive({int(slot)}u)) dut.{sn} = {wire_from_frame_expr(w, slot)};\n")
+    lines.append("}\n\n")
+
+    lines.append("template <typename Dut>\n")
+    lines.append("void applyPeriodicDrive(Dut &dut, const pyc::cpp::SidecarPeriodicDrive &pattern, std::uint64_t cyc) {\n")
+    lines.append("  const auto &words = pattern.activeAt(cyc) ? pattern.active_words : pattern.default_words;\n")
+    lines.append("  switch (pattern.port_id) {\n")
+    for pid, sn, w in drive_ports:
+        lines.append(f"  case {int(pid)}u:\n")
+        lines.append(f"    dut.{sn} = pyc::cpp::Wire<{int(w)}>({{{', '.join(f'words[{i}]' for i in range(nwords(w)))}}});\n")
+        lines.append("    return;\n")
+    lines.append("  default:\n")
+    lines.append("    std::cerr << \"ERROR: invalid periodic drive port_id=\" << pattern.port_id << \" at cycle=\" << cyc << \"\\n\";\n")
+    lines.append("    std::exit(1);\n")
+    lines.append("  }\n")
+    lines.append("}\n\n")
+
+    lines.append("template <typename WireT>\n")
+    lines.append("void printWireHex(const WireT &v) {\n")
+    lines.append("  for (int i = static_cast<int>(WireT::kWords) - 1; i >= 0; --i) {\n")
+    lines.append("    std::cerr << v.word(static_cast<unsigned>(i));\n")
+    lines.append("  }\n")
+    lines.append("}\n\n")
+
+    lines.append("template <typename Dut>\n")
+    lines.append("bool checkExpect(Dut &dut, const SidecarEvent &ev, const char *phase) {\n")
+    lines.append("  switch (ev.port_id) {\n")
+    for pid, sn, w in expect_ports:
+        exp_expr = wire_from_event_expr(w)
+        lines.append(f"  case {int(pid)}u: {{\n")
+        lines.append(f"    const auto expected = {exp_expr};\n")
+        lines.append(f"    if (!(dut.{sn} == expected)) {{\n")
+        lines.append("      std::cerr << \"ERROR(\" << phase << \"): cycle=\" << ev.cycle")
+        lines.append(f" << \" port={sn}\";\n")
+        lines.append("      if (!ev.msg.empty()) std::cerr << \" msg=\" << ev.msg;\n")
+        lines.append("      std::cerr << \" got=0x\" << std::hex;\n")
+        lines.append(f"      printWireHex(dut.{sn});\n")
+        lines.append("      std::cerr << \" exp=0x\";\n")
+        lines.append("      printWireHex(expected);\n")
+        lines.append("      std::cerr << std::dec << \"\\n\";\n")
+        lines.append("      return false;\n")
+        lines.append("    }\n")
+        lines.append("    return true;\n")
+        lines.append("  }\n")
+    lines.append("  default:\n")
+    lines.append("    std::cerr << \"ERROR(\" << phase << \"): invalid expect port_id=\" << ev.port_id << \" at cycle=\" << ev.cycle << \"\\n\";\n")
+    lines.append("    return false;\n")
+    lines.append("  }\n")
+    lines.append("}\n\n")
+    lines.append("} // namespace\n\n")
+
+    lines.append("int main() {\n")
+    lines.append(f"  pyc::gen::{top} dut;\n")
+    lines.append(f"  Testbench<pyc::gen::{top}> tb(dut);\n\n")
+    lines.append("  const char *schedule_env = std::getenv(\"PYC_TB_SCHEDULE\");\n")
+    lines.append(
+        f"  const std::filesystem::path schedule_path = schedule_env != nullptr && schedule_env[0] != '\\0' ? std::filesystem::path(schedule_env) : std::filesystem::path({json.dumps(str(schedule_path))});\n"
+    )
+    lines.append("  pyc::cpp::SidecarRunnerSchedule<kMaxEventWords, kDrivePortCount> schedule;\n")
+    lines.append("  pyc::cpp::SidecarSchedule sidecar_schedule;\n")
+    lines.append("  std::string sidecar_error;\n")
+    lines.append("  if (!pyc::cpp::loadSidecarSchedule(schedule_path, &sidecar_schedule, &sidecar_error)) {\n")
+    lines.append("    std::cerr << \"ERROR: failed to load sidecar schedule: \" << sidecar_error << \"\\n\";\n")
+    lines.append("    return 1;\n")
+    lines.append("  }\n")
+    lines.append("  if (!pyc::cpp::convertSidecarToRunnerSchedule(sidecar_schedule, kDrivePortIds, &schedule, &sidecar_error)) {\n")
+    lines.append("    std::cerr << \"ERROR: failed to convert sidecar schedule: \" << sidecar_error << \"\\n\";\n")
+    lines.append("    return 1;\n")
+    lines.append("  }\n\n")
+    if rand_specs:
+        lines.append("  // Random streams (deterministic).\n")
+        for sn, _w, seed, _st, _ev in rand_specs:
+            seed64 = int(seed) & ((1 << 64) - 1)
+            lines.append(f"  std::uint64_t rng_{sn} = 0x{seed64:x}ull;\n")
+        lines.append("\n")
+
+    lines.append("  const char *trace_dir_env = std::getenv(\"PYC_TRACE_DIR\");\n")
+    lines.append("  const bool trace_env_enabled = (trace_dir_env != nullptr) && (std::string(trace_dir_env).size() != 0);\n")
+    lines.append("  if (trace_env_enabled) {\n")
+    lines.append("    std::filesystem::path out_dir = std::filesystem::path(trace_dir_env);\n")
+    lines.append(f"    out_dir /= \"tb_{iface.sym}\";\n")
+    lines.append("    std::filesystem::create_directories(out_dir);\n")
+    lines.append(f"    tb.enableVcd((out_dir / \"tb_{iface.sym}.vcd\").string(), /*top=*/\"tb_{iface.sym}\");\n")
+    for sn in [*iface.in_names, *iface.out_names]:
+        lines.append(f"    tb.vcdTrace(dut.{sn}, \"{sn}\");\n")
+    lines.append("  }\n\n")
+
+    if has_clocks:
+        for c in t.clocks:
+            dir_, sn, _ = iface.resolve(c.port)
+            if dir_ != "in":
+                raise SystemExit(f"clock must be an input port, got output: {c.port!r}")
+            lines.append(
+                f"  tb.addClock(dut.{sn}, /*halfPeriodSteps=*/{int(c.half_period_steps)}, /*phaseSteps=*/{int(c.phase_steps)}, /*startHigh=*/{str(bool(c.start_high)).lower()});\n"
+            )
+    if has_reset:
+        lines.append(f"  tb.reset(dut.{rst_sn}, /*cyclesAsserted=*/{int(ca)}, /*cyclesDeasserted=*/{int(cd)});\n\n")
+
+    lines.append(f"  const std::uint64_t timeout_cycles = {int(t.timeout_cycles)}ull;\n")
+    lines.append(f"  bool ok = {str(t.finish_cycle is None).lower()};\n")
+    lines.append("  std::size_t drive_frame_idx = 0;\n")
+    lines.append("  std::size_t pre_expect_idx = 0;\n")
+    lines.append("  std::size_t post_expect_idx = 0;\n")
+    lines.append("  for (std::uint64_t cyc = 0; cyc < timeout_cycles; ++cyc) {\n")
+
+    if rand_specs:
+        lines.append("    // Random drives for this cycle (applied before explicit drives).\n")
+        for sn, w, _seed, st, ev in rand_specs:
+            mask = (1 << w) - 1 if w < 64 else (1 << 64) - 1
+            lines.append(
+                f"    if (cyc >= {int(st)}ull && ((cyc - {int(st)}ull) % {int(ev)}ull) == 0ull) {{\n"
+                f"      rng_{sn} = rng_{sn} * 6364136223846793005ull + 1ull;\n"
+                f"      dut.{sn} = pyc::cpp::Wire<{w}>(0x{mask:x}ull & rng_{sn});\n"
+                f"    }}\n"
+            )
+        lines.append("\n")
+
+    lines.append("    for (const auto &pattern : sidecar_schedule.periodic_drives) {\n")
+    lines.append("      if (cyc >= pattern.start_cycle && cyc < pattern.end_cycle) applyPeriodicDrive(dut, pattern, cyc);\n")
+    lines.append("    }\n")
+    lines.append("    while (drive_frame_idx < schedule.drive_frames.size() && schedule.drive_frames[drive_frame_idx].cycle == cyc) {\n")
+    lines.append("      applyDriveFrame(dut, schedule.drive_frames[drive_frame_idx]);\n")
+    lines.append("      ++drive_frame_idx;\n")
+    lines.append("    }\n")
+    lines.append("    if (pre_expect_idx < schedule.pre_expect_events.size() && schedule.pre_expect_events[pre_expect_idx].cycle == cyc) {\n")
+    lines.append("      pyc::cpp::detail::maybe_comb(dut);\n")
+    lines.append("    }\n")
+    lines.append("    while (pre_expect_idx < schedule.pre_expect_events.size() && schedule.pre_expect_events[pre_expect_idx].cycle == cyc) {\n")
+    lines.append("      if (!checkExpect(dut, schedule.pre_expect_events[pre_expect_idx], \"pre\")) return 1;\n")
+    lines.append("      ++pre_expect_idx;\n")
+    lines.append("    }\n")
+    if has_clocks:
+        lines.append("    tb.runCycleAutoTrace(cyc, nullptr);\n")
+    else:
+        lines.append("    tb.runSteps(1);\n")
+    lines.append("    while (post_expect_idx < schedule.post_expect_events.size() && schedule.post_expect_events[post_expect_idx].cycle == cyc) {\n")
+    lines.append("      if (!checkExpect(dut, schedule.post_expect_events[post_expect_idx], \"post\")) return 1;\n")
+    lines.append("      ++post_expect_idx;\n")
+    lines.append("    }\n")
+    if prints_at or prints_every:
+        if prints_at:
+            lines.append("    // Per-cycle prints.\n")
+            lines.append("    switch (cyc) {\n")
+            for cyc in sorted(prints_at.keys()):
+                lines.append(f"    case {cyc}: {{\n")
+                for fmt, ports in prints_at[cyc]:
+                    msg_lit = json.dumps(f" {fmt}")
+                    lines.append(f"      std::cerr << \"[tb] cyc=\" << cyc << {msg_lit}")
+                    for raw, sn, w in ports:
+                        raw_lit = json.dumps(f" {raw}=")
+                        if w == 1:
+                            lines.append(f" << {raw_lit} << dut.{sn}.value()")
+                        else:
+                            lines.append(f" << {raw_lit} << \"0x\" << std::hex << dut.{sn}.value() << std::dec")
+                    lines.append(" << \"\\n\";\n")
+                lines.append("      break; }\n")
+            lines.append("    default: break;\n")
+            lines.append("    }\n")
+        if prints_every:
+            lines.append("    // Periodic prints.\n")
+            for fmt, st, ev, ports in prints_every:
+                msg_lit = json.dumps(f" {fmt}")
+                lines.append(f"    if (cyc >= {st}ull && ((cyc - {st}ull) % {ev}ull) == 0ull) {{\n")
+                lines.append(f"      std::cerr << \"[tb] cyc=\" << cyc << {msg_lit}")
+                for raw, sn, w in ports:
+                    raw_lit = json.dumps(f" {raw}=")
+                    if w == 1:
+                        lines.append(f" << {raw_lit} << dut.{sn}.value()")
+                    else:
+                        lines.append(f" << {raw_lit} << \"0x\" << std::hex << dut.{sn}.value() << std::dec")
+                lines.append(" << \"\\n\";\n")
+                lines.append("    }\n")
+    if t.finish_cycle is not None:
+        lines.append(f"    if (cyc >= {int(t.finish_cycle)}ull) {{ ok = true; break; }}\n")
+    lines.append("  }\n\n")
+    lines.append("  if (!ok) {\n")
+    lines.append("    std::cerr << \"TIMEOUT: finish cycle not reached within \" << timeout_cycles << \" cycles\\n\";\n")
+    lines.append("    return 1;\n")
+    lines.append("  }\n")
+    lines.append("  return 0;\n")
+    lines.append("}\n")
+    return "".join(lines)
+
+
+def _render_tb_cpp(
+    iface: _TopIface,
+    t: Tb,
+    *,
+    trace_plan: TracePlan | None = None,
+    schedule_mode: str = "inline",
+    schedule_path: Path | None = None,
+) -> str:
+    mode = str(schedule_mode).strip().lower()
+    if mode == "sidecar":
+        return _render_tb_cpp_sidecar(
+            iface,
+            t,
+            trace_plan=trace_plan,
+            schedule_path=schedule_path,
+        )
+    if mode != "inline":
+        raise SystemExit(f"unsupported C++ TB schedule mode: {schedule_mode!r}")
+
     has_clocks = bool(t.clocks)
     has_reset = t.reset_spec is not None
     if has_reset and not has_clocks:
@@ -459,6 +1021,101 @@ def _render_tb_cpp(iface: _TopIface, t: Tb, *, trace_plan: TracePlan | None = No
         for i in range(words):
             raw_words.append(f"0x{((vv >> (64 * i)) & ((1 << 64) - 1)):x}ull")
         return f"pyc::cpp::Wire<{width}>({{{', '.join(raw_words)}}})"
+
+    def flat_indices(shape: tuple[int, ...]) -> list[tuple[int, ...]]:
+        if not shape:
+            return [()]
+        out: list[tuple[int, ...]] = []
+
+        def walk(prefix: tuple[int, ...], rest: tuple[int, ...]) -> None:
+            if not rest:
+                out.append(prefix)
+                return
+            for i in range(int(rest[0])):
+                walk((*prefix, i), rest[1:])
+
+        walk((), tuple(shape))
+        return out
+
+    def cpp_access(sn: str, idx: tuple[int, ...]) -> str:
+        return "dut." + str(sn) + "".join(f"[{i}]" for i in idx)
+
+    def lane_value(v: int | bool, info: _PortInfo, lane: int) -> int:
+        vv = mask_value(v, info.total_width)
+        return (vv >> (lane * info.leaf_width)) & ((1 << info.leaf_width) - 1)
+
+    def drive_const_lines(sn: str, value: int | bool, ty: str, *, indent: str) -> list[str]:
+        info = _port_info(ty)
+        if not info.is_vector:
+            return [f"{indent}dut.{sn} = {wire_literal(value, info.leaf_width)};\n"]
+        out: list[str] = []
+        for lane, idx in enumerate(flat_indices(info.shape)):
+            out.append(f"{indent}{cpp_access(sn, idx)} = {wire_literal(lane_value(value, info, lane), info.leaf_width)};\n")
+        return out
+
+    def drive_expr_lines(sn: str, expr: str, ty: str, *, indent: str) -> list[str]:
+        info = _port_info(ty)
+        if info.total_width > 64:
+            raise SystemExit(f"random() for i{info.total_width} not supported in C++ TB generator (prototype limitation)")
+        if not info.is_vector:
+            return [f"{indent}dut.{sn} = pyc::cpp::Wire<{info.leaf_width}>({expr});\n"]
+        out: list[str] = []
+        for lane, idx in enumerate(flat_indices(info.shape)):
+            mask = (1 << info.leaf_width) - 1
+            shift = lane * info.leaf_width
+            out.append(
+                f"{indent}{cpp_access(sn, idx)} = pyc::cpp::Wire<{info.leaf_width}>((({expr}) >> {shift}) & 0x{mask:x}ull);\n"
+            )
+        return out
+
+    def packed_value_expr(sn: str, ty: str) -> str:
+        info = _port_info(ty)
+        if info.total_width > 64:
+            raise SystemExit(f"print() for i{info.total_width} not supported in C++ TB generator (prototype limitation)")
+        if not info.is_vector:
+            return f"dut.{sn}.value()"
+        parts: list[str] = []
+        for lane, idx in enumerate(flat_indices(info.shape)):
+            mask = (1 << info.leaf_width) - 1
+            shift = lane * info.leaf_width
+            access = cpp_access(sn, idx)
+            term = f"(({access}.value() & 0x{mask:x}ull) << {shift})"
+            parts.append(term)
+        return "(" + " | ".join(parts or ["0ull"]) + ")"
+
+    def expect_lines(sn: str, value: int | bool, msg: str, ty: str, *, indent: str, phase: str) -> list[str]:
+        info = _port_info(ty)
+        if not info.is_vector:
+            vv = mask_value(value, info.leaf_width)
+            exp = wire_literal(value, info.leaf_width)
+            if info.leaf_width == 1:
+                return [
+                    f"{indent}if (dut.{sn}.value() != {vv}u) {{ std::cerr << \"ERROR{phase}: {msg}: got=\" << dut.{sn}.value() << \" exp={vv}\\n\"; return 1; }}\n"
+                ]
+            if info.leaf_width <= 64:
+                return [
+                    f"{indent}if (dut.{sn}.value() != {vv}u) {{ std::cerr << \"ERROR{phase}: {msg}: got=0x\" << std::hex << dut.{sn}.value() << \" exp=0x{vv:x}\" << std::dec << \"\\n\"; return 1; }}\n"
+                ]
+            return [f"{indent}if (!(dut.{sn} == {exp})) {{ std::cerr << \"ERROR{phase}: {msg}\\n\"; return 1; }}\n"]
+
+        out: list[str] = []
+        for lane, idx in enumerate(flat_indices(info.shape)):
+            access = cpp_access(sn, idx)
+            vv = lane_value(value, info, lane)
+            lane_msg = f"{msg}[{']['.join(str(i) for i in idx)}]"
+            if info.leaf_width == 1:
+                out.append(
+                    f"{indent}if ({access}.value() != {vv}u) {{ std::cerr << \"ERROR{phase}: {lane_msg}: got=\" << {access}.value() << \" exp={vv}\\n\"; return 1; }}\n"
+                )
+            elif info.leaf_width <= 64:
+                out.append(
+                    f"{indent}if ({access}.value() != {vv}u) {{ std::cerr << \"ERROR{phase}: {lane_msg}: got=0x\" << std::hex << {access}.value() << \" exp=0x{vv:x}\" << std::dec << \"\\n\"; return 1; }}\n"
+                )
+            else:
+                out.append(
+                    f"{indent}if (!({access} == {wire_literal(vv, info.leaf_width)})) {{ std::cerr << \"ERROR{phase}: {lane_msg}\\n\"; return 1; }}\n"
+                )
+        return out
 
     # Group actions by cycle for compact emission.
     drives_by: dict[int, list[tuple[str, int | bool, str]]] = {}
@@ -495,7 +1152,7 @@ def _render_tb_cpp(iface: _TopIface, t: Tb, *, trace_plan: TracePlan | None = No
             ev = 1 if p.every is None else int(p.every)
             prints_every.append((fmt, st, ev, port_specs))
 
-    rand_specs: list[tuple[str, int, int, int, int]] = []
+    rand_specs: list[tuple[str, int, str, int, int, int]] = []
     if t.random_streams:
         used_ports: set[str] = set()
         for r in t.random_streams:
@@ -510,7 +1167,7 @@ def _render_tb_cpp(iface: _TopIface, t: Tb, *, trace_plan: TracePlan | None = No
             w = _as_int_width(ty)
             if w > 64:
                 raise SystemExit(f"random() for i{w} not supported in C++ TB generator (prototype limitation)")
-            rand_specs.append((sn, w, int(r.seed), int(r.start), int(r.every)))
+            rand_specs.append((sn, w, ty, int(r.seed), int(r.start), int(r.every)))
 
     clk_sn = ""
     rst_sn = ""
@@ -546,7 +1203,7 @@ def _render_tb_cpp(iface: _TopIface, t: Tb, *, trace_plan: TracePlan | None = No
     lines.append("  std::optional<pyc::cpp::PycTraceBinWriter> bin_trace;\n\n")
     if rand_specs:
         lines.append("  // Random streams (deterministic).\n")
-        for sn, _w, seed, _st, _ev in rand_specs:
+        for sn, _w, _ty, seed, _st, _ev in rand_specs:
             seed64 = int(seed) & ((1 << 64) - 1)
             lines.append(f"  std::uint64_t rng_{sn} = 0x{seed64:x}ull;\n")
         lines.append("\n")
@@ -690,14 +1347,14 @@ def _render_tb_cpp(iface: _TopIface, t: Tb, *, trace_plan: TracePlan | None = No
 
     if rand_specs:
         lines.append("    // Random drives for this cycle (applied before explicit drives).\n")
-        for sn, w, _seed, st, ev in rand_specs:
+        for sn, w, ty, _seed, st, ev in rand_specs:
             mask = (1 << w) - 1 if w < 64 else (1 << 64) - 1
             lines.append(
                 f"    if (cyc >= {int(st)}ull && ((cyc - {int(st)}ull) % {int(ev)}ull) == 0ull) {{\n"
                 f"      rng_{sn} = rng_{sn} * 6364136223846793005ull + 1ull;\n"
-                f"      dut.{sn} = pyc::cpp::Wire<{w}>(0x{mask:x}ull & rng_{sn});\n"
-                f"    }}\n"
             )
+            lines.extend(drive_expr_lines(sn, f"(0x{mask:x}ull & rng_{sn})", ty, indent="      "))
+            lines.append("    }\n")
         lines.append("\n")
 
     if drives_by:
@@ -705,8 +1362,7 @@ def _render_tb_cpp(iface: _TopIface, t: Tb, *, trace_plan: TracePlan | None = No
         for cyc in sorted(drives_by.keys()):
             lines.append(f"    case {cyc}:\n")
             for sn, val, ty in drives_by[cyc]:
-                w = _as_int_width(ty)
-                lines.append(f"      dut.{sn} = {wire_literal(val, w)};\n")
+                lines.extend(drive_const_lines(sn, val, ty, indent="      "))
             lines.append("      break;\n")
         lines.append("    default: break;\n")
         lines.append("    }\n")
@@ -721,20 +1377,8 @@ def _render_tb_cpp(iface: _TopIface, t: Tb, *, trace_plan: TracePlan | None = No
         for cyc in sorted(expects_pre_by.keys()):
             lines.append(f"    case {cyc}: {{\n")
             for sn, val, msg, ty in expects_pre_by[cyc]:
-                w = _as_int_width(ty)
-                vv = mask_value(val, w)
-                exp = wire_literal(val, w)
                 m = msg if msg is not None else f"{sn} mismatch"
-                if w == 1:
-                    lines.append(
-                        f"      if (dut.{sn}.value() != {vv}u) {{ std::cerr << \"ERROR(pre): {m}: got=\" << dut.{sn}.value() << \" exp={vv}\\n\"; return 1; }}\n"
-                    )
-                elif w <= 64:
-                    lines.append(
-                        f"      if (dut.{sn}.value() != {vv}u) {{ std::cerr << \"ERROR(pre): {m}: got=0x\" << std::hex << dut.{sn}.value() << \" exp=0x{vv:x}\" << std::dec << \"\\n\"; return 1; }}\n"
-                    )
-                else:
-                    lines.append(f"      if (!(dut.{sn} == {exp})) {{ std::cerr << \"ERROR(pre): {m}\\n\"; return 1; }}\n")
+                lines.extend(expect_lines(sn, val, m, ty, indent="      ", phase="(pre)"))
             lines.append("      break; }\n")
         lines.append("    default: break;\n")
         lines.append("    }\n")
@@ -762,21 +1406,8 @@ def _render_tb_cpp(iface: _TopIface, t: Tb, *, trace_plan: TracePlan | None = No
         for cyc in sorted(expects_post_by.keys()):
             lines.append(f"    case {cyc}: {{\n")
             for sn, val, msg, ty in expects_post_by[cyc]:
-                w = _as_int_width(ty)
-                vv = mask_value(val, w)
-                exp = wire_literal(val, w)
                 m = msg if msg is not None else f"{sn} mismatch"
-                # Print decimal for i1, hex for <=64 wider signals.
-                if w == 1:
-                    lines.append(
-                        f"      if (dut.{sn}.value() != {vv}u) {{ std::cerr << \"ERROR: {m}: got=\" << dut.{sn}.value() << \" exp={vv}\\n\"; return 1; }}\n"
-                    )
-                elif w <= 64:
-                    lines.append(
-                        f"      if (dut.{sn}.value() != {vv}u) {{ std::cerr << \"ERROR: {m}: got=0x\" << std::hex << dut.{sn}.value() << \" exp=0x{vv:x}\" << std::dec << \"\\n\"; return 1; }}\n"
-                    )
-                else:
-                    lines.append(f"      if (!(dut.{sn} == {exp})) {{ std::cerr << \"ERROR: {m}\\n\"; return 1; }}\n")
+                lines.extend(expect_lines(sn, val, m, ty, indent="      ", phase=""))
             lines.append("      break; }\n")
         lines.append("    default: break;\n")
         lines.append("    }\n")
@@ -792,10 +1423,11 @@ def _render_tb_cpp(iface: _TopIface, t: Tb, *, trace_plan: TracePlan | None = No
                     lines.append(f"      std::cerr << \"[tb] cyc=\" << cyc << {msg_lit}")
                     for raw, sn, w in ports:
                         raw_lit = json.dumps(f" {raw}=")
+                        expr = packed_value_expr(sn, iface.resolve(raw)[2])
                         if w == 1:
-                            lines.append(f" << {raw_lit} << dut.{sn}.value()")
+                            lines.append(f" << {raw_lit} << {expr}")
                         else:
-                            lines.append(f" << {raw_lit} << \"0x\" << std::hex << dut.{sn}.value() << std::dec")
+                            lines.append(f" << {raw_lit} << \"0x\" << std::hex << {expr} << std::dec")
                     lines.append(" << \"\\n\";\n")
                 lines.append("      break; }\n")
             lines.append("    default: break;\n")
@@ -808,10 +1440,11 @@ def _render_tb_cpp(iface: _TopIface, t: Tb, *, trace_plan: TracePlan | None = No
                 lines.append(f"      std::cerr << \"[tb] cyc=\" << cyc << {msg_lit}")
                 for raw, sn, w in ports:
                     raw_lit = json.dumps(f" {raw}=")
+                    expr = packed_value_expr(sn, iface.resolve(raw)[2])
                     if w == 1:
-                        lines.append(f" << {raw_lit} << dut.{sn}.value()")
+                        lines.append(f" << {raw_lit} << {expr}")
                     else:
-                        lines.append(f" << {raw_lit} << \"0x\" << std::hex << dut.{sn}.value() << std::dec")
+                        lines.append(f" << {raw_lit} << \"0x\" << std::hex << {expr} << std::dec")
                 lines.append(" << \"\\n\";\n")
                 lines.append("    }\n")
 
@@ -848,16 +1481,55 @@ def _render_tb_sv(iface: _TopIface, t: Tb, *, trace_plan: TracePlan | None = Non
         return f"{width}'h{vv:x}"
 
     def decl(name: str, ty: str) -> str:
-        w = _as_int_width(ty)
+        info = _port_info(ty)
+        # Match VerilogEmitter packed vector ports (flat bus), not unpacked arrays.
+        w = info.total_width
         if w == 1:
             return f"  logic {name};\n"
         return f"  logic [{w - 1}:0] {name};\n"
 
+    def flat_indices(shape: tuple[int, ...]) -> list[tuple[int, ...]]:
+        if not shape:
+            return [()]
+        out: list[tuple[int, ...]] = []
+
+        def walk(prefix: tuple[int, ...], rest: tuple[int, ...]) -> None:
+            if not rest:
+                out.append(prefix)
+                return
+            for i in range(int(rest[0])):
+                walk((*prefix, i), rest[1:])
+
+        walk((), tuple(shape))
+        return out
+
+
+    def sv_packed_expr(name: str, ty: str) -> str:
+        # TB signals are declared as packed buses matching DUT ports.
+        _ = ty
+        return str(name)
+
+    def sv_drive_const_lines(name: str, value: int | bool, ty: str, *, indent: str) -> list[str]:
+        info = _port_info(ty)
+        return [f"{indent}{name} = {sv_lit(info.total_width, value)};\n"]
+
+    def sv_drive_expr_lines(name: str, expr: str, ty: str, *, indent: str) -> list[str]:
+        info = _port_info(ty)
+        if info.total_width > 64:
+            raise SystemExit(f"random() for i{info.total_width} not supported in SV TB generator (prototype limitation)")
+        hi = 63 if info.total_width >= 64 else (info.total_width - 1)
+        return [f"{indent}{name} = {expr}[{hi}:0];\n"]
+
+    def sv_expect_lines(name: str, value: int | bool, msg: str, ty: str, *, indent: str, phase: str) -> list[str]:
+        info = _port_info(ty)
+        prefix = "PRE: " if phase == "pre" else ""
+        return [f"{indent}if ({name} !== {sv_lit(info.total_width, value)}) $fatal(1, \"{prefix}{msg}\");\n"]
+
     drives_by: dict[int, list[tuple[str, int | bool, str]]] = {}
     expects_pre_by: dict[int, list[tuple[str, int | bool, str | None, str]]] = {}
     expects_post_by: dict[int, list[tuple[str, int | bool, str | None, str]]] = {}
-    prints_at: dict[int, list[tuple[str, list[str]]]] = {}
-    prints_every: list[tuple[str, int, int, list[str]]] = []
+    prints_at: dict[int, list[tuple[str, list[tuple[str, str, str]]]]] = {}
+    prints_every: list[tuple[str, int, int, list[tuple[str, str, str]]]] = []
     for d in t.drives:
         dir_, sn, ty = iface.resolve(d.port)
         if dir_ != "in":
@@ -874,8 +1546,8 @@ def _render_tb_sv(iface: _TopIface, t: Tb, *, trace_plan: TracePlan | None = Non
         fmt = str(p.fmt)
         ports = []
         for raw in p.ports:
-            _dir, sn, _ty = iface.resolve(raw)
-            ports.append(sn)
+            _dir, sn, ty = iface.resolve(raw)
+            ports.append((str(raw), sn, ty))
         if p.at is not None:
             prints_at.setdefault(int(p.at), []).append((fmt, ports))
         else:
@@ -883,7 +1555,7 @@ def _render_tb_sv(iface: _TopIface, t: Tb, *, trace_plan: TracePlan | None = Non
             ev = 1 if p.every is None else int(p.every)
             prints_every.append((fmt, st, ev, ports))
 
-    rand_specs: list[tuple[str, int, int, int, int]] = []
+    rand_specs: list[tuple[str, int, str, int, int, int]] = []
     if t.random_streams:
         used_ports: set[str] = set()
         for r in t.random_streams:
@@ -898,7 +1570,7 @@ def _render_tb_sv(iface: _TopIface, t: Tb, *, trace_plan: TracePlan | None = Non
             w = _as_int_width(ty)
             if w > 64:
                 raise SystemExit(f"random() for i{w} not supported in SV TB generator (prototype limitation)")
-            rand_specs.append((sn, w, int(r.seed), int(r.start), int(r.every)))
+            rand_specs.append((sn, w, ty, int(r.seed), int(r.start), int(r.every)))
 
     clk_sn = ""
     rst_sn = ""
@@ -926,7 +1598,7 @@ def _render_tb_sv(iface: _TopIface, t: Tb, *, trace_plan: TracePlan | None = Non
     if rand_specs:
         lines.append("\n")
         lines.append("  // Random stream state.\n")
-        for sn, _w, _seed, _st, _ev in rand_specs:
+        for sn, _w, _ty, _seed, _st, _ev in rand_specs:
             lines.append(f"  longint unsigned rng_{sn};\n")
     lines.append("  integer timeout_cycles;\n")
     lines.append("  integer cyc;\n")
@@ -990,14 +1662,13 @@ def _render_tb_sv(iface: _TopIface, t: Tb, *, trace_plan: TracePlan | None = Non
     for sn, ty in zip(iface.in_names, iface.in_tys):
         if sn == clk_sn:
             continue
-        w = _as_int_width(ty)
-        lines.append(f"    {sn} = {w}'d0;\n")
+        lines.extend(sv_drive_const_lines(sn, 0, ty, indent="    "))
     lines.append("    __pyc_tb_active = 1'b0;\n")
     lines.append("    __pyc_tb_done = 1'b0;\n")
     if rand_specs:
         lines.append("\n")
         lines.append("    // Random stream seeds.\n")
-        for sn, _w, seed, _st, _ev in rand_specs:
+        for sn, _w, _ty, seed, _st, _ev in rand_specs:
             seed64 = int(seed) & ((1 << 64) - 1)
             lines.append(f"    rng_{sn} = 64'h{seed64:016x};\n")
     lines.append("\n")
@@ -1028,12 +1699,11 @@ def _render_tb_sv(iface: _TopIface, t: Tb, *, trace_plan: TracePlan | None = Non
 
     if rand_specs:
         lines.append("      // Random drives for this cycle (applied before explicit drives).\n")
-        for sn, w, _seed, st, ev in rand_specs:
-            hi = 63 if w >= 64 else (w - 1)
+        for sn, _w, ty, _seed, st, ev in rand_specs:
             lines.append(f"      if (cyc >= {int(st)} && (((cyc - {int(st)}) % {int(ev)}) == 0)) begin\n")
             lines.append("        // LCG: state = state * 6364136223846793005 + 1.\n")
             lines.append(f"        rng_{sn} = (rng_{sn} * 64'd6364136223846793005) + 64'd1;\n")
-            lines.append(f"        {sn} = rng_{sn}[{hi}:0];\n")
+            lines.extend(sv_drive_expr_lines(sn, f"rng_{sn}", ty, indent="        "))
             lines.append("      end\n")
         lines.append("\n")
 
@@ -1043,8 +1713,7 @@ def _render_tb_sv(iface: _TopIface, t: Tb, *, trace_plan: TracePlan | None = Non
         for cyc in sorted(drives_by.keys()):
             lines.append(f"        {cyc}: begin\n")
             for sn, val, ty in drives_by[cyc]:
-                w = _as_int_width(ty)
-                lines.append(f"          {sn} = {sv_lit(w, val)};\n")
+                lines.extend(sv_drive_const_lines(sn, val, ty, indent="          "))
             lines.append("        end\n")
         lines.append("        default: begin end\n")
         lines.append("      endcase\n")
@@ -1059,9 +1728,8 @@ def _render_tb_sv(iface: _TopIface, t: Tb, *, trace_plan: TracePlan | None = Non
         for cyc in sorted(expects_pre_by.keys()):
             lines.append(f"        {cyc}: begin\n")
             for sn, val, msg, ty in expects_pre_by[cyc]:
-                w = _as_int_width(ty)
                 m = msg if msg is not None else f"{sn} mismatch"
-                lines.append(f"          if ({sn} !== {sv_lit(w, val)}) $fatal(1, \"PRE: {m}\");\n")
+                lines.extend(sv_expect_lines(sn, val, m, ty, indent="          ", phase="pre"))
             lines.append("        end\n")
         lines.append("        default: begin end\n")
         lines.append("      endcase\n")
@@ -1079,9 +1747,8 @@ def _render_tb_sv(iface: _TopIface, t: Tb, *, trace_plan: TracePlan | None = Non
         for cyc in sorted(expects_post_by.keys()):
             lines.append(f"        {cyc}: begin\n")
             for sn, val, msg, ty in expects_post_by[cyc]:
-                w = _as_int_width(ty)
                 m = msg if msg is not None else f"{sn} mismatch"
-                lines.append(f"          if ({sn} !== {sv_lit(w, val)}) $fatal(1, \"{m}\");\n")
+                lines.extend(sv_expect_lines(sn, val, m, ty, indent="          ", phase="post"))
             lines.append("        end\n")
         lines.append("        default: begin end\n")
         lines.append("      endcase\n")
@@ -1094,8 +1761,8 @@ def _render_tb_sv(iface: _TopIface, t: Tb, *, trace_plan: TracePlan | None = Non
             for fmt, ports in prints_at[cyc]:
                 esc = str(fmt).replace("\\", "\\\\").replace("\"", "\\\"")
                 if ports:
-                    suffix = "".join(f" {p}=%0h" for p in ports)
-                    args = ", ".join(["cyc", *ports])
+                    suffix = "".join(f" {raw}=%0h" for raw, _sn, _ty in ports)
+                    args = ", ".join(["cyc", *(sv_packed_expr(sn, ty) for _raw, sn, ty in ports)])
                     lines.append(f"          $display(\"[tb] cyc=%0d {esc}{suffix}\", {args});\n")
                 else:
                     lines.append(f"          $display(\"[tb] cyc=%0d {esc}\", cyc);\n")
@@ -1109,8 +1776,8 @@ def _render_tb_sv(iface: _TopIface, t: Tb, *, trace_plan: TracePlan | None = Non
             esc = str(fmt).replace("\\", "\\\\").replace("\"", "\\\"")
             lines.append(f"      if (cyc >= {st} && (((cyc - {st}) % {ev}) == 0)) begin\n")
             if ports:
-                suffix = "".join(f" {p}=%0h" for p in ports)
-                args = ", ".join(["cyc", *ports])
+                suffix = "".join(f" {raw}=%0h" for raw, _sn, _ty in ports)
+                args = ", ".join(["cyc", *(sv_packed_expr(sn, ty) for _raw, sn, ty in ports)])
                 lines.append(f"        $display(\"[tb] cyc=%0d {esc}{suffix}\", {args});\n")
             else:
                 lines.append(f"        $display(\"[tb] cyc=%0d {esc}\", cyc);\n")
@@ -1224,6 +1891,8 @@ def _collect_testbench_payload(
     *,
     trace_plan: TracePlan | None = None,
     tb_probes: TbProbes | None = None,
+    tb_schedule_mode: str = "inline",
+    tb_schedule_dir: Path | None = None,
 ) -> tuple[str, str]:
     if not hasattr(mod, "tb") or not callable(getattr(mod, "tb")):
         raise SystemExit("build requires `@testbench def tb(t: Tb): ...`")
@@ -1256,9 +1925,22 @@ def _collect_testbench_payload(
     tb_name = _sanitize_id(str(tb_name))
     payload = payload_obj.as_dict()
     payload["tb_name"] = str(tb_name)
+    payload["tb_schedule_mode"] = str(tb_schedule_mode)
+    tb_runtime_schedule_path: Path | None = None
+    if str(tb_schedule_mode).strip().lower() == "sidecar":
+        if tb_schedule_dir is None:
+            raise SystemExit("sidecar TB requires a schedule output directory")
+        tb_runtime_schedule_path = tb_schedule_dir / f"{tb_name}.schedule.bin"
+        payload["tb_schedule"] = str(tb_runtime_schedule_path)
     if trace_plan is not None:
         payload["trace_plan"] = trace_plan.as_dict()
-    payload["cpp_text"] = _render_tb_cpp(iface, t, trace_plan=trace_plan)
+    payload["cpp_text"] = _render_tb_cpp(
+        iface,
+        t,
+        trace_plan=trace_plan,
+        schedule_mode=tb_schedule_mode,
+        schedule_path=tb_runtime_schedule_path,
+    )
     payload["sv_text"] = _render_tb_sv(iface, t, trace_plan=trace_plan)
     return (str(tb_name), json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False))
 
@@ -1525,7 +2207,20 @@ def _cmd_build(args: argparse.Namespace) -> int:
 
     if not cache_hit:
         try:
-            design_obj = compile(build, name=top_name, **jit_params)
+            params = list(inspect.signature(build).parameters.values())
+            if len(params) >= 2 and params[1].name == "domain":
+                from .v5 import compile_cycle_aware
+
+                cycle_circuit = compile_cycle_aware(
+                    build,
+                    name=top_name,
+                    eager=True,
+                    hierarchical=True,
+                    **jit_params,
+                )
+                design_obj = getattr(cycle_circuit, "_v5_design", None)
+            else:
+                design_obj = compile(build, name=top_name, **jit_params)
         except (DesignError, JitError) as e:
             raise SystemExit(f"design compile failed: {e}") from e
         if not isinstance(design_obj, Design):
@@ -1564,6 +2259,7 @@ def _cmd_build(args: argparse.Namespace) -> int:
         "inline_policy": "off",
         "hierarchy_policy": "strict",
         "target": target,
+        "tb_schedule_mode": str(args.tb_schedule_mode),
         "frontend_contract": FRONTEND_CONTRACT,
     }
     build_flags_hash = _canonical_hash(build_flags)
@@ -1631,7 +2327,14 @@ def _cmd_build(args: argparse.Namespace) -> int:
                 raise SystemExit(f"trace config error: {e}") from e
 
     tb_probes = TbProbes.from_probe_manifest(probe_manifest_obj)
-    tb_name, tb_payload_json = _collect_testbench_payload(mod, iface, trace_plan=trace_plan, tb_probes=tb_probes)
+    tb_name, tb_payload_json = _collect_testbench_payload(
+        mod,
+        iface,
+        trace_plan=trace_plan,
+        tb_probes=tb_probes,
+        tb_schedule_mode=str(args.tb_schedule_mode),
+        tb_schedule_dir=out_dir / "tb",
+    )
     tb_pyc_path = _emit_testbench_pyc_file(out_dir=out_dir, tb_name=tb_name, payload_json=tb_payload_json)
     manifest["testbench"] = {"name": tb_name, "pyc": str(tb_pyc_path.relative_to(out_dir))}
     if trace_plan is not None:
@@ -1728,6 +2431,9 @@ def _cmd_build(args: argparse.Namespace) -> int:
         cpp_headers = _gather_cpp_headers(device_cpp_root)
         include_dirs: list[str] = []
         include_dirs.append(str(device_cpp_root))
+        runtime_source_include = Path(__file__).resolve().parents[3] / "runtime"
+        if runtime_source_include.is_dir():
+            include_dirs.append(str(runtime_source_include))
         for p in [*cpp_sources, *cpp_headers]:
             parent = str(p.parent)
             if parent not in include_dirs:
@@ -1889,6 +2595,27 @@ def _cmd_build(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_sidecar_inspect(args: argparse.Namespace) -> int:
+    report = inspect_sidecar_file(Path(args.file))
+    sys.stdout.write(render_sidecar_inspect_text(report))
+    return 1 if bool(report.get("errors")) and bool(getattr(args, "strict", False)) else 0
+
+
+def _cmd_sidecar_verify(args: argparse.Namespace) -> int:
+    report = inspect_sidecar_file(Path(args.file))
+    if report.get("errors"):
+        for item in report["errors"]:
+            print(f"ERROR: {item}", file=sys.stderr)
+    if report.get("warnings"):
+        for item in report["warnings"]:
+            print(f"WARNING: {item}", file=sys.stderr)
+    if report.get("valid"):
+        print("sidecar verify: ok")
+        return 0
+    print("sidecar verify: failed", file=sys.stderr)
+    return 1
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="pycircuit")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -1984,6 +2711,12 @@ def main(argv: list[str] | None = None) -> int:
         help="Optional trace configuration JSON (instance globs + probe tags + windows) for VCD generation.",
     )
     build.add_argument(
+        "--tb-schedule-mode",
+        choices=["inline", "sidecar"],
+        default="inline",
+        help="C++ testbench schedule rendering mode: inline preserves existing per-cycle emission; sidecar emits a stable runner plus external schedule sidecar data.",
+    )
+    build.add_argument(
         "--run-verilator",
         action="store_true",
         help="Also run generated Verilator binary after build",
@@ -1995,6 +2728,18 @@ def main(argv: list[str] | None = None) -> int:
         help="Argument passed to the Verilator binary when --run-verilator is set (repeatable).",
     )
     build.set_defaults(fn=_cmd_build)
+
+    sidecar = sub.add_parser("sidecar", help="Inspect and verify sidecar schedule files.")
+    sidecar_sub = sidecar.add_subparsers(dest="sidecar_cmd", required=True)
+
+    sidecar_inspect = sidecar_sub.add_parser("inspect", help="Print a human-readable sidecar section summary.")
+    sidecar_inspect.add_argument("file", help="sidecar file path")
+    sidecar_inspect.add_argument("--strict", action="store_true", help="Return non-zero if framework-level errors exist.")
+    sidecar_inspect.set_defaults(fn=_cmd_sidecar_inspect)
+
+    sidecar_verify = sidecar_sub.add_parser("verify", help="Verify sidecar container and section-directory consistency.")
+    sidecar_verify.add_argument("file", help="sidecar file path")
+    sidecar_verify.set_defaults(fn=_cmd_sidecar_verify)
 
     ns = p.parse_args(argv)
     return int(ns.fn(ns))

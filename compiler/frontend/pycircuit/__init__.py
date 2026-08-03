@@ -13,7 +13,7 @@ from .connectors import (
     WireConnector,
 )
 from .design import const, function, module, probe as _probe_decorator, testbench as _testbench_decorator
-from .hw import Bundle, Circuit, ClockDomain, Pop, Reg, Vec, Wire, cat, unsigned
+from .hw import Bundle, Circuit, ClockDomain, Pop, Reg, Wire, cat, sext, trunc, unsigned, zext
 from .jit import JitError, compile
 from .literals import LiteralValue, S, U, s, u
 from .v5 import (
@@ -24,9 +24,11 @@ from .v5 import (
     ForwardSignal,
     StateSignal,
     cas,
+    cat,
     compile_cycle_aware,
     log,
     mux,
+    priority_mux,
     pyc_CircuitLogger,
     pyc_CircuitModule,
     pyc_ClockDomain,
@@ -85,7 +87,6 @@ __all__ = [
     "TbProbes",
     "TestbenchProgram",
     "U",
-    "Vec",
     "Wire",
     "WireConnector",
     "cat",
@@ -95,12 +96,16 @@ __all__ = [
     "lib",
     "logic",
     "module",
+    "priority_mux",
     "probe",
     "spec",
     "testbench",
     "wiring",
     "s",
+    "sext",
     "sva",
+    "trunc",
     "u",
     "unsigned",
+    "zext",
 ]

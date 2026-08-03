@@ -11,6 +11,7 @@ from pycircuit import (
     CycleAwareDomain,
     cas,
     compile_cycle_aware,
+    sext,
     wire_of,
 )
 
@@ -29,19 +30,21 @@ def build(m: CycleAwareCircuit, domain: CycleAwareDomain, *,
     x_in = cas(domain, m.input("x_in", width=DATA_W), cycle=0)
     x_valid = cas(domain, m.input("x_valid", width=1), cycle=0)
 
-    delay_states = [domain.signal(width=DATA_W, reset_value=0, name=f"delay_{i}") for i in range(1, TAPS)]
-
-    taps_wire = [wire_of(x_in)] + [wire_of(st) for st in delay_states]
-
-    coeff_wires = [m.const(cv, width=ACC_W) for cv in COEFFS]
-
-    acc_w = m.const(0, width=ACC_W)
-    for i in range(TAPS):
-        tap_ext = taps_wire[i].as_signed()._sext(width=ACC_W)
-        product = tap_ext * coeff_wires[i]
-        acc_w = acc_w + product
-
-    y_comb = cas(domain, acc_w[0:ACC_W], cycle=0)
+    # Keep state as scalar registers: Vector state assignment is not yet
+    # legal after ``pyc-vector-unroll``.  The homogeneous tap/MAC datapath is
+    # still represented as Vector operations and safely lowered by pycc.
+    delay_states = [
+        domain.signal(width=DATA_W, reset_value=0, name=f"delay_{i}")
+        for i in range(1, TAPS)
+    ]
+    delay_lanes = delay_states
+    taps = domain.vec(x_in, *delay_lanes)
+    coeffs = cas(domain, domain.create_const(list(COEFFS), width=ACC_W), cycle=0)
+    tap_ext = cas(domain, sext(wire_of(taps), width=ACC_W), cycle=taps.cycle)
+    products = tap_ext * coeffs
+    y_comb = products[0]
+    for i in range(1, TAPS):
+        y_comb = y_comb + products[i]
 
     y_out_state = domain.signal(width=ACC_W, reset_value=0, name="y_out_reg")
     y_valid_state = domain.signal(width=1, reset_value=0, name="y_valid_reg")
