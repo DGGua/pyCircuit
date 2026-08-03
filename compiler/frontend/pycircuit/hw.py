@@ -822,11 +822,11 @@ class Circuit(Module):
         return CycleAwareDomain(self, str(name))
 
     @overload
-    def input(self, name:str, *, width: int, signed: bool = False) -> Wire[Bits]: ...
+    def input(self, name:str, *, width: int,signed: bool = False, shape: None = None) -> Wire[Bits]: ...
 
     @overload
     def input(
-        self, name: str, *, width: int, shape: list[int], signed: bool = False
+        self, name: str, *, width: int, signed: bool, shape: list[int]
     ) -> Wire[Vector[Data]]: ...
 
     def input(  # type: ignore[override]
@@ -835,8 +835,8 @@ class Circuit(Module):
         *,
         width: int,
         signed: bool = False,
-        shape: list[int] = [],
-    ) -> Wire[Bits] | Wire[Vector[Data]]:
+        shape: list[int] | None = None,
+    ) -> Wire:
         """Declare a module input port.
 
         Scalar inputs return ``Wire[Bits]``. Shaped inputs return
@@ -1053,6 +1053,7 @@ class Circuit(Module):
         (shared enable for the whole vector register).
         """
         _ = signed  # unused for now (kept for API stability)
+        shape = [] if shape is None else list(shape)
 
         if domain is not None:
             clk = domain.clk

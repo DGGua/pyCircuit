@@ -59,11 +59,28 @@ class CycleAwareCircuit(Circuit):
         _ = (frequency_desc, reset_active_high)
         return CycleAwareDomain(self, str(name))
 
-    def const_signal(self, value: int, width: int, domain: "CycleAwareDomain") -> Wire:
-        return domain.create_const(int(value), width=int(width))
+    def const_signal(
+        self,
+        value: int | list,
+        width: int,
+        domain: "CycleAwareDomain",
+        *,
+        signed: bool = False,
+    ) -> Wire:
+        """Create a scalar or shaped constant in a V5 clock domain."""
+        return domain.create_const(value, width=int(width), signed=signed)
 
-    def input_signal(self, name: str, width: int, domain: "CycleAwareDomain") -> Wire:
-        return domain.create_signal(str(name), width=int(width))
+    def input_signal(
+        self,
+        name: str,
+        width: int,
+        domain: "CycleAwareDomain",
+        *,
+        shape: list[int] | None = None,
+        signed: bool = False,
+    ) -> Wire:
+        """Create a scalar or Vector input port in a V5 clock domain."""
+        return domain.create_signal(str(name), width=int(width), shape=shape, signed=signed)
 
 
 class CycleAwareDomain:

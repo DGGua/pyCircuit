@@ -116,18 +116,19 @@ class Module:
         return Signal(ref=tmp, ty=Bits(1))
 
     @overload
-    def input(self, name:str, *, width: int) -> Signal[Bits]: ...
+    def input(self, name:str, *, width: int, shape: None = None) -> Signal[Bits]: ...
     
     @overload
-    def input(self, name:str, *, width: int, shape: list[int]) -> Signal[Vector]: ...     
+    def input(self, name:str, *, width: int, shape: list[int]) -> Signal[Vector[Data]]: ...     
 
     def input(
         self,
         name: str,
         *,
         width: int,
-        shape: list[int] = [],
+        shape: list[int] | None = None,
     ) -> Signal:
+        shape = [] if shape is None else list(shape)
         if width <= 0:
             raise ValueError("width must be > 0")
         if not all(isinstance(d, int) and d > 0 for d in shape):
