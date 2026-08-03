@@ -3,9 +3,16 @@ name: CI
 on:
   workflow_dispatch:
   push:
-    branches: [main, develop]
+    # Run CI on every branch push (including PR head branches; PR push also fires
+    # pull_request synchronize below — concurrency cancels the duplicate).
   pull_request:
     types: [opened, synchronize, reopened]
+
+concurrency:
+  # On PR events, key on the PR so new pushes cancel stale runs. On push events,
+  # key on the ref so each branch only keeps its latest run.
+  group: ci-${{ github.event_name }}-${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 env:
   LLVM_VERSION: "19"
@@ -15,9 +22,42 @@ env:
   PYC_GATE_RUN_ID: ${{ github.run_id }}-${{ github.run_attempt }}
 
 jobs:
+  # Skip the duplicate push run when the pushed branch has an open PR —
+  # the pull_request synchronize event will cover the same commit.
+  gate:
+    name: Decide
+    runs-on: ubuntu-latest
+    outputs:
+      should_run: ${{ steps.decide.outputs.should_run }}
+    steps:
+      - id: decide
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${{ github.event_name }}" != "push" ]]; then
+            echo "should_run=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # For push events, check if the head branch has an open PR.
+          # pr ls --head only accepts the short branch name.
+          branch="${GITHUB_REF#refs/heads/}"
+          count=$(gh pr list --repo "${{ github.repository }}" \
+                    --state open --head "${branch}" --json number --limit 1 \
+                    | jq 'length')
+          if [[ "${count}" -gt 0 ]]; then
+            echo "Skipping push run: PR exists for ${branch} (pull_request event will run)."
+            echo "should_run=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "should_run=true" >> "$GITHUB_OUTPUT"
+          fi
+
   lint:
     name: "G0: Python Checks"
     runs-on: ubuntu-latest
+    needs: gate
+    if: needs.gate.outputs.should_run == 'true'
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -52,7 +92,8 @@ jobs:
   build-linux:
     name: "G0: Build Toolchain (Linux)"
     runs-on: ubuntu-latest
-    needs: lint
+    needs: [gate, lint]
+    if: needs.gate.outputs.should_run == 'true'
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -113,7 +154,8 @@ jobs:
   gate-g1-linux:
     name: "G1: Examples + Semantic Gates (Linux)"
     runs-on: ubuntu-latest
-    needs: build-linux
+    needs: [gate, build-linux]
+    if: needs.gate.outputs.should_run == 'true'
     timeout-minutes: 90
     steps:
       - name: Checkout
@@ -192,7 +234,8 @@ jobs:
   gate-g2-linux:
     name: "G2: Cross-backend Sims (Linux)"
     runs-on: ubuntu-latest
-    needs: build-linux
+    needs: [gate, build-linux]
+    if: needs.gate.outputs.should_run == 'true'
     timeout-minutes: 120
     steps:
       - name: Checkout
@@ -269,7 +312,8 @@ jobs:
   wheel-linux:
     name: "G0: Wheel Smoke (Linux)"
     runs-on: ubuntu-latest
-    needs: build-linux
+    needs: [gate, build-linux]
+    if: needs.gate.outputs.should_run == 'true'
     steps:
       - name: Checkout
         uses: actions/checkout@v7
