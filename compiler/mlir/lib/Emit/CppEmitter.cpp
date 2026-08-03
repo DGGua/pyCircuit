@@ -572,8 +572,13 @@ static LogicalResult emitCombAssign(Operation &op, llvm::raw_ostream &os, NameTa
     unsigned ow = bitWidth(ex.getResult().getType());
     if (iw == 0 || ow == 0)
       return ex.emitError("invalid extract width");
-    os << "    " << nt.get(ex.getResult()) << " = pyc::cpp::extract<" << ow << ", " << iw << ">("
-       << nt.get(ex.getIn()) << ", " << ex.getLsbAttr().getInt() << "u);\n";
+    bool inIsVec = isa<VectorType>(ex.getIn().getType());
+    assignExpr(ex.getResult(), ex.getType(), os, nt,
+               [&](llvm::raw_ostream &e) {
+                 e << "pyc::cpp::" << (inIsVec ? "extract_vec<" : "extract<")
+                   << ow << ", " << iw << ">(" << nt.get(ex.getIn()) << ", "
+                   << ex.getLsbAttr().getInt() << "u)";
+               });
     return success();
   }
   if (auto sh = dyn_cast<pyc::ShliOp>(op)) {
@@ -726,12 +731,31 @@ static LogicalResult emitCombAssign(Operation &op, llvm::raw_ostream &os, NameTa
       if (lanes <= 0)
         return vr.emitError("pyc.") << opName << " requires non-empty vector dimensions";
     }
-    std::int64_t dim = vr.getDim().value_or(0);
+    bool useTree = isTreeReduceMode(vr.getOperation());
+
+    if (!vr.getDim()) {
+      assignExpr(vr.getResult(), vr.getType(), os, nt,
+                 [&](llvm::raw_ostream &e) {
+                   llvm::SmallVector<std::string> terms;
+                   if (vt.getRank() == 1) {
+                     for (std::int64_t i = 0; i < vt.getShape()[0]; ++i)
+                       terms.push_back(nt.get(vr.getVec()) + "[" +
+                                       std::to_string(static_cast<long long>(i)) + "]");
+                   } else {
+                     for (std::int64_t i = 0; i < vt.getShape()[0]; ++i)
+                       for (std::int64_t j = 0; j < vt.getShape()[1]; ++j)
+                         terms.push_back(nt.get(vr.getVec()) + "[" +
+                                         std::to_string(static_cast<long long>(i)) + "][" +
+                                         std::to_string(static_cast<long long>(j)) + "]");
+                   }
+                   e << (useTree ? treeReduceExpr(terms, opToken) : chainReduceExpr(terms, opToken));
+                 });
+      return success();
+    }
+
+    std::int64_t dim = *vr.getDim();
     if (dim < 0 || dim >= vt.getRank())
       return vr.emitError("pyc.") << opName << " dim out of range";
-    if (!vr.getDim() && vt.getRank() != 1)
-      return vr.emitError("pyc.") << opName << " requires explicit dim for rank > 1";
-    bool useTree = isTreeReduceMode(vr.getOperation());
 
     std::int64_t lanes = vt.getShape()[0];
     if (vt.getRank() == 1) {
@@ -1204,7 +1228,7 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
 		    unsigned w = bitWidth(f.getResultTypes()[i]);
 		    if (w == 0)
 		      return f.emitError("invalid output port width for ProbeRegistry: ") << getPortCanonicalFieldPath(f, i, /*isResult=*/true);
-		    if (outIsReg[i]) {
+		    if (outIsReg[i] && !isa<VectorType>(f.getResultTypes()[i])) {
 		      os << "    reg.addReg<" << w << ">(reg_path(" << cppStringLiteral(outCanon[i]) << "), &" << outNames[i]
 		         << ", &" << nt.get(outRegQ[i]) << "_inst->pending, &" << nt.get(outRegQ[i]) << "_inst->qNext);\n";
 		    } else {
@@ -1212,7 +1236,7 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
 		    }
 		  }
       for (const auto &named : namedProbes) {
-        if (named.isReg) {
+        if (named.isReg && !isa<VectorType>(named.type)) {
           os << "    reg.addReg<" << named.width << ">(reg_path(" << cppStringLiteral(named.fieldPath) << "), &"
              << named.cppValue << ", &" << named.cppRegInst << "->pending, &" << named.cppRegInst << "->qNext);\n";
         } else {
@@ -1266,7 +1290,10 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
 	    unsigned w = bitWidth(r.getQ().getType());
 	    if (w == 0)
 	      return r.emitError("invalid reg width");
-    os << "  pyc::cpp::pyc_reg<" << w << "> *" << nt.get(r.getQ()) << "_inst = nullptr;\n";
+    if (isa<VectorType>(r.getQ().getType()))
+      os << "  pyc::cpp::pyc_vec_reg<" << cppType(r.getQ().getType()) << "> *" << nt.get(r.getQ()) << "_inst = nullptr;\n";
+    else
+      os << "  pyc::cpp::pyc_reg<" << w << "> *" << nt.get(r.getQ()) << "_inst = nullptr;\n";
   }
   for (auto fifo : fifos) {
     unsigned w = bitWidth(fifo.getOutData().getType());
@@ -1545,9 +1572,13 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
     unsigned w = bitWidth(r.getQ().getType());
     if (w == 0)
       return r.emitError("invalid reg width");
-    os << "    " << nt.get(r.getQ()) << "_inst = new pyc::cpp::pyc_reg<" << w << ">("
-       << nt.get(r.getClk()) << ", " << nt.get(r.getRst()) << ", " << nt.get(r.getEn()) << ", " << nt.get(r.getNext())
-       << ", " << nt.get(r.getInit()) << ", " << nt.get(r.getQ()) << ");\n";
+    if (isa<VectorType>(r.getQ().getType()))
+      os << "    " << nt.get(r.getQ()) << "_inst = new pyc::cpp::pyc_vec_reg<"
+         << cppType(r.getQ().getType()) << ">(";
+    else
+      os << "    " << nt.get(r.getQ()) << "_inst = new pyc::cpp::pyc_reg<" << w << ">(";
+    os << nt.get(r.getClk()) << ", " << nt.get(r.getRst()) << ", " << nt.get(r.getEn()) << ", "
+       << nt.get(r.getNext()) << ", " << nt.get(r.getInit()) << ", " << nt.get(r.getQ()) << ");\n";
   }
   for (auto mem : syncMems) {
     auto addrTy = dyn_cast<IntegerType>(mem.getRaddr().getType());

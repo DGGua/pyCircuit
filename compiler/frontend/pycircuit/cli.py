@@ -118,10 +118,14 @@ def _collect_jit_params(build: Any, *, overrides: list[str]) -> dict[str, object
         raise SystemExit("build must use JIT entry semantics: `@module def build(m: Circuit, ...)`")
     value_param_names = set(value_params_of(build).keys())
 
+    # Cycle-aware entrypoints use ``build(m, domain, *, ...)``.  The domain is
+    # supplied by ``compile_cycle_aware`` rather than being a JIT parameter.
+    param_start = 2 if len(params) >= 2 and params[1].name == "domain" else 1
+
     # Collect JIT-time parameters from defaults.
     jit_params: dict[str, object] = {}
     missing: list[str] = []
-    for p in params[1:]:
+    for p in params[param_start:]:
         if p.name in value_param_names:
             continue
         if p.default is inspect._empty:
@@ -306,7 +310,11 @@ def _runtime_manifest_for_toolchain(toolchain_root: Path | None) -> dict[str, ob
         )
 
     include_dir = (toolchain_root / "include").resolve()
-    lib_dir = (toolchain_root / "lib").resolve()
+    # Prefer lib/, fall back to lib64/ (common on RHEL/Fedora 64-bit multilib).
+    lib_dir = (toolchain_root / "lib")
+    if not (lib_dir / _runtime_lib_filename()).is_file():
+        lib_dir = toolchain_root / "lib64"
+    lib_dir = lib_dir.resolve()
     cmake_config_dir = (toolchain_root / "share" / "pycircuit" / "cmake").resolve()
     runtime_lib = (lib_dir / _runtime_lib_filename()).resolve()
 
@@ -427,6 +435,11 @@ def _collect_build(mod: object, src: Path, args: argparse.Namespace) -> Module |
     jit_params = _collect_jit_params(build, overrides=list(getattr(args, "param", []) or []))
     top_name = _top_name_for_build(src, build)
     try:
+        params = list(inspect.signature(build).parameters.values())
+        if len(params) >= 2 and params[1].name == "domain":
+            from .v5 import compile_cycle_aware
+
+            return compile_cycle_aware(build, name=top_name, **jit_params)
         return compile(build, name=top_name, **jit_params)
     except (DesignError, JitError) as e:
         raise SystemExit(f"design compile failed: {e}") from e
@@ -1469,15 +1482,11 @@ def _render_tb_sv(iface: _TopIface, t: Tb, *, trace_plan: TracePlan | None = Non
 
     def decl(name: str, ty: str) -> str:
         info = _port_info(ty)
-        if not info.is_vector:
-            w = info.leaf_width
-            if w == 1:
-                return f"  logic {name};\n"
-            return f"  logic [{w - 1}:0] {name};\n"
-        unpacked = "".join(f" [0:{int(d) - 1}]" for d in info.shape)
-        if info.leaf_width == 1:
-            return f"  logic {name}{unpacked};\n"
-        return f"  logic [{info.leaf_width - 1}:0] {name}{unpacked};\n"
+        # Match VerilogEmitter packed vector ports (flat bus), not unpacked arrays.
+        w = info.total_width
+        if w == 1:
+            return f"  logic {name};\n"
+        return f"  logic [{w - 1}:0] {name};\n"
 
     def flat_indices(shape: tuple[int, ...]) -> list[tuple[int, ...]]:
         if not shape:
@@ -1494,57 +1503,27 @@ def _render_tb_sv(iface: _TopIface, t: Tb, *, trace_plan: TracePlan | None = Non
         walk((), tuple(shape))
         return out
 
-    def sv_access(name: str, idx: tuple[int, ...]) -> str:
-        return str(name) + "".join(f"[{i}]" for i in idx)
-
-    def lane_value(v: int | bool, info: _PortInfo, lane: int) -> int:
-        vv = int(v) if not isinstance(v, bool) else (1 if v else 0)
-        vv &= (1 << info.total_width) - 1
-        return (vv >> (lane * info.leaf_width)) & ((1 << info.leaf_width) - 1)
 
     def sv_packed_expr(name: str, ty: str) -> str:
-        info = _port_info(ty)
-        if not info.is_vector:
-            return str(name)
-        lanes = [sv_access(name, idx) for idx in flat_indices(info.shape)]
-        return "{" + ", ".join(reversed(lanes)) + "}"
+        # TB signals are declared as packed buses matching DUT ports.
+        _ = ty
+        return str(name)
 
     def sv_drive_const_lines(name: str, value: int | bool, ty: str, *, indent: str) -> list[str]:
         info = _port_info(ty)
-        if not info.is_vector:
-            return [f"{indent}{name} = {sv_lit(info.leaf_width, value)};\n"]
-        out: list[str] = []
-        for lane, idx in enumerate(flat_indices(info.shape)):
-            out.append(f"{indent}{sv_access(name, idx)} = {sv_lit(info.leaf_width, lane_value(value, info, lane))};\n")
-        return out
+        return [f"{indent}{name} = {sv_lit(info.total_width, value)};\n"]
 
     def sv_drive_expr_lines(name: str, expr: str, ty: str, *, indent: str) -> list[str]:
         info = _port_info(ty)
         if info.total_width > 64:
             raise SystemExit(f"random() for i{info.total_width} not supported in SV TB generator (prototype limitation)")
-        if not info.is_vector:
-            hi = 63 if info.leaf_width >= 64 else (info.leaf_width - 1)
-            return [f"{indent}{name} = {expr}[{hi}:0];\n"]
-        out: list[str] = []
-        for lane, idx in enumerate(flat_indices(info.shape)):
-            lo = lane * info.leaf_width
-            hi = lo + info.leaf_width - 1
-            out.append(f"{indent}{sv_access(name, idx)} = {expr}[{hi}:{lo}];\n")
-        return out
+        hi = 63 if info.total_width >= 64 else (info.total_width - 1)
+        return [f"{indent}{name} = {expr}[{hi}:0];\n"]
 
     def sv_expect_lines(name: str, value: int | bool, msg: str, ty: str, *, indent: str, phase: str) -> list[str]:
         info = _port_info(ty)
-        if not info.is_vector:
-            prefix = "PRE: " if phase == "pre" else ""
-            return [f"{indent}if ({name} !== {sv_lit(info.leaf_width, value)}) $fatal(1, \"{prefix}{msg}\");\n"]
-        out: list[str] = []
         prefix = "PRE: " if phase == "pre" else ""
-        for lane, idx in enumerate(flat_indices(info.shape)):
-            lane_msg = f"{msg}[{']['.join(str(i) for i in idx)}]"
-            out.append(
-                f"{indent}if ({sv_access(name, idx)} !== {sv_lit(info.leaf_width, lane_value(value, info, lane))}) $fatal(1, \"{prefix}{lane_msg}\");\n"
-            )
-        return out
+        return [f"{indent}if ({name} !== {sv_lit(info.total_width, value)}) $fatal(1, \"{prefix}{msg}\");\n"]
 
     drives_by: dict[int, list[tuple[str, int | bool, str]]] = {}
     expects_pre_by: dict[int, list[tuple[str, int | bool, str | None, str]]] = {}
@@ -2228,7 +2207,20 @@ def _cmd_build(args: argparse.Namespace) -> int:
 
     if not cache_hit:
         try:
-            design_obj = compile(build, name=top_name, **jit_params)
+            params = list(inspect.signature(build).parameters.values())
+            if len(params) >= 2 and params[1].name == "domain":
+                from .v5 import compile_cycle_aware
+
+                cycle_circuit = compile_cycle_aware(
+                    build,
+                    name=top_name,
+                    eager=True,
+                    hierarchical=True,
+                    **jit_params,
+                )
+                design_obj = getattr(cycle_circuit, "_v5_design", None)
+            else:
+                design_obj = compile(build, name=top_name, **jit_params)
         except (DesignError, JitError) as e:
             raise SystemExit(f"design compile failed: {e}") from e
         if not isinstance(design_obj, Design):

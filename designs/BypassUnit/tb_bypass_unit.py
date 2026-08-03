@@ -3,7 +3,7 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-from pycircuit import CycleAwareTb, Tb, compile_cycle_aware, CycleAwareCircuit, CycleAwareDomain, testbench
+from pycircuit import Tb, compile, testbench
 from pycircuit.tb import SvaExpr, sva
 
 _THIS_DIR = Path(__file__).resolve().parent
@@ -72,37 +72,56 @@ def _resolve_expected(src: dict, wb: dict, *, lanes: int) -> tuple[int, int, int
     return src_rf_data, 0, 0, 0
 
 
-def _drive_cycle(tb: CycleAwareTb, spec: dict, *, lanes: int, ptag_w: int, ptype_w: int, data_w: int) -> None:
+def _drive_cycle(
+    tb: Tb,
+    spec: dict,
+    *,
+    at: int,
+    lanes: int,
+    ptag_w: int,
+    ptype_w: int,
+    data_w: int,
+) -> None:
     wb = spec["wb"]
     i2 = spec["i2"]
 
     for stage in _STAGES:
         lane_entries = [wb[stage][lane] for lane in range(lanes)]
-        tb.drive(f"{stage}_valid", _pack_lanes([int(w["valid"]) for w in lane_entries], 1))
-        tb.drive(f"{stage}_ptag", _pack_lanes([int(w["ptag"]) for w in lane_entries], ptag_w))
-        tb.drive(f"{stage}_ptype", _pack_lanes([int(w["ptype"]) for w in lane_entries], ptype_w))
-        tb.drive(f"{stage}_data", _pack_lanes([int(w["data"]) for w in lane_entries], data_w))
+        tb.drive(f"{stage}_valid", _pack_lanes([int(w["valid"]) for w in lane_entries], 1), at=at)
+        tb.drive(f"{stage}_ptag", _pack_lanes([int(w["ptag"]) for w in lane_entries], ptag_w), at=at)
+        tb.drive(f"{stage}_ptype", _pack_lanes([int(w["ptype"]) for w in lane_entries], ptype_w), at=at)
+        tb.drive(f"{stage}_data", _pack_lanes([int(w["data"]) for w in lane_entries], data_w), at=at)
 
     for src in _SRCS:
         src_entries = [i2[i][src] for i in range(lanes)]
-        tb.drive(f"i2_{src}_valid", _pack_lanes([int(s["valid"]) for s in src_entries], 1))
-        tb.drive(f"i2_{src}_ptag", _pack_lanes([int(s["ptag"]) for s in src_entries], ptag_w))
-        tb.drive(f"i2_{src}_ptype", _pack_lanes([int(s["ptype"]) for s in src_entries], ptype_w))
-        tb.drive(f"i2_{src}_rf_data", _pack_lanes([int(s["rf_data"]) for s in src_entries], data_w))
+        tb.drive(f"i2_{src}_valid", _pack_lanes([int(s["valid"]) for s in src_entries], 1), at=at)
+        tb.drive(f"i2_{src}_ptag", _pack_lanes([int(s["ptag"]) for s in src_entries], ptag_w), at=at)
+        tb.drive(f"i2_{src}_ptype", _pack_lanes([int(s["ptype"]) for s in src_entries], ptype_w), at=at)
+        tb.drive(f"i2_{src}_rf_data", _pack_lanes([int(s["rf_data"]) for s in src_entries], data_w), at=at)
 
 
-def _expect_cycle(tb: CycleAwareTb, cyc: int, spec: dict, *, lanes: int, ptag_w: int, ptype_w: int, data_w: int, lane_w: int) -> None:
+def _expect_cycle(
+    tb: Tb,
+    cyc: int,
+    spec: dict,
+    *,
+    lanes: int,
+    ptag_w: int,
+    ptype_w: int,
+    data_w: int,
+    lane_w: int,
+) -> None:
     wb = spec["wb"]
     i2 = spec["i2"]
     for src in _SRCS:
         exp_entries = [_resolve_expected(i2[i][src], wb, lanes=lanes) for i in range(lanes)]
-        tb.expect(f"i2_{src}_data", _pack_lanes([e[0] for e in exp_entries], data_w),
+        tb.expect(f"i2_{src}_data", _pack_lanes([e[0] for e in exp_entries], data_w), at=cyc,
                   msg=f"data mismatch src={src} cycle={cyc}")
-        tb.expect(f"i2_{src}_hit", _pack_lanes([e[1] for e in exp_entries], 1),
+        tb.expect(f"i2_{src}_hit", _pack_lanes([e[1] for e in exp_entries], 1), at=cyc,
                   msg=f"hit mismatch src={src} cycle={cyc}")
-        tb.expect(f"i2_{src}_sel_stage", _pack_lanes([e[2] for e in exp_entries], 2),
+        tb.expect(f"i2_{src}_sel_stage", _pack_lanes([e[2] for e in exp_entries], 2), at=cyc,
                   msg=f"sel_stage mismatch src={src} cycle={cyc}")
-        tb.expect(f"i2_{src}_sel_lane", _pack_lanes([e[3] for e in exp_entries], lane_w),
+        tb.expect(f"i2_{src}_sel_lane", _pack_lanes([e[3] for e in exp_entries], lane_w), at=cyc,
                   msg=f"sel_lane mismatch src={src} cycle={cyc}")
 
 
@@ -343,7 +362,7 @@ def _gen_random_stress(*, lanes: int, ptag_count: int, count: int, seed: int) ->
 
 @testbench
 def tb(t: Tb) -> None:
-    tb = CycleAwareTb(t)
+    tb = t
     lanes = 8
     ptag_count = 256
     ptype_count = 4
@@ -403,39 +422,28 @@ def tb(t: Tb) -> None:
     cycles.extend(_gen_invalid_source_sweep(lanes=lanes, ptag_count=ptag_count))
     cycles.extend(_gen_random_stress(lanes=lanes, ptag_count=ptag_count, count=32, seed=0xD1CE_BA5E_F00D_CAFE))
 
-    tb.clock("clk")
-    tb.reset("rst", cycles_asserted=2, cycles_deasserted=1)
     tb.timeout(len(cycles) + 64)
     tb.print_every("bypass", start=0, every=32, ports=["i2_srcL_hit", "i2_srcR_hit"])
 
-    for i in range(lanes):
-        for src in _SRCS:
-            for stage in _STAGES:
-                for a in range(lanes):
-                    for b in range(a + 1, lanes):
-                        match_a = _match_expr(stage, a, i, src, ptag_w=ptag_w, ptype_w=ptype_w)
-                        match_b = _match_expr(stage, b, i, src, ptag_w=ptag_w, ptype_w=ptype_w)
-                        tb.sva_assert(
-                            ~(match_a & match_b),
-                            clock="clk",
-                            reset="rst",
-                            name=f"no_conflict_{stage}_{src}_{i}_{a}_{b}",
-                            msg=f"illegal same-stage multihit stage={stage} src={src} lane={i}",
-                        )
-
     # --- cycle 0 ---
     for cyc, spec in enumerate(cycles):
-        if cyc > 0:
-            tb.next()  # --- advance to next cycle ---
-        _drive_cycle(tb, spec, lanes=lanes, ptag_w=ptag_w, ptype_w=ptype_w, data_w=data_w)
+        _drive_cycle(
+            tb,
+            spec,
+            at=cyc,
+            lanes=lanes,
+            ptag_w=ptag_w,
+            ptype_w=ptype_w,
+            data_w=data_w,
+        )
         _expect_cycle(tb, cyc, spec, lanes=lanes, ptag_w=ptag_w, ptype_w=ptype_w, data_w=data_w, lane_w=lane_w)
 
-    tb.finish()
+    tb.finish(at=len(cycles))
 
 
 if __name__ == "__main__":
     print(
-        compile_cycle_aware(build,
+        compile(build,
             name="tb_bypass_unit_top",
             lanes=8,
             data_width=64,

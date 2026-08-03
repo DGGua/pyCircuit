@@ -5,9 +5,10 @@ import inspect
 import json
 import re
 from dataclasses import dataclass, fields, is_dataclass
-from typing import Any, Callable, Iterable, Mapping, TYPE_CHECKING
+from typing import Any, Callable, Iterable, Mapping, ParamSpec, TYPE_CHECKING, TypeVar, overload
 
 from .api_contract import FRONTEND_CONTRACT
+from .data import Data
 from .dsl import Module
 from .jit_cache import get_structural_metrics
 
@@ -17,6 +18,10 @@ if TYPE_CHECKING:
 
 class DesignError(RuntimeError):
     pass
+
+
+P = ParamSpec("P")
+R = TypeVar("R")
 
 
 _CANON_PATH_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -128,13 +133,25 @@ def module(
     return deco(_fn)
 
 
-def function(_fn: Any | None = None, *, name: str | None = None) -> Callable[[Any], Any] | Any:
+@overload
+def function(_fn: Callable[P, R], *, name: str | None = None) -> Callable[P, R]: ...
+
+
+@overload
+def function(
+    _fn: None = None, *, name: str | None = None
+) -> Callable[[Callable[P, R]], Callable[P, R]]: ...
+
+
+def function(
+    _fn: Callable[P, R] | None = None, *, name: str | None = None
+) -> Callable[P, R] | Callable[[Callable[P, R]], Callable[P, R]]:
     """Mark a function as an inline hardware helper.
 
     Function callsites are lowered inline into the caller.
     """
 
-    def deco(fn: Any) -> Any:
+    def deco(fn: Callable[P, R]) -> Callable[P, R]:
         if isinstance(name, str) and name.strip():
             setattr(fn, "__pycircuit_module_name__", str(name).strip())
         setattr(fn, "__pycircuit_kind__", "function")
@@ -148,14 +165,26 @@ def function(_fn: Any | None = None, *, name: str | None = None) -> Callable[[An
     return deco(_fn)
 
 
-def const(_fn: Any | None = None, *, name: str | None = None) -> Callable[[Any], Any] | Any:
+@overload
+def const(_fn: Callable[P, R], *, name: str | None = None) -> Callable[P, R]: ...
+
+
+@overload
+def const(
+    _fn: None = None, *, name: str | None = None
+) -> Callable[[Callable[P, R]], Callable[P, R]]: ...
+
+
+def const(
+    _fn: Callable[P, R] | None = None, *, name: str | None = None
+) -> Callable[P, R] | Callable[[Callable[P, R]], Callable[P, R]]:
     """Mark a function as compile-time metaprogramming logic.
 
     `@const` calls execute in Python during JIT and must be pure: they may not
     emit IR or mutate module interfaces.
     """
 
-    def deco(fn: Any) -> Any:
+    def deco(fn: Callable[P, R]) -> Callable[P, R]:
         if isinstance(name, str) and name.strip():
             setattr(fn, "__pycircuit_module_name__", str(name).strip())
         setattr(fn, "__pycircuit_kind__", "const")
@@ -327,9 +356,9 @@ class CompiledModule:
     sym_name: str
     mod: Module
     arg_names: tuple[str, ...]
-    arg_types: tuple[str, ...]
+    arg_types: tuple[Data, ...]
     result_names: tuple[str, ...]
-    result_types: tuple[str, ...]
+    result_types: tuple[Data, ...]
     value_param_names: tuple[str, ...]
     value_param_types: tuple[str, ...]
     struct_metrics_json: str
@@ -394,10 +423,10 @@ class Design:
 
     @staticmethod
     def _emit_dep_decl_mlir(cm: CompiledModule) -> str:
-        args_sig = ", ".join(cm.arg_types)
+        args_sig = ", ".join(str(t) for t in cm.arg_types)
         sig = f"({args_sig})"
         if cm.result_types:
-            sig += f" -> ({', '.join(cm.result_types)})"
+            sig += f" -> ({', '.join(str(t) for t in cm.result_types)})"
         kind = _kind_of(cm.fn)
         inline = "true" if _inline_of(cm.fn) else "false"
         base = _base_name(cm.fn)
@@ -438,9 +467,9 @@ class Design:
                     "base": _base_name(cm.fn),
                     "deps": deps,
                     "arg_names": list(cm.arg_names),
-                    "arg_types": list(cm.arg_types),
+                    "arg_types": [str(t) for t in cm.arg_types],
                     "result_names": list(cm.result_names),
-                    "result_types": list(cm.result_types),
+                    "result_types": [str(t) for t in cm.result_types],
                     "value_param_names": list(cm.value_param_names),
                     "value_param_types": list(cm.value_param_types),
                 }

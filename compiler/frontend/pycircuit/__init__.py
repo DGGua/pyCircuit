@@ -13,21 +13,9 @@ from .connectors import (
     WireConnector,
 )
 from .design import const, function, module, probe as _probe_decorator, testbench as _testbench_decorator
-from .hw import Bundle, Circuit, ClockDomain, Pop, Reg, Vec, Wire, cat, sext, trunc, unsigned, zext
+from .hw import Bundle, Circuit, ClockDomain, Pop, Reg, Wire, cat, sext, trunc, unsigned, zext
 from .jit import JitError, compile
 from .literals import LiteralValue, S, U, s, u
-from .record import (
-    Record,
-    RecordArray,
-    RecordField,
-    RecordSpec,
-    record_input,
-    record_mux,
-    record_next,
-    record_output,
-    record_outputs_dict,
-    record_state,
-)
 from .v5 import (
     CycleAwareCircuit,
     CycleAwareDomain,
@@ -36,9 +24,11 @@ from .v5 import (
     ForwardSignal,
     StateSignal,
     cas,
+    cat,
     compile_cycle_aware,
     log,
     mux,
+    priority_mux,
     pyc_CircuitLogger,
     pyc_CircuitModule,
     pyc_ClockDomain,
@@ -89,10 +79,6 @@ __all__ = [
     "ProbeBuilder",
     "ProbeRef",
     "ProbeView",
-    "Record",
-    "RecordArray",
-    "RecordField",
-    "RecordSpec",
     "Reg",
     "RegConnector",
     "S",
@@ -101,7 +87,6 @@ __all__ = [
     "TbProbes",
     "TestbenchProgram",
     "U",
-    "Vec",
     "Wire",
     "WireConnector",
     "cat",
@@ -111,13 +96,8 @@ __all__ = [
     "lib",
     "logic",
     "module",
+    "priority_mux",
     "probe",
-    "record_input",
-    "record_mux",
-    "record_next",
-    "record_output",
-    "record_outputs_dict",
-    "record_state",
     "spec",
     "testbench",
     "wiring",

@@ -55,6 +55,16 @@ static std::optional<unsigned> leafWidth(Type ty) {
   return intTy.getWidth();
 }
 
+/// Flatten recursively nested vector dimensions from outermost to innermost.
+static SmallVector<int64_t> vectorShape(Type ty) {
+  SmallVector<int64_t> shape;
+  while (auto vt = dyn_cast<VectorType>(ty)) {
+    llvm::append_range(shape, vt.getShape());
+    ty = vt.getElementType();
+  }
+  return shape;
+}
+
 static int64_t vectorLaneCount(ArrayRef<int64_t> shape) {
   int64_t lanes = 1;
   for (int64_t d : shape)
@@ -67,7 +77,7 @@ static std::optional<int64_t> flatBitWidth(Type ty) {
   if (!width)
     return std::nullopt;
   if (auto vt = dyn_cast<VectorType>(ty))
-    return vectorLaneCount(vt.getShape()) * static_cast<int64_t>(*width);
+    return vectorLaneCount(vectorShape(vt)) * static_cast<int64_t>(*width);
   return static_cast<int64_t>(*width);
 }
 
@@ -85,7 +95,7 @@ static std::string vPortRange(Type ty) {
 static std::string vUnpacked(Type ty) {
   if (auto vt = dyn_cast<VectorType>(ty)) {
     std::string dims;
-    for (int64_t d : vt.getShape())
+    for (int64_t d : vectorShape(vt))
       dims += " [0:" + std::to_string(d - 1) + "]";
     return dims;
   }
@@ -140,7 +150,7 @@ static void emitUnpackFromPacked(llvm::StringRef arrayBase, llvm::StringRef pack
   auto width = leafWidth(ty);
   if (!width)
     return;
-  ArrayRef<int64_t> shape = vt.getShape();
+  SmallVector<int64_t> shape = vectorShape(vt);
   walkVectorIndices(shape, [&](ArrayRef<int64_t> indices) {
     os << "assign " << arrayBase << indexSuffix(indices) << " = "
        << packedSlice(packedBase, shape, indices, *width) << ";\n";
@@ -156,7 +166,7 @@ static void emitPackToPacked(llvm::StringRef packedBase, llvm::StringRef arrayBa
   auto width = leafWidth(ty);
   if (!width)
     return;
-  ArrayRef<int64_t> shape = vt.getShape();
+  SmallVector<int64_t> shape = vectorShape(vt);
   walkVectorIndices(shape, [&](ArrayRef<int64_t> indices) {
     os << "assign " << packedSlice(packedBase, shape, indices, *width)
        << " = " << arrayBase << indexSuffix(indices) << ";\n";
@@ -586,12 +596,29 @@ static std::optional<LogicalResult> emitScalarOpAssign(Operation &op, raw_ostrea
       if (lanes <= 0)
         return vr.emitError("pyc.") << opName << " requires non-empty vector dimensions for verilog emission";
     }
-    std::int64_t dim = vr.getDim().value_or(0);
+    bool useTree = isTreeReduceMode(vr.getOperation());
+
+    if (!vr.getDim()) {
+      llvm::SmallVector<std::string> terms;
+      if (vt.getRank() == 1) {
+        for (std::int64_t i = 0; i < vt.getShape()[0]; ++i)
+          terms.push_back(nt.get(vr.getVec()) + "[" +
+                          std::to_string(static_cast<long long>(i)) + "]");
+      } else {
+        for (std::int64_t i = 0; i < vt.getShape()[0]; ++i)
+          for (std::int64_t j = 0; j < vt.getShape()[1]; ++j)
+            terms.push_back(nt.get(vr.getVec()) + "[" +
+                            std::to_string(static_cast<long long>(i)) + "][" +
+                            std::to_string(static_cast<long long>(j)) + "]");
+      }
+      std::string expr = useTree ? treeReduceExpr(terms, opToken) : chainReduceExpr(terms, opToken);
+      emitConnectAssign(nt.get(vr.getResult()), expr, vr.getResult().getType(), os);
+      return success();
+    }
+
+    std::int64_t dim = *vr.getDim();
     if (dim < 0 || dim >= vt.getRank())
       return vr.emitError("pyc.") << opName << " dim out of range for verilog emission";
-    if (!vr.getDim() && vt.getRank() != 1)
-      return vr.emitError("pyc.") << opName << " requires explicit dim for rank > 1";
-    bool useTree = isTreeReduceMode(vr.getOperation());
 
     if (vt.getRank() == 1) {
       std::int64_t lanes = vt.getShape()[0];
@@ -644,7 +671,7 @@ static std::optional<LogicalResult> emitScalarOpAssign(Operation &op, raw_ostrea
 
 // Unroll element-wise vector ops into per-lane scalar assigns.
 static LogicalResult emitVectorElementwise(Operation &op, VectorType vt, raw_ostream &os, NameTable &nt) {
-  ArrayRef<int64_t> shape = vt.getShape();
+  SmallVector<int64_t> shape = vectorShape(vt);
   unsigned rank = static_cast<unsigned>(shape.size());
   Value res = op.getResult(0);
 
@@ -665,7 +692,7 @@ static LogicalResult emitVectorElementwise(Operation &op, VectorType vt, raw_ost
       rebind(res);
       for (Value operand : op.getOperands()) {
         if (auto ovt = dyn_cast<VectorType>(operand.getType()))
-          if (ovt.getShape() == shape)
+          if (vectorShape(ovt) == shape)
             rebind(operand);
       }
       auto handled = emitScalarOpAssign(op, os, nt);
@@ -714,17 +741,11 @@ static void emitConnectAssign(llvm::StringRef lhs, llvm::StringRef rhs, Type ty,
     os << "assign " << lhs << " = " << rhs << ";\n";
     return;
   }
-  ArrayRef<int64_t> shape = vt.getShape();
-  if (shape.size() == 1) {
-    for (int64_t i = 0; i < shape[0]; ++i)
-      os << "assign " << lhs << "[" << i << "] = " << rhs << "[" << i << "];\n";
-  } else {
-    for (int64_t i = 0; i < shape[0]; ++i) {
-      std::string is = "[" + std::to_string(i) + "]";
-      for (int64_t j = 0; j < shape[1]; ++j)
-        os << "assign " << lhs << is << "[" << j << "] = " << rhs << is << "[" << j << "];\n";
-    }
-  }
+  SmallVector<int64_t> shape = vectorShape(vt);
+  walkVectorIndices(shape, [&](ArrayRef<int64_t> indices) {
+    std::string suffix = indexSuffix(indices);
+    os << "assign " << lhs << suffix << " = " << rhs << suffix << ";\n";
+  });
 }
 
 static LogicalResult emitComb(pyc::CombOp comb, raw_ostream &os, NameTable &nt) {
@@ -1181,17 +1202,34 @@ static LogicalResult emitFunc(func::FuncOp f, raw_ostream &os, const VerilogEmit
     os << "// --- Sequential primitives\n";
     for (Operation *op : seqInstOps) {
       if (auto r = dyn_cast<pyc::RegOp>(op)) {
-        auto qTy = dyn_cast<IntegerType>(r.getQ().getType());
-        if (!qTy)
+        auto qTy = r.getQ().getType();
+        auto width = leafWidth(qTy);
+        if (!width)
           return r.emitError("verilog emitter only supports integer reg data type");
-        os << "pyc_reg #(.WIDTH(" << qTy.getWidth() << ")) " << nt.get(r.getQ()) << "_inst (\n";
-        os << "  .clk(" << nt.get(r.getClk()) << "),\n";
-        os << "  .rst(" << nt.get(r.getRst()) << "),\n";
-        os << "  .en(" << nt.get(r.getEn()) << "),\n";
-        os << "  .d(" << nt.get(r.getNext()) << "),\n";
-        os << "  .init(" << nt.get(r.getInit()) << "),\n";
-        os << "  .q(" << nt.get(r.getQ()) << ")\n";
-        os << ");\n";
+
+        auto emitReg = [&](llvm::StringRef suffix, llvm::StringRef instanceSuffix) {
+          os << "pyc_reg #(.WIDTH(" << *width << ")) " << nt.get(r.getQ()) << "_inst" << instanceSuffix << " (\n";
+          os << "  .clk(" << nt.get(r.getClk()) << "),\n";
+          os << "  .rst(" << nt.get(r.getRst()) << "),\n";
+          os << "  .en(" << nt.get(r.getEn()) << "),\n";
+          os << "  .d(" << nt.get(r.getNext()) << suffix << "),\n";
+          os << "  .init(" << nt.get(r.getInit()) << suffix << "),\n";
+          os << "  .q(" << nt.get(r.getQ()) << suffix << ")\n";
+          os << ");\n";
+        };
+
+        if (auto vt = dyn_cast<VectorType>(qTy)) {
+          SmallVector<int64_t> shape = vectorShape(vt);
+          walkVectorIndices(shape, [&](ArrayRef<int64_t> indices) {
+            std::string suffix = indexSuffix(indices);
+            std::string instanceSuffix;
+            for (int64_t index : indices)
+              instanceSuffix += "_" + std::to_string(index);
+            emitReg(suffix, instanceSuffix);
+          });
+        } else {
+          emitReg("", "");
+        }
         continue;
       }
       if (auto fifo = dyn_cast<pyc::FifoOp>(op)) {

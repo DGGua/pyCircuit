@@ -196,9 +196,9 @@ def PYC_SextOp : PYC_Op<"sext", [Pure]> {
 }
 
 def PYC_ExtractOp : PYC_Op<"extract", [Pure]> {
-  let summary = "Bit-slice extraction (scalar only)";
-  let arguments = (ins AnyInteger:$in, I64Attr:$lsb);
-  let results = (outs AnyInteger:$result);
+  let summary = "Bit-slice extraction (element-wise for vectors)";
+  let arguments = (ins AnyIntegerOrV:$in, I64Attr:$lsb);
+  let results = (outs AnyIntegerOrV:$result);
   let hasVerifier = 1;
   let assemblyFormat = "$in attr-dict `:` type($in) `->` type($result)";
   let hasFolder = 1;
@@ -409,6 +409,7 @@ def PYC_VGetOp : PYC_Op<"v_get", [Pure]> {
   let arguments = (ins AnyIntegerOrV:$vec, I64Attr:$index);
   let results = (outs AnyIntegerOrV:$result);
   let hasVerifier = 1;
+  let hasFolder = 1;
   let assemblyFormat = "$vec `[` $index `]` attr-dict `:` type($vec) `->` type($result)";
 }
 
@@ -420,6 +421,7 @@ def PYC_VCreateOp : PYC_Op<"v_create", [Pure]> {
   let arguments = (ins Variadic<AnyIntegerOrV>:$elements);
   let results = (outs AnyIntegerOrV:$result);
   let hasVerifier = 1;
+  let hasFolder = 1;
   let assemblyFormat = "`(` $elements `)` attr-dict `:` `(` type($elements) `)` `->` type($result)";
 }
 
@@ -430,6 +432,7 @@ def PYC_VBroadcastOp : PYC_Op<"v_broadcast", [Pure]> {
   let arguments = (ins AnyInteger:$scalar, I64Attr:$size);
   let results = (outs AnyIntegerOrV:$result);
   let hasVerifier = 1;
+  let hasFolder = 1;
   let assemblyFormat = "$scalar `to` $size attr-dict `:` type($scalar) `->` type($result)";
 }
 
@@ -438,27 +441,30 @@ def PYC_VBroadcastDimOp : PYC_Op<"v_broadcast_dim", [Pure]> {
   let arguments = (ins AnyIntegerOrV:$vec, I64Attr:$size, I64Attr:$dim);
   let results = (outs AnyIntegerOrV:$result);
   let hasVerifier = 1;
+  let hasFolder = 1;
   let assemblyFormat = "$vec `to` $size `,` $dim attr-dict `:` type($vec) `->` type($result)";
 }
 
-// Reduce a vector with bitwise OR over a selected dimension.
+// Reduce a vector with bitwise OR. Omitted dim reduces every dimension.
 // v_or_reduce vector<16xi1> -> i1
+// v_or_reduce vector<2x16xi1> -> i1
 // v_or_reduce vector<2x16xi1> {dim = 0} -> vector<16xi1>
 def PYC_VOrReduceOp : PYC_Op<"v_or_reduce", [Pure]> {
   let summary = "Bitwise OR reduction over vector lanes";
-  let arguments = (ins AnyIntegerOrV:$vec, OptionalAttr<I64Attr>:$dim, OptionalAttr<StrAttr>:$mode);
+  let arguments = (ins AnyIntegerOrV:$vec, OptionalAttr<I64Attr>:$dim, StrAttr:$mode);
   let results = (outs AnyIntegerOrV:$result);
   let hasVerifier = 1;
   let hasFolder = 1;
   let assemblyFormat = "$vec attr-dict `:` type($vec) `->` type($result)";
 }
 
-// Reduce a vector with bitwise AND over a selected dimension.
+// Reduce a vector with bitwise AND. Omitted dim reduces every dimension.
 // v_and_reduce vector<16xi1> -> i1
+// v_and_reduce vector<2x16xi1> -> i1
 // v_and_reduce vector<2x16xi1> {dim = 0} -> vector<16xi1>
 def PYC_VAndReduceOp : PYC_Op<"v_and_reduce", [Pure]> {
   let summary = "Bitwise AND reduction over vector lanes";
-  let arguments = (ins AnyIntegerOrV:$vec, OptionalAttr<I64Attr>:$dim, OptionalAttr<StrAttr>:$mode);
+  let arguments = (ins AnyIntegerOrV:$vec, OptionalAttr<I64Attr>:$dim, StrAttr:$mode);
   let results = (outs AnyIntegerOrV:$result);
   let hasVerifier = 1;
   let hasFolder = 1;
@@ -468,11 +474,13 @@ def PYC_VAndReduceOp : PYC_Op<"v_and_reduce", [Pure]> {
 // Reduce a vector with integer addition over a selected dimension.
 // The operand element width is the result element width. Frontends should
 // zext/sext/trunc lanes before this op when a wider/narrower sum is desired.
+// Omitted dim reduces every dimension.
 // v_add_reduce vector<16xi8> -> i8
+// v_add_reduce vector<2x16xi8> -> i8
 // v_add_reduce vector<2x16xi8> {dim = 0} -> vector<16xi8>
 def PYC_VAddReduceOp : PYC_Op<"v_add_reduce", [Pure]> {
   let summary = "Integer add reduction over vector lanes";
-  let arguments = (ins AnyIntegerOrV:$vec, OptionalAttr<I64Attr>:$dim, OptionalAttr<StrAttr>:$mode);
+  let arguments = (ins AnyIntegerOrV:$vec, OptionalAttr<I64Attr>:$dim, StrAttr:$mode);
   let results = (outs AnyIntegerOrV:$result);
   let hasVerifier = 1;
   let hasFolder = 1;

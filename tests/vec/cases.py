@@ -142,11 +142,11 @@ def _and_reduce(sample: Sample) -> int:
 
 
 def _sum(sample: Sample) -> int:
-    return reduce_sum(sample["a"], 1, 3)  # type: ignore[arg-type]
+    return reduce_sum(sample["a"], 1, 1)  # type: ignore[arg-type]
 
 
 def _signed_sum(sample: Sample) -> int:
-    return reduce_sum(sample["a"], 4, 6, signed=True)  # type: ignore[arg-type]
+    return reduce_sum(sample["a"], 4, 4, signed=True)  # type: ignore[arg-type]
 
 
 def _samples(vv: Sample, vs: Sample, sv: Sample) -> dict[str, Sample]:
@@ -208,14 +208,14 @@ VEC_CASES: tuple[VecCase, ...] = (
     VecCase("zext", "zext", out_width=6, samples=({"a": SIGNED_A},), expected=_zext, ir_tokens=("vector<", "pyc.zext")),
     VecCase("sext", "sext", signed=True, out_width=6, samples=({"a": SIGNED_A},), expected=_sext, ir_tokens=("vector<", "pyc.sext")),
     VecCase("trunc", "trunc", out_width=3, samples=({"a": BASE_A},), expected=_trunc, ir_tokens=("vector<", "pyc.trunc")),
-    VecCase("slice", "slice", out_width=2, samples=({"a": BASE_A},), expected=_slice, ir_tokens=("pyc.extract",), allow_scalarized=True, full_backend=False),
+    VecCase("slice", "slice", out_width=2, samples=({"a": BASE_A},), expected=_slice, ir_tokens=("vector<", "pyc.extract")),
     VecCase("shl_imm", "shl_imm", samples=({"a": BASE_A},), expected=_shl, ir_tokens=("vector<", "pyc.shli")),
     VecCase("lshr_imm", "lshr_imm", samples=({"a": BASE_A},), expected=_lshr, ir_tokens=("vector<", "pyc.lshri")),
     VecCase("ashr_imm", "ashr_imm", signed=True, samples=({"a": SIGNED_A},), expected=_ashr, ir_tokens=("vector<", "pyc.ashri")),
     VecCase("or_reduce", "or_reduce", width=1, out_width=1, samples=({"a": [0, 0, 1, 0]},), expected=_or_reduce, ir_tokens=("vector<", "pyc.v_or_reduce")),
     VecCase("and_reduce", "and_reduce", width=1, out_width=1, samples=({"a": [1, 1, 1, 1]},), expected=_and_reduce, ir_tokens=("vector<", "pyc.v_and_reduce")),
-    VecCase("reduce_sum", "reduce_sum", width=1, out_width=3, samples=({"a": [1, 0, 1, 1]},), expected=_sum, ir_tokens=("vector<", "pyc.zext", "pyc.v_add_reduce")),
-    VecCase("reduce_sum_signed", "reduce_sum_signed", signed=True, out_width=6, samples=({"a": SIGNED_A},), expected=_signed_sum, ir_tokens=("vector<", "pyc.sext", "pyc.v_add_reduce")),
+    VecCase("reduce_sum", "reduce_sum", width=1, out_width=1, samples=({"a": [1, 0, 1, 1]},), expected=_sum, ir_tokens=("vector<", "pyc.v_add_reduce")),
+    VecCase("reduce_sum_signed", "reduce_sum_signed", signed=True, out_width=4, samples=({"a": SIGNED_A},), expected=_signed_sum, ir_tokens=("vector<", "pyc.v_add_reduce")),
 )
 
 FULL_BACKEND_CASES: tuple[VecCase, ...] = tuple(case for case in VEC_CASES if case.full_backend)

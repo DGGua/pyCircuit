@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from .cases import FRONTEND_ONLY_CASES, FULL_BACKEND_CASES, VEC_CASES, VecCase
+from .cases import FULL_BACKEND_CASES, VEC_CASES, VecCase
 from .generate import render_case_source
 from .runner import assert_verilator_ran, check_cpp_manifest_syntax, check_ir, merged_env, run_cmd, run_cpp_binary, run_vec_case
 
@@ -87,11 +87,11 @@ def test_true_division_is_rejected(repo_root: Path) -> None:
     if str(frontend) not in sys.path:
         sys.path.insert(0, str(frontend))
 
-    from pycircuit import Circuit, Vec, compile, module
+    from pycircuit import Circuit
 
     m = Circuit("vec_true_division_rejected")
-    a = Vec([m.input(f"a{i}", width=4) for i in range(4)])
-    b = Vec([m.input(f"b{i}", width=4) for i in range(4)])
+    a = m.vec([m.input(f"a{i}", width=4) for i in range(4)])
+    b = m.vec([m.input(f"b{i}", width=4) for i in range(4)])
 
     with pytest.raises(TypeError, match="use `//`"):
         _ = a / b
@@ -101,25 +101,407 @@ def test_true_division_is_rejected(repo_root: Path) -> None:
         _ = 12 / a
     with pytest.raises(TypeError, match="use `//`"):
         _ = a[0] / b[0]
-
-    @module
-    def build(m: Circuit) -> None:
-        lhs = Vec([m.input(f"lhs{i}", width=4) for i in range(4)])
-        rhs = Vec([m.input(f"rhs{i}", width=4) for i in range(4)])
-        out = lhs / rhs
-        m.output("out0", out[0])
-
-    build.__globals__["Vec"] = Vec
-    with pytest.raises(Exception, match="use `//`"):
         compile(build, name="vec_true_division_jit_rejected")
 
 
 @pytest.mark.vec
-@pytest.mark.parametrize("case", FRONTEND_ONLY_CASES, ids=[case.name for case in FRONTEND_ONLY_CASES])
-def test_frontend_only_case_generation(case: VecCase) -> None:
-    source = render_case_source(case)
-    assert "Vec([" in source
-    assert case.kind in source or case.name in source
+def test_vec_accepts_wire_list_only(repo_root: Path) -> None:
+    import sys
+
+    frontend = repo_root / "compiler" / "frontend"
+    if str(frontend) not in sys.path:
+        sys.path.insert(0, str(frontend))
+
+    from pycircuit import Circuit
+
+    m = Circuit("vec_wire_list_only")
+    lanes = [m.input(f"a{i}", width=1) for i in range(2)]
+    assert m.vec(lanes).ty == "vector<2xi1>"
+    with pytest.raises(TypeError, match="expects list\\[Wire\\], got tuple"):
+        m.vec(tuple(lanes))  # type: ignore[arg-type]
+
+
+@pytest.mark.vec
+def test_constant_vector_elementwise_and_reductions_emit(repo_root: Path) -> None:
+    """Exercise rank-1/rank-2 constant Vec forms accepted by dialect folders."""
+    import sys
+
+    frontend = repo_root / "compiler" / "frontend"
+    if str(frontend) not in sys.path:
+        sys.path.insert(0, str(frontend))
+
+    from pycircuit import Circuit
+
+    m = Circuit("constant_vector_folds")
+    known = m.const([1, 2, 3, 4], width=4)
+    mixed = m.vec(
+        [m.const(1, width=4), m.input("unknown", width=4), m.const(3, width=4), m.const(4, width=4)]
+    )
+    matrix = m.const([[1, 2], [3, 4]], width=4)
+
+    m.output("add_known", known + known)
+    m.output("add_mixed", mixed + known)
+    m.output("get_known", (known + known)[2])
+    m.output("sum_all", matrix.reduce_sum())
+    m.output("or_dim0", matrix.reduce_or(dim=0))
+    m.output("and_dim1", matrix.reduce_and(dim=1))
+
+    mlir = m.emit_mlir()
+    assert mlir.count("pyc.v_create") >= 3
+    assert "pyc.v_add_reduce" in mlir
+    assert "pyc.v_or_reduce" in mlir
+    assert "pyc.v_and_reduce" in mlir
+
+
+@pytest.mark.vec
+def test_circuit_priority_mux_lowers_chain_and_tree_forms(repo_root: Path) -> None:
+    import sys
+
+    frontend = repo_root / "compiler" / "frontend"
+    if str(frontend) not in sys.path:
+        sys.path.insert(0, str(frontend))
+
+    from pycircuit import Circuit
+
+    m = Circuit("circuit_priority_mux")
+    sel = m.vec([m.input(f"sel{i}", width=1) for i in range(3)])
+    vals = m.vec([m.input(f"val{i}", width=4) for i in range(3)])
+    m.output("priority", m.priority_mux(sel, vals, default=m.const(0, width=4)))
+    m.output("tree", m.priority_mux(sel, vals, mode="tree"))
+    mlir = m.emit_mlir()
+
+    assert mlir.count("pyc.mux") == 6
+    assert mlir.count("pyc.or") == 2
+    assert mlir.count("pyc.v_get") == 13
+
+
+@pytest.mark.vec
+def test_vector_api_functional_gaps_run_cpp(
+    *,
+    repo_root: Path,
+    vec_test_root: Path,
+    pyc_pythonpath: str,
+    pycc: Path,
+) -> None:
+    """Exercise vector APIs that are not represented by the generated case matrix."""
+    case_root = vec_test_root / "vector_api_functional_gaps"
+    src_dir = case_root / "src"
+    out_dir = case_root / "build"
+    src_dir.mkdir(parents=True, exist_ok=True)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    src = src_dir / "vector_api_functional_gaps.py"
+    src.write_text(
+        "\n".join(
+            [
+                "from __future__ import annotations",
+                "",
+                "from pycircuit import Circuit, Tb, module, testbench",
+                "",
+                "",
+                "@module",
+                "def build(m: Circuit) -> None:",
+                '    a = m.input("a", width=2, shape=[2])',
+                '    m.output("bcast0", a.broadcast(size=2, dim=0))',
+                '    m.output("bcast1", a.broadcast(size=2, dim=1))',
+                '    m.output("index", a[1])',
+                '    m.output("cat", m.cat(a[0], a[1]))',
+                '    rank2 = m.input("rank2", width=4, shape=[2, 2])',
+                '    m.output("slice_rank2", rank2.slice(lsb=1, width=2))',
+                '    shift = m.input("shift", width=2)',
+                '    m.output("shifted", a << shift)',
+                '    m.output("shifted_right", a >> shift)',
+                '    sels = m.input("sels", width=1, shape=[3])',
+                '    no_sels = m.input("no_sels", width=1, shape=[3])',
+                '    vals = m.input("vals", width=4, shape=[3])',
+                '    fallback = m.input("fallback", width=4)',
+                '    m.output("priority", m.priority_mux(sels, vals, default=fallback))',
+                '    m.output("priority_default", m.priority_mux(no_sels, vals, default=fallback))',
+                '    m.output("priority_last", m.priority_mux(no_sels, vals))',
+                '    a2 = m.input("a2", width=2, shape=[2, 2])',
+                '    b2 = m.input("b2", width=2, shape=[2, 2])',
+                '    m.output("add2", a2 + b2)',
+                '    red = m.input("red", width=1, shape=[3])',
+                '    m.output("or_all", red.reduce_or(dim=None))',
+                '    m.output("and_all", red.reduce_and(dim=None))',
+                '    m.output("sum_all", red.reduce_sum())',
+                '    sa = m.input("sa", width=4, signed=True, shape=[2])',
+                '    sb = m.input("sb", width=4, signed=True, shape=[2])',
+                '    m.output("signed_add", sa + sb)',
+                '    m.output("signed_shifted_right", sa >> shift)',
+                "",
+                "",
+                "@testbench",
+                "def tb(t: Tb) -> None:",
+                "    t.timeout(1)",
+                '    t.drive("a", 0x9, at=0)',
+                '    t.drive("shift", 1, at=0)',
+                '    t.drive("sels", 0x6, at=0)',
+                '    t.drive("no_sels", 0, at=0)',
+                '    t.drive("vals", 0x961, at=0)',
+                '    t.drive("fallback", 9, at=0)',
+                '    t.drive("a2", 0x39, at=0)',
+                '    t.drive("b2", 0x5B, at=0)',
+                '    t.drive("red", 0x3, at=0)',
+                '    t.drive("sa", 0x2F, at=0)',
+                '    t.drive("sb", 0xF1, at=0)',
+                '    t.expect("bcast0", 0x99, at=0)',
+                '    t.expect("bcast1", 0xA5, at=0)',
+                '    t.expect("index", 2, at=0)',
+                '    t.expect("cat", 0x6, at=0)',
+                '    t.expect("shifted", 0x42, at=0)',
+                '    t.expect("shifted_right", 0x4, at=0)',
+                '    t.expect("priority", 6, at=0)',
+                '    t.expect("priority_default", 9, at=0)',
+                '    t.expect("priority_last", 9, at=0)',
+                '    t.expect("add2", 0x40, at=0)',
+                '    t.expect("or_all", 1, at=0)',
+                '    t.expect("and_all", 0, at=0)',
+                '    t.expect("sum_all", 0, at=0)',
+                '    t.expect("signed_add", 0x10, at=0)',
+                '    t.expect("signed_shifted_right", 0x1F, at=0)',
+                "    t.finish(at=0)",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    env = merged_env(pythonpath=pyc_pythonpath, pycc=pycc)
+    run_cmd(
+        [
+            "python3",
+            "-m",
+            "pycircuit.cli",
+            "build",
+            str(src),
+            "--out-dir",
+            str(out_dir),
+            "--target",
+            "cpp",
+            "--jobs",
+            "2",
+            "--logic-depth",
+            "64",
+            "--profile",
+            "dev",
+        ],
+        cwd=repo_root,
+        env=env,
+    )
+    run_cpp_binary(out_dir)
+
+
+@pytest.mark.vec
+def test_vector_api_rejects_invalid_shapes_and_priority_inputs(repo_root: Path) -> None:
+    import sys
+
+    frontend = repo_root / "compiler" / "frontend"
+    if str(frontend) not in sys.path:
+        sys.path.insert(0, str(frontend))
+
+    from pycircuit import Circuit
+
+    m = Circuit("vector_api_invalid")
+    scalar = m.input("scalar", width=1)
+    sels = m.input("sels", width=1, shape=[2])
+    vals = m.input("vals", width=4, shape=[2])
+    wrong_vals = m.input("wrong_vals", width=4, shape=[3])
+    wrong_default = m.input("wrong_default", width=3)
+    rank2 = m.input("rank2", width=1, shape=[2, 2])
+
+    assert len(sels) == 2
+    assert [lane.ty for lane in sels] == [sels.ty.elem, sels.ty.elem]
+
+    with pytest.raises(TypeError, match="broadcast requires Vector"):
+        scalar.broadcast(size=2, dim=0)
+    with pytest.raises(ValueError, match="dim out of range"):
+        sels.broadcast(size=2, dim=2)
+    with pytest.raises(TypeError, match="sels must be vector<Nxi1>"):
+        m.priority_mux(vals, vals)
+    with pytest.raises(TypeError, match="sels length must equal"):
+        m.priority_mux(sels, wrong_vals)
+    with pytest.raises(TypeError, match="default shape/type"):
+        m.priority_mux(sels, vals, default=wrong_default)
+    with pytest.raises(ValueError, match="mode must be"):
+        m.priority_mux(sels, vals, mode="flat")
+    with pytest.raises(ValueError, match="dim out of range"):
+        rank2.reduce_or(dim=2)
+
+    m.output("or_rank2_all", rank2.reduce_or())
+    m.output("and_rank2_all", rank2.reduce_and())
+    m.output("sum_rank2_all", rank2.reduce_sum())
+    mlir = m.emit_mlir()
+    assert mlir.count("pyc.v_or_reduce") == 1
+    assert mlir.count("pyc.v_and_reduce") == 1
+    assert mlir.count("pyc.v_add_reduce") == 1
+    assert mlir.count("-> i1") >= 3
+
+
+@pytest.mark.vec
+def test_unroll_vector_precedes_wire_and_state_cleanup(repo_root: Path) -> None:
+    """Keep scalar cleanup after the optional Vector-to-lane expansion."""
+    pipeline = (repo_root / "compiler" / "mlir" / "tools" / "pycc.cpp").read_text(encoding="utf-8")
+    lower_scf = pipeline.index("pm.addNestedPass<func::FuncOp>(pyc::createLowerSCFToPYCStaticPass());")
+    unroll = pipeline.index("pm.addNestedPass<func::FuncOp>(pyc::createVectorUnrollPass());")
+    eliminate_wires = pipeline.index("pm.addNestedPass<func::FuncOp>(pyc::createEliminateWiresPass());")
+    eliminate_state = pipeline.index("pm.addNestedPass<func::FuncOp>(pyc::createEliminateDeadStatePass());")
+    slp_pack = pipeline.index("pm.addNestedPass<func::FuncOp>(pyc::createSLPPackWiresPass());")
+
+    assert lower_scf < unroll < eliminate_wires < eliminate_state < slp_pack
+
+
+@pytest.mark.vec
+def test_vector_state_assign_unroll_runs_cpp(
+    *,
+    repo_root: Path,
+    vec_test_root: Path,
+    pyc_pythonpath: str,
+    pycc: Path,
+) -> None:
+    """Vector wire→assign→reg must remain legal after --unroll-vector."""
+    case_root = vec_test_root / "vector_state_assign"
+    src_dir = case_root / "src"
+    out_dir = case_root / "build"
+    src_dir.mkdir(parents=True, exist_ok=True)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    src = src_dir / "vector_state_assign.py"
+    src.write_text(
+        "\n".join(
+            [
+                "from __future__ import annotations",
+                "",
+                "from pycircuit import Circuit, Tb, module, testbench",
+                "",
+                "",
+                "@module",
+                "def build(m: Circuit) -> None:",
+                '    clk = m.clock("clk")',
+                '    rst = m.reset("rst")',
+                '    r = m.out("cnt", clk=clk, rst=rst, width=4, shape=[2], init=0)',
+                "    r.set(r + 1)",
+                '    m.output("cnt", r)',
+                "",
+                "",
+                "@testbench",
+                "def tb(t: Tb) -> None:",
+                '    t.clock("clk")',
+                '    t.reset("rst", cycles_asserted=2, cycles_deasserted=1)',
+                "    t.timeout(8)",
+                "    t.finish(at=4)",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    env = merged_env(pythonpath=pyc_pythonpath, pycc=pycc)
+    pyc = out_dir / "vector_state_assign.pyc"
+    run_cmd(["python3", "-m", "pycircuit.cli", "emit", str(src), "-o", str(pyc)], cwd=repo_root, env=env)
+    mlir = pyc.read_text(encoding="utf-8")
+    assert "vector<" in mlir
+    assert "pyc.assign" in mlir
+    assert "pyc.reg" in mlir
+    cpp_dir = out_dir / "cpp_unroll"
+    run_cmd(
+        [
+            str(pycc),
+            str(pyc),
+            "--emit=cpp",
+            "--cpp-split=module",
+            "--out-dir",
+            str(cpp_dir),
+            "--build-profile=dev-fast",
+            "--unroll-vector",
+        ],
+        cwd=repo_root,
+        env=env,
+    )
+    # Unrolled vector state must become scalar regs/wires, not keep vector ops.
+    cpp_text = "\n".join(p.read_text(encoding="utf-8") for p in cpp_dir.rglob("*.cpp"))
+    assert "pyc_vec_reg" not in cpp_text
+    assert "pyc_reg" in cpp_text
+    verilog = out_dir / "vector_state_assign.v"
+    run_cmd(
+        [
+            str(pycc),
+            str(pyc),
+            "--emit=verilog",
+            "-o",
+            str(verilog),
+            "--build-profile=dev-fast",
+            "--unroll-vector",
+        ],
+        cwd=repo_root,
+        env=env,
+    )
+    verilog_text = verilog.read_text(encoding="utf-8")
+    assert "pyc_reg" in verilog_text or "reg " in verilog_text
+    # Keep-vector path should still compile and link a TB (smoke).
+    run_cmd(
+        [
+            "python3",
+            "-m",
+            "pycircuit.cli",
+            "build",
+            str(src),
+            "--out-dir",
+            str(out_dir / "sim"),
+            "--target",
+            "cpp",
+            "--jobs",
+            "2",
+            "--logic-depth",
+            "64",
+            "--profile",
+            "dev",
+        ],
+        cwd=repo_root,
+        env=env,
+    )
+    run_cpp_binary(out_dir / "sim")
+
+
+@pytest.mark.vec
+def test_assign_dst_must_be_wire_verifier(
+    *,
+    repo_root: Path,
+    vec_test_root: Path,
+    pyc_pythonpath: str,
+    pycc: Path,
+) -> None:
+    """AssignOp verifier must keep rejecting non-wire destinations."""
+    case_root = vec_test_root / "bad_assign_dst"
+    case_root.mkdir(parents=True, exist_ok=True)
+    pyc = case_root / "bad_assign_dst.pyc"
+    pyc.write_text(
+        "\n".join(
+            [
+                "module {",
+                'func.func @bad_assign_dst(%a: vector<2xi4>) -> (i4) attributes {arg_names = ["a"], result_names = ["o"]} {',
+                "  %v0 = pyc.v_get %a[0] : vector<2xi4> -> i4",
+                "  %v1 = pyc.constant 1 : i4",
+                "  pyc.assign %v0, %v1 : i4",
+                "  func.return %v0 : i4",
+                "}",
+                "}",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    import subprocess
+
+    env = merged_env(pythonpath=pyc_pythonpath, pycc=pycc)
+    proc = subprocess.run(
+        [str(pycc), str(pyc), "--emit=verilog", "-o", str(case_root / "out.v"), "--build-profile=dev-fast"],
+        cwd=str(repo_root),
+        env=env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    assert proc.returncode != 0
+    combined = proc.stdout + proc.stderr
+    assert "dst must be defined by pyc.wire" in combined
 
 
 @pytest.mark.vec
@@ -146,7 +528,7 @@ def test_vector_io_emit_and_pycc(
                 "",
                 "@module",
                 "def build(m: Circuit) -> None:",
-                '    a = m.input("a", width=4, shape=4)',
+                '    a = m.input("a", width=4, shape=[4])',
                 "    out = a + a",
                 '    m.output("out", out)',
                 "",
@@ -199,7 +581,7 @@ def test_rank2_vector_io_verilog_uses_packed_ports_and_yosys(
                 "",
                 "@module",
                 "def build(m: Circuit) -> None:",
-                '    a = m.input("a", width=2, shape=(2, 3))',
+                '    a = m.input("a", width=2, shape=[2, 3])',
                 "    out = a + a",
                 '    m.output("out", out)',
                 "",
@@ -245,7 +627,7 @@ def test_vector_port_cli_build_runs_tb(
                 "",
                 "@module",
                 "def build(m: Circuit) -> None:",
-                '    a = m.input("a", width=4, shape=4)',
+                '    a = m.input("a", width=4, shape=[4])',
                 "    out = a + 1",
                 '    m.output("out", out)',
                 "",
@@ -330,12 +712,12 @@ def test_eager_vec_broadcast_emit_and_pycc(
             [
                 "from __future__ import annotations",
                 "",
-                "from pycircuit import Circuit, Vec, module",
+                "from pycircuit import Circuit, module",
                 "",
                 "",
                 "@module",
                 "def build(m: Circuit) -> None:",
-                '    a = Vec([m.input(f"a{i}", width=4) for i in range(4)])',
+                '    a = m.vec([m.input(f"a{i}", width=4) for i in range(4)])',
                 "    out = a.broadcast(dim=1, size=2)",
                 '    m.output("out", out)',
                 "",
@@ -377,7 +759,7 @@ def test_jit_instance_vec_port_emit_and_pycc(
             [
                 "from __future__ import annotations",
                 "",
-                "from pycircuit import Circuit, Vec, module",
+                "from pycircuit import Circuit, module",
                 "",
                 "",
                 "@module",
@@ -387,7 +769,7 @@ def test_jit_instance_vec_port_emit_and_pycc(
                 "",
                 "@module",
                 "def build(m: Circuit) -> None:",
-                '    a = Vec([m.input(f"a{i}", width=4) for i in range(4)])',
+                '    a = m.vec([m.input(f"a{i}", width=4) for i in range(4)])',
                 '    y = m.instance(child, name="u_child", a=a).read()',
                 '    m.output("out", y)',
                 "",
@@ -420,213 +802,6 @@ def test_jit_instance_vec_port_emit_and_pycc(
 
 
 @pytest.mark.vec
-def test_eager_vec_caches_sig(repo_root: Path) -> None:
-    import sys
-
-    frontend = repo_root / "compiler" / "frontend"
-    if str(frontend) not in sys.path:
-        sys.path.insert(0, str(frontend))
-
-    from pycircuit import Circuit, Vec
-
-    m = Circuit("vec_cached_signal")
-    a = Vec([m.input(f"a{i}", width=4) for i in range(4)])
-    first = a._as_vector_signal()
-    second = a._as_vector_signal()
-
-    assert first is not None
-    assert second is not None
-    assert a.sig is not None
-    assert first[1].ref == second[1].ref
-    assert first[1].ref == a.sig.ref
-    assert len(a.elems) == 4
-    assert m.emit_mlir().count("pyc.v_create") == 1
-
-
-@pytest.mark.vec
-def test_vec_cycle_aware_lanes_require_matching_cycle(repo_root: Path) -> None:
-    import sys
-
-    frontend = repo_root / "compiler" / "frontend"
-    if str(frontend) not in sys.path:
-        sys.path.insert(0, str(frontend))
-
-    from pycircuit import CycleAwareCircuit, Vec, cas
-
-    m = CycleAwareCircuit("vec_cas_cycles")
-    domain = m.create_domain("main")
-    same_cycle = Vec([cas(domain, m.input(f"a{i}", width=4), cycle=2) for i in range(2)])
-
-    assert same_cycle.sig is not None
-    assert same_cycle.sig.ty == "vector<2xi4>"
-    assert same_cycle.domain is domain
-    assert same_cycle.cycle == 2
-
-    with pytest.raises(ValueError, match="same cycle"):
-        Vec(
-            [
-                cas(domain, m.input("b0", width=4), cycle=1),
-                cas(domain, m.input("b1", width=4), cycle=2),
-            ]
-        )
-
-    with pytest.raises(ValueError, match="cannot mix cycle-aware"):
-        Vec(
-            [
-                cas(domain, m.input("c0", width=4), cycle=2),
-                m.input("c1", width=4),
-            ]
-        )
-
-
-@pytest.mark.vec
-def test_cycle_aware_vec_binary_ops_align_to_latest_cycle(repo_root: Path) -> None:
-    import sys
-
-    frontend = repo_root / "compiler" / "frontend"
-    if str(frontend) not in sys.path:
-        sys.path.insert(0, str(frontend))
-
-    from pycircuit import CycleAwareCircuit, Vec, cas
-
-    m = CycleAwareCircuit("vec_cas_binary_align")
-    domain = m.create_domain("main")
-    a = Vec([cas(domain, m.input(f"a{i}", width=4), cycle=0) for i in range(2)])
-    b = Vec([cas(domain, m.input(f"b{i}", width=4), cycle=2) for i in range(2)])
-
-    out = a + b
-
-    assert out.domain is domain
-    assert out.cycle == 2
-    assert "_v5_bal_" in m.emit_mlir()
-
-
-@pytest.mark.vec
-def test_cycle_aware_vec_select_aligns_selector_and_arms(repo_root: Path) -> None:
-    import sys
-
-    frontend = repo_root / "compiler" / "frontend"
-    if str(frontend) not in sys.path:
-        sys.path.insert(0, str(frontend))
-
-    from pycircuit import CycleAwareCircuit, Vec, cas
-
-    m = CycleAwareCircuit("vec_cas_select_align")
-    domain = m.create_domain("main")
-    sel = Vec([cas(domain, m.input(f"sel{i}", width=1), cycle=1) for i in range(2)])
-    a = Vec([cas(domain, m.input(f"a{i}", width=4), cycle=0) for i in range(2)])
-    b = Vec([cas(domain, m.input(f"b{i}", width=4), cycle=2) for i in range(2)])
-
-    out = sel.select(a, b)
-
-    assert out.domain is domain
-    assert out.cycle == 2
-    assert "_v5_bal_" in m.emit_mlir()
-
-
-@pytest.mark.vec
-def test_cycle_aware_vec_assign_lanes(repo_root: Path) -> None:
-    import sys
-
-    frontend = repo_root / "compiler" / "frontend"
-    if str(frontend) not in sys.path:
-        sys.path.insert(0, str(frontend))
-
-    from pycircuit import CycleAwareCircuit, Vec, cas, wire_of
-
-    m = CycleAwareCircuit("vec_assign_lanes")
-    domain = m.create_domain("main")
-    states = Vec([domain.signal(width=4, reset_value=0, name=f"q{i}") for i in range(2)])
-    data = Vec([cas(domain, m.input(f"d{i}", width=4), cycle=0) for i in range(2)])
-    mask = Vec([cas(domain, m.input(f"en{i}", width=1), cycle=0) for i in range(2)])
-
-    m.output("q0", wire_of(states[0]))
-    m.output("q1", wire_of(states[1]))
-    domain.next()
-    states.assign(data, when=mask)
-
-    mlir = m.emit_mlir()
-    assert "q0" in mlir
-    assert "q1" in mlir
-
-
-@pytest.mark.vec
-def test_vector_op_result_reuses_vec_sig(repo_root: Path) -> None:
-    import sys
-
-    frontend = repo_root / "compiler" / "frontend"
-    if str(frontend) not in sys.path:
-        sys.path.insert(0, str(frontend))
-
-    from pycircuit import Circuit, Vec
-
-    m = Circuit("vec_result_reuses_sig")
-    a = Vec([m.input(f"a{i}", width=4) for i in range(4)])
-    b = a + a
-    c = b & b
-
-    assert b.sig is not None
-    assert c.sig is not None
-    assert len(b.elems) == 4
-    assert m.emit_mlir().count("pyc.v_create") == 1
-
-
-@pytest.mark.vec
-def test_function_style_casts_cover_wire_reg_and_vec(repo_root: Path) -> None:
-    import sys
-
-    frontend = repo_root / "compiler" / "frontend"
-    if str(frontend) not in sys.path:
-        sys.path.insert(0, str(frontend))
-
-    from pycircuit import Circuit, Reg, Vec, sext, trunc, zext
-
-    m = Circuit("function_style_casts")
-    domain = m.domain("main")
-    en = m.const(1, width=1)
-    w = m.input("w", width=4)
-    r = m.reg_domain(domain, en, w, init=0)
-    v = Vec([m.input(f"a{i}", width=4) for i in range(4)])
-
-    assert zext(w, width=6).ty == "i6"
-    assert sext(r, width=6).ty == "i6"
-    tv = trunc(v, width=3)
-
-    assert isinstance(r, Reg)
-    assert isinstance(tv, Vec)
-    assert tv.sig is not None
-    assert tv.sig.ty == "vector<4xi3>"
-
-
-@pytest.mark.vec
-def test_vec_reg_lane_view_uses_reg_q_for_sig(repo_root: Path) -> None:
-    import sys
-
-    frontend = repo_root / "compiler" / "frontend"
-    if str(frontend) not in sys.path:
-        sys.path.insert(0, str(frontend))
-
-    from pycircuit import Circuit, Reg, Vec
-
-    m = Circuit("vec_reg_lane_view")
-    domain = m.domain("main")
-    en = m.const(1, width=1)
-    regs = [
-        m.reg_domain(domain, en, m.input(f"d{i}", width=4), init=0)
-        for i in range(2)
-    ]
-    v = Vec(regs)
-    info = v._as_vector_signal()
-
-    assert isinstance(v[0], Reg)
-    assert info is not None
-    assert v.sig is not None
-    assert info[1].ty == "vector<2xi4>"
-    assert v.sig.ty == "vector<2xi4>"
-    assert "pyc.v_create" in m.emit_mlir()
-
-
-@pytest.mark.vec
 def test_dim_reduce_emit_and_pycc(
     *,
     repo_root: Path,
@@ -650,13 +825,14 @@ def test_dim_reduce_emit_and_pycc(
                 "",
                 "@module",
                 "def build(m: Circuit) -> None:",
-                '    a = m.input("a", width=1, shape=(2, 3))',
-                '    m.output("or0", a.or_reduce(dim=0))',
-                '    m.output("or1", a.or_reduce(dim=1))',
-                '    m.output("and0", a.and_reduce(dim=0))',
-                '    m.output("and1", a.and_reduce(dim=1))',
+                '    a = m.input("a", width=1, shape=[2, 3])',
+                '    m.output("or0", a.reduce_or(dim=0))',
+                '    m.output("or1", a.reduce_or(dim=1))',
+                '    m.output("and0", a.reduce_and(dim=0))',
+                '    m.output("and1", a.reduce_and(dim=1))',
                 '    m.output("sum0", a.reduce_sum(dim=0))',
                 '    m.output("sum1", a.reduce_sum(dim=1))',
+                '    m.output("sum_all", a.reduce_sum())',
                 "",
             ]
         ),
@@ -665,10 +841,13 @@ def test_dim_reduce_emit_and_pycc(
     env = merged_env(pythonpath=pyc_pythonpath, pycc=pycc)
     pyc = out_dir / "dim_reduce.pyc"
     run_cmd(["python3", "-m", "pycircuit.cli", "emit", str(src), "-o", str(pyc)], cwd=repo_root, env=env)
+    mlir = pyc.read_text(encoding="utf-8")
     check_ir(
         VecCase("dim_reduce", "dim_reduce", ir_tokens=("vector<", "pyc.v_or_reduce", "pyc.v_and_reduce", "pyc.v_add_reduce")),
-        pyc.read_text(encoding="utf-8"),
+        mlir,
     )
+    assert "pyc.v_add_reduce" in mlir
+    assert "-> i1" in mlir
     cpp_dir = out_dir / "cpp"
     run_cmd(
         [str(pycc), str(pyc), "--emit=cpp", "--cpp-split=module", "--out-dir", str(cpp_dir), "--build-profile=dev-fast"],
@@ -693,12 +872,16 @@ def test_reduce_mode_attr_and_pycc(
     if str(frontend) not in sys.path:
         sys.path.insert(0, str(frontend))
 
-    from pycircuit import Circuit, Vec
+    from pycircuit import Circuit
 
     m = Circuit("reduce_mode_invalid")
-    bad = Vec([m.input(f"bad{i}", width=1) for i in range(2)])
+    bad = m.vec([m.input(f"bad{i}", width=1) for i in range(2)])
     with pytest.raises(ValueError, match="reduce mode"):
-        bad.or_reduce(mode="flat")
+        bad.reduce_or(mode="flat")
+    with pytest.raises(TypeError, match="unexpected keyword argument 'width'"):
+        bad.reduce_sum(width=2)  # type: ignore[call-arg]
+    with pytest.raises(TypeError, match="unexpected keyword argument 'signed'"):
+        bad.reduce_sum(signed=True)  # type: ignore[call-arg]
 
     case_root = vec_test_root / "reduce_modes"
     src_dir = case_root / "src"
@@ -716,11 +899,11 @@ def test_reduce_mode_attr_and_pycc(
                 "",
                 "@module",
                 "def build(m: Circuit) -> None:",
-                '    a = m.input("a", width=1, shape=4)',
-                '    b = m.input("b", width=2, shape=4)',
-                '    m.output("chain_or", a.or_reduce())',
-                '    m.output("tree_or", a.or_reduce(mode="tree"))',
-                '    m.output("tree_sum", b.reduce_sum(width=4, mode="tree"))',
+                '    a = m.input("a", width=1, shape=[4])',
+                '    b = m.input("b", width=2, shape=[4])',
+                '    m.output("chain_or", a.reduce_or())',
+                '    m.output("tree_or", a.reduce_or(mode="tree"))',
+                '    m.output("tree_sum", b.reduce_sum(mode="tree"))',
                 "",
             ]
         ),
@@ -733,15 +916,16 @@ def test_reduce_mode_attr_and_pycc(
     assert "pyc.v_or_reduce" in mlir
     assert "pyc.v_add_reduce" in mlir
     assert mlir.count('mode = "tree"') == 2
-    assert 'mode = "chain"' not in mlir
+    assert mlir.count('mode = "chain"') == 1
 
     direct_verilog = out_dir / "reduce_modes.v"
     run_cmd([str(pycc), str(pyc), "--emit=verilog", "-o", str(direct_verilog), "--build-profile=dev-fast"], cwd=repo_root, env=env)
     direct_text = direct_verilog.read_text(encoding="utf-8")
     assert "chain_or" in direct_text
     assert "tree_or" in direct_text
-    assert "(((a__vec[0] | a__vec[1]) | a__vec[2]) | a__vec[3])" in direct_text
-    assert "((a__vec[0] | a__vec[1]) | (a__vec[2] | a__vec[3]))" in direct_text
+    # The reduction consumes the JIT alias, not the raw packed-port unpack view.
+    assert "(((a__reduce_modes__L8[0] | a__reduce_modes__L8[1]) | a__reduce_modes__L8[2]) | a__reduce_modes__L8[3])" in direct_text
+    assert "((a__reduce_modes__L8[0] | a__reduce_modes__L8[1]) | (a__reduce_modes__L8[2] | a__reduce_modes__L8[3]))" in direct_text
 
     unrolled_verilog = out_dir / "reduce_modes_unroll.v"
     run_cmd(

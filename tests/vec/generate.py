@@ -28,7 +28,7 @@ BINARY_EXPR: dict[str, str] = {
 
 def _vec_input(name: str, width: int, lanes: int, *, signed: bool = False) -> str:
     signed_arg = ", signed=True" if signed else ""
-    return f'{name} = Vec([m.input(f"{name}{{i}}", width={width}{signed_arg}) for i in range({lanes})])'
+    return f'{name} = m.vec([m.input(f"{name}{{i}}", width={width}{signed_arg}) for i in range({lanes})])'
 
 
 def _binary_case_expr(case: VecCase, *, width: int, lanes: int, signed: bool) -> tuple[list[str], str, bool] | None:
@@ -102,10 +102,10 @@ def _case_expr(case: VecCase) -> tuple[list[str], str, bool]:
     if case.kind in {"or_reduce", "and_reduce", "reduce_sum", "reduce_sum_signed"}:
         lines = [_vec_input("a", w, n, signed=signed)]
         exprs = {
-            "or_reduce": "a.or_reduce()",
-            "and_reduce": "a.and_reduce()",
+            "or_reduce": "a.reduce_or()",
+            "and_reduce": "a.reduce_and()",
             "reduce_sum": "a.reduce_sum()",
-            "reduce_sum_signed": "a.reduce_sum(width=6, signed=True)",
+            "reduce_sum_signed": "a.reduce_sum()",
         }
         return lines, exprs[case.kind], False
 
@@ -124,7 +124,7 @@ def render_case_source(case: VecCase) -> str:
     lines: list[str] = [
         "from __future__ import annotations",
         "",
-        "from pycircuit import Circuit, Tb, Vec, module, sext, testbench, trunc, zext",
+        "from pycircuit import Circuit, Tb, module, sext, testbench, trunc, zext",
         "",
         "",
         "@module",
@@ -177,10 +177,10 @@ def render_vector_ir_source(case: VecCase) -> str:
         raise ValueError(f"{case.name} does not have a vector-IR-only source")
     signed_arg = ", signed=True" if case.signed else ""
     exprs = {
-        "or_reduce": "a.or_reduce()",
-        "and_reduce": "a.and_reduce()",
+        "or_reduce": "a.reduce_or()",
+        "and_reduce": "a.reduce_and()",
         "reduce_sum": "a.reduce_sum()",
-        "reduce_sum_signed": "a.reduce_sum(width=6, signed=True)",
+        "reduce_sum_signed": "a.reduce_sum()",
     }
     return "\n".join(
         [
@@ -191,7 +191,7 @@ def render_vector_ir_source(case: VecCase) -> str:
             "",
             "@module",
             "def build(m: Circuit) -> None:",
-            f'    a = m.input("a", width={case.width}{signed_arg}, shape={case.lanes})',
+            f'    a = m.input("a", width={case.width}{signed_arg}, shape=[{case.lanes}])',
             f"    out = {exprs[case.kind]}",
             '    m.output("out", out)',
             "",

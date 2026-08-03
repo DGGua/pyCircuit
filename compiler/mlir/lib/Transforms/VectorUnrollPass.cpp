@@ -7,6 +7,7 @@
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/Pass/Pass.h"
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"
 
 #include <functional>
@@ -114,9 +115,7 @@ static Value unrollReduceOp(Operation &op, OpBuilder &builder) {
   Location loc = op.getLoc();
   Value vec = op.getOperand(0);
   auto vt = cast<VectorType>(vec.getType());
-  int64_t dim = 0;
-  if (auto dimAttr = op.getAttrOfType<IntegerAttr>("dim"))
-    dim = dimAttr.getInt();
+  auto dimAttr = op.getAttrOfType<IntegerAttr>("dim");
   Type leafTy = vt.getElementType();
 
   std::function<Value(Value, Value)> reducePair;
@@ -161,6 +160,16 @@ static Value unrollReduceOp(Operation &op, OpBuilder &builder) {
   }
 
   int64_t rows = vt.getShape()[0], cols = vt.getShape()[1];
+  if (!dimAttr) {
+    llvm::SmallVector<Value> values;
+    values.reserve(rows * cols);
+    for (int64_t i = 0; i < rows; ++i)
+      for (int64_t j = 0; j < cols; ++j)
+        values.push_back(extractLane(builder, loc, vec, {i, j}));
+    return reduceValues(values);
+  }
+
+  int64_t dim = dimAttr.getInt();
   if (dim == 0) {
     llvm::SmallVector<Value> resultLanes;
     for (int64_t j = 0; j < cols; ++j) {
@@ -212,34 +221,53 @@ static Value unrollBroadcastDim(pyc::VBroadcastDimOp op, OpBuilder &builder) {
   return createVector(builder, op.getLoc(), dstVT, lanes, dstShape, 0);
 }
 
+// Map from a vector wire's post-unroll replacement (v_create) to the scalar
+// WireOp results created for each leaf lane (walkShape order). AssignOp::verify
+// requires each assign dst to be defined directly by pyc.wire; looking those
+// lanes up here avoids extractLane(v_create) -> illegal pyc.v_get destinations.
+using VectorWireLaneMap = llvm::DenseMap<Value, llvm::SmallVector<Value, 8>>;
+
 // Unroll WireOp: split into N scalar wires, rebuild with v_create.
-static void unrollWire(pyc::WireOp op, OpBuilder &builder) {
+static void unrollWire(pyc::WireOp op, OpBuilder &builder, VectorWireLaneMap &laneMap) {
   auto vt = cast<VectorType>(op.getResult().getType());
   ArrayRef<int64_t> shape = vt.getShape();
   llvm::SmallVector<Value> lanes;
   llvm::SmallVector<int64_t> indices;
   walkShape(shape, 0, indices, [&](const llvm::SmallVectorImpl<int64_t> &idx) {
+    (void)idx;
     auto w = builder.create<pyc::WireOp>(op.getLoc(), vt.getElementType());
     lanes.push_back(w.getResult());
   });
   Value replacement = (shape.size() == 1)
       ? builder.create<pyc::VCreateOp>(op.getLoc(), vt, lanes)
       : createVector(builder, op.getLoc(), vt, lanes, shape, 0);
+  laneMap[replacement] = std::move(lanes);
   op.getResult().replaceAllUsesWith(replacement);
   op.erase();
 }
 
-// Unroll AssignOp: per-lane scalar assigns.
-static void unrollAssign(pyc::AssignOp op, OpBuilder &builder) {
+// Unroll AssignOp: per-lane scalar assigns onto the original scalar wires.
+// Returns failure if the vector dst was not produced by an unrolled WireOp.
+static LogicalResult unrollAssign(pyc::AssignOp op, OpBuilder &builder,
+                                  const VectorWireLaneMap &laneMap) {
   auto vt = cast<VectorType>(op.getDst().getType());
   ArrayRef<int64_t> shape = vt.getShape();
+  auto mapped = laneMap.find(op.getDst());
+  if (mapped == laneMap.end()) {
+    return op.emitOpError(
+        "vector assign dst has no scalar wire lanes; expected a pyc.wire "
+        "unrolled earlier in pyc-unroll-vector");
+  }
+  size_t laneIdx = 0;
   llvm::SmallVector<int64_t> indices;
   walkShape(shape, 0, indices, [&](const llvm::SmallVectorImpl<int64_t> &idx) {
-    Value dstL = extractLane(builder, op.getLoc(), op.getDst(), idx);
+    assert(laneIdx < mapped->second.size() && "vector wire lane map size mismatch");
+    Value dstL = mapped->second[laneIdx++];
     Value srcL = extractLane(builder, op.getLoc(), op.getSrc(), idx);
     builder.create<pyc::AssignOp>(op.getLoc(), dstL, srcL);
   });
   op.erase();
+  return success();
 }
 
 // Unroll RegOp: N scalar regs sharing clk/rst/en.
@@ -275,7 +303,7 @@ static bool isElementWiseVectorOp(Operation &op) {
              pyc::UdivOp, pyc::UremOp, pyc::SdivOp, pyc::SremOp,
              pyc::AndOp, pyc::OrOp, pyc::XorOp, pyc::NotOp,
              pyc::EqOp, pyc::UltOp, pyc::SltOp,
-             pyc::TruncOp, pyc::ZextOp, pyc::SextOp,
+             pyc::TruncOp, pyc::ZextOp, pyc::SextOp, pyc::ExtractOp,
              pyc::ShlOp, pyc::LshrOp, pyc::AshrOp,
              pyc::ShliOp, pyc::LshriOp, pyc::AshriOp,
              pyc::MuxOp>(op);
@@ -356,13 +384,15 @@ struct VectorUnrollPass : public PassWrapper<VectorUnrollPass, OperationPass<fun
       Value r = unrollBroadcastDim(vbd, builder);
       op->getResult(0).replaceAllUsesWith(r); op->erase();
     }
+    VectorWireLaneMap wireLaneMap;
     for (auto *op : wireOps) {
       builder.setInsertionPoint(op);
-      unrollWire(cast<pyc::WireOp>(op), builder);
+      unrollWire(cast<pyc::WireOp>(op), builder, wireLaneMap);
     }
     for (auto *op : assignOps) {
       builder.setInsertionPoint(op);
-      unrollAssign(cast<pyc::AssignOp>(op), builder);
+      if (failed(unrollAssign(cast<pyc::AssignOp>(op), builder, wireLaneMap)))
+        return signalPassFailure();
     }
     for (auto *op : regOps) {
       builder.setInsertionPoint(op);
