@@ -8,7 +8,6 @@ import importlib.util
 import inspect
 import json
 import os
-import re
 import shutil
 import subprocess
 import sys
@@ -293,32 +292,6 @@ def _detect_pycc() -> Path:
         return Path(found)
 
     raise SystemExit("missing pycc (set PYCC=... or build it with: flows/scripts/pyc build)")
-
-
-def _verilator_supports_flag(
-    verilator_exe: str,
-    flag: str,
-    *,
-    env: Mapping[str, str] | None = None,
-) -> bool:
-    """True if `verilator --help` documents *flag* as its own option.
-
-    Distro packages (e.g. Ubuntu apt) may ship Verilator < 5.024 without
-    ``--quiet``; probing help avoids hard-failing on ``Invalid option``.
-    """
-    try:
-        proc = subprocess.run(
-            [verilator_exe, "--help"],
-            check=False,
-            capture_output=True,
-            text=True,
-            env=None if env is None else dict(env),
-        )
-    except OSError:
-        return False
-    text = f"{proc.stdout or ''}\n{proc.stderr or ''}"
-    # Match the exact flag token so --quiet does not match --quiet-build.
-    return re.search(rf"(?m)^\s*{re.escape(flag)}(?:\s|$)", text) is not None
 
 
 def _toolchain_roots(pycc: Path | None = None) -> list[Path]:
@@ -2594,11 +2567,8 @@ def _cmd_build(args: argparse.Namespace) -> int:
                 "-Wno-DECLFILENAME",
                 "-Wno-UNUSEDSIGNAL",
                 "-Wno-WIDTHEXPAND",
+                "--quiet",
             ]
-            # --quiet exists since Verilator 5.024; skip on older distro packages.
-            # Prefer --quiet over --quiet-build (unsupported on some Windows wrappers).
-            if _verilator_supports_flag(str(verilator_exe), "--quiet", env=run_env):
-                cmd.append("--quiet")
             cmd.extend(
                 [
                     "--timing",

@@ -32,6 +32,7 @@ pyCircuit is a Python-based hardware description framework that compiles Python 
 - LLVM/MLIR 19 (for compiler backend)
 - CMake 3.20+
 - Ninja build system
+- Verilator 5.024+ (for `--target verilator` / `--run-verilator`; CI pins 5.048)
 - Git
 
 ### Clone and Install
