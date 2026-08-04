@@ -407,15 +407,6 @@ static void assignExpr(Value result, Type ty, llvm::raw_ostream &os, NameTable &
   os << "    " << nt.get(result) << " = " << ess.str() << ";\n";
 }
 
-// Simplified assignExpr without placement support — writes a direct assignment.
-static void assignExpr(Value result, Type ty, llvm::raw_ostream &os, NameTable &nt,
-                       llvm::function_ref<void(llvm::raw_ostream &)> buildExpr) {
-  std::string expr;
-  llvm::raw_string_ostream ess(expr);
-  buildExpr(ess);
-  os << "    " << nt.get(result) << " = " << ess.str() << ";\n";
-}
-
 static void assignExpr(Value result, Type ty, llvm::raw_ostream &os, NameTable &nt,
                        llvm::function_ref<void(llvm::raw_ostream &)> buildExpr,
                        CppEmitterPlacementState *ps) {

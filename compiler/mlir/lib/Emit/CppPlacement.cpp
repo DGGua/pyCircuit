@@ -341,14 +341,17 @@ crossingStats(pyc::CombOp comb, ArrayRef<Operation *> order,
 
 // Assign each Comb body op to an eval_comb_* / eval_comb_*_part_* method.
 // When chunking, compare locality-aware schedule + DP cuts against fixed-size
-// chunks, reorder the body to the winner, and stamp pyc.cpp.method. Cut stats
-// are accumulated into `summary` (no intermediate IR attrs).
+// chunks, reorder the body to the winner, and stamp pyc.cpp.method.
+//
+// `crossPartValues` collects localizable comb values whose uses leave their
+// defining part (i.e. they cross method boundaries). The placement main loop
+// uses this set to promote those values to struct members: a local Wire<> is
+// only valid when every use shares the same part method. Cut cost stats are
+// accumulated into `summary` (no intermediate IR attrs).
 static void assignCombOpMethods(pyc::CombOp comb, unsigned combIdx, unsigned combChunkNodes,
                                 llvm::DenseMap<Operation *, std::string> &opToMethod,
-                                llvm::DenseMap<pyc::CombOp, std::string> &combWrappers,
+                                llvm::DenseSet<mlir::Value> &crossPartValues,
                                 CppPlacementSummary &summary) {
-  combWrappers[comb] = "eval_comb_" + std::to_string(combIdx);
-
   Block &b = comb.getBody().front();
   llvm::SmallVector<Operation *> combOps;
   for (Operation &op : b) {
@@ -392,7 +395,6 @@ static void assignCombOpMethods(pyc::CombOp comb, unsigned combIdx, unsigned com
     scheduledStats = fixedStats;
   }
 
-  summary.fixedOrderCrossMethod += fixedStats.first;
   summary.scheduledCrossMethod += scheduledStats.first;
   summary.scheduledCutWeight += scheduledStats.second;
 
@@ -402,14 +404,33 @@ static void assignCombOpMethods(pyc::CombOp comb, unsigned combIdx, unsigned com
     op->moveBefore(terminator);
 
   // Stamp each op with its part method so the C++ emitter can split the TU.
+  // Also record which localizable values cross part boundaries: their defining
+  // op is in one part but at least one use is in another.
+  llvm::DenseMap<Operation *, unsigned> partIndexOfOp;
   unsigned begin = 0;
   for (auto [partIdx, end] : llvm::enumerate(partEnds)) {
     std::string m = methodForCombPart(combIdx, partIdx, true);
     for (unsigned i = begin; i < end; ++i) {
       opToMethod[ordered[i]] = m;
       ordered[i]->setAttr(kCppMethodAttr, StringAttr::get(ordered[i]->getContext(), m));
+      partIndexOfOp[ordered[i]] = partIdx;
     }
     begin = end;
+  }
+
+  for (Operation *op : ordered) {
+    unsigned defPart = partIndexOfOp.lookup(op);
+    for (mlir::Value result : op->getResults()) {
+      if (!isLocalizableCombValue(result, comb))
+        continue;
+      for (OpOperand &use : result.getUses()) {
+        auto it = partIndexOfOp.find(use.getOwner());
+        if (it != partIndexOfOp.end() && it->second != defPart) {
+          crossPartValues.insert(result);
+          break;
+        }
+      }
+    }
   }
 }
 
@@ -446,22 +467,6 @@ static bool pinToStruct(Value v) {
     }
   }
   return false;
-}
-
-/// Resolve which method an op belongs to (for cross-method detection).
-static StringRef methodForUserOp(Operation *user,
-                                 const llvm::DenseMap<Operation *, std::string> &opToMethod,
-                                 const llvm::DenseMap<pyc::CombOp, std::string> &combWrappers) {
-  if (auto it = opToMethod.find(user); it != opToMethod.end())
-    return it->second;
-  // Yield ops forward to the comb's wrapper method.
-  if (isa<pyc::YieldOp>(user)) {
-    if (auto comb = user->getParentOfType<pyc::CombOp>()) {
-      if (auto it = combWrappers.find(comb); it != combWrappers.end())
-        return it->second;
-    }
-  }
-  return "core";
 }
 
 /// Annotate a single value with its storage kind and owning method.
@@ -548,13 +553,16 @@ void CppEmitterPlacementState::emitValueAssign(Value result, Type ty, StringRef 
 CppPlacementSummary runCppMemberPlacement(func::FuncOp f, unsigned combChunkNodes) {
   CppPlacementSummary summary;
 
-  // Schedule each Comb into eval_comb_* / _part_* methods, then localize.
+  // Phase A — Comb method assignment (independent of storage decisions):
+  // assign each comb body op to an eval_comb_* / eval_comb_*_part_* method and
+  // record which localizable values cross part boundaries. Storage is NOT
+  // decided here; that is Phase B's job, using only the comb boundary.
   llvm::DenseMap<Operation *, std::string> opToMethod;
-  llvm::DenseMap<pyc::CombOp, std::string> combWrappers;
+  llvm::DenseSet<Value> crossPartValues;
   llvm::SmallVector<pyc::CombOp> combs = collectTopLevelCombs(f);
   for (auto [i, comb] : llvm::enumerate(combs))
-    assignCombOpMethods(comb, static_cast<unsigned>(i), combChunkNodes, opToMethod, combWrappers,
-                        summary);
+    assignCombOpMethods(comb, static_cast<unsigned>(i), combChunkNodes, opToMethod,
+                        crossPartValues, summary);
 
   llvm::SmallVector<Value> candidates;
   f.walk([&](Operation *op) {
@@ -566,49 +574,52 @@ CppPlacementSummary runCppMemberPlacement(func::FuncOp f, unsigned combChunkNode
       candidates.push_back(r);
   });
 
-  // Phase 1: for each comb-region value, decide struct vs local.
+  // Phase B — Storage decision using ONLY the comb boundary:
+  //   a value is Local iff it is defined inside a comb, is not a comb result,
+  //   is not a block argument, and every use stays inside the same comb.
+  // The comb region trait IsolatedFromAbove guarantees no SSA can escape the
+  // region except via comb results / block args, so this rule is exact.
+  //
+  // One additional demotion applies: a value that crosses part methods cannot
+  // be a method-local Wire<> (it would be invisible to the other part), so it
+  // is promoted to a struct member even though it passes the boundary test.
   for (Value v : candidates) {
     Operation *def = v.getDefiningOp();
 
-    // Determine the owner method for this value.
-    StringRef owner = "core";
+    // Owner method is only needed for Local values (emit uses it to gate where
+    // the local Wire<> is declared). Struct values carry an empty owner.
+    std::string owner;
     if (def) {
       auto it = opToMethod.find(def);
       if (it != opToMethod.end())
         owner = it->second;
     }
 
-    // Values pinned to struct (block args, state ops, cross-comb uses) stay struct.
+    // Pinned-to-struct values (block args, state ops, comb results, values
+    // escaping their comb) always live on the struct.
     if (pinToStruct(v)) {
-      annotatePlacement(v, CppStorageKind::Struct, owner);
+      annotatePlacement(v, CppStorageKind::Struct, {});
       summary.structMembers++;
       if (!def)
         summary.probePinnedStruct++;
       continue;
     }
 
-    // Promote to local only when all uses are in the same method.
-    bool crossMethod = false;
-    for (OpOperand &use : v.getUses()) {
-      Operation *user = use.getOwner();
-      if (methodForUserOp(user, opToMethod, combWrappers) != owner) {
-        crossMethod = true;
-        break;
-      }
-    }
-    if (crossMethod) {
-      annotatePlacement(v, CppStorageKind::Struct, owner);
+    // Boundary rule says Local. Demote to struct if the value is used across
+    // part methods (collected in Phase A), since a method-local Wire<> would
+    // be invisible to the consuming part.
+    if (crossPartValues.contains(v)) {
+      annotatePlacement(v, CppStorageKind::Struct, {});
       summary.structMembers++;
-      summary.promotedCrossMethod++;
+      summary.crossPartPromoted++;
       continue;
     }
 
-    // Single-method: make it a function-local Wire<>.
     annotatePlacement(v, CppStorageKind::Local, owner);
     summary.localInMethod++;
   }
 
-  // Phase 2: ensure non-comb values (regs, instances, ports, etc.) are struct members.
+  // Phase C: ensure non-comb values (regs, instances, ports, etc.) are struct members.
   f.walk([&](Operation *op) {
     if (op->getParentOfType<pyc::CombOp>() != nullptr)
       return;
@@ -647,12 +658,10 @@ void setFuncPlacementSummary(func::FuncOp f, const CppPlacementSummary &summary)
                       IntegerAttr::get(IntegerType::get(ctx, 64), summary.structMembers));
   fields.emplace_back(StringAttr::get(ctx, "local_in_method"),
                       IntegerAttr::get(IntegerType::get(ctx, 64), summary.localInMethod));
-  fields.emplace_back(StringAttr::get(ctx, "promoted_cross_method"),
-                      IntegerAttr::get(IntegerType::get(ctx, 64), summary.promotedCrossMethod));
   fields.emplace_back(StringAttr::get(ctx, "probe_pinned_struct"),
                       IntegerAttr::get(IntegerType::get(ctx, 64), summary.probePinnedStruct));
-  fields.emplace_back(StringAttr::get(ctx, "fixed_order_cross_method"),
-                      IntegerAttr::get(IntegerType::get(ctx, 64), summary.fixedOrderCrossMethod));
+  fields.emplace_back(StringAttr::get(ctx, "cross_part_promoted"),
+                      IntegerAttr::get(IntegerType::get(ctx, 64), summary.crossPartPromoted));
   fields.emplace_back(StringAttr::get(ctx, "scheduled_cross_method"),
                       IntegerAttr::get(IntegerType::get(ctx, 64), summary.scheduledCrossMethod));
   fields.emplace_back(StringAttr::get(ctx, "scheduled_cut_weight"),
@@ -680,12 +689,10 @@ std::optional<CppPlacementSummary> getFuncPlacementSummary(func::FuncOp f) {
   summary.structMembers = static_cast<unsigned>(*structMembers);
   if (auto v = readSummaryField(f, "local_in_method"))
     summary.localInMethod = static_cast<unsigned>(*v);
-  if (auto v = readSummaryField(f, "promoted_cross_method"))
-    summary.promotedCrossMethod = static_cast<unsigned>(*v);
   if (auto v = readSummaryField(f, "probe_pinned_struct"))
     summary.probePinnedStruct = static_cast<unsigned>(*v);
-  if (auto v = readSummaryField(f, "fixed_order_cross_method"))
-    summary.fixedOrderCrossMethod = static_cast<unsigned>(*v);
+  if (auto v = readSummaryField(f, "cross_part_promoted"))
+    summary.crossPartPromoted = static_cast<unsigned>(*v);
   if (auto v = readSummaryField(f, "scheduled_cross_method"))
     summary.scheduledCrossMethod = static_cast<unsigned>(*v);
   if (auto v = readSummaryField(f, "scheduled_cut_weight"))
@@ -701,9 +708,8 @@ CppPlacementSummary accumulateModulePlacementSummary(ModuleOp module) {
     if (auto summary = getFuncPlacementSummary(f)) {
       totals.structMembers += summary->structMembers;
       totals.localInMethod += summary->localInMethod;
-      totals.promotedCrossMethod += summary->promotedCrossMethod;
       totals.probePinnedStruct += summary->probePinnedStruct;
-      totals.fixedOrderCrossMethod += summary->fixedOrderCrossMethod;
+      totals.crossPartPromoted += summary->crossPartPromoted;
       totals.scheduledCrossMethod += summary->scheduledCrossMethod;
       totals.scheduledCutWeight += summary->scheduledCutWeight;
     }

@@ -2441,10 +2441,8 @@ int main(int argc, char **argv) {
       llvm::json::Object placement;
       placement["struct_members"] = static_cast<int64_t>(placementSummary.structMembers);
       placement["local_in_method"] = static_cast<int64_t>(placementSummary.localInMethod);
-      placement["promoted_cross_method"] = static_cast<int64_t>(placementSummary.promotedCrossMethod);
       placement["probe_pinned_struct"] = static_cast<int64_t>(placementSummary.probePinnedStruct);
-      placement["fixed_order_cross_method"] =
-          static_cast<int64_t>(placementSummary.fixedOrderCrossMethod);
+      placement["cross_part_promoted"] = static_cast<int64_t>(placementSummary.crossPartPromoted);
       placement["scheduled_cross_method"] =
           static_cast<int64_t>(placementSummary.scheduledCrossMethod);
       placement["scheduled_cut_weight"] =

@@ -22,13 +22,14 @@ enum class CppStorageKind { Struct, Local };
 
 struct CppPlacementSummary {
   unsigned structMembers = 0;
-  /// Comb wires localized as function-local Wire<> (all uses in one eval_comb_*).
+  /// Comb wires localized as function-local Wire<> purely by comb boundary:
+  /// defined inside a comb, not a comb result, not a block arg, no escaping use.
   unsigned localInMethod = 0;
-  unsigned promotedCrossMethod = 0;
   /// Comb-region values without a defining op (e.g. block args) kept on the struct.
   unsigned probePinnedStruct = 0;
-  /// Cross-part localizable wires under fixed-size chunking (baseline).
-  unsigned fixedOrderCrossMethod = 0;
+  /// Comb wires that would be local by boundary, but are used across part methods
+  /// and therefore promoted to struct members.
+  unsigned crossPartPromoted = 0;
   /// Cross-part localizable wires under the chosen schedule/cut (or fallback).
   unsigned scheduledCrossMethod = 0;
   /// Weighted cut cost for the chosen scheduled partition.
