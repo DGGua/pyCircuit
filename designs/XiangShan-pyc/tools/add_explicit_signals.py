@@ -28,7 +28,7 @@ ALL_MODULES: list[tuple[str, str]] = [
     ("backend/fu/fpu.py", "build_fpu"),
     ("backend/regfile/regfile.py", "build_regfile"),
     ("backend/rename/rename.py", "build_rename"),
-    ("backend/dispatch/dispatch.py", "build_dispatch"),
+    ("backend/dispatch/dispatch.py", "dispatch"),
     ("backend/issue/issue_queue.py", "build_issue_queue"),
     ("backend/rob/rob.py", "build_rob"),
     ("backend/ctrlblock/ctrlblock.py", "build_ctrlblock"),

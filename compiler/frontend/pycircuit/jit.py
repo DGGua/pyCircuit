@@ -3,18 +3,19 @@ from __future__ import annotations
 import ast
 import copy
 import inspect
+import operator as _pyop
 from dataclasses import dataclass
 from typing import Any, Hashable, Mapping, get_args, get_origin
 
 from .api_contract import removed_call_diagnostic
 from .connectors import Connector, ConnectorBundle, is_connector, is_connector_bundle
+from .data import Bits, Data, Vector
 from .diagnostics import Diagnostic, make_diagnostic, render_diagnostic, snippet_from_text
 from .dsl import Signal
 from .hw import (
     Bundle,
     Circuit,
     Reg,
-    Vec,
     Wire,
 )
 from .jit_cache import assigned_names_for, get_function_meta, get_signature, get_structural_metrics
@@ -39,6 +40,53 @@ class _InlineReturn(RuntimeError):
 
 
 _HAS_AST_MATCH = hasattr(ast, "Match")
+
+# ── Cycle-aware signal interop ─────────────────────────────────────────────
+# V5 cycle-aware wrappers (CycleAwareSignal / StateSignal / ForwardSignal)
+# carry their own cycle metadata and emit balancing registers through the
+# same Circuit builder the JIT compiles into.  The JIT treats them as opaque
+# Python values and delegates operators to their native implementations, so
+# `domain.next()` / auto cycle balancing work identically to eager mode.
+# Elaboration is still fully static: params are compile-time constants and
+# every distinct specialization is a separate re-JIT.
+
+_CAS_TYPES: tuple[type, ...] | None = None
+
+
+def _cas_types() -> tuple[type, ...]:
+    global _CAS_TYPES
+    if _CAS_TYPES is None:
+        from .v5 import CycleAwareSignal, ForwardSignal, StateSignal
+
+        _CAS_TYPES = (CycleAwareSignal, StateSignal, ForwardSignal)
+    return _CAS_TYPES
+
+
+def _is_cas(v: Any) -> bool:
+    return isinstance(v, _cas_types())
+
+
+_PY_BINOPS: dict[type, Any] = {
+    ast.Add: _pyop.add,
+    ast.Sub: _pyop.sub,
+    ast.Mult: _pyop.mul,
+    ast.FloorDiv: _pyop.floordiv,
+    ast.Mod: _pyop.mod,
+    ast.LShift: _pyop.lshift,
+    ast.RShift: _pyop.rshift,
+    ast.BitAnd: _pyop.and_,
+    ast.BitOr: _pyop.or_,
+    ast.BitXor: _pyop.xor,
+}
+
+_PY_CMPOPS: dict[type, Any] = {
+    ast.Eq: _pyop.eq,
+    ast.NotEq: _pyop.ne,
+    ast.Lt: _pyop.lt,
+    ast.LtE: _pyop.le,
+    ast.Gt: _pyop.gt,
+    ast.GtE: _pyop.ge,
+}
 
 
 def _check_removed_api_call(node: ast.Call, *, compiler: "_Compiler") -> None:
@@ -134,7 +182,11 @@ def _expect_wire(v: Any, *, ctx: str) -> Wire:
 
 
 def _wire_ifexpr(cond: Wire, true_v: Any, false_v: Any) -> Wire:
-    if cond.ty != "i1":
+    cond_is_vec = isinstance(cond.ty, Vector)
+    if cond_is_vec:
+        if cond.width != 1:
+            raise JitError("if-expression vector condition must be vector<...xi1>")
+    elif cond.ty != Bits(1):
         raise JitError("if-expression condition must be an i1 wire")
     if isinstance(true_v, Connector):
         true_v = true_v.read()
@@ -239,7 +291,7 @@ def _validate_template_return(v: Any, *, where: str = "return") -> None:
         return
     if v is None or isinstance(v, (bool, int, str, LiteralValue)):
         return
-    if isinstance(v, (Wire, Reg, Signal, Connector, ConnectorBundle, Bundle, Vec)):
+    if isinstance(v, (Wire, Reg, Signal, Connector, ConnectorBundle, Bundle)):
         raise JitError(f"@const {where} cannot be a hardware value ({type(v).__name__})")
     if isinstance(v, (list, tuple)):
         for i, elem in enumerate(v):
@@ -261,11 +313,11 @@ def _emit_scf_yield(m: Circuit, values: list[Wire]) -> None:
         m.emit_line("scf.yield")
         return
     refs = ", ".join(v.ref for v in values)
-    tys = ", ".join(v.ty for v in values)
+    tys = ", ".join(str(v.ty) for v in values)
     m.emit_line(f"scf.yield {refs} : {tys}")
 
 
-def _emit_scf_if_header(m: Circuit, results: list[str], cond: Wire, result_types: list[str]) -> None:
+def _emit_scf_if_header(m: Circuit, results: list[str], cond: Wire, result_types: list[Data]) -> None:
     if not results:
         m.emit_line(f"scf.if {cond.ref} {{")
         return
@@ -273,7 +325,7 @@ def _emit_scf_if_header(m: Circuit, results: list[str], cond: Wire, result_types
     if len(result_types) == 1:
         ty_sig = result_types[0]
     else:
-        ty_sig = f"({', '.join(result_types)})"
+        ty_sig = f"({', '.join(str(t) for t in result_types)})"
     m.emit_line(f"{res_lhs} = scf.if {cond.ref} -> {ty_sig} {{")
 
 
@@ -334,18 +386,21 @@ class _Compiler:
         self._value_param_types: dict[str, str] = dict(value_param_types or {})
 
     @staticmethod
-    def _ty_width(ty: str) -> int:
-        if not ty.startswith("i"):
+    def _ty_width(ty: "str | Data") -> int:
+        if isinstance(ty, Bits):
+            return ty.width
+        raw = str(ty).strip()
+        if not raw.startswith("i"):
             raise JitError(f"expected integer type iN, got {ty!r}")
         try:
-            w = int(ty[1:])
+            w = int(raw[1:])
         except ValueError as e:
             raise JitError(f"invalid integer type: {ty!r}") from e
         if w <= 0:
             raise JitError(f"invalid integer width in type: {ty!r}")
         return w
 
-    def _coerce_to_type(self, v: Any, *, expected_ty: str, ctx: str) -> Wire:
+    def _coerce_to_type(self, v: Any, *, expected_ty: "str | Data", ctx: str) -> Wire:
         """Coerce a value into a Wire of `expected_ty` (ints become constants)."""
         if isinstance(v, Connector):
             v = v.read()
@@ -370,12 +425,12 @@ class _Compiler:
         if w.ty == expected_ty:
             return w
 
-        if w.ty.startswith("i") and expected_ty.startswith("i"):
-            ew = self._ty_width(expected_ty)
+        if isinstance(w.ty, Bits) and isinstance(expected_ty, Bits):
+            ew = expected_ty.width
             if w.width < ew:
-                return w._sext(width=ew) if w.signed else w._zext(width=ew)
+                return w.sext(width=ew) if w.signed else w.zext(width=ew)
             if w.width > ew:
-                return w._trunc(width=ew)
+                return w.trunc(width=ew)
             return w
 
         raise JitError(f"{ctx}: type mismatch, got {w.ty} expected {expected_ty}")
@@ -427,7 +482,7 @@ class _Compiler:
 
     @staticmethod
     def _is_hw_value(v: Any) -> bool:
-        if isinstance(v, (Wire, Reg, Signal, Vec, Bundle, Connector, LiteralValue)):
+        if isinstance(v, (Wire, Reg, Signal, Bundle, Connector, LiteralValue)):
             return True
         if is_connector_bundle(v):
             return True
@@ -662,8 +717,6 @@ class _Compiler:
                 return
             raise JitError("subscript assignment target must be a list or dict variable")
         if isinstance(target, (ast.Tuple, ast.List)):
-            if isinstance(value, Vec):
-                value = list(value.elems)
             if not isinstance(value, (tuple, list)):
                 raise JitError("tuple/list assignment requires tuple/list values")
             if len(value) != len(target.elts):
@@ -732,9 +785,9 @@ class _Compiler:
                 return int(self.eval_const(node.args[0]))
             if isinstance(node.func, ast.Name) and node.func.id == "len" and len(node.args) == 1 and not node.keywords:
                 v = self.eval_expr(node.args[0])
-                if isinstance(v, (list, tuple, Vec, Bundle)):
+                if isinstance(v, (list, tuple, Bundle)):
                     return int(len(v))
-                raise JitError(f"len() const-eval expects list/tuple/Vec/Bundle, got {type(v).__name__}")
+                raise JitError(f"len() const-eval expects list/tuple/Bundle, got {type(v).__name__}")
         raise JitError(f"unsupported const-eval expression: {ast.dump(node, include_attributes=False)}")
 
     # ---- expression evaluation (hardware + params) ----
@@ -760,7 +813,7 @@ class _Compiler:
         if isinstance(node, ast.List):
             elts = [self.eval_expr(e) for e in node.elts]
             if elts and all(isinstance(e, (Wire, Reg)) for e in elts):
-                return Vec(tuple(elts))
+                return elts
             return elts
         if isinstance(node, ast.ListComp):
             if len(node.generators) != 1:
@@ -796,7 +849,7 @@ class _Compiler:
                 raw_iter = self.eval_expr(gen.iter)
                 if isinstance(raw_iter, range):
                     iter_vals = [int(i) for i in raw_iter]
-                elif isinstance(raw_iter, (list, tuple, Vec)):
+                elif isinstance(raw_iter, (list, tuple)):
                     iter_vals = list(raw_iter)
                 else:
                     raise JitError(
@@ -816,12 +869,12 @@ class _Compiler:
             else:
                 self.env.pop(name, None)
             if out and all(isinstance(e, (Wire, Reg)) for e in out):
-                return Vec(tuple(out))
+                return out
             return out
         if isinstance(node, ast.Tuple):
             elts = [self.eval_expr(e) for e in node.elts]
             if elts and all(isinstance(e, (Wire, Reg)) for e in elts):
-                return Vec(tuple(elts))
+                return elts
             return tuple(elts)
         if isinstance(node, ast.Dict):
             out: dict[Any, Any] = {}
@@ -847,19 +900,14 @@ class _Compiler:
         if isinstance(node, ast.Subscript):
             base = self.eval_expr(node.value)
             sl = node.slice
-            if isinstance(base, Vec):
+            if _is_cas(base):
                 if isinstance(sl, ast.Slice):
                     if sl.step is not None:
-                        raise JitError("Vec slicing does not support step (prototype)")
-                    lo = None
-                    if sl.lower is not None:
-                        lo = self.eval_const(sl.lower)
-                    hi = None
-                    if sl.upper is not None:
-                        hi = self.eval_const(sl.upper)
-                    return base[slice(lo, hi, None)]
-                idx_i = self.eval_const(sl)
-                return base[int(idx_i)]
+                        raise JitError("cycle-aware signal slicing does not support step")
+                    lo = None if sl.lower is None else self.eval_const(sl.lower)
+                    hi = None if sl.upper is None else self.eval_const(sl.upper)
+                    return base[slice(lo, hi)]
+                return base[int(self.eval_const(sl))]
             if isinstance(base, Bundle):
                 if isinstance(sl, ast.Name) and sl.id in self._value_param_names:
                     raise JitError(
@@ -923,6 +971,14 @@ class _Compiler:
             if isinstance(rhs, Connector):
                 rhs = rhs.read()
 
+            if _is_cas(lhs) or _is_cas(rhs):
+                fn = _PY_BINOPS.get(type(node.op))
+                if fn is None:
+                    raise JitError(
+                        f"unsupported operator on cycle-aware signal: {node.op.__class__.__name__}"
+                    )
+                return fn(lhs, rhs)
+
             def _as_py_int(v: Any) -> int:
                 if isinstance(v, LiteralValue):
                     return int(v.value)
@@ -937,8 +993,6 @@ class _Compiler:
                     return lhs + rhs
                 if isinstance(lhs, tuple) and isinstance(rhs, tuple):
                     return lhs + rhs
-                if isinstance(lhs, Vec) and isinstance(rhs, Vec):
-                    return Vec((*lhs.elems, *rhs.elems))
                 return _as_py_int(lhs) + _as_py_int(rhs)
             if isinstance(node.op, ast.Sub):
                 if isinstance(lhs, (Wire, Reg)):
@@ -952,7 +1006,9 @@ class _Compiler:
                 if isinstance(rhs, (Wire, Reg)):
                     return _expect_wire(rhs, ctx="*") * lhs
                 return _as_py_int(lhs) * _as_py_int(rhs)
-            if isinstance(node.op, ast.FloorDiv) or isinstance(node.op, ast.Div):
+            if isinstance(node.op, ast.Div):
+                raise JitError("hardware `/` division is not supported; use `//` for integer division")
+            if isinstance(node.op, ast.FloorDiv):
                 if isinstance(lhs, (Wire, Reg)):
                     return _expect_wire(lhs, ctx="/") // rhs
                 if isinstance(rhs, (Wire, Reg)):
@@ -1010,13 +1066,27 @@ class _Compiler:
             v = self.eval_expr(node.operand)
             if isinstance(v, Connector):
                 v = v.read()
+            if _is_cas(v):
+                if isinstance(node.op, ast.Invert):
+                    return ~v
+                if isinstance(node.op, ast.USub):
+                    return -v
+                if isinstance(node.op, ast.UAdd):
+                    return v
+                raise JitError(
+                    "`not` on a cycle-aware signal is not supported; use mux/select for conditional logic"
+                )
             if isinstance(node.op, ast.Invert):
+                if isinstance(v, LiteralValue):
+                    return ~int(v.value)
+                if isinstance(v, (int, bool)):
+                    return ~int(v)
                 w = _expect_wire(v, ctx="~")
                 return ~w
             if isinstance(node.op, ast.Not):
                 if isinstance(v, (Wire, Reg)):
                     w = _expect_wire(v, ctx="not")
-                    if w.ty != "i1":
+                    if w.ty != Bits(1):
                         raise JitError("not only supports i1 wires")
                     return ~w
                 return not bool(v)
@@ -1035,7 +1105,7 @@ class _Compiler:
                         else:
                             out = _expect_wire(b, ctx="and") & out
                     else:
-                        out = bool(out) and bool(b)
+                        out = bool(out) and bool(o=b)
                 return out
             if isinstance(node.op, ast.Or):
                 out = self.eval_expr(node.values[0])
@@ -1059,7 +1129,6 @@ class _Compiler:
                 return self.eval_expr(node.body if bool(int(cond_v.value)) else node.orelse)
             if not isinstance(cond_v, (Wire, Reg)) and isinstance(cond_v, (bool, int)):
                 return self.eval_expr(node.body if bool(cond_v) else node.orelse)
-
             cond = _expect_wire(cond_v, ctx="if-expression condition")
             true_v = self.eval_expr(node.body)
             false_v = self.eval_expr(node.orelse)
@@ -1074,6 +1143,24 @@ class _Compiler:
                     return lhs is rhs
                 if isinstance(op, ast.IsNot):
                     return lhs is not rhs
+                if _is_cas(lhs) or _is_cas(rhs):
+                    fn = _PY_CMPOPS.get(type(op))
+                    if fn is None:
+                        raise JitError(
+                            f"unsupported comparison on cycle-aware signal: {op.__class__.__name__}"
+                        )
+                    return fn(lhs, rhs)
+                if isinstance(op, (ast.In, ast.NotIn)):
+                    # Compile-time membership test (e.g. `if "decode" in cut_after:`).
+                    # Operands must be static Python values; the branch is folded
+                    # during elaboration and the emitted netlist stays fully static.
+                    if isinstance(lhs, (Wire, Reg, Vec)) or isinstance(rhs, (Wire, Reg, Vec)):
+                        raise JitError(
+                            "`in` is a compile-time membership test on Python values; "
+                            "hardware values are not supported (use ==/mux instead)"
+                        )
+                    contained = _py_cmp_value(lhs) in rhs
+                    return contained if isinstance(op, ast.In) else (not contained)
                 if isinstance(op, ast.Eq):
                     if not isinstance(lhs, (Wire, Reg)) and not isinstance(rhs, (Wire, Reg)):
                         return _py_cmp_value(lhs) == _py_cmp_value(rhs)
@@ -1133,10 +1220,7 @@ class _Compiler:
                 if chain_out is None:
                     chain_out = cmp_out
                 elif isinstance(chain_out, (Wire, Reg)) or isinstance(cmp_out, (Wire, Reg)):
-                    if isinstance(chain_out, (Wire, Reg)):
-                        chain_out = _expect_wire(chain_out, ctx="comparison chain") & cmp_out
-                    else:
-                        chain_out = _expect_wire(cmp_out, ctx="comparison chain") & chain_out
+                    chain_out = _expect_wire(chain_out, ctx="comparison chain") & cmp_out
                 else:
                     chain_out = bool(chain_out) and bool(cmp_out)
                 lhs = rhs
@@ -1295,7 +1379,7 @@ class _Compiler:
     def _snapshot_template_purity_state(self) -> dict[str, Any]:
         snap: dict[str, Any] = {
             "lines": list(self.m._lines),  # noqa: SLF001
-            "next_tmp": int(self.m._next_tmp),  # noqa: SLF001
+            "next_tmp": int(self.m._temp_var_index),  # noqa: SLF001
             "args": list(self.m._args),  # noqa: SLF001
             "results": list(self.m._results),  # noqa: SLF001
             "finalizers": list(getattr(self.m, "_finalizers", [])),  # noqa: SLF001
@@ -1310,7 +1394,7 @@ class _Compiler:
 
     def _restore_template_purity_state(self, snap: Mapping[str, Any]) -> None:
         self.m._lines = list(snap["lines"])  # noqa: SLF001
-        self.m._next_tmp = int(snap["next_tmp"])  # noqa: SLF001
+        self.m._temp_var_index = int(snap["next_tmp"])  # noqa: SLF001
         self.m._args = list(snap["args"])  # noqa: SLF001
         self.m._results = list(snap["results"])  # noqa: SLF001
         if hasattr(self.m, "_finalizers"):
@@ -1328,7 +1412,7 @@ class _Compiler:
         changed: list[str] = []
         if list(self.m._lines) != list(snap["lines"]):  # noqa: SLF001
             changed.append("_lines")
-        if int(self.m._next_tmp) != int(snap["next_tmp"]):  # noqa: SLF001
+        if int(self.m._temp_var_index) != int(snap["next_tmp"]):  # noqa: SLF001
             changed.append("_next_tmp")
         if list(self.m._args) != list(snap["args"]):  # noqa: SLF001
             changed.append("_args")
@@ -1431,6 +1515,19 @@ class _Compiler:
             if cur is None:
                 raise JitError(f"augassign to unknown name {name!r}")
             rhs = self.eval_expr(node.value)
+            if _is_cas(cur):
+                if isinstance(node.op, ast.LShift):
+                    # StateSignal feedback assignment (`sig <<= value`).
+                    cur <<= rhs
+                    self.env[name] = cur
+                    return
+                fn = _PY_BINOPS.get(type(node.op))
+                if fn is None:
+                    raise JitError(
+                        f"unsupported augmented assignment on cycle-aware signal: {node.op.__class__.__name__}"
+                    )
+                self.env[name] = fn(cur, rhs)
+                return
             if isinstance(node.op, ast.Add):
                 self.env[name] = self._alias_if_wire(_expect_wire(cur, ctx="+=") + rhs, base_name=name, node=node)
                 return
@@ -1465,7 +1562,7 @@ class _Compiler:
                 return
 
             w = _expect_wire(test_v, ctx="assert")
-            if w.ty != "i1":
+            if w.ty != Bits(1):
                 raise JitError("assert condition must be an i1 Wire")
             self.m.assert_(w, msg=msg)
             return
@@ -1521,7 +1618,7 @@ class _Compiler:
             return
 
         cond = _expect_wire(cond_v, ctx="if condition")
-        if cond.ty != "i1":
+        if cond.ty != Bits(1):
             raise JitError("if condition must be an i1 wire or a python bool")
 
         pre_env = dict(self.env)
@@ -1540,7 +1637,7 @@ class _Compiler:
                 self.m._lines = saved_lines  # noqa: SLF001
             return local_lines
 
-        def value_ty(v: Any) -> str | None:
+        def value_ty(v: Any) -> Data | None:
             if isinstance(v, Reg):
                 v = v.q
             if isinstance(v, Wire):
@@ -1548,7 +1645,7 @@ class _Compiler:
             if isinstance(v, Signal):
                 return v.ty
             if isinstance(v, LiteralValue) and v.width is not None:
-                return f"i{int(v.width)}"
+                return Bits(int(v.width))
             return None
 
         def int_width(v: int) -> int:
@@ -1607,7 +1704,7 @@ class _Compiler:
 
         phi_vars = list(assigned)
 
-        expected_types: list[str] = []
+        expected_types: list[Data] = []
         for name in phi_vars:
             pre_v = pre_env.get(name)
             if isinstance(pre_v, Wire):
@@ -1631,8 +1728,8 @@ class _Compiler:
                 if then_ty == else_ty:
                     expected_types.append(then_ty)
                     continue
-                if then_ty.startswith("i") and else_ty.startswith("i"):
-                    expected_types.append(f"i{max(self._ty_width(then_ty), self._ty_width(else_ty))}")
+                if isinstance(then_ty, Bits) and isinstance(else_ty, Bits):
+                    expected_types.append(Bits(max(self._ty_width(then_ty), self._ty_width(else_ty))))
                     continue
                 raise JitError(f"if assigns {name!r} with incompatible types: {then_ty} vs {else_ty}")
 
@@ -1649,11 +1746,11 @@ class _Compiler:
             tv_i = int(tv.value) if isinstance(tv, LiteralValue) else int(tv)
             ev_i = int(ev.value) if isinstance(ev, LiteralValue) else int(ev)
             w = max(int_width(tv_i), int_width(ev_i))
-            expected_types.append(f"i{w}")
+            expected_types.append(Bits(w))
 
         results: list[str] = []
         if phi_vars:
-            results = [self.m._tmp() for _ in phi_vars]  # noqa: SLF001
+            results = [self.m._get_next_temp_var() for _ in phi_vars]  # noqa: SLF001
 
         _emit_scf_if_header(self.m, results, cond, expected_types)
 
@@ -1967,6 +2064,27 @@ def compile_module(
                 raise JitError(f"invalid integer width in signature-bound port {p.name!r}: {ty!r}")
             signed = bool(spec.get("signed", False))
             c.env[p.name] = m.input(p.name, width=width, signed=signed)
+            continue
+        if kind == "vec":
+            ty = str(spec.get("ty", "")).strip()
+            if not ty.startswith("vector<"):
+                raise JitError(f"invalid vector type in signature-bound port {p.name!r}: {ty!r}")
+            try:
+                parsed = Data.from_str(ty)
+            except ValueError as e:
+                raise JitError(f"invalid vector type in signature-bound port {p.name!r}: {ty!r}") from e
+            if not isinstance(parsed, Vector):
+                raise JitError(f"invalid vector type in signature-bound port {p.name!r}: {ty!r}")
+            shape = parsed.shape()
+            elem_ty = parsed.datatype()
+            if not isinstance(elem_ty, Bits):
+                raise JitError(f"invalid vector element type in signature-bound port {p.name!r}: {elem_ty!r}")
+            width = elem_ty.width
+            if width <= 0:
+                raise JitError(f"invalid vector element width in signature-bound port {p.name!r}: {elem_ty!r}")
+            signed_raw = spec.get("signed", False)
+            signed = any(bool(v) for v in signed_raw) if isinstance(signed_raw, list) else bool(signed_raw)
+            c.env[p.name] = m.input(p.name, width=width, shape=shape, signed=signed)
             continue
         raise JitError(f"unsupported signature-bound port kind for {p.name!r}: {kind!r}")
 

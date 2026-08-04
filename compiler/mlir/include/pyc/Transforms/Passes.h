@@ -27,5 +27,6 @@ std::unique_ptr<::mlir::Pass> createCollectCompileStatsPass();
 std::unique_ptr<::mlir::Pass> createFlattenInstancesPass();
 /// C++ emit prep: sets module comb chunk size and runs member placement.
 std::unique_ptr<::mlir::Pass> createCppPlacementPass(unsigned combChunkNodes);
+std::unique_ptr<::mlir::Pass> createVectorUnrollPass();
 
 } // namespace pyc

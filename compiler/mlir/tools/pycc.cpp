@@ -3,11 +3,13 @@
 #include "pyc/Emit/CppEmitter.h"
 #include "pyc/Emit/CppPlacement.h"
 #include "pyc/Emit/VerilogEmitter.h"
+#include "pyc/Support/PassIRDumper.h"
 #include "pyc/Transforms/Passes.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Func/Extensions/InlinerExtension.h"
+#include "mlir/IR/AsmState.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/BuiltinOps.h"
@@ -184,6 +186,11 @@ static llvm::cl::opt<bool> cppOnlyPreserveOps(
     llvm::cl::desc("Preserve operation-granular C++ scheduling in --sim-mode=cpp-only (disables comb fusion)"),
     llvm::cl::init(false));
 
+static llvm::cl::opt<bool> unrollVector(
+    "unroll-vector",
+    llvm::cl::desc("Unroll vector operations to scalars at IR level before optimization passes"),
+    llvm::cl::init(false));
+
 static llvm::cl::opt<bool> noInline(
     "noinline",
     llvm::cl::desc("Disable MLIR inliner to preserve module boundaries (prevents merge/flatten)"),
@@ -218,6 +225,25 @@ static llvm::cl::opt<bool> profilePassTiming(
     "profile-pass-timing",
     llvm::cl::desc("Collect pass-level timing and memory stats (included in --profile-json)"),
     llvm::cl::init(false));
+
+// --- Per-pass IR dump (diagnostics only; never modifies IR) ---
+static llvm::cl::opt<std::string> dumpPassIrDir(
+    "dump-pass-ir",
+    llvm::cl::desc("Dump IR before/after each pass to this directory "
+                   "(use 'auto' for <out-dir>/pass_ir)"),
+    llvm::cl::init(""));
+static llvm::cl::opt<std::string> dumpPassIrPhase(
+    "dump-pass-ir-phase",
+    llvm::cl::desc("Which phase to dump: before | after | both"),
+    llvm::cl::init("both"));
+static llvm::cl::opt<std::string> dumpPassIrFilter(
+    "dump-pass-ir-filter",
+    llvm::cl::desc("Regex filtering pass short names (e.g. 'eliminate-wires|fuse-comb')"),
+    llvm::cl::init(""));
+static llvm::cl::opt<unsigned> dumpPassIrMaxLines(
+    "dump-pass-ir-max-lines",
+    llvm::cl::desc("Truncate each IR dump file after N lines (0 = unlimited)"),
+    llvm::cl::init(0));
 
 static llvm::cl::opt<std::string> emitStructuralMode(
     "emit-structural",
@@ -1141,7 +1167,7 @@ static bool isProbeOnlyFunc(func::FuncOp f) {
   return false;
 }
 
-static constexpr double kHardMaxSourcePredictedCompileCost = 15000.0;
+static constexpr double kHardMaxSourcePredictedCompileCost = 40000.0;
 static constexpr double kHardMaxModulePredictedCompileCost = 40000.0;
 static constexpr double kHardMaxTotalPredictedCompileCost = 700000.0;
 
@@ -2112,6 +2138,7 @@ int main(int argc, char **argv) {
   }
   sm.AddNewSourceBuffer(std::move(*fileOrErr), llvm::SMLoc());
 
+  SourceMgrDiagnosticHandler handler(sm, &ctx);
   OwningOpRef<ModuleOp> module = parseSourceFile<ModuleOp>(sm, &ctx);
   if (!module) {
     llvm::errs() << "error: failed to parse MLIR\n";
@@ -2273,6 +2300,31 @@ int main(int argc, char **argv) {
     passTimingCollector = passTimingStorage.get();
     pm.addInstrumentation(std::move(passTimingStorage));
   }
+  // Per-pass IR dump (diagnostics). 'auto' resolves to <out-dir>/pass_ir so the
+  // dump travels with profile/gate artifacts. Disabled entirely if no flag given.
+  std::unique_ptr<pyc::PassIRDumper> passIRDumperStorage;
+  if (!dumpPassIrDir.empty()) {
+    pyc::PassIRDumperOptions dumperOpts;
+    if (dumpPassIrDir == "auto") {
+      if (outDir.empty()) {
+        llvm::errs() << "error: --dump-pass-ir=auto requires --out-dir\n";
+        return 1;
+      }
+      llvm::SmallString<256> p(outDir);
+      llvm::sys::path::append(p, "pass_ir");
+      dumperOpts.dir = p.str().str();
+    } else {
+      dumperOpts.dir = dumpPassIrDir;
+    }
+    dumperOpts.phase = dumpPassIrPhase;
+    dumperOpts.filterRegex = dumpPassIrFilter;
+    dumperOpts.maxLines = static_cast<uint64_t>(dumpPassIrMaxLines);
+    passIRDumperStorage = std::make_unique<pyc::PassIRDumper>(std::move(dumperOpts));
+    // addInstrumentation takes ownership; passIRDumperStorage is released here.
+    // The PassManager keeps the instrumentation alive until `pm` is destroyed,
+    // which happens at end of scope (after pm.run() and any post-run use).
+    pm.addInstrumentation(std::move(passIRDumperStorage));
+  }
   pm.addPass(pyc::createCheckFrontendContractPass());
   pm.addPass(pyc::createInlineFunctionsPass());
   if (wantFlatten)
@@ -2289,10 +2341,13 @@ int main(int argc, char **argv) {
   pm.addPass(createSymbolDCEPass());
 
   pm.addNestedPass<func::FuncOp>(pyc::createLowerSCFToPYCStaticPass());
+  if (unrollVector)
+    pm.addNestedPass<func::FuncOp>(pyc::createVectorUnrollPass());
   pm.addNestedPass<func::FuncOp>(pyc::createEliminateWiresPass());
   pm.addNestedPass<func::FuncOp>(pyc::createEliminateDeadStatePass());
+  if (!unrollVector)
+    pm.addNestedPass<func::FuncOp>(pyc::createSLPPackWiresPass());
   pm.addNestedPass<func::FuncOp>(pyc::createCombCanonicalizePass());
-  pm.addNestedPass<func::FuncOp>(pyc::createSLPPackWiresPass());
   pm.addPass(pyc::createCheckCombCyclesPass());
   pm.addPass(pyc::createCheckClockDomainsPass());
   pm.addNestedPass<func::FuncOp>(pyc::createPackI1RegsPass());
