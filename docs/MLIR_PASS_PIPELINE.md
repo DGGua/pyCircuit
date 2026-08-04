@@ -50,6 +50,10 @@
 
 通过第 27–29 项 legality gate 后，`pycc` 才调用 C++ 或 Verilog emitter。
 
+`14a` / `14b` 共用序号前缀：源码里 `pyc-unroll-vector`（可选）紧挨在
+始终执行的 `pyc-eliminate-wires` 之前；用 a/b 标出这一对，这样无论是否开启
+`--unroll-vector`，后面的 15–30 编号都能与另一条路径对照，而不必整表重排。
+
 ## Vector 分支
 
 第 14a / 14b / 15 / 16 项是 Vector 处理的主要分支。`pyc-eliminate-wires` 与

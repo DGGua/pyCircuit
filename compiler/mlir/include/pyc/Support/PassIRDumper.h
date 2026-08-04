@@ -15,9 +15,9 @@ struct PassIRDumperOptions {
   std::string dir;
   /// Which phase(s) to dump: "before", "after", or "both" (default).
   std::string phase = "both";
-  /// Regex (ECMAScript style, via std::regex) to filter pass short names.
-  /// Empty matches everything. Match is performed against the pass short name
-  /// (e.g. "eliminate-wires" without the "pyc-" prefix).
+  /// Regex (ECMAScript-ish; compiled with llvm::Regex, no exceptions) to filter
+  /// pass short names. Empty matches everything. Match is performed against the
+  /// pass short name (e.g. "eliminate-wires" without the "pyc-" prefix).
   std::string filterRegex;
   /// Maximum number of IR lines per file. 0 = unlimited. Files exceeding the
   /// limit are truncated and a `// truncated at N lines` marker is appended.

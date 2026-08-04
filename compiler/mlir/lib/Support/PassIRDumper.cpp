@@ -1,7 +1,6 @@
 #include "pyc/Support/PassIRDumper.h"
 
 #include "mlir/IR/Operation.h"
-#include "mlir/IR/OpDefinition.h"
 #include "mlir/Pass/Pass.h"
 
 #include "llvm/ADT/SmallString.h"
@@ -11,12 +10,8 @@
 #include "llvm/Support/Regex.h"
 #include "llvm/Support/raw_ostream.h"
 
-#include <algorithm>
-#include <chrono>
 #include <cstdio>
-#include <cstring>
 #include <memory>
-#include <sstream>
 #include <string>
 #include <system_error>
 #include <vector>
@@ -129,6 +124,11 @@ struct PassIRDumper::Impl {
   explicit Impl(PassIRDumperOptions o) : opts(std::move(o)) {
     if (opts.dir.empty() || opts.dir == "auto")
       return; // "auto" must be resolved by the caller; treat as disabled here.
+    if (opts.phase != "before" && opts.phase != "after" && opts.phase != "both") {
+      llvm::errs() << "warning: invalid --dump-pass-ir-phase '" << opts.phase
+                   << "' (expected: before|after|both); falling back to both\n";
+      opts.phase = "both";
+    }
     enabled = true;
     resolvedDir = opts.dir;
     if (!opts.filterRegex.empty()) {
