@@ -5,6 +5,8 @@
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/IR/Attributes.h"
+#include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Types.h"
 #include "llvm/ADT/DenseMap.h"
@@ -29,6 +31,19 @@ using namespace mlir;
 
 namespace pyc {
 namespace {
+
+// ---------------------------------------------------------------------------
+// placement attribute readers (used internally by the emitter)
+// ---------------------------------------------------------------------------
+
+// C++ type string for a local Wire<> declaration.
+static std::string cppTypeForWire(Type ty) {
+  if (isa<pyc::ClockType>(ty) || isa<pyc::ResetType>(ty))
+    return "pyc::cpp::Wire<1>";
+  if (auto intTy = dyn_cast<IntegerType>(ty))
+    return "pyc::cpp::Wire<" + std::to_string(intTy.getWidth()) + ">";
+  return "pyc::cpp::Wire<1>";
+}
 
 static CppEmitterOptions effectiveEmitOpts(ModuleOp module, const CppEmitterOptions &opts) {
   CppEmitterOptions out = opts;
@@ -2857,6 +2872,105 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
 	}
 
 } // namespace
+
+// ---------------------------------------------------------------------------
+// placement attribute readers (used by emit + profile consumers)
+// ---------------------------------------------------------------------------
+
+std::optional<unsigned> getModuleCombChunkNodes(ModuleOp module) {
+  auto attr = module->getAttrOfType<IntegerAttr>(kCppCombChunkNodesAttr);
+  if (!attr)
+    return std::nullopt;
+  return static_cast<unsigned>(attr.getValue().getZExtValue());
+}
+
+static std::optional<uint64_t> readSummaryField(func::FuncOp f, StringRef key) {
+  auto dict = f->getAttrOfType<DictionaryAttr>(kCppPlacementSummaryAttr);
+  if (!dict)
+    return std::nullopt;
+  auto attr = dict.get(key);
+  if (!attr)
+    return std::nullopt;
+  if (auto intAttr = dyn_cast<IntegerAttr>(attr))
+    return intAttr.getValue().getZExtValue();
+  return std::nullopt;
+}
+
+std::optional<CppPlacementSummary> getFuncPlacementSummary(func::FuncOp f) {
+  auto structMembers = readSummaryField(f, "struct_members");
+  if (!structMembers)
+    return std::nullopt;
+  CppPlacementSummary summary;
+  summary.structMembers = static_cast<unsigned>(*structMembers);
+  if (auto v = readSummaryField(f, "local_in_method"))
+    summary.localInMethod = static_cast<unsigned>(*v);
+  if (auto v = readSummaryField(f, "probe_pinned_struct"))
+    summary.probePinnedStruct = static_cast<unsigned>(*v);
+  if (auto v = readSummaryField(f, "cross_part_promoted"))
+    summary.crossPartPromoted = static_cast<unsigned>(*v);
+  if (auto v = readSummaryField(f, "scheduled_cross_method"))
+    summary.scheduledCrossMethod = static_cast<unsigned>(*v);
+  if (auto v = readSummaryField(f, "scheduled_cut_weight"))
+    summary.scheduledCutWeight = *v;
+  return summary;
+}
+
+CppStorageKind getValueCppStorage(Value v) {
+  Operation *op = v.getDefiningOp();
+  if (!op)
+    return CppStorageKind::Struct;
+  if (auto a = op->getAttrOfType<StringAttr>(kCppStorageAttr)) {
+    if (a.getValue() == "local")
+      return CppStorageKind::Local;
+  }
+  return CppStorageKind::Struct;
+}
+
+StringRef getValueCppOwner(Value v) {
+  Operation *op = v.getDefiningOp();
+  if (!op)
+    return {};
+  if (auto a = op->getAttrOfType<StringAttr>(kCppOwnerAttr))
+    return a.getValue();
+  return {};
+}
+
+// ---------------------------------------------------------------------------
+// CppEmitterPlacementState (per-emission helpers used by emit code)
+// ---------------------------------------------------------------------------
+
+bool CppEmitterPlacementState::emitLocalDeclIfNeeded(Value v, Type ty, StringRef name,
+                                                     llvm::raw_ostream &os, unsigned indentSpaces) {
+  if (getValueCppStorage(v) != CppStorageKind::Local)
+    return false;
+  StringRef owner = getValueCppOwner(v);
+  if (!owner.empty() && owner != currentMethod)
+    return false;
+  if (!declaredLocals.insert(v).second)
+    return false;
+  for (unsigned i = 0; i < indentSpaces; ++i)
+    os << ' ';
+  os << cppTypeForWire(ty) << " " << name << "{};\n";
+  return true;
+}
+
+void CppEmitterPlacementState::emitValueAssign(Value result, Type ty, StringRef name, StringRef expr,
+                                               llvm::raw_ostream &os, unsigned indentSpaces) {
+  for (unsigned i = 0; i < indentSpaces; ++i)
+    os << ' ';
+
+  // Struct members: plain assignment.
+  if (getValueCppStorage(result) != CppStorageKind::Local) {
+    os << name << " = " << expr << ";\n";
+    return;
+  }
+
+  // Method-local Wire<>: declare-with-init on first assignment, plain assign on reuse.
+  if (declaredLocals.insert(result).second)
+    os << cppTypeForWire(ty) << " " << name << " = " << expr << ";\n";
+  else
+    os << name << " = " << expr << ";\n";
+}
 
 LogicalResult emitCpp(ModuleOp module, llvm::raw_ostream &os, const CppEmitterOptions &opts) {
   if (failed(requireCombChunkConfig(module)))

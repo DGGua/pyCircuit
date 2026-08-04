@@ -1,7 +1,6 @@
 #include "pyc/Dialect/PYC/PYCDialect.h"
 #include "pyc/Dialect/PYC/PYCOps.h"
 #include "pyc/Emit/CppEmitter.h"
-#include "pyc/Emit/CppPlacement.h"
 #include "pyc/Emit/VerilogEmitter.h"
 #include "pyc/Support/PassIRDumper.h"
 #include "pyc/Transforms/Passes.h"

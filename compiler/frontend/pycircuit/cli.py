@@ -1978,21 +1978,6 @@ def _gather_cpp_headers(cpp_root: Path) -> list[Path]:
     return out
 
 
-def _collect_pch_headers_from_device_cpp(device_cpp_root: Path) -> list[str]:
-    headers: list[str] = []
-    seen: set[str] = set()
-    for manifest_path in sorted(device_cpp_root.rglob("cpp_compile_manifest.json")):
-        data = json.loads(manifest_path.read_text(encoding="utf-8"))
-        profile = data.get("profile_summary") or {}
-        if not profile.get("cpp_pch"):
-            continue
-        for header in data.get("precompile_headers") or []:
-            if header not in seen:
-                seen.add(header)
-                headers.append(header)
-    return sorted(headers)
-
-
 def _module_hash(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
@@ -2471,7 +2456,19 @@ def _cmd_build(args: argparse.Namespace) -> int:
             "profile": str(args.profile),
         }
         if args.cpp_pch:
-            pch_headers = _collect_pch_headers_from_device_cpp(device_cpp_root)
+            # Collect device hpp headers flagged for PCH across all module manifests.
+            seen: set[str] = set()
+            pch_headers: list[str] = []
+            for manifest_path in sorted(device_cpp_root.rglob("cpp_compile_manifest.json")):
+                data = json.loads(manifest_path.read_text(encoding="utf-8"))
+                profile = data.get("profile_summary") or {}
+                if not profile.get("cpp_pch"):
+                    continue
+                for header in data.get("precompile_headers") or []:
+                    if header not in seen:
+                        seen.add(header)
+                        pch_headers.append(header)
+            pch_headers.sort()
             if not pch_headers:
                 pch_script = _tool_script("cpp_pch_headers.py")
                 pch_mod = _load_py_file(pch_script)
