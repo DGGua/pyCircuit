@@ -77,7 +77,7 @@ PyCircuit V6 强制单一信号类型。以下规则**不可违反**：
 | **`domain.state()` 不存在** | 创建寄存器的唯一方式是 `domain.signal()` + `<<=` / `.assign()`。 |
 | **`.wire` / `.w` 不可访问** | 所有算术、比较、mux、切片直接在 CAS 上进行。设计代码中读取 `.wire` 是错误。 |
 | **`wire_of()` 是唯一的 Wire 提取方式** | 仅在 `m.output()` 边界调用。 |
-| **`cas()` 包装裸 Wire** | `m.input()` / `m.const()` 返回裸 `Wire`，必须用 `cas(domain, w, cycle=0)` 或 `submodule_input()` 包装后才能参与 CAS 表达式。 |
+| **`cas()` 包装裸 Wire** | `m.input()` 和 `m.const` 助手返回裸 `Wire`，必须用 `cas(domain, w, cycle=0)` 或 `submodule_input()` 包装后才能参与 CAS 表达式。`u(w,v)` / `s(w,v)` 字面量是 `LiteralValue`，CAS 运算符 / `mux()` / `cas()` 可直接消费，无需手动包装。 |
 | **输出 dict 存 CAS** | 子模块返回的 dict 值必须是 `CycleAwareSignal`（保留 cycle 来源信息）。 |
 | **向量走 `Wire[Vector]`** | 多 lane 同构数据统一用 `m.input(..., shape=[N])` 声明为向量 `Wire[Vector[...]]`，不要手工拆 lane 拼标量。 |
 
@@ -160,7 +160,7 @@ sel = mux(cond_vec, v, w)  # 逐 lane mux
 ```python
 r = a + b;  r = a - b;  r = a * b          # 算术
 r = a & b;  r = a | b;  r = a ^ b;  r = ~a  # 位运算
-r = a == b; r = a != b                      # 比较（也可 a.eq(b) / a.ne(b)）
+r = a == b; r = a != b                      # 比较
 r = a < b;  r = a > b;  r = a <= b; r = a >= b
 r = a << k; r = a >> k                      # 移位
 low = data[0:8];  bit5 = data[5]            # 切片 / 索引（向量：取 lane）
@@ -265,7 +265,7 @@ rtc_clk = m.create_domain("RTC_CLK", frequency_desc="1Hz")
 ```python
 r = a + b;  r = a - b;  r = a * b          # 算术
 r = a & b;  r = a | b;  r = a ^ b;  r = ~a  # 位运算
-r = a == b; r = a != b                      # 比较（也可 a.eq(b) / a.ne(b)）
+r = a == b; r = a != b                      # 比较
 r = a < b;  r = a > b;  r = a <= b; r = a >= b
 r = a << k; r = a >> k                      # 移位
 low = data[0:8];  bit5 = data[5]            # 切片 / 索引
@@ -332,7 +332,7 @@ counter <<= count_next
 x = cas(domain, m.input("x", width=8), cycle=0)
 ```
 
-将裸 `Wire`（来自 `m.input()` / `m.const()`）包装为 CAS。是端口层与 CAS 类型系统之间的唯一桥梁。
+将裸 `Wire`（来自 `m.input()` 或 `u(w,v)` 字面量）包装为 CAS。是端口层与 CAS 类型系统之间的唯一桥梁。
 
 ### mux()
 

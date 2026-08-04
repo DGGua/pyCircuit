@@ -139,7 +139,7 @@ r = a + b       # r 在 cycle 2；a 被自动延迟 2 拍（插 2 级 DFF）
 | N=0 | M=2 | 两级流水反馈 |
 | — | M < N | 编译错误（不能向过去赋值） |
 
-**一个必须内化的规则**：CAS 不能当 Python 布尔用。`if sig:` 是错的——硬件里没有「运行时 if」，条件逻辑用 `mux(cond, a, b)` 或 `cond.select(a, b)` 表达。Python 的 `if`/`for` 只用来做**元编程**（生成电路结构），在 `eager=True` 模式下它们在编译期展开。
+**一个必须内化的规则**：CAS 不能当 Python 布尔用。`if sig:` 是错的——硬件里没有「运行时 if」，条件逻辑用 `mux(cond, a, b)` 表达。Python 的 `if`/`for` 只用来做**元编程**（生成电路结构），在 `eager=True` 模式下它们在编译期展开。
 
 ---
 
@@ -182,7 +182,7 @@ mini_alu.__pycircuit_name__ = "mini_alu"
 要点：
 
 - 所有运算符（`+ - * & | ^ ~`、比较、切片 `x[i]` / `x[lo:hi]`、移位）都直接作用在 CAS 上，结果仍是 CAS。
-- 宽度变换用 `x.trunc(w)` / `x.zext(w)` / `x.sext(w)`；有符号比较先 `x.as_signed()`。
+- 宽度变换用 `trunc(x, width=w)` / `zext(x, width=w)` / `sext(x, width=w)`（函数式，从 `pycircuit` 导入）；有符号比较先 `x.as_signed()`。
 - 整段代码没有 `domain.next()`——全部逻辑都在 cycle 0，输出即纯组合。
 
 ---
@@ -352,7 +352,7 @@ def frontend(m, domain, *, inputs=None, pc_width=32, prefix="fe") -> dict:
     redirect_target = _in(inputs, "redirect_target", m, domain, prefix=prefix, width=pc_width)
 
     pc = domain.signal(width=pc_width, reset_value=0, name=f"{prefix}_pc")
-    FOUR = cas(domain, m.const(4, width=pc_width), cycle=0)
+    FOUR = cas(domain, u(pc_width, 4), cycle=0)
     next_pc = mux(redirect_valid, redirect_target, pc + FOUR)
 
     domain.next()
@@ -399,8 +399,8 @@ def cpu_core(m, domain, *, inputs=None, data_width=32, pc_width=32, prefix="cpu"
     # 级联：frontend 输出直接喂给 backend
     be = domain.call(backend, inputs={
         "op_a":   fe["pc"],
-        "op_b":   cas(domain, m.const(0, width=data_width), cycle=0),
-        "alu_op": cas(domain, m.const(0, width=4), cycle=0),
+        "op_b":   cas(domain, u(data_width, 0), cycle=0),
+        "alu_op": cas(domain, u(4, 0), cycle=0),
     }, data_width=data_width, prefix=f"{prefix}_be")
 
     outs = {"pc": fe["pc"], "wb_data": be["wb_data"]}
@@ -514,7 +514,7 @@ def bypass(m, domain, *, n_src=2, n_wb=4, tag_w=6, data_w=64):
 
     # 选数据：以 hit 行为选择器，在 wb_data 中按最小索引优先取值；
     # 未命中时回退到 default（必须显式给出，否则按约定回退到 vals 的最后一个元素）。
-    zero_data = m.const(0, width=data_w)
+    zero_data = u(data_w, 0)
     for s in range(n_src):
         data_s = priority_mux(hit_mat[s], wb_data, default=zero_data)
         m.output(f"fwd_data_{s}", data_s)
@@ -536,7 +536,7 @@ pop = valid_vec.reduce_sum(mode="tree")   # popcount：数有多少 lane 有效
 `reduce_sum` **保持叶元素宽度，溢出回绕**——即结果宽度等于输入 lane 的位宽，不会自动扩展。如果担心溢出，需要先用 `zext`/`sext` 把 lane 加宽再归约：
 
 ```python
-wide = valid_vec.zext(width=4)     # 1-bit lane → 4-bit
+wide = zext(valid_vec, width=4)     # 1-bit lane → 4-bit
 pop  = wide.reduce_sum(mode="tree")
 ```
 

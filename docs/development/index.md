@@ -12,9 +12,27 @@ This page lists the active pyc4.0 development entrypoints and gate commands.
 ## Build and gate commands
 
 - `bash flows/scripts/pyc build`
-- `bash flows/scripts/run_examples.sh`
-- `bash flows/scripts/run_sims.sh`
-- `bash flows/scripts/run_sims_nightly.sh`
+- `bash flows/scripts/run_examples.sh` — G1 (includes semantic regressions unless `PYC_SKIP_SEMANTIC_REGRESSIONS=1`)
+- `bash flows/scripts/run_sims.sh` — G2 merge-blocker
+- `bash flows/scripts/run_sims_nightly.sh` — G3 nightly
+- `python3 flows/tools/summarize_gate_run.py --run-id <id>` — render gate matrix
+
+### PR CI gates
+
+GitHub Actions (`.github/workflows/ci.yml`) runs G0 + G1 + G2 on every PR.
+G3 runs in `.github/workflows/gates-nightly.yml` (schedule / manual).
+See `docs/gates/README.md` for the level mapping and artifact names.
+
+Local reproduce (Linux, after toolchain build):
+
+```bash
+export PYC_TOOLCHAIN_ROOT="$PWD/.pycircuit_out/toolchain/install"
+export PATH="$PYC_TOOLCHAIN_ROOT/bin:$PATH"
+export PYC_GATE_RUN_ID="local-$(date +%Y%m%d-%H%M%S)"
+unset PYC_SKIP_SEMANTIC_REGRESSIONS
+bash flows/scripts/run_examples.sh
+bash flows/scripts/run_sims.sh
+```
 
 ## Repository layout
 
