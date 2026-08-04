@@ -36,15 +36,6 @@ namespace {
 // placement attribute readers (used internally by the emitter)
 // ---------------------------------------------------------------------------
 
-// C++ type string for a local Wire<> declaration.
-static std::string cppTypeForWire(Type ty) {
-  if (isa<pyc::ClockType>(ty) || isa<pyc::ResetType>(ty))
-    return "pyc::cpp::Wire<1>";
-  if (auto intTy = dyn_cast<IntegerType>(ty))
-    return "pyc::cpp::Wire<" + std::to_string(intTy.getWidth()) + ">";
-  return "pyc::cpp::Wire<1>";
-}
-
 static CppEmitterOptions effectiveEmitOpts(ModuleOp module, const CppEmitterOptions &opts) {
   CppEmitterOptions out = opts;
   if (auto chunk = getModuleCombChunkNodes(module)) {
@@ -2950,7 +2941,7 @@ bool CppEmitterPlacementState::emitLocalDeclIfNeeded(Value v, Type ty, StringRef
     return false;
   for (unsigned i = 0; i < indentSpaces; ++i)
     os << ' ';
-  os << cppTypeForWire(ty) << " " << name << "{};\n";
+  os << cppType(ty) << " " << name << "{};\n";
   return true;
 }
 
@@ -2967,7 +2958,7 @@ void CppEmitterPlacementState::emitValueAssign(Value result, Type ty, StringRef 
 
   // Method-local Wire<>: declare-with-init on first assignment, plain assign on reuse.
   if (declaredLocals.insert(result).second)
-    os << cppTypeForWire(ty) << " " << name << " = " << expr << ";\n";
+    os << cppType(ty) << " " << name << " = " << expr << ";\n";
   else
     os << name << " = " << expr << ";\n";
 }
