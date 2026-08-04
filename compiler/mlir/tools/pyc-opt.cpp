@@ -80,6 +80,12 @@ int main(int argc, char **argv) {
   config.setPassPipelineSetupFn([](PassManager &pm) -> LogicalResult {
     if (dumpPassIrDir.empty())
       return success();
+    if (dumpPassIrDir.getValue() == "auto") {
+      // pycc resolves `auto` to <--out-dir>/pass_ir; pyc-opt has no --out-dir.
+      llvm::errs() << "error: --dump-pass-ir=auto is not supported by pyc-opt; "
+                      "pass an explicit directory\n";
+      return failure();
+    }
     pyc::PassIRDumperOptions opts;
     opts.dir = dumpPassIrDir.getValue();
     opts.phase = dumpPassIrPhase.getValue();

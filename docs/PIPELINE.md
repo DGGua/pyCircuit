@@ -40,7 +40,7 @@ Default backend hierarchy policy:
 Write the MLIR IR before and/or after every pass to a directory so the effect
 of any single pass is directly diffable. Diagnostics only; disabled by
 default (zero overhead when not requested). Works on both `pycc` and
-`pyc-opt`.
+`pyc-opt` (pass an explicit dump directory on `pyc-opt`).
 
 ```bash
 pycc foo.pyc --emit=none --dump-pass-ir=/tmp/pir
@@ -49,8 +49,8 @@ diff /tmp/pir/*_before_*eliminate-wires*.mlir /tmp/pir/*_after_*eliminate-wires*
 
 Related flags: `--dump-pass-ir-phase=before|after|both`,
 `--dump-pass-ir-filter=<regex>`, `--dump-pass-ir-max-lines=<N>`, and
-`--dump-pass-ir=auto` (resolves to `<--out-dir>/pass_ir`). Coexists with
-`--profile-pass-timing` / `--profile-json`.
+`--dump-pass-ir=auto` on **`pycc` only** (resolves to `<--out-dir>/pass_ir`).
+Coexists with `--profile-pass-timing` / `--profile-json`.
 
 See [mlir_pass_ir_dump.md](mlir_pass_ir_dump.md) for full details.
 

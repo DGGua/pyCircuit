@@ -62,4 +62,4 @@ diff /tmp/pir/*_before_*eliminate-wires*.mlir \
 
 See [mlir_pass_ir_dump.md](mlir_pass_ir_dump.md) for the full flag set
 (`--dump-pass-ir-phase`, `--dump-pass-ir-filter`, `--dump-pass-ir-max-lines`,
-`--dump-pass-ir=auto`).
+and `pycc`-only `--dump-pass-ir=auto`).
