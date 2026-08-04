@@ -542,7 +542,8 @@ static LogicalResult emitCombAssign(Operation &op, llvm::raw_ostream &os, NameTa
                  else
                    e << "pyc::cpp::mux<" << w << ">(" << nt.get(m.getSel()) << ", " << nt.get(m.getA()) << ", "
                      << nt.get(m.getB()) << ")";
-               });
+               },
+               ps);
     return success();
   }
   if (auto s = dyn_cast<arith::SelectOp>(op)) {
