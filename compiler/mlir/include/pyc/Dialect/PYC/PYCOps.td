@@ -197,7 +197,7 @@ def PYC_SextOp : PYC_Op<"sext", [Pure]> {
 
 def PYC_ExtractOp : PYC_Op<"extract", [Pure]> {
   let summary = "Bit-slice extraction (element-wise for vectors)";
-  let arguments = (ins AnyIntegerOrV:$in, I64Attr:$lsb);
+  let arguments = (ins AnyIntegerOrV:$in, I64Attr:$lsb, OptionalAttr<I64Attr>:$msb);
   let results = (outs AnyIntegerOrV:$result);
   let hasVerifier = 1;
   let assemblyFormat = "$in attr-dict `:` type($in) `->` type($result)";
