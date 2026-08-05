@@ -124,3 +124,60 @@ def test_vec_backward_compat_wires_only() -> None:
 
     assert v.ty == Vector(2, Bits(8))
     assert "pyc.v_create" in c.emit_mlir()
+
+
+# ── CycleAwareDomain.vec (v5 layer) ──────────────────────────────────────
+
+
+def _cycle_domain(name: str):
+    from pycircuit import CycleAwareCircuit
+
+    m = CycleAwareCircuit(name)
+    return m, m.create_domain("clk")
+
+
+def test_cas_vec_accepts_literals() -> None:
+    """domain.vec(u(8,1), u(8,2)) builds vector<2xi8> at cycle 0."""
+    from pycircuit import u
+
+    _, domain = _cycle_domain("cas_vec_lit")
+
+    v = domain.vec(u(8, 1), u(8, 2))
+
+    assert v.ty == Vector(2, Bits(8))
+    assert v.cycle == 0
+
+
+def test_cas_vec_accepts_bare_ints() -> None:
+    _, domain = _cycle_domain("cas_vec_int")
+
+    v = domain.vec(1, 2, 3)
+
+    assert v.ty == Vector(3, Bits(2))
+
+
+def test_cas_vec_aligns_cycles() -> None:
+    """A literal at cycle 0 and a signal at cycle 1 align to cycle 1."""
+    from pycircuit import cas, u
+
+    _, domain = _cycle_domain("cas_vec_align")
+    early_lit = u(8, 1)
+    domain.next()
+    late_sig = cas(domain, domain.create_signal("late", width=8))
+
+    v = domain.vec(early_lit, late_sig)
+
+    assert v.cycle == 1
+    assert v.ty == Vector(2, Bits(8))
+
+
+def test_cas_vec_mixed_widthless_literal_and_signal() -> None:
+    """Width-less literal adopts the signal's width (parity with Wire layer)."""
+    from pycircuit import U, cas
+
+    _, domain = _cycle_domain("cas_vec_mixed")
+    sig = cas(domain, domain.create_signal("s", width=16))
+
+    v = domain.vec(U(1), sig)
+
+    assert v.ty == Vector(2, Bits(16))
