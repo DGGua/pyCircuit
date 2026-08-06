@@ -11,6 +11,9 @@ permissions:
   packages: write
   id-token: write
 
+env:
+  VERILATOR_VERSION: "5.048"
+
 jobs:
   build-packages:
     strategy:
@@ -22,20 +25,26 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install deps (Ubuntu)
         if: runner.os == 'Linux'
         run: |
           set -euxo pipefail
           sudo apt-get update
-          sudo apt-get install -y wget gnupg software-properties-common cmake ninja-build python3 python3-pip clang tar verilator iverilog
+          sudo apt-get install -y wget gnupg software-properties-common cmake ninja-build python3 python3-pip clang tar iverilog
           python3 -m pip install setuptools wheel
           wget https://apt.llvm.org/llvm.sh
           chmod +x llvm.sh
           sudo ./llvm.sh 19
           sudo apt-get install -y llvm-19-dev mlir-19-tools libmlir-19-dev
           echo "/usr/lib/llvm-19/bin" >> "$GITHUB_PATH"
+
+      - name: Setup Verilator (Ubuntu)
+        if: runner.os == 'Linux'
+        uses: ./.github/actions/setup-verilator
+        with:
+          version: ${{ env.VERILATOR_VERSION }}
 
       - name: Install deps (macOS)
         if: runner.os == 'macOS'
@@ -97,7 +106,7 @@ jobs:
           bash flows/scripts/run_examples.sh
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: pycircuit-${{ runner.os }}-${{ runner.arch }}
           path: |
@@ -116,7 +125,7 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v')
     steps:
       - name: Download artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
@@ -152,7 +161,7 @@ jobs:
 
     steps:
       - name: Download artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
@@ -172,7 +181,7 @@ jobs:
       name: pypi
     steps:
       - name: Download wheel artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true

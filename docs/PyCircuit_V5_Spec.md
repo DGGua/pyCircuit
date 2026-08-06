@@ -55,8 +55,9 @@ from pycircuit import (
     CycleAwareSignal,     # 周期感知信号（唯一信号类型）
     cas,                  # 将 Wire 包装为 CycleAwareSignal
     compile_cycle_aware,  # V5 编译入口
-    mux,                  # 多路选择器
+    mux,                  # 多路选择器（eager 路径仍需要）
     submodule_input,      # 双模输入辅助函数
+    u,                    # 位宽字面量 u(width, value)
     wire_of,              # 安全提取 Wire（仅用于 m.output()）
 )
 ```
@@ -171,12 +172,12 @@ result = a | b
 result = a ^ b
 result = ~a
 
-# 比较
-result = a == b       # 或 a.eq(b)
-result = a < b        # 或 a.lt(b)
-result = a > b        # 或 a.gt(b)
-result = a <= b       # 或 a.le(b)
-result = a >= b       # 或 a.ge(b)
+# 比较（使用运算符，不要用已移除的 .eq/.lt 方法）
+result = a == b
+result = a < b
+result = a > b
+result = a <= b
+result = a >= b
 
 # 切片/索引（返回 CycleAwareSignal）
 low_byte = data[0:8]
@@ -650,7 +651,7 @@ for i in range(W):                           # 循环：每 slot 一组信号
     srs_inputs[f"disp_pdst{i}"]   = ds_pdst[i]
 for c in range(CDB_PORTS):
     srs_inputs[f"cdb_valid{c}"] = zero1
-    srs_inputs[f"cdb_tag{c}"]   = cas(domain, m.const(0, width=TAG_W), cycle=0)
+    srs_inputs[f"cdb_tag{c}"]   = cas(domain, u(TAG_W, 0), cycle=0)
 
 srs_out = domain.call(scalar_rs, inputs=srs_inputs,
                       n_entries=32, n_dispatch=W, n_cdb=CDB_PORTS,
@@ -660,8 +661,8 @@ srs_out = domain.call(scalar_rs, inputs=srs_inputs,
 **在 dict 中传递常量（无有效信号时）：**
 
 ```python
-zero1  = cas(domain, m.const(0, width=1), cycle=0)
-zero64 = cas(domain, m.const(0, width=64), cycle=0)
+zero1  = cas(domain, u(1, 0), cycle=0)
+zero64 = cas(domain, u(64, 0), cycle=0)
 
 fetch_out = domain.call(fetch, inputs={
     "stall":      stall_in,
@@ -1066,8 +1067,9 @@ def counter(m: CycleAwareCircuit, domain: CycleAwareDomain):
     enable = cas(domain, m.input("enable", width=1), cycle=0)
     count = domain.signal(width=8, reset_value=0, name="count")
     m.output("count", wire_of(count))
+    count_next = mux(enable, count + 1, count)
     domain.next()
-    count <<= mux(enable, count + 1, count)
+    count <<= count_next
 
 counter.__pycircuit_name__ = "counter"
 
@@ -1412,7 +1414,7 @@ if __name__ == "__main__":
 ```python
 def sram_bank(m, domain, *, depth, width, prefix,
               rd_addr, wr_addr, wr_en, wr_data):
-    from pycircuit import cas
+    from pycircuit import cas, mux, u
 
     storage = [
         domain.signal(width=width, reset_value=0, name=f"{prefix}_{d}")
@@ -1420,16 +1422,16 @@ def sram_bank(m, domain, *, depth, width, prefix,
     ]
 
     # Cycle 0: 组合读
-    zero = cas(domain, m.const(0, width=width), cycle=0)
+    zero = cas(domain, u(width, 0), cycle=0)
     rd_data = zero
     for d in range(depth):
-        hit = rd_addr.eq(d)
+        hit = rd_addr == d
         rd_data = mux(hit, storage[d], rd_data)
 
     # Deferred write（在 domain.next() 之后调用）
     def commit_write():
         for d in range(depth):
-            hit = wr_en & wr_addr.eq(d)
+            hit = wr_en & (wr_addr == d)
             storage[d].assign(wr_data, when=hit)
 
     return rd_data, commit_write
@@ -1449,7 +1451,7 @@ SoC Top
 ```python
 from pycircuit import (
     CycleAwareCircuit, CycleAwareDomain,
-    cas, compile_cycle_aware, mux, submodule_input, wire_of,
+    cas, compile_cycle_aware, mux, submodule_input, u, wire_of,
 )
 
 def frontend(m, domain, *, inputs=None, pc_width=32, prefix="fe") -> dict:
@@ -1460,7 +1462,7 @@ def frontend(m, domain, *, inputs=None, pc_width=32, prefix="fe") -> dict:
 
     pc = domain.signal(width=pc_width, reset_value=0, name=f"{prefix}_pc")
 
-    FOUR = cas(domain, m.const(4, width=pc_width), cycle=0)
+    FOUR = cas(domain, u(pc_width, 4), cycle=0)
     next_pc = mux(redirect_valid, redirect_target, pc + FOUR)
 
     domain.next()
@@ -1510,8 +1512,8 @@ def cpu_core(m, domain, *, inputs=None, data_width=32, pc_width=32, prefix="cpu"
 
     be_out = domain.call(backend, inputs={
         "op_a": fe_out["pc"],
-        "op_b": cas(domain, m.const(0, width=data_width), cycle=0),
-        "alu_op": cas(domain, m.const(0, width=4), cycle=0),
+        "op_b": cas(domain, u(data_width, 0), cycle=0),
+        "alu_op": cas(domain, u(4, 0), cycle=0),
     }, data_width=data_width, prefix=f"{prefix}_be")
 
     outs = {"pc": fe_out["pc"], "wb_data": be_out["wb_data"]}
@@ -1562,7 +1564,7 @@ Davinci 核（[`DavinciOO` / `davinci/davinci_top.py`](https://github.com/hengli
 ```python
 def davinci_top(m, domain, *, inputs=None, prefix="dv") -> dict:
     _in = submodule_input
-    zero1 = cas(domain, m.const(0, width=1), cycle=0)
+    zero1 = cas(domain, u(1, 0), cycle=0)
 
     # ── 外部输入 ──
     stall_in     = _in(inputs, "stall",        m, domain, prefix=prefix, width=1)
@@ -1613,7 +1615,7 @@ davinci_top.__pycircuit_name__ = "davinci_top"
 ```python
 # ✅ 所有运算在 CAS 上进行
 result = a + b                              # CAS + CAS → CAS
-flag   = result.eq(0)                       # CAS → CAS
+flag   = result == 0                        # CAS → CAS
 
 # ✅ wire_of() 仅在 m.output() 边界
 m.output("result", wire_of(result))
