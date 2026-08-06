@@ -923,6 +923,22 @@ static LogicalResult emitCombAssign(Operation &op, llvm::raw_ostream &os, NameTa
   return op.emitError("unsupported combinational op for C++ emission");
 }
 
+static void emitCombInputGuard(pyc::CombOp comb,
+                               llvm::raw_ostream &os,
+                               NameTable &nt,
+                               unsigned idx) {
+  os << "    bool _pyc_comb_inputs_changed = !_pyc_comb_" << idx << "_inputs_valid;\n";
+  for (auto [inputIndex, input] : llvm::enumerate(comb.getInputs())) {
+    std::string cacheName = "_pyc_comb_" + std::to_string(idx) + "_input_" + std::to_string(inputIndex);
+    os << "    if (" << cacheName << " != " << nt.get(input) << ") {\n";
+    os << "      " << cacheName << " = " << nt.get(input) << ";\n";
+    os << "      _pyc_comb_inputs_changed = true;\n";
+    os << "    }\n";
+  }
+  os << "    if (!_pyc_comb_inputs_changed) return;\n";
+  os << "    _pyc_comb_" << idx << "_inputs_valid = true;\n";
+}
+
 static LogicalResult emitCombMethod(pyc::CombOp comb,
                                     llvm::raw_ostream &os,
                                     NameTable &nt,
@@ -976,6 +992,7 @@ static LogicalResult emitCombMethod(pyc::CombOp comb,
     }
 
     os << "  inline void eval_comb_" << idx << "() {\n";
+    emitCombInputGuard(comb, os, nt, idx);
     for (const std::string &partName : partMethods)
       os << "    " << partName << "();\n";
 
@@ -997,6 +1014,7 @@ static LogicalResult emitCombMethod(pyc::CombOp comb,
 
   std::string methodName = "eval_comb_" + std::to_string(idx);
   os << "  inline void " << methodName << "() {\n";
+  emitCombInputGuard(comb, os, nt, idx);
   placement.beginMethod(methodName);
   for (Operation *op : combOps) {
     if (failed(emitCombAssign(*op, os, nt, &placement)))
@@ -1106,6 +1124,22 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
       instances.push_back(inst);
     else if (auto comb = dyn_cast<pyc::CombOp>(op))
       combs.push_back(comb);
+  }
+
+  // Each fused comb region owns snapshots of its direct SSA inputs.  These
+  // values are all emitted as Wire<N> instances, so equality is a value
+  // comparison (including multiword wires).  A guarded comb still evaluates
+  // once to establish its outputs; later eval passes skip it until an input
+  // snapshot differs.
+  if (!combs.empty()) {
+    os << "  // Per-comb input snapshots for change-driven evaluation.\n";
+    for (auto [combIndex, comb] : llvm::enumerate(combs)) {
+      os << "  bool _pyc_comb_" << combIndex << "_inputs_valid = false;\n";
+      for (auto [inputIndex, input] : llvm::enumerate(comb.getInputs()))
+        os << "  " << cppType(input.getType()) << " _pyc_comb_" << combIndex << "_input_"
+           << inputIndex << "{};\n";
+    }
+    os << "\n";
   }
 
   auto regKey = [&](pyc::RegOp r) { return nt.get(r.getQ()); };
