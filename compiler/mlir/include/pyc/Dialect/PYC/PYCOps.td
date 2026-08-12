@@ -300,6 +300,16 @@ def PYC_RegOp : PYC_Op<"reg", [MemoryEffects<[MemRead, MemWrite]>, AllTypesMatch
   let assemblyFormat = "$clk `,` $rst `,` $en `,` $next `,` $init attr-dict `:` type($q)";
 }
 
+// Compact IR form of DEPTH cascaded registers with common controls. Backends
+// may choose an efficient simulator representation, but retain DEPTH states.
+def PYC_DelayLineOp : PYC_Op<"delay_line", [MemoryEffects<[MemRead, MemWrite]>, AllTypesMatch<["next", "init", "q"]>]> {
+  let summary = "Fixed-latency delay line with reset + enable";
+  let arguments = (ins PYC_ClockType:$clk, PYC_ResetType:$rst, I1:$en, AnyIntegerOrV:$next, AnyIntegerOrV:$init);
+  let results = (outs AnyIntegerOrV:$q);
+  let hasVerifier = 1;
+  let assemblyFormat = "$clk `,` $rst `,` $en `,` $next `,` $init attr-dict `:` type($q)";
+}
+
 def PYC_FifoOp : PYC_Op<"fifo", [MemoryEffects<[MemRead, MemWrite]>, AllTypesMatch<["in_data", "out_data"]>]> {
   let summary = "Ready/valid FIFO (single-clock, strict handshake)";
   let arguments = (ins PYC_ClockType:$clk, PYC_ResetType:$rst, I1:$in_valid, AnyInteger:$in_data, I1:$out_ready);

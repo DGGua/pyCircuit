@@ -1050,7 +1050,7 @@ static LogicalResult emitFunc(func::FuncOp f, raw_ostream &os, const VerilogEmit
         instOps.push_back(&op);
         continue;
       }
-      if (isa<pyc::RegOp, pyc::FifoOp, pyc::ByteMemOp>(op)) {
+      if (isa<pyc::RegOp, pyc::DelayLineOp, pyc::FifoOp, pyc::ByteMemOp>(op)) {
         seqInstOps.push_back(&op);
         continue;
       }
@@ -1219,6 +1219,8 @@ static LogicalResult emitFunc(func::FuncOp f, raw_ostream &os, const VerilogEmit
         };
 
         if (auto vt = dyn_cast<VectorType>(qTy)) {
+          // The primitive has scalar leaf ports, so preserve vector shape by
+          // emitting one delay instance per leaf, as for vector registers.
           SmallVector<int64_t> shape = vectorShape(vt);
           walkVectorIndices(shape, [&](ArrayRef<int64_t> indices) {
             std::string suffix = indexSuffix(indices);
@@ -1229,6 +1231,42 @@ static LogicalResult emitFunc(func::FuncOp f, raw_ostream &os, const VerilogEmit
           });
         } else {
           emitReg("", "");
+        }
+        continue;
+      }
+      if (auto delay = dyn_cast<pyc::DelayLineOp>(op)) {
+        auto qTy = delay.getQ().getType();
+        auto width = leafWidth(qTy);
+        if (!width)
+          return delay.emitError("verilog emitter only supports integer delay_line leaf data type");
+        auto depthAttr = delay->getAttrOfType<IntegerAttr>("depth");
+        if (!depthAttr)
+          return delay.emitError("missing integer attribute `depth`");
+        auto depth = depthAttr.getValue().getZExtValue();
+
+        auto emitDelay = [&](llvm::StringRef suffix, llvm::StringRef instanceSuffix) {
+          os << "pyc_delay_line #(.WIDTH(" << *width << "), .DEPTH(" << depth << ")) "
+             << nt.get(delay.getQ()) << "_inst" << instanceSuffix << " (\n";
+          os << "  .clk(" << nt.get(delay.getClk()) << "),\n";
+          os << "  .rst(" << nt.get(delay.getRst()) << "),\n";
+          os << "  .en(" << nt.get(delay.getEn()) << "),\n";
+          os << "  .d(" << nt.get(delay.getNext()) << suffix << "),\n";
+          os << "  .init(" << nt.get(delay.getInit()) << suffix << "),\n";
+          os << "  .q(" << nt.get(delay.getQ()) << suffix << ")\n";
+          os << ");\n";
+        };
+
+        if (auto vt = dyn_cast<VectorType>(qTy)) {
+          SmallVector<int64_t> shape = vectorShape(vt);
+          walkVectorIndices(shape, [&](ArrayRef<int64_t> indices) {
+            std::string suffix = indexSuffix(indices);
+            std::string instanceSuffix;
+            for (int64_t index : indices)
+              instanceSuffix += "_" + std::to_string(index);
+            emitDelay(suffix, instanceSuffix);
+          });
+        } else {
+          emitDelay("", "");
         }
         continue;
       }
@@ -1405,6 +1443,7 @@ LogicalResult emitVerilog(ModuleOp module, llvm::raw_ostream &os, const VerilogE
   }
   if (opts.includePrimitives) {
     os << "`include \"pyc_reg.v\"\n";
+    os << "`include \"pyc_delay_line.v\"\n";
     os << "`include \"pyc_fifo.v\"\n\n";
     os << "`include \"pyc_byte_mem.v\"\n\n";
     os << "`include \"pyc_sync_mem.v\"\n";

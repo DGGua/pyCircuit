@@ -49,6 +49,11 @@ struct EliminateDeadStatePass : public PassWrapper<EliminateDeadStatePass, Opera
             toErase.push_back(op);
           return;
         }
+        if (auto delay = dyn_cast<pyc::DelayLineOp>(op)) {
+          if (delay.getQ().use_empty())
+            toErase.push_back(op);
+          return;
+        }
         if (auto fifo = dyn_cast<pyc::FifoOp>(op)) {
           if (allResultsUnused(fifo))
             toErase.push_back(op);
