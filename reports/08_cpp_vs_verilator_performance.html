@@ -1,0 +1,697 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="pyCircuit C++ Model 与 Verilator 的 30 样例性能对比实验">
+  <title>pyCircuit C++ Model vs Verilator｜性能对比</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --ink: #17212b;
+      --muted: #607080;
+      --paper: #f5f2eb;
+      --card: rgba(255, 255, 255, .86);
+      --line: #d9d5ca;
+      --cpp: #087e8b;
+      --cpp-soft: #d5eeef;
+      --verilator: #ec6b3c;
+      --verilator-soft: #fbe0d4;
+      --dark: #102a38;
+      --shadow: 0 16px 38px rgba(22, 37, 46, .09);
+    }
+
+    * { box-sizing: border-box; }
+
+    html { scroll-behavior: smooth; }
+
+    body {
+      margin: 0;
+      color: var(--ink);
+      background:
+        radial-gradient(circle at 10% 4%, rgba(8, 126, 139, .12), transparent 24rem),
+        radial-gradient(circle at 94% 12%, rgba(236, 107, 60, .13), transparent 27rem),
+        var(--paper);
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
+        "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+      line-height: 1.62;
+    }
+
+    a { color: var(--cpp); text-underline-offset: 3px; }
+    button { font: inherit; }
+
+    .wrap { width: min(1180px, calc(100% - 36px)); margin: 0 auto; }
+
+    .hero {
+      padding: 66px 0 34px;
+      border-bottom: 1px solid rgba(23, 33, 43, .08);
+    }
+
+    .eyebrow {
+      margin: 0 0 12px;
+      color: var(--cpp);
+      font-weight: 800;
+      font-size: .78rem;
+      letter-spacing: .14em;
+      text-transform: uppercase;
+    }
+
+    h1 {
+      max-width: 930px;
+      margin: 0;
+      font-size: clamp(2.1rem, 5vw, 4.7rem);
+      line-height: 1.04;
+      letter-spacing: -.045em;
+    }
+
+    .lede {
+      max-width: 810px;
+      margin: 24px 0 0;
+      color: var(--muted);
+      font-size: clamp(1rem, 2vw, 1.22rem);
+    }
+
+    .hero-links { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 26px; }
+    .hero-links a {
+      padding: 9px 13px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      color: var(--ink);
+      background: rgba(255,255,255,.58);
+      text-decoration: none;
+      font-size: .9rem;
+    }
+    .hero-links a:hover { border-color: var(--cpp); }
+
+    main { padding: 34px 0 76px; }
+
+    .stats {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 14px;
+    }
+
+    .stat, .panel, .note-card {
+      border: 1px solid rgba(23, 33, 43, .1);
+      border-radius: 18px;
+      background: var(--card);
+      box-shadow: var(--shadow);
+      backdrop-filter: blur(12px);
+    }
+
+    .stat { min-height: 132px; padding: 20px; }
+    .stat .value { font-size: clamp(1.75rem, 4vw, 2.7rem); font-weight: 850; line-height: 1; }
+    .stat .label { margin-top: 12px; color: var(--muted); font-size: .9rem; }
+    .stat.cpp .value { color: var(--cpp); }
+    .stat.vlt .value { color: var(--verilator); }
+    .stats + .panel { margin-top: 14px; }
+
+    section { margin-top: 42px; }
+    .section-head { display: flex; justify-content: space-between; gap: 18px; align-items: end; margin-bottom: 16px; }
+    h2 { margin: 0; font-size: clamp(1.5rem, 3vw, 2.25rem); letter-spacing: -.025em; }
+    h3 { margin: 0; font-size: 1.05rem; }
+    .section-head p { max-width: 620px; margin: 0; color: var(--muted); font-size: .92rem; }
+    .panel { padding: 22px; overflow: hidden; }
+
+    .legend { display: flex; flex-wrap: wrap; gap: 16px; color: var(--muted); font-size: .85rem; }
+    .legend span::before {
+      content: "";
+      display: inline-block;
+      width: 10px;
+      height: 10px;
+      margin-right: 6px;
+      border-radius: 50%;
+      background: var(--dot);
+    }
+
+    .ratio-axis {
+      display: grid;
+      grid-template-columns: minmax(130px, 1.1fr) 2fr 62px;
+      gap: 12px;
+      margin: 20px 0 6px;
+      color: var(--muted);
+      font-size: .72rem;
+    }
+    .axis-labels { display: flex; justify-content: space-between; }
+    .ratio-chart { display: grid; gap: 8px; }
+    .ratio-row {
+      display: grid;
+      grid-template-columns: minmax(130px, 1.1fr) 2fr 62px;
+      gap: 12px;
+      align-items: center;
+      min-height: 27px;
+      font-size: .78rem;
+    }
+    .case-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .bar-zone {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      height: 17px;
+      background: linear-gradient(to right, rgba(8,126,139,.045) 50%, rgba(236,107,60,.045) 50%);
+      border-radius: 4px;
+      overflow: hidden;
+      position: relative;
+    }
+    .bar-zone::after {
+      content: "";
+      position: absolute;
+      left: 50%; top: 0; bottom: 0;
+      width: 1px;
+      background: #89949a;
+    }
+    .half { display: flex; align-items: stretch; }
+    .half.left { justify-content: flex-end; }
+    .ratio-bar { min-width: 2px; border-radius: 3px; }
+    .ratio-bar.cpp { background: var(--cpp); }
+    .ratio-bar.vlt { background: var(--verilator); }
+    .ratio-value { text-align: right; font-variant-numeric: tabular-nums; font-weight: 750; }
+    .ratio-value.cpp { color: var(--cpp); }
+    .ratio-value.vlt { color: var(--verilator); }
+
+    .scatter-wrap { overflow-x: auto; }
+    #scatter { display: block; width: 100%; min-width: 680px; height: auto; }
+    .scatter-grid { stroke: #dcd9d0; stroke-width: 1; }
+    .scatter-diagonal { stroke: #7c878d; stroke-width: 1.5; stroke-dasharray: 6 5; }
+    .scatter-label { fill: var(--muted); font-size: 12px; }
+    .scatter-dot { stroke: white; stroke-width: 1.5; opacity: .9; transition: r .15s, opacity .15s; }
+    .scatter-dot:hover { r: 8; opacity: 1; }
+
+    .callouts { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; }
+    .note-card { padding: 21px; }
+    .note-card .metric { margin: 8px 0 12px; font-size: 1.52rem; font-weight: 850; line-height: 1.15; }
+    .note-card p { margin: 0; color: var(--muted); font-size: .91rem; }
+    .note-card.cpp { border-top: 5px solid var(--cpp); }
+    .note-card.vlt { border-top: 5px solid var(--verilator); }
+
+    .pipeline {
+      display: grid;
+      grid-template-columns: 1fr auto 1fr auto 1fr;
+      align-items: center;
+      gap: 12px;
+      text-align: center;
+    }
+    .pipe-node { padding: 18px 12px; border-radius: 12px; background: #f0eee8; }
+    .pipe-node strong { display: block; }
+    .pipe-node small { color: var(--muted); }
+    .pipe-arrow { color: var(--muted); font-size: 1.35rem; }
+    .split { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin-top: 14px; }
+    .backend { padding: 18px; border-radius: 14px; }
+    .backend.cpp { background: var(--cpp-soft); }
+    .backend.vlt { background: var(--verilator-soft); }
+    .backend p { margin: 8px 0 0; color: #40505b; font-size: .88rem; }
+
+    .controls { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 12px; margin-bottom: 14px; }
+    .filters { display: flex; flex-wrap: wrap; gap: 8px; }
+    .filter {
+      padding: 7px 12px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      color: var(--ink);
+      background: white;
+      cursor: pointer;
+    }
+    .filter.active { color: white; border-color: var(--dark); background: var(--dark); }
+    .table-note { color: var(--muted); font-size: .82rem; }
+    .table-scroll { overflow-x: auto; }
+    table { width: 100%; border-collapse: collapse; font-size: .86rem; }
+    th, td { padding: 10px 11px; border-bottom: 1px solid #e4e1d9; text-align: right; }
+    th:first-child, td:first-child { text-align: left; }
+    th {
+      color: var(--muted);
+      background: rgba(245,242,235,.75);
+      cursor: pointer;
+      white-space: nowrap;
+      position: sticky;
+      top: 0;
+    }
+    tbody tr:hover { background: rgba(8,126,139,.045); }
+    td { font-variant-numeric: tabular-nums; }
+    .winner { display: inline-block; padding: 3px 8px; border-radius: 999px; font-weight: 750; white-space: nowrap; }
+    .winner.cpp { color: #08606a; background: var(--cpp-soft); }
+    .winner.vlt { color: #9b3a19; background: var(--verilator-soft); }
+
+    .method-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; }
+    .method-item { padding: 15px; border: 1px solid var(--line); border-radius: 12px; background: rgba(255,255,255,.55); }
+    .method-item strong { display: block; font-size: .86rem; }
+    .method-item span { color: var(--muted); font-size: .8rem; }
+    .warning { margin-top: 15px; padding: 15px 17px; border-left: 4px solid #d79a18; background: #fff5d8; border-radius: 8px; font-size: .88rem; }
+
+    .recommendations { counter-reset: rec; display: grid; gap: 10px; }
+    .rec { display: grid; grid-template-columns: 36px 1fr; gap: 12px; align-items: start; padding: 14px; border-radius: 12px; background: rgba(255,255,255,.55); }
+    .rec::before {
+      counter-increment: rec;
+      content: counter(rec);
+      display: grid;
+      place-items: center;
+      width: 32px; height: 32px;
+      color: white;
+      background: var(--dark);
+      border-radius: 50%;
+      font-weight: 800;
+    }
+    .rec p { margin: 3px 0 0; color: var(--muted); font-size: .9rem; }
+
+    footer { padding: 26px 0 42px; color: var(--muted); border-top: 1px solid rgba(23,33,43,.08); font-size: .82rem; }
+    code { padding: .1em .35em; border-radius: 4px; background: #ebe8e0; }
+
+    @media (max-width: 820px) {
+      .stats, .method-grid { grid-template-columns: repeat(2, 1fr); }
+      .callouts { grid-template-columns: 1fr; }
+      .section-head { display: block; }
+      .section-head p { margin-top: 8px; }
+      .pipeline { grid-template-columns: 1fr; }
+      .pipe-arrow { transform: rotate(90deg); }
+      .split { grid-template-columns: 1fr; }
+      .ratio-axis, .ratio-row { grid-template-columns: minmax(100px, .9fr) 2fr 55px; gap: 7px; }
+    }
+
+    @media (max-width: 520px) {
+      .wrap { width: min(100% - 22px, 1180px); }
+      .hero { padding-top: 40px; }
+      .stats { grid-template-columns: 1fr 1fr; }
+      .stat { min-height: 112px; padding: 15px; }
+      .panel { padding: 15px; }
+      .method-grid { grid-template-columns: 1fr; }
+      .case-name { font-size: .68rem; }
+    }
+
+    @media print {
+      body { background: white; }
+      .hero-links, .controls { display: none; }
+      .stat, .panel, .note-card { box-shadow: none; break-inside: avoid; }
+      section { break-inside: avoid; }
+    }
+  </style>
+</head>
+<body>
+  <header class="hero">
+    <div class="wrap">
+      <p class="eyebrow">pyCircuit · Simulation Performance Study · 2026-08-11</p>
+      <h1>C++ Model 与 Verilator，谁跑得更快？</h1>
+      <p class="lede">同一份 PYC MLIR，经两条后端路径生成 cycle simulator。30 个 examples 的结论不是单一胜负，而是一条随设计复杂度变化的分界线。</p>
+      <nav class="hero-links" aria-label="报告相关文件">
+        <a href="08_cpp_vs_verilator_performance.md">阅读完整报告</a>
+        <a href="benchmarks/cpp_vs_verilator/results_20260811.csv">下载 CSV</a>
+        <a href="benchmarks/cpp_vs_verilator/perf_stat_all_20260811.csv">下载全量 perf CSV</a>
+        <a href="benchmarks/cpp_vs_verilator/run_experiment.py">复现实验脚本</a>
+      </nav>
+    </div>
+  </header>
+
+  <main class="wrap">
+    <div class="stats" aria-label="实验摘要">
+      <article class="stat"><div class="value">30 / 30</div><div class="label">跨后端 4,096 周期 checksum 一致</div></article>
+      <article class="stat cpp"><div class="value">23</div><div class="label">pycc C++ model 胜出的样例</div></article>
+      <article class="stat vlt"><div class="value">7</div><div class="label">Verilator 胜出的样例</div></article>
+      <article class="stat"><div class="value">2.26×</div><div class="label">等权几何平均：C++ model 更快</div></article>
+    </div>
+
+    <section aria-labelledby="ratio-title">
+      <div class="section-head">
+        <div><p class="eyebrow">The landscape</p><h2 id="ratio-title">每个样例的相对速度</h2></div>
+        <p>以 1× 为中心，条形长度使用 log₂ 尺度。左侧表示 C++ model 更快，右侧表示 Verilator 更快，能同时看清 1.05× 与 7.8× 的差异。</p>
+      </div>
+      <div class="panel">
+        <div class="legend">
+          <span style="--dot:var(--cpp)">pycc C++ model 更快</span>
+          <span style="--dot:var(--verilator)">Verilator 更快</span>
+        </div>
+        <div class="ratio-axis"><span></span><span class="axis-labels"><span>← C++ 优势</span><span>1×</span><span>Verilator 优势 →</span></span><span>优势</span></div>
+        <div id="ratio-chart" class="ratio-chart"></div>
+      </div>
+    </section>
+
+    <section aria-labelledby="scatter-title">
+      <div class="section-head">
+        <div><p class="eyebrow">Absolute throughput</p><h2 id="scatter-title">绝对吞吐量与胜负边界</h2></div>
+        <p>双对数坐标，虚线为两者相同。点在线上方表示 Verilator 更快；在线下方表示 C++ model 更快。悬停可查看样例名称和数值。</p>
+      </div>
+      <div class="panel scatter-wrap">
+        <svg id="scatter" viewBox="0 0 900 500" role="img" aria-label="C++ model 和 Verilator 吞吐量散点图"></svg>
+      </div>
+    </section>
+
+    <section aria-labelledby="cases-title">
+      <div class="section-head">
+        <div><p class="eyebrow">Three archetypes</p><h2 id="cases-title">三个样例，解释两种相反结果</h2></div>
+      </div>
+      <div class="callouts">
+        <article class="note-card cpp">
+          <h3>Counter：固定框架成本</h3>
+          <div class="metric">C++ 快 4.53×</div>
+          <p>逻辑很浅，C++ 的直接 <code>comb/tick/transfer</code> 调用成本低；Verilator 的 trigger、settle、NBA 与运行时收尾成本无法被有效摊薄。</p>
+        </article>
+        <article class="note-card vlt">
+          <h3>BF16 FMAC：大组合网表</h3>
+          <div class="metric">Verilator 快 3.19×</div>
+          <p>C++ gprof 热点有超过 75% 落在组合块。Verilator 能对 RTL 做更成熟的常量传播、wire folding、表达式合并和内联。</p>
+        </article>
+        <article class="note-card vlt">
+          <h3>SW5809S：组合 + 状态提交</h3>
+          <div class="metric">Verilator 快 3.19×</div>
+          <p>C++ model 同时付出整网表组合求值和 16 个 FIFO 的 <code>tick_compute/tick_commit</code> 成本，字段化状态也限制了宿主编译器的全局优化。</p>
+        </article>
+      </div>
+    </section>
+
+    <section aria-labelledby="path-title">
+      <div class="section-head">
+        <div><p class="eyebrow">What is compared</p><h2 id="path-title">共同前端，两条仿真路径</h2></div>
+        <p>本实验比较宿主机 cycle simulation 效率，不比较综合后的面积、功耗或硬件最高频率。</p>
+      </div>
+      <div class="panel">
+        <div class="pipeline">
+          <div class="pipe-node"><strong>examples 源码</strong><small>Python/CycleAware 描述</small></div>
+          <div class="pipe-arrow">→</div>
+          <div class="pipe-node"><strong>PYC MLIR</strong><small>完全相同的输入与策略</small></div>
+          <div class="pipe-arrow">→</div>
+          <div class="pipe-node"><strong>两个 emitter</strong><small>从这里分叉</small></div>
+        </div>
+        <div class="split">
+          <div class="backend cpp"><h3>CppEmitter → native C++ model</h3><p>轻量直接调度，小模型优势明显；复杂模型中，大量字段 load/store、组合块和状态提交可能阻挡跨操作优化。</p></div>
+          <div class="backend vlt"><h3>VerilogEmitter → Verilator C++</h3><p>有统一 eval/trigger/settle 固定成本；设计变大后，成熟的 RTL 全局简化与紧凑求值逐渐占优。</p></div>
+        </div>
+      </div>
+    </section>
+
+    <section aria-labelledby="perf-title">
+      <div class="section-head">
+        <div><p class="eyebrow">Hardware counters · all 30 cases</p><h2 id="perf-title">perf：每推进一个逻辑周期，CPU 做了多少工作</h2></div>
+        <p>全部 30 个 case、两个后端均已采集。条形长度使用 log₂ 尺度，指向每周期执行指令更少的一方。</p>
+      </div>
+      <div class="stats" aria-label="perf 全量摘要">
+        <article class="stat"><div class="value">60 / 60</div><div class="label">后端结果 coverage 100%</div></article>
+        <article class="stat cpp"><div class="value">25 / 30</div><div class="label">C++ model 每周期指令更少</div></article>
+        <article class="stat"><div class="value">28 / 30</div><div class="label">指令较少的一方也是吞吐胜者</div></article>
+        <article class="stat"><div class="value">0.998</div><div class="label">吞吐比与 HW cycle 比的 log correlation</div></article>
+      </div>
+      <div class="panel">
+        <div class="legend">
+          <span style="--dot:var(--cpp)">C++ model 指令更少</span>
+          <span style="--dot:var(--verilator)">Verilator 指令更少</span>
+        </div>
+        <div class="ratio-axis"><span></span><span class="axis-labels"><span>← C++ 更少</span><span>相同</span><span>Verilator 更少 →</span></span><span>倍数</span></div>
+        <div id="instruction-chart" class="ratio-chart"></div>
+      </div>
+      <div class="panel" style="margin-top:14px">
+        <div class="table-scroll">
+          <table>
+            <thead><tr><th>模型 / 后端</th><th>HW cycle</th><th>指令</th><th>IPC</th><th>分支</th><th>L1D load</th></tr></thead>
+            <tbody>
+              <tr><td>Counter / C++</td><td>60</td><td>161</td><td>2.68</td><td>30</td><td>53</td></tr>
+              <tr><td>Counter / Verilator</td><td>273</td><td>575</td><td>2.11</td><td>102</td><td>185</td></tr>
+              <tr><td>BF16 FMAC / C++</td><td>3,871</td><td>8,721</td><td>2.25</td><td>246</td><td>1,744</td></tr>
+              <tr><td>BF16 FMAC / Verilator</td><td>1,232</td><td>3,540</td><td>2.87</td><td>164</td><td>837</td></tr>
+              <tr><td>SW5809S / C++</td><td>1,952</td><td>4,546</td><td>2.33</td><td>624</td><td>1,569</td></tr>
+              <tr><td>SW5809S / Verilator</td><td>637</td><td>1,471</td><td>2.31</td><td>167</td><td>475</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="split">
+          <div class="backend cpp"><h3>Counter：Verilator 做得更多</h3><p>每周期指令数是 C++ 的 3.57×。perf record 中约 60.8% 的周期样本落在由 <code>VlDeleter::deleteAll</code> 路径触发的 pthread mutex lock/unlock。</p></div>
+          <div class="backend vlt"><h3>复杂模型：C++ model 做得更多</h3><p>BF16 与 SW5809S 的 C++ 指令数分别是 Verilator 的 2.47× 和 3.09×；SW 的分支和 L1D load 还分别多 3.75× 和 3.31×。</p></div>
+        </div>
+        <div class="warning"><strong>全量结论：</strong>最大 L1D miss rate 仅 0.0169%，最大 branch miss rate 为 0.933%。主要问题不是 cache 装不下，而是动态指令、字段 load、调度和状态提交工作量。两个“指令更少却更慢”的例外是 calculator 与 digital_filter，原因是 C++ IPC 明显更低。<a href="benchmarks/cpp_vs_verilator/perf_stat_all_20260811.csv">下载 60 行完整 perf 数据</a>。</div>
+      </div>
+    </section>
+
+    <section aria-labelledby="table-title">
+      <div class="section-head">
+        <div><p class="eyebrow">All measurements</p><h2 id="table-title">30 项完整结果</h2></div>
+        <p>点击表头可排序。除吞吐外，表中同时给出全部 perf 指令数和 IPC；横向滚动可查看所有列。</p>
+      </div>
+      <div class="panel">
+        <div class="controls">
+          <div class="filters" role="group" aria-label="结果筛选">
+            <button class="filter active" data-filter="all">全部 30</button>
+            <button class="filter" data-filter="cpp">C++ 胜 23</button>
+            <button class="filter" data-filter="vlt">Verilator 胜 7</button>
+          </div>
+          <span class="table-note" id="table-status">按 C++ 吞吐降序</span>
+        </div>
+        <div class="table-scroll">
+          <table>
+            <thead><tr>
+              <th data-sort="name">样例</th>
+              <th data-sort="cpp">C++ M cycle/s</th>
+              <th data-sort="vlt">Verilator M cycle/s</th>
+              <th data-sort="ratio">V / C</th>
+              <th data-sort="advantage">胜者与优势</th>
+              <th data-sort="cppInstr">C++ 指令/周期</th>
+              <th data-sort="vltInstr">V 指令/周期</th>
+              <th data-sort="instrRatio">指令 C/V</th>
+              <th data-sort="cppIpc">C++ IPC</th>
+              <th data-sort="vltIpc">V IPC</th>
+            </tr></thead>
+            <tbody id="results-body"></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <section aria-labelledby="method-title">
+      <div class="section-head">
+        <div><p class="eyebrow">Fairness & limits</p><h2 id="method-title">实验控制与边界</h2></div>
+      </div>
+      <div class="panel">
+        <div class="method-grid">
+          <div class="method-item"><strong>同一 PYC 输入</strong><span>两后端使用相同优化策略生成</span></div>
+          <div class="method-item"><strong>统一编译参数</strong><span>GCC 13.1，-O2 -DNDEBUG</span></div>
+          <div class="method-item"><strong>统一执行环境</strong><span>CPU 0、单线程、trace off</span></div>
+          <div class="method-item"><strong>统一刺激与观测</strong><span>确定性输入，全部输出 checksum</span></div>
+          <div class="method-item"><strong>先验证再计时</strong><span>每项先比较 4,096 个周期</span></div>
+          <div class="method-item"><strong>抑制测量波动</strong><span>交替运行，各 3 次取中位数</span></div>
+          <div class="method-item"><strong>目标时长</strong><span>自动校准至每次约 0.35 秒</span></div>
+          <div class="method-item"><strong>生成器版本</strong><span>Verilator 5.048</span></div>
+        </div>
+        <div class="warning"><strong>perf 已启用：</strong>全部 30 case 使用相同 case 内周期数、core/cache 分组和 3 次重复。较快后端单次至少约 0.25 秒；hardware cycles 标准差超过 3% 自动重采，最终最大 2.69%。代表样例的 <code>perf record</code> 与独立 gprof 归因一致。</div>
+      </div>
+    </section>
+
+    <section aria-labelledby="next-title">
+      <div class="section-head">
+        <div><p class="eyebrow">Engineering direction</p><h2 id="next-title">下一步优化建议</h2></div>
+        <p>遵守 pyc4.0 的 gate-first 原则：语义与优化应进入 dialect/MLIR verifier 和 pass，而不是只在某个 emitter 中增加特殊修补。</p>
+      </div>
+      <div class="panel recommendations">
+        <div class="rec"><div><strong>建立分层性能门禁</strong><p>保留小型、组合密集、状态密集、FIFO 密集四类代表用例，持续记录 cycle/s、生成代码体积和热点结构。</p></div></div>
+        <div class="rec"><div><strong>在 MLIR 层减少无效工作</strong><p>优先调查组合区域融合、临时信号消除、live-cone pruning，以及无变化周期的组合求值跳过。</p></div></div>
+        <div class="rec"><div><strong>降低字段化带来的内存往返</strong><p>让可局部化的 SSA 值保持为局部表达式，减少每个 op 都落入 model field 后产生的 load/store 与别名阻碍。</p></div></div>
+        <div class="rec"><div><strong>优化状态提交协议</strong><p>针对 FIFO 和寄存器阵列评估 dirty-state、局部 commit 与更紧凑的 current/next 表示，同时以 verifier 保证时序语义。</p></div></div>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    <div class="wrap">数据来源：pyCircuit examples，实验日期 2026-08-11。完整方法、gprof 热点和限制条件请参阅 <a href="08_cpp_vs_verilator_performance.md">Markdown 报告</a>。</div>
+  </footer>
+
+  <script>
+    "use strict";
+
+    const data = [
+      ["arith/arith", 76603287.9117, 9819436.86558],
+      ["boundary_value_ports/boundary_value_ports", 75231371.9037, 10097639.1461],
+      ["cache_params/cache_params", 71354917.7892, 9882428.06583],
+      ["calculator/calculator", 5641437.81641, 6830531.83079],
+      ["counter/counter", 45947248.1776, 10144804.239],
+      ["decode_rules/decode_rules", 44957122.2845, 9660570.79438],
+      ["digital_clock/digital_clock", 3877436.7132, 8410057.62288],
+      ["digital_filter/digital_filter", 8779494.52896, 9606961.88164],
+      ["dodgeball_game/lab_final_VGA", 10458189.524, 9383562.58711],
+      ["dodgeball_game/lab_final_top", 1762584.793, 7068816.96544],
+      ["fastfwd/fastfwd", 27819035.5942, 6893595.52284],
+      ["fifo_loopback/fifo_loopback", 30456528.2492, 8473658.60942],
+      ["fm16/npu_node", 4343536.34014, 3622128.84411],
+      ["fm16/sw5809s", 1406916.74336, 4490868.00146],
+      ["fmac/bf16_fmac", 697617.151132, 2224002.35077],
+      ["hier_modules/hier_modules", 68515423.7743, 10147178.8686],
+      ["issue_queue_2picker/issue_queue_2picker", 7575565.25689, 7201466.14196],
+      ["jit_control_flow/jit_control_flow", 41132326.0978, 8686270.45972],
+      ["jit_pipeline_vec/jit_pipeline_vec", 11929556.3288, 9450260.09687],
+      ["mem_rdw_olddata/mem_rdw_olddata", 47205616.7767, 9089143.04833],
+      ["multiclock_regs/multiclock_regs", 37340404.9954, 9770761.16681],
+      ["net_resolution_depth_smoke/net_resolution_depth_smoke", 57514906.4434, 10052506.1705],
+      ["obs_points/obs_points", 55859835.7143, 9180573.72884],
+      ["pipeline_builder/pipeline_builder", 19377749.5389, 9750641.94133],
+      ["reset_invalidate_order_smoke/reset_invalidate_order_smoke", 26394001.8694, 8424130.02778],
+      ["struct_transform/struct_transform", 17182121.4928, 9543585.66317],
+      ["sync_mem_init_zero/sync_mem_init_zero", 46970247.3763, 9013863.4776],
+      ["traffic_lights_ce_pyc/traffic_lights_ce", 3566520.86288, 6372922.06999],
+      ["wire_ops/wire_ops", 49359695.7435, 9953105.65242],
+      ["xz_value_model_smoke/xz_value_model_smoke", 62118165.0838, 10104668.1381]
+    ].map(([name, cpp, vlt]) => ({
+      name, cpp, vlt,
+      ratio: vlt / cpp,
+      winner: vlt > cpp ? "vlt" : "cpp",
+      advantage: Math.max(vlt / cpp, cpp / vlt)
+    }));
+
+    const perfData = new Map([
+      ["arith/arith", 76.148479, 605.164990, 35.680656, 276.392319, 2.134167, 2.189514],
+      ["boundary_value_ports/boundary_value_ports", 83.143950, 596.159499, 36.812883, 271.389587, 2.258556, 2.196693],
+      ["cache_params/cache_params", 73.158599, 601.176652, 38.072750, 271.886644, 1.921548, 2.211130],
+      ["calculator/calculator", 1021.544974, 1106.987230, 489.336526, 404.955742, 2.087612, 2.733601],
+      ["counter/counter", 161.233023, 575.257670, 60.127653, 273.007538, 2.681512, 2.107113],
+      ["decode_rules/decode_rules", 155.366448, 627.767912, 60.132757, 287.668432, 2.583724, 2.182262],
+      ["digital_clock/digital_clock", 1207.265044, 778.145909, 651.111298, 326.120751, 1.854161, 2.386067],
+      ["digital_filter/digital_filter", 605.098078, 620.713120, 313.698910, 285.457517, 1.928914, 2.174450],
+      ["dodgeball_game/lab_final_VGA", 593.029640, 638.133349, 258.056023, 289.317013, 2.298065, 2.205654],
+      ["dodgeball_game/lab_final_top", 3187.046527, 982.450869, 1528.807829, 387.144324, 2.084661, 2.537686],
+      ["fastfwd/fastfwd", 200.527251, 786.583304, 97.980630, 404.436330, 2.046601, 1.944888],
+      ["fifo_loopback/fifo_loopback", 261.855891, 730.394440, 90.022433, 319.292535, 2.908785, 2.287540],
+      ["fm16/npu_node", 1645.187608, 1805.293994, 614.613397, 766.036128, 2.676784, 2.356670],
+      ["fm16/sw5809s", 4546.369381, 1470.606560, 1951.553594, 637.478450, 2.329615, 2.306912],
+      ["fmac/bf16_fmac", 8721.364045, 3539.528396, 3871.282662, 1232.109671, 2.252836, 2.872738],
+      ["hier_modules/hier_modules", 70.157606, 596.174594, 40.273494, 273.785064, 1.742029, 2.177528],
+      ["issue_queue_2picker/issue_queue_2picker", 829.401962, 1020.548733, 366.413970, 383.450626, 2.263565, 2.661487],
+      ["jit_control_flow/jit_control_flow", 198.259321, 642.787079, 58.489057, 287.211746, 3.389682, 2.238025],
+      ["jit_pipeline_vec/jit_pipeline_vec", 455.890262, 606.483215, 227.399794, 281.355736, 2.004796, 2.155574],
+      ["mem_rdw_olddata/mem_rdw_olddata", 169.726828, 645.750843, 58.245969, 296.363467, 2.913967, 2.178915],
+      ["multiclock_regs/multiclock_regs", 177.289051, 611.319677, 74.844053, 280.717143, 2.368779, 2.177707],
+      ["net_resolution_depth_smoke/net_resolution_depth_smoke", 129.187117, 574.206991, 48.117779, 274.413151, 2.684810, 2.092491],
+      ["obs_points/obs_points", 117.196134, 663.217036, 50.345434, 302.695639, 2.327840, 2.191036],
+      ["pipeline_builder/pipeline_builder", 281.549580, 594.607475, 144.078814, 278.448308, 1.954136, 2.135432],
+      ["reset_invalidate_order_smoke/reset_invalidate_order_smoke", 161.402232, 575.444650, 61.967607, 273.397869, 2.604623, 2.104788],
+      ["struct_transform/struct_transform", 332.626157, 603.692254, 155.045980, 282.593956, 2.145339, 2.136253],
+      ["sync_mem_init_zero/sync_mem_init_zero", 169.727961, 645.752127, 58.128411, 292.415136, 2.919880, 2.208340],
+      ["traffic_lights_ce_pyc/traffic_lights_ce", 1559.673504, 1101.348389, 757.969199, 404.926042, 2.057700, 2.719875],
+      ["wire_ops/wire_ops", 165.217287, 588.740297, 56.240252, 277.672377, 2.937705, 2.120270],
+      ["xz_value_model_smoke/xz_value_model_smoke", 103.173600, 573.192043, 44.392708, 271.953393, 2.324111, 2.107685]
+    ].map(([name, cppInstr, vltInstr, cppHw, vltHw, cppIpc, vltIpc]) => [name, {
+      cppInstr, vltInstr, cppHw, vltHw, cppIpc, vltIpc,
+      instrRatio: cppInstr / vltInstr,
+      hwRatio: cppHw / vltHw
+    }]));
+
+    data.forEach(item => Object.assign(item, perfData.get(item.name)));
+
+    const formatM = value => (value / 1e6).toLocaleString("zh-CN", {minimumFractionDigits: 3, maximumFractionDigits: 3});
+    const shortName = name => name.split("/").at(-1);
+
+    function renderRatioChart() {
+      const root = document.querySelector("#ratio-chart");
+      const maxLog = Math.max(...data.map(d => Math.abs(Math.log2(d.ratio))));
+      [...data].sort((a, b) => a.ratio - b.ratio).forEach(d => {
+        const row = document.createElement("div");
+        row.className = "ratio-row";
+        row.title = `${d.name}\nC++ ${formatM(d.cpp)} M cycle/s\nVerilator ${formatM(d.vlt)} M cycle/s`;
+        const width = Math.max(1.5, Math.abs(Math.log2(d.ratio)) / maxLog * 100);
+        row.innerHTML = `
+          <span class="case-name">${shortName(d.name)}</span>
+          <span class="bar-zone">
+            <span class="half left">${d.winner === "cpp" ? `<i class="ratio-bar cpp" style="width:${width}%"></i>` : ""}</span>
+            <span class="half right">${d.winner === "vlt" ? `<i class="ratio-bar vlt" style="width:${width}%"></i>` : ""}</span>
+          </span>
+          <span class="ratio-value ${d.winner}">${d.advantage.toFixed(2)}×</span>`;
+        root.appendChild(row);
+      });
+    }
+
+    function renderInstructionChart() {
+      const root = document.querySelector("#instruction-chart");
+      const maxLog = Math.max(...data.map(d => Math.abs(Math.log2(d.instrRatio))));
+      [...data].sort((a, b) => a.instrRatio - b.instrRatio).forEach(d => {
+        const row = document.createElement("div");
+        const fewer = d.instrRatio <= 1 ? "cpp" : "vlt";
+        const advantage = Math.max(d.instrRatio, 1 / d.instrRatio);
+        const width = Math.max(1.5, Math.abs(Math.log2(d.instrRatio)) / maxLog * 100);
+        row.className = "ratio-row";
+        row.title = `${d.name}\nC++ ${d.cppInstr.toFixed(1)} instructions/cycle\nVerilator ${d.vltInstr.toFixed(1)} instructions/cycle`;
+        row.innerHTML = `
+          <span class="case-name">${shortName(d.name)}</span>
+          <span class="bar-zone">
+            <span class="half left">${fewer === "cpp" ? `<i class="ratio-bar cpp" style="width:${width}%"></i>` : ""}</span>
+            <span class="half right">${fewer === "vlt" ? `<i class="ratio-bar vlt" style="width:${width}%"></i>` : ""}</span>
+          </span>
+          <span class="ratio-value ${fewer}">${advantage.toFixed(2)}×</span>`;
+        root.appendChild(row);
+      });
+    }
+
+    function svgElement(name, attrs = {}, text = "") {
+      const el = document.createElementNS("http://www.w3.org/2000/svg", name);
+      Object.entries(attrs).forEach(([key, value]) => el.setAttribute(key, value));
+      if (text) el.textContent = text;
+      return el;
+    }
+
+    function renderScatter() {
+      const svg = document.querySelector("#scatter");
+      const width = 900, height = 500;
+      const margin = {left: 76, right: 28, top: 26, bottom: 62};
+      const min = Math.log10(0.5e6), max = Math.log10(100e6);
+      const x = value => margin.left + (Math.log10(value) - min) / (max - min) * (width - margin.left - margin.right);
+      const y = value => height - margin.bottom - (Math.log10(value) - min) / (max - min) * (height - margin.top - margin.bottom);
+      const ticks = [0.5e6, 1e6, 2e6, 5e6, 10e6, 20e6, 50e6, 100e6];
+
+      ticks.forEach(tick => {
+        svg.appendChild(svgElement("line", {x1:x(tick), y1:margin.top, x2:x(tick), y2:height-margin.bottom, class:"scatter-grid"}));
+        svg.appendChild(svgElement("line", {x1:margin.left, y1:y(tick), x2:width-margin.right, y2:y(tick), class:"scatter-grid"}));
+        svg.appendChild(svgElement("text", {x:x(tick), y:height-margin.bottom+22, "text-anchor":"middle", class:"scatter-label"}, `${tick/1e6}M`));
+        svg.appendChild(svgElement("text", {x:margin.left-10, y:y(tick)+4, "text-anchor":"end", class:"scatter-label"}, `${tick/1e6}M`));
+      });
+
+      svg.appendChild(svgElement("line", {x1:x(0.5e6), y1:y(0.5e6), x2:x(100e6), y2:y(100e6), class:"scatter-diagonal"}));
+      svg.appendChild(svgElement("text", {x:(margin.left+width-margin.right)/2, y:height-15, "text-anchor":"middle", class:"scatter-label"}, "pycc C++ model 吞吐量"));
+      const yLabel = svgElement("text", {x:17, y:height/2, "text-anchor":"middle", class:"scatter-label", transform:`rotate(-90 17 ${height/2})`}, "Verilator 吞吐量");
+      svg.appendChild(yLabel);
+
+      data.forEach(d => {
+        const circle = svgElement("circle", {cx:x(d.cpp), cy:y(d.vlt), r:5.5, fill:d.winner === "cpp" ? "#087e8b" : "#ec6b3c", class:"scatter-dot"});
+        circle.appendChild(svgElement("title", {}, `${d.name}\nC++ ${formatM(d.cpp)} M cycle/s\nVerilator ${formatM(d.vlt)} M cycle/s\n${d.winner === "cpp" ? "C++" : "Verilator"} 快 ${d.advantage.toFixed(2)}×`));
+        svg.appendChild(circle);
+      });
+    }
+
+    let filter = "all";
+    let sortKey = "cpp";
+    let sortDirection = -1;
+
+    function renderTable() {
+      const rows = data
+        .filter(d => filter === "all" || d.winner === filter)
+        .sort((a, b) => {
+          const av = sortKey === "name" ? a.name : a[sortKey];
+          const bv = sortKey === "name" ? b.name : b[sortKey];
+          return (typeof av === "string" ? av.localeCompare(bv) : av - bv) * sortDirection;
+        });
+      document.querySelector("#results-body").innerHTML = rows.map(d => `
+        <tr>
+          <td title="${d.name}">${d.name}</td>
+          <td>${formatM(d.cpp)}</td>
+          <td>${formatM(d.vlt)}</td>
+          <td>${d.ratio.toFixed(3)}</td>
+          <td><span class="winner ${d.winner}">${d.winner === "cpp" ? "C++" : "Verilator"} ${d.advantage.toFixed(2)}×</span></td>
+          <td>${d.cppInstr.toFixed(1)}</td>
+          <td>${d.vltInstr.toFixed(1)}</td>
+          <td>${d.instrRatio.toFixed(3)}</td>
+          <td>${d.cppIpc.toFixed(2)}</td>
+          <td>${d.vltIpc.toFixed(2)}</td>
+        </tr>`).join("");
+      const direction = sortDirection === 1 ? "升序" : "降序";
+      const names = {name:"样例名称", cpp:"C++ 吞吐", vlt:"Verilator 吞吐", ratio:"V/C", advantage:"优势倍数", cppInstr:"C++ 指令", vltInstr:"Verilator 指令", instrRatio:"指令 C/V", cppIpc:"C++ IPC", vltIpc:"Verilator IPC"};
+      document.querySelector("#table-status").textContent = `${rows.length} 项 · 按${names[sortKey]}${direction}`;
+    }
+
+    document.querySelectorAll(".filter").forEach(button => button.addEventListener("click", () => {
+      document.querySelectorAll(".filter").forEach(b => b.classList.remove("active"));
+      button.classList.add("active");
+      filter = button.dataset.filter;
+      renderTable();
+    }));
+
+    document.querySelectorAll("th[data-sort]").forEach(header => header.addEventListener("click", () => {
+      const next = header.dataset.sort;
+      sortDirection = sortKey === next ? -sortDirection : (next === "name" ? 1 : -1);
+      sortKey = next;
+      renderTable();
+    }));
+
+    renderRatioChart();
+    renderInstructionChart();
+    renderScatter();
+    renderTable();
+  </script>
+</body>
+</html>
