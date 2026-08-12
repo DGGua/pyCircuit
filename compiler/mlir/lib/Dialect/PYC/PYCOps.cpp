@@ -912,6 +912,13 @@ LogicalResult ExtractOp::verify() {
   if (static_cast<std::uint64_t>(lsb) + static_cast<std::uint64_t>(outTy.getWidth()) >
       static_cast<std::uint64_t>(inTy.getWidth()))
     return emitOpError("slice out of range for input type");
+  if (auto msbAttr = getMsbAttr()) {
+    std::int64_t msb = msbAttr.getInt();
+    std::int64_t expected = lsb + static_cast<std::int64_t>(outTy.getWidth()) - 1;
+    if (msb != expected)
+      return emitOpError("msb must equal lsb + result_width - 1 (expected ")
+             << expected << ", got " << msb << ")";
+  }
   return success();
 }
 

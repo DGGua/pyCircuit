@@ -334,9 +334,20 @@ class Module:
         in_width = a.ty.width
         if lsb + width > in_width:
             raise ValueError("extract slice out of range for input width")
-        out_ty = Vector.from_shape(a.ty.shape(), Bits(width)) if isinstance(a.ty, Vector) else Bits(width)
         tmp = self._get_next_temp_var()
-        self._emit(f"{tmp} = pyc.extract {a.ref} {{lsb = {int(lsb)}}} : {a.ty} -> {out_ty}")
+        if isinstance(a.ty, Vector):
+            # Element-wise vector slice: no ``msb`` self-consistency attr (the
+            # scalar ASL bitfield/lane gate is the only consumer of ``msb``).
+            out_ty = Vector.from_shape(a.ty.shape(), Bits(width))
+            self._emit(f"{tmp} = pyc.extract {a.ref} {{lsb = {int(lsb)}}} : {a.ty} -> {out_ty}")
+        else:
+            # Scalar slice: also emit the optional ``msb`` attribute so the MLIR
+            # verifier checks ``msb == lsb + width - 1`` (ASL T1 self-consistency).
+            out_ty = Bits(width)
+            msb = int(lsb) + int(width) - 1
+            self._emit(
+                f"{tmp} = pyc.extract {a.ref} {{lsb = {int(lsb)}, msb = {int(msb)}}} : {a.ty} -> {out_ty}"
+            )
         return Signal(ref=tmp, ty=out_ty)
 
     def shli(self, a: Signal, *, amount: int) -> Signal:
