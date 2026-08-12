@@ -180,6 +180,11 @@ static llvm::cl::opt<bool> unrollVector(
     llvm::cl::desc("Unroll vector operations to scalars at IR level before optimization passes"),
     llvm::cl::init(false));
 
+static llvm::cl::opt<bool> combineDelayChains(
+    "combine-delay-chains",
+    llvm::cl::desc("Combine generated cycle-balance register chains into pyc.delay_line"),
+    llvm::cl::init(true));
+
 static llvm::cl::opt<bool> noInline(
     "noinline",
     llvm::cl::desc("Disable MLIR inliner to preserve module boundaries (prevents merge/flatten)"),
@@ -657,6 +662,8 @@ static LogicalResult emitProbeManifest(ModuleOp module, llvm::StringRef outPath)
             v = a.getIn();
           if (v.getDefiningOp<pyc::RegOp>() != nullptr)
             return true;
+          if (v.getDefiningOp<pyc::DelayLineOp>() != nullptr)
+            return true;
           auto comb = v.getDefiningOp<pyc::CombOp>();
           if (!comb)
             return false;
@@ -741,6 +748,8 @@ static LogicalResult emitProbeManifest(ModuleOp module, llvm::StringRef outPath)
           v = a.getIn();
         if (auto rop = v.getDefiningOp<pyc::RegOp>())
           return rop.getQ();
+        if (auto delay = v.getDefiningOp<pyc::DelayLineOp>())
+          return delay.getQ();
         auto comb = v.getDefiningOp<pyc::CombOp>();
         if (!comb)
           return Value();
@@ -775,6 +784,10 @@ static LogicalResult emitProbeManifest(ModuleOp module, llvm::StringRef outPath)
 
     llvm::StringSet<> localNamedFields;
     f.walk([&](Operation *op) {
+      // Cycle-balance names are compiler temporaries, not stable user probes.
+      if (auto generated = op->getAttrOfType<StringAttr>("pyc.generated");
+          generated && generated.getValue() == "cycle_balance")
+        return;
       auto nameAttr = op->getAttrOfType<StringAttr>("pyc.name");
       if (!nameAttr)
         return;
@@ -1071,6 +1084,7 @@ static std::optional<std::string> findToolchainRoot(const char *argv0) {
 static LogicalResult emitPrimitivesFile(llvm::StringRef outPath, llvm::StringRef primDir, bool targetFpga) {
   static const char *kFiles[] = {
       "pyc_reg.v",
+      "pyc_delay_line.v",
       "pyc_fifo.v",
       "pyc_byte_mem.v",
       "pyc_sync_mem.v",
@@ -1938,6 +1952,8 @@ static LogicalResult writeCppCompileManifest(llvm::StringRef path,
 struct CompileStatsSummary {
   int64_t regCount = 0;
   int64_t regBits = 0;
+  int64_t delayLineCount = 0;
+  int64_t delayLineDepthTotal = 0;
   int64_t memCount = 0;
   int64_t memBits = 0;
   int64_t maxLogicDepth = 0;
@@ -1971,6 +1987,9 @@ static CompileStatsSummary collectCompileStats(ModuleOp module, int64_t depthLim
   for (auto f : module.getOps<func::FuncOp>()) {
     s.regCount = satAdd(s.regCount, getI64Attr(f, "pyc.stats.reg_count", 0));
     s.regBits = satAdd(s.regBits, getI64Attr(f, "pyc.stats.reg_bits", 0));
+    s.delayLineCount = satAdd(s.delayLineCount, getI64Attr(f, "pyc.stats.delay_line_count", 0));
+    s.delayLineDepthTotal =
+        satAdd(s.delayLineDepthTotal, getI64Attr(f, "pyc.stats.delay_line_depth_total", 0));
     s.memCount = satAdd(s.memCount, getI64Attr(f, "pyc.stats.mem_count", 0));
     s.memBits = satAdd(s.memBits, getI64Attr(f, "pyc.stats.mem_bits", 0));
 
@@ -1993,6 +2012,7 @@ static CompileStatsSummary collectCompileStats(ModuleOp module, int64_t depthLim
 
 static void printCompileStats(const CompileStatsSummary &s) {
   llvm::errs() << "stats: regs=" << s.regCount << " (" << s.regBits << " bits)"
+               << ", delay_lines=" << s.delayLineCount << " (depth_total=" << s.delayLineDepthTotal << ")"
                << ", mems=" << s.memCount << " (" << s.memBits << " bits)"
                << ", max_depth=" << s.maxLogicDepth << "/" << s.logicDepthLimit
                << ", WNS=" << s.wns << ", TNS=" << s.tns
@@ -2003,6 +2023,8 @@ static LogicalResult writeCompileStatsJson(llvm::StringRef outPath, const Compil
   llvm::json::Object obj;
   obj["reg_count"] = s.regCount;
   obj["reg_bits"] = s.regBits;
+  obj["delay_line_count"] = s.delayLineCount;
+  obj["delay_line_depth_total"] = s.delayLineDepthTotal;
   obj["mem_count"] = s.memCount;
   obj["mem_bits"] = s.memBits;
   obj["logic_depth_limit"] = s.logicDepthLimit;
@@ -2318,6 +2340,10 @@ int main(int argc, char **argv) {
     pm.addNestedPass<func::FuncOp>(pyc::createVectorUnrollPass());
   pm.addNestedPass<func::FuncOp>(pyc::createEliminateWiresPass());
   pm.addNestedPass<func::FuncOp>(pyc::createEliminateDeadStatePass());
+  // Match normalized frontend-owned chains before downstream analyses and
+  // emitters consume the first-class sequential operation.
+  if (combineDelayChains)
+    pm.addNestedPass<func::FuncOp>(pyc::createCombineDelayChainsPass());
   if (!unrollVector)
     pm.addNestedPass<func::FuncOp>(pyc::createSLPPackWiresPass());
   pm.addNestedPass<func::FuncOp>(pyc::createCombCanonicalizePass());
@@ -2447,6 +2473,8 @@ int main(int argc, char **argv) {
     llvm::json::Object stats;
     stats["reg_count"] = compileStats.regCount;
     stats["reg_bits"] = compileStats.regBits;
+    stats["delay_line_count"] = compileStats.delayLineCount;
+    stats["delay_line_depth_total"] = compileStats.delayLineDepthTotal;
     stats["mem_count"] = compileStats.memCount;
     stats["mem_bits"] = compileStats.memBits;
     stats["logic_depth_limit"] = compileStats.logicDepthLimit;

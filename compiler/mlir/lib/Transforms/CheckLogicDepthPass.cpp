@@ -23,6 +23,7 @@ namespace {
 
 static bool isSequentialOp(Operation *op) {
   return isa<pyc::RegOp,
+             pyc::DelayLineOp,
              pyc::FifoOp,
              pyc::ByteMemOp,
              pyc::SyncMemOp,

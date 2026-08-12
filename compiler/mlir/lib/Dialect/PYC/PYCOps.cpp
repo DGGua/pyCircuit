@@ -1001,6 +1001,20 @@ LogicalResult RegOp::verify() {
   return success();
 }
 
+LogicalResult DelayLineOp::verify() {
+  auto nextTy = getNext().getType();
+  if (getInit().getType() != nextTy)
+    return emitOpError("init type must match next type");
+  if (getQ().getType() != nextTy)
+    return emitOpError("result type must match next type");
+  auto depthAttr = (*this)->getAttrOfType<IntegerAttr>("depth");
+  if (!depthAttr)
+    return emitOpError("requires integer attribute `depth`");
+  if (depthAttr.getValue().getSExtValue() <= 1)
+    return emitOpError("depth must be > 1");
+  return success();
+}
+
 LogicalResult FifoOp::verify() {
   auto inTy = getInData().getType();
   auto outTy = getOutData().getType();

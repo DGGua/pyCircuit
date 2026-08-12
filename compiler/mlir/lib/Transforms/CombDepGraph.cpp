@@ -15,7 +15,8 @@ namespace {
 static constexpr int64_t kUnreachable = -1;
 
 static bool isSequentialCut(Operation *op) {
-  return isa<pyc::RegOp, pyc::FifoOp, pyc::ByteMemOp, pyc::SyncMemOp, pyc::SyncMemDPOp, pyc::AsyncFifoOp, pyc::CdcSyncOp>(op);
+  return isa<pyc::RegOp, pyc::DelayLineOp, pyc::FifoOp, pyc::ByteMemOp, pyc::SyncMemOp,
+             pyc::SyncMemDPOp, pyc::AsyncFifoOp, pyc::CdcSyncOp>(op);
 }
 
 static int64_t ceilLog2(int64_t n) {

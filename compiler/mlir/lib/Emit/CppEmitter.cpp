@@ -272,6 +272,8 @@ static Value findRegQFromValue(Value v) {
       v = a.getIn();
     if (auto rop = v.getDefiningOp<pyc::RegOp>())
       return rop.getQ();
+    if (auto delay = v.getDefiningOp<pyc::DelayLineOp>())
+      return delay.getQ();
     auto comb = v.getDefiningOp<pyc::CombOp>();
     if (!comb)
       return Value();
@@ -349,6 +351,7 @@ static bool functionHasSequentialState(func::FuncOp f,
 
   for (Operation &op : *bodyBlock) {
     if (isa<pyc::RegOp,
+            pyc::DelayLineOp,
             pyc::FifoOp,
             pyc::ByteMemOp,
             pyc::SyncMemOp,
@@ -942,6 +945,7 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
 
   // Sequential primitive instances.
   llvm::SmallVector<pyc::RegOp> regs;
+  llvm::SmallVector<pyc::DelayLineOp> delayLines;
   llvm::SmallVector<pyc::FifoOp> fifos;
   llvm::SmallVector<pyc::ByteMemOp> byteMems;
   llvm::SmallVector<pyc::SyncMemOp> syncMems;
@@ -954,6 +958,8 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
   for (Operation &op : top) {
     if (auto r = dyn_cast<pyc::RegOp>(op))
       regs.push_back(r);
+    else if (auto delay = dyn_cast<pyc::DelayLineOp>(op))
+      delayLines.push_back(delay);
     else if (auto fifo = dyn_cast<pyc::FifoOp>(op))
       fifos.push_back(fifo);
     else if (auto mem = dyn_cast<pyc::ByteMemOp>(op))
@@ -973,6 +979,7 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
   }
 
   auto regKey = [&](pyc::RegOp r) { return nt.get(r.getQ()); };
+  auto delayKey = [&](pyc::DelayLineOp delay) { return nt.get(delay.getQ()); };
   auto fifoKey = [&](pyc::FifoOp f) { return nt.get(f.getInReady()); };
   auto memKey = [&](pyc::ByteMemOp m) -> std::string {
     if (auto nameAttr = m->getAttrOfType<StringAttr>("name"))
@@ -993,6 +1000,9 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
   auto cdcKey = [&](pyc::CdcSyncOp s) { return nt.get(s.getOut()); };
 
   std::sort(regs.begin(), regs.end(), [&](pyc::RegOp a, pyc::RegOp b) { return regKey(a) < regKey(b); });
+  std::sort(delayLines.begin(), delayLines.end(), [&](pyc::DelayLineOp a, pyc::DelayLineOp b) {
+    return delayKey(a) < delayKey(b);
+  });
   std::sort(fifos.begin(), fifos.end(), [&](pyc::FifoOp a, pyc::FifoOp b) { return fifoKey(a) < fifoKey(b); });
   std::sort(byteMems.begin(), byteMems.end(), [&](pyc::ByteMemOp a, pyc::ByteMemOp b) { return memKey(a) < memKey(b); });
   std::sort(syncMems.begin(), syncMems.end(), [&](pyc::SyncMemOp a, pyc::SyncMemOp b) { return syncMemKey(a) < syncMemKey(b); });
@@ -1193,6 +1203,10 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
 
       llvm::StringSet<> seenNamedFields;
       f.walk([&](Operation *op) {
+        // Cycle-balance names are compiler temporaries, not stable user probes.
+        if (auto generated = op->getAttrOfType<StringAttr>("pyc.generated");
+            generated && generated.getValue() == "cycle_balance")
+          return;
         auto nameAttr = op->getAttrOfType<StringAttr>("pyc.name");
         if (!nameAttr || op->getNumResults() != 1)
           return;
@@ -1294,6 +1308,21 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
       os << "  pyc::cpp::pyc_vec_reg<" << cppType(r.getQ().getType()) << "> *" << nt.get(r.getQ()) << "_inst = nullptr;\n";
     else
       os << "  pyc::cpp::pyc_reg<" << w << "> *" << nt.get(r.getQ()) << "_inst = nullptr;\n";
+  }
+  for (auto delay : delayLines) {
+    unsigned w = bitWidth(delay.getQ().getType());
+    if (w == 0)
+      return delay.emitError("invalid delay_line width");
+    auto depthAttr = delay->getAttrOfType<IntegerAttr>("depth");
+    if (!depthAttr)
+      return delay.emitError("missing integer attribute `depth`");
+    auto depth = depthAttr.getValue().getZExtValue();
+    if (isa<VectorType>(delay.getQ().getType()))
+      os << "  pyc::cpp::pyc_vec_delay_line<" << cppType(delay.getQ().getType()) << ", " << depth << "> *"
+         << nt.get(delay.getQ()) << "_inst = nullptr;\n";
+    else
+      os << "  pyc::cpp::pyc_delay_line<" << w << ", " << depth << "> *" << nt.get(delay.getQ())
+         << "_inst = nullptr;\n";
   }
   for (auto fifo : fifos) {
     unsigned w = bitWidth(fifo.getOutData().getType());
@@ -1518,6 +1547,9 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
   for (auto r : regs)
     os << "    if (!" << nt.get(r.getQ()) << "_inst) { std::cerr << \"pyc null reg binding: " << nt.get(r.getQ())
        << "_inst\" << \"\\n\"; std::abort(); }\n";
+  for (auto delay : delayLines)
+    os << "    if (!" << nt.get(delay.getQ()) << "_inst) { std::cerr << \"pyc null delay_line binding: "
+       << nt.get(delay.getQ()) << "_inst\" << \"\\n\"; std::abort(); }\n";
   for (auto mem : syncMems) {
     std::string instName = syncMemInstName.lookup(mem.getOperation());
     os << "    if (!" << instName << ") { std::cerr << \"pyc null sync_mem binding: " << instName
@@ -1580,6 +1612,18 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
     os << nt.get(r.getClk()) << ", " << nt.get(r.getRst()) << ", " << nt.get(r.getEn()) << ", "
        << nt.get(r.getNext()) << ", " << nt.get(r.getInit()) << ", " << nt.get(r.getQ()) << ");\n";
   }
+  for (auto delay : delayLines) {
+    unsigned w = bitWidth(delay.getQ().getType());
+    auto depth = delay->getAttrOfType<IntegerAttr>("depth").getValue().getZExtValue();
+    if (isa<VectorType>(delay.getQ().getType()))
+      os << "    " << nt.get(delay.getQ()) << "_inst = new pyc::cpp::pyc_vec_delay_line<"
+         << cppType(delay.getQ().getType()) << ", " << depth << ">(";
+    else
+      os << "    " << nt.get(delay.getQ()) << "_inst = new pyc::cpp::pyc_delay_line<" << w << ", " << depth
+         << ">(";
+    os << nt.get(delay.getClk()) << ", " << nt.get(delay.getRst()) << ", " << nt.get(delay.getEn()) << ", "
+       << nt.get(delay.getNext()) << ", " << nt.get(delay.getInit()) << ", " << nt.get(delay.getQ()) << ");\n";
+  }
   for (auto mem : syncMems) {
     auto addrTy = dyn_cast<IntegerType>(mem.getRaddr().getType());
     auto dataTy = dyn_cast<IntegerType>(mem.getRdata().getType());
@@ -1640,7 +1684,8 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
     llvm::DenseMap<Operation *, unsigned> nodeIndex;
 
     auto shouldInclude = [&](Operation &op) -> bool {
-      if (isa<func::ReturnOp>(op) || isa<pyc::WireOp>(op) || isa<pyc::RegOp>(op) || isa<pyc::SyncMemOp>(op) ||
+      if (isa<func::ReturnOp>(op) || isa<pyc::WireOp>(op) || isa<pyc::RegOp>(op) ||
+          isa<pyc::DelayLineOp>(op) || isa<pyc::SyncMemOp>(op) ||
           isa<pyc::SyncMemDPOp>(op) || isa<pyc::CdcSyncOp>(op))
         return false;
       if (!includePrims &&
@@ -1833,7 +1878,8 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
             pyc::SyncMemDPOp,
             pyc::CdcSyncOp,
             pyc::InstanceOp,
-            pyc::RegOp>(*op)) {
+            pyc::RegOp,
+            pyc::DelayLineOp>(*op)) {
       // Primitives are evaluated in eval(), and regs only tick.
       continue;
     }
@@ -2270,7 +2316,8 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
 
     llvm::DenseMap<Operation *, unsigned> nodeIndex;
     for (Operation &op : top) {
-      if (isa<func::ReturnOp>(op) || isa<pyc::WireOp>(op) || isa<pyc::RegOp>(op) || isa<pyc::SyncMemOp>(op) ||
+      if (isa<func::ReturnOp>(op) || isa<pyc::WireOp>(op) || isa<pyc::RegOp>(op) ||
+          isa<pyc::DelayLineOp>(op) || isa<pyc::SyncMemOp>(op) ||
           isa<pyc::SyncMemDPOp>(op) || isa<pyc::CdcSyncOp>(op))
         continue;
 
@@ -2671,6 +2718,8 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
   os << "    // Local sequential primitives.\n";
   for (auto r : regs)
     os << "    " << nt.get(r.getQ()) << "_inst->tick_compute();\n";
+  for (auto delay : delayLines)
+    os << "    " << nt.get(delay.getQ()) << "_inst->tick_compute();\n";
   for (auto fifo : fifos)
     os << "    " << nt.get(fifo.getInReady()) << "_inst.tick_compute();\n";
   for (auto mem : byteMems)
@@ -2695,6 +2744,8 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
   os << "    // Local sequential primitives.\n";
   for (auto r : regs)
     os << "    " << nt.get(r.getQ()) << "_inst->tick_commit();\n";
+  for (auto delay : delayLines)
+    os << "    " << nt.get(delay.getQ()) << "_inst->tick_commit();\n";
   for (auto fifo : fifos)
     os << "    " << nt.get(fifo.getInReady()) << "_inst.tick_commit();\n";
   for (auto mem : byteMems)
