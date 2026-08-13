@@ -2786,6 +2786,15 @@ def main(argv: list[str] | None = None) -> int:
     sidecar_verify.add_argument("file", help="sidecar file path")
     sidecar_verify.set_defaults(fn=_cmd_sidecar_verify)
 
+    from .sim_benchmark import add_benchmark_arguments, run_from_namespace
+
+    benchmark = sub.add_parser(
+        "benchmark",
+        help="Compare generated C++ simulation performance with trace-free Verilator.",
+    )
+    add_benchmark_arguments(benchmark)
+    benchmark.set_defaults(fn=run_from_namespace)
+
     ns = p.parse_args(argv)
     return int(ns.fn(ns))
 

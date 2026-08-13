@@ -127,6 +127,7 @@ pyCircuit
 - `docs/QUICKSTART.md`
 - `docs/FRONTEND_API.md`
 - `docs/TESTBENCH.md`
+- `docs/BENCHMARK.md` — generated C++ simulator vs Verilator benchmark
 - `docs/IR_SPEC.md`
 - `docs/updatePLAN.md` and `docs/rfcs/pyc4.0-decisions.md`
 
