@@ -32,6 +32,7 @@ pyCircuit is a Python-based hardware description framework that compiles Python 
 - LLVM/MLIR 19 (for compiler backend)
 - CMake 3.20+
 - Ninja build system
+- Verilator 5.024+ (for `--target verilator` / `--run-verilator`; CI pins 5.048)
 - Git
 
 ### Clone and Install
@@ -99,10 +100,27 @@ mypy .
 
 ### Before Submitting
 
-1. **Run tests**: Ensure all tests pass
+1. **Run gates locally** (or rely on CI): G0 hygiene/build, G1 `run_examples.sh` (semantic regressions on), G2 `run_sims.sh`
 2. **Format code**: Run Black and Ruff
 3. **Update documentation**: If adding new features, update docs
 4. **Update examples**: If changing codegen, regenerate examples
+5. **Reference decision IDs** when implementing pyc4.0 contracts (see `docs/rfcs/pyc4.0-decisions.md`)
+
+### What CI runs on a PR
+
+| Check | Level | Notes |
+|-------|-------|-------|
+| `G0: Python Checks` | G0 | API hygiene + packaging compile |
+| `G0: Build Toolchain (Linux)` | G0 | `flows/scripts/pyc build` |
+| `G1: Examples + Semantic Gates` | G1 | `run_examples.sh` (no semantic skip) |
+| `G2: Cross-backend Sims` | G2 | `run_sims.sh` (merge blocker; timeout = fail) |
+| `G0: Wheel Smoke` | G0 | installed-wheel smoke (semantic skip OK) |
+| macOS toolchain (`CI (macOS)` workflow) | optional | only with label `ci-macos`, or on `main`/`develop` |
+
+Nightly G3 (`gates-nightly.yml`): `run_sims_nightly.sh` + Linx CPU C++ smoke.
+
+Failed runs attach `gate-logs-*` artifacts under Actions; Job Summary shows the gate matrix.
+Details: `docs/gates/README.md`.
 
 ### PR Description
 
@@ -110,16 +128,18 @@ Include in your PR description:
 
 1. **Summary**: What does this PR do?
 2. **Motivation**: Why is this change needed?
-3. **Testing**: How did you test this change?
-4. **Screenshots**: If applicable, show before/after
+3. **Testing**: How did you test this change? (gate commands / CI links)
+4. **Decision IDs**: e.g. `Implements 0134/0135` when applicable
+5. **Screenshots**: If applicable, show before/after
 
 ### PR Checklist
 
-- [ ] Tests pass
+- [ ] G0/G1/G2 gates pass (CI or local)
 - [ ] Code is formatted
 - [ ] Documentation updated
 - [ ] Examples regenerated (if applicable)
 - [ ] No new warnings
+- [ ] Decision IDs referenced when relevant
 
 ## Reporting Bugs
 
