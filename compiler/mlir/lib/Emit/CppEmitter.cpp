@@ -8,6 +8,7 @@
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Types.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/SmallSet.h"
 #include "llvm/ADT/STLExtras.h"
@@ -22,6 +23,9 @@
 #include <algorithm>
 #include <cstdint>
 #include <functional>
+#include <map>
+#include <set>
+#include <string>
 #include <vector>
 
 using namespace mlir;
@@ -390,7 +394,15 @@ static void assignExpr(Value result, Type ty, llvm::raw_ostream &os, NameTable &
   os << "    " << nt.get(result) << " = " << ess.str() << ";\n";
 }
 
-static LogicalResult emitCombAssign(Operation &op, llvm::raw_ostream &os, NameTable &nt) {
+// Per-function state for pyc.array_read lowering: array members are deduplicated
+// by their slot list (multiple read ports over the same state share one array).
+struct ArrayReadEmitState {
+  std::map<std::string, std::string> memberByName; // slot-list key -> member name
+  std::set<std::string> copied;                    // arrays whose slot copies were emitted
+};
+
+static LogicalResult emitCombAssign(Operation &op, llvm::raw_ostream &os, NameTable &nt,
+                                    ArrayReadEmitState *ars = nullptr) {
   if (auto c = dyn_cast<pyc::ConstantOp>(op)) {
     unsigned w = bitWidth(c.getType());
     if (w == 0)
@@ -811,6 +823,27 @@ static LogicalResult emitCombAssign(Operation &op, llvm::raw_ostream &os, NameTa
   if (auto vr = dyn_cast<pyc::VAddReduceOp>(op)) {
     return emitVectorReduce(vr, "v_add_reduce", "+");
   }
+  if (auto ar = dyn_cast<pyc::ArrayReadOp>(op)) {
+    if (!ars)
+      return ar.emitError("pyc.array_read requires array emit state");
+    std::string key;
+    for (Value s : ar.getSlots())
+      key += std::to_string(reinterpret_cast<uintptr_t>(s.getAsOpaquePointer())) + ";";
+    auto it = ars->memberByName.find(key);
+    if (it == ars->memberByName.end())
+      return ar.emitError("pyc.array_read slot list has no array member (emitter state mismatch)");
+    const std::string &arrName = it->second;
+    if (ars->copied.insert(arrName).second) {
+      for (auto [i, s] : llvm::enumerate(ar.getSlots()))
+        os << "    " << arrName << "[" << i << "] = " << nt.get(s) << ";\n";
+    }
+    os << "    { const uint64_t __arr_i = " << nt.get(ar.getAddr()) << ".value();\n";
+    os << "      " << nt.get(ar.getResult()) << " = ((__arr_i >= " << ar.getBase()
+       << "ull) && (__arr_i < " << (ar.getBase() + ar.getCount())
+       << "ull)) ? " << arrName << "[__arr_i - " << ar.getBase() << "ull] : "
+       << nt.get(ar.getFallback()) << "; }\n";
+    return success();
+  }
   return op.emitError("unsupported combinational op for C++ emission");
 }
 
@@ -818,7 +851,8 @@ static LogicalResult emitCombMethod(pyc::CombOp comb,
                                     llvm::raw_ostream &os,
                                     NameTable &nt,
                                     unsigned idx,
-                                    const CppEmitterOptions &opts) {
+                                    const CppEmitterOptions &opts,
+                                    ArrayReadEmitState *ars) {
   if (comb.getBody().empty())
     return comb.emitError("pyc.comb must have a non-empty region");
 
@@ -848,7 +882,7 @@ static LogicalResult emitCombMethod(pyc::CombOp comb,
       partMethods.push_back(partName);
       os << "  inline void " << partName << "() {\n";
       for (unsigned i = begin; i < end; ++i) {
-        if (failed(emitCombAssign(*combOps[i], os, nt)))
+        if (failed(emitCombAssign(*combOps[i], os, nt, ars)))
           return failure();
       }
       os << "  }\n\n";
@@ -872,7 +906,7 @@ static LogicalResult emitCombMethod(pyc::CombOp comb,
 
   os << "  inline void eval_comb_" << idx << "() {\n";
   for (Operation *op : combOps) {
-    if (failed(emitCombAssign(*op, os, nt)))
+    if (failed(emitCombAssign(*op, os, nt, ars)))
       return failure();
   }
 
@@ -939,6 +973,22 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
   for (const Decl &d : decls)
     os << "  " << cppType(d.ty) << " " << d.name << "{};\n";
   os << "\n";
+
+  // Array storage for pyc.array_read ops (deduplicated by slot list).
+  ArrayReadEmitState ars;
+  f.walk([&](pyc::ArrayReadOp ar) {
+    std::string key;
+    for (Value s : ar.getSlots())
+      key += std::to_string(reinterpret_cast<uintptr_t>(s.getAsOpaquePointer())) + ";";
+    if (ars.memberByName.count(key))
+      return;
+    std::string name = "pyc_arr_" + std::to_string(ars.memberByName.size());
+    ars.memberByName[key] = name;
+    os << "  std::array<" << cppType(ar.getResult().getType()) << ", " << ar.getCount()
+       << "> " << name << "{};\n";
+  });
+  if (!ars.memberByName.empty())
+    os << "\n";
 
   // Sequential primitive instances.
   llvm::SmallVector<pyc::RegOp> regs;
@@ -1624,7 +1674,7 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
 
   // Emit fused comb helpers.
   for (auto [i, comb] : llvm::enumerate(combs)) {
-    if (failed(emitCombMethod(comb, os, nt, static_cast<unsigned>(i), opts)))
+    if (failed(emitCombMethod(comb, os, nt, static_cast<unsigned>(i), opts, &ars)))
       return failure();
   }
 
@@ -1800,6 +1850,7 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
             pyc::NotOp,
             pyc::ConcatOp,
             pyc::AliasOp,
+            pyc::ArrayReadOp,
             pyc::ResetActiveOp,
             pyc::EqOp,
             pyc::UltOp,
@@ -1822,7 +1873,7 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
             pyc::VAndReduceOp,
             pyc::VAddReduceOp,
             arith::SelectOp>(*op)) {
-      if (failed(emitCombAssign(*op, os, nt)))
+      if (failed(emitCombAssign(*op, os, nt, &ars)))
         return failure();
       continue;
     }
@@ -2222,6 +2273,7 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
             pyc::NotOp,
             pyc::ConcatOp,
             pyc::AliasOp,
+            pyc::ArrayReadOp,
             pyc::ResetActiveOp,
             pyc::EqOp,
             pyc::UltOp,
@@ -2244,7 +2296,7 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
             pyc::VAndReduceOp,
             pyc::VAddReduceOp,
             arith::SelectOp>(*op)) {
-      if (failed(emitCombAssign(*op, os, nt)))
+      if (failed(emitCombAssign(*op, os, nt, &ars)))
         return failure();
       return success();
     }

@@ -7,6 +7,7 @@
 namespace pyc {
 
 std::unique_ptr<::mlir::Pass> createCombCanonicalizePass();
+std::unique_ptr<::mlir::Pass> createLowerArrayReadsPass();
 std::unique_ptr<::mlir::Pass> createInlineFunctionsPass();
 std::unique_ptr<::mlir::Pass> createFuseCombPass();
 std::unique_ptr<::mlir::Pass> createEliminateWiresPass();

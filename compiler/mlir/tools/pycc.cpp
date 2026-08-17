@@ -179,6 +179,11 @@ static llvm::cl::opt<bool> unrollVector(
     "unroll-vector",
     llvm::cl::desc("Unroll vector operations to scalars at IR level before optimization passes"),
     llvm::cl::init(false));
+static llvm::cl::opt<bool> noArrayReads(
+    "no-lower-array-reads",
+    llvm::cl::desc("Disable pyc-lower-array-reads (A/B baseline)"),
+    llvm::cl::init(false));
+
 
 static llvm::cl::opt<bool> noInline(
     "noinline",
@@ -2321,6 +2326,8 @@ int main(int argc, char **argv) {
   if (!unrollVector)
     pm.addNestedPass<func::FuncOp>(pyc::createSLPPackWiresPass());
   pm.addNestedPass<func::FuncOp>(pyc::createCombCanonicalizePass());
+  if (!noArrayReads)
+    pm.addNestedPass<func::FuncOp>(pyc::createLowerArrayReadsPass());
   pm.addPass(pyc::createCheckCombCyclesPass());
   pm.addPass(pyc::createCheckClockDomainsPass());
   pm.addNestedPass<func::FuncOp>(pyc::createPackI1RegsPass());

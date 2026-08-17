@@ -52,6 +52,7 @@ static bool isFusableCombOp(Operation *op) {
              pyc::VOrReduceOp,
              pyc::VAndReduceOp,
              pyc::VAddReduceOp,
+             pyc::ArrayReadOp,
              arith::SelectOp>(op);
 }
 
@@ -78,7 +79,11 @@ struct FuseCombPass : public PassWrapper<FuseCombPass, OperationPass<func::FuncO
     llvm::SmallVector<Operation *> run;
 
     auto flushRun = [&]() {
-      if (run.size() < 2) {
+      // Fuse runs of >= 2 ops, and also lone pyc.array_read ops: an unfused
+      // array_read is emitted into the (possibly dead) eval_comb_pass fallback
+      // as well as the topo schedule, and its slot-copy side effects must only
+      // exist in one scheduled place (inside a fused region).
+      if (run.size() < 2 && !(run.size() == 1 && isa<pyc::ArrayReadOp>(run.front()))) {
         run.clear();
         return;
       }

@@ -492,6 +492,21 @@ def PYC_VAddReduceOp : PYC_Op<"v_add_reduce", [Pure]> {
 // This is intended as a codegen-friendly wrapper that allows backends to emit
 // a single flattened combinational block (Verilog assigns / inlined C++ function)
 // instead of instantiating lots of tiny primitives.
+def PYC_ArrayReadOp : PYC_Op<"array_read", [Pure]> {
+  let summary = "Runtime-indexed read over a set of homogeneous slot values";
+  let description = [{
+    Selects one of `slots` at runtime by `addr`:
+      result = (addr >= base && addr < base + count) ? slots[addr - base] : fallback
+    Introduced by `pyc-lower-array-reads` from eq+mux read chains so the C++
+    emitter can lower the select to a direct array-indexed read instead of a
+    long nested mux chain.
+  }];
+  let arguments = (ins AnyInteger:$addr, AnyInteger:$fallback, Variadic<AnyInteger>:$slots, I64Attr:$base, I64Attr:$count);
+  let results = (outs AnyInteger:$result);
+  let hasVerifier = 1;
+  let assemblyFormat = "$addr `,` $fallback `,` $base `,` $count `(` $slots `)` attr-dict `:` type($addr) `,` type($fallback) `,` `(` type($slots) `)` `->` type($result)";
+}
+
 def PYC_CombOp : PYC_Op<"comb", [Pure, IsolatedFromAbove]> {
   let summary = "Fused combinational region";
   let arguments = (ins Variadic<AnyType>:$inputs);

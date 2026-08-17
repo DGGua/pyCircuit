@@ -1509,3 +1509,22 @@ LogicalResult VAddReduceOp::verify() {
 
 #define GET_OP_CLASSES
 #include "pyc/Dialect/PYC/PYCOps.cpp.inc"
+
+// ---------------------------------------------------------------------------
+// pyc.array_read
+// ---------------------------------------------------------------------------
+LogicalResult ArrayReadOp::verify() {
+  if (getSlots().size() != static_cast<size_t>(getCount()))
+    return emitOpError("slot count (")
+           << getSlots().size() << ") does not match count attr (" << getCount() << ")";
+  Type resTy = getResult().getType();
+  if (getFallback().getType() != resTy)
+    return emitOpError("fallback type ")
+           << getFallback().getType() << " does not match result type " << resTy;
+  for (Value s : getSlots())
+    if (s.getType() != resTy)
+      return emitOpError("slot type ") << s.getType() << " does not match result type " << resTy;
+  if (getCount() <= 0)
+    return emitOpError("count attr must be positive");
+  return success();
+}

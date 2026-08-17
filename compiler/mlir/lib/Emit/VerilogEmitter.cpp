@@ -382,6 +382,19 @@ static std::optional<LogicalResult> emitScalarOpAssign(Operation &op, raw_ostrea
        << nt.get(m.getB()) << ");\n";
     return success();
   }
+  if (auto ar = dyn_cast<pyc::ArrayReadOp>(op)) {
+    // Re-expand into the equivalent nested ternary chain (the Verilog side
+    // keeps the original mux-chain semantics; only the C++ side is indexed).
+    os << "assign " << nt.get(ar.getResult()) << " = ";
+    for (auto [i, s] : llvm::enumerate(ar.getSlots()))
+      os << "((" << nt.get(ar.getAddr()) << " == " << (ar.getBase() + static_cast<int64_t>(i))
+         << ") ? " << nt.get(s) << " : ";
+    os << nt.get(ar.getFallback());
+    for (size_t i = 0; i < ar.getSlots().size(); ++i)
+      os << ")";
+    os << ";\n";
+    return success();
+  }
   if (auto s = dyn_cast<arith::SelectOp>(op)) {
     if (!s.getCondition().getType().isInteger(1))
       return {s.emitError("verilog emitter only supports arith.select with i1 condition")};
