@@ -30,6 +30,7 @@ void setCommonInputs(Dut &dut) {
   dut.mask = pyc::cpp::Wire<8>(0x00);
   dut.b = pyc::cpp::Wire<8>(0x03);
   dut.c = pyc::cpp::Wire<8>(0x05);
+  dut.assert_ok = pyc::cpp::Wire<1>(1);
 
   dut.wide = pyc::cpp::Wire<130>({0x1234, 0x2, 0x1});
   dut.wide_mask = pyc::cpp::Wire<130>({0x0, 0x0, 0x0});

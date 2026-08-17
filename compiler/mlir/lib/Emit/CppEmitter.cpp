@@ -2,6 +2,7 @@
 
 #include "pyc/Dialect/PYC/PYCOps.h"
 #include "pyc/Dialect/PYC/PYCTypes.h"
+#include "pyc/Transforms/CombPartition.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -157,6 +158,22 @@ struct NameTable {
     if (auto it = names.find(v); it != names.end())
       return it->second;
     if (Operation *def = v.getDefiningOp()) {
+      if (auto comb = dyn_cast<pyc::CombOp>(def)) {
+        if (auto result = dyn_cast<OpResult>(v)) {
+          if (auto resultNames =
+                  comb->getAttrOfType<ArrayAttr>(kCombResultNamesAttr)) {
+            unsigned index = result.getResultNumber();
+            if (index < resultNames.size()) {
+              if (auto name = dyn_cast<StringAttr>(resultNames[index]);
+                  name && !name.getValue().empty()) {
+                std::string candidate = unique(sanitizeId(name.getValue()));
+                names.try_emplace(v, candidate);
+                return candidate;
+              }
+            }
+          }
+        }
+      }
       if (auto nAttr = def->getAttrOfType<StringAttr>("pyc.name")) {
         std::string cand = unique(sanitizeId(nAttr.getValue()));
         names.try_emplace(v, cand);
@@ -1485,28 +1502,50 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
         outIsReg[i] = static_cast<bool>(outRegQ[i]);
 
       llvm::StringSet<> seenNamedFields;
-      f.walk([&](Operation *op) {
-        auto nameAttr = op->getAttrOfType<StringAttr>("pyc.name");
-        if (!nameAttr || op->getNumResults() != 1)
+      auto recordNamedProbe = [&](StringRef fieldPathRef, Value value) {
+        if (fieldPathRef.empty() ||
+            getValueCppStorage(value) == CppStorageKind::Local)
           return;
-        Value value = op->getResult(0);
-        if (getValueCppStorage(value) == CppStorageKind::Local)
+        std::string fieldPath = fieldPathRef.str();
+        if (!seenNamedFields.insert(fieldPath).second)
           return;
         unsigned width = bitWidth(value.getType());
         if (width == 0)
-          return;
-        std::string fieldPath = nameAttr.getValue().str();
-        if (!seenNamedFields.insert(fieldPath).second)
           return;
         Value regQ = findRegQFromValue(value);
         namedProbes.push_back(NamedProbeInfo{
             fieldPath,
             nt.get(value),
-            static_cast<bool>(regQ) ? (nt.get(regQ) + "_inst") : std::string(),
+            static_cast<bool>(regQ) ? (nt.get(regQ) + "_inst")
+                                    : std::string(),
             width,
             static_cast<bool>(regQ),
             value.getType(),
         });
+      };
+
+      // Unified partitioning promotes per-result probe names to the sibling
+      // Comb boundary. Register those storage-backed values before walking the
+      // nested body, so a local cloned alias cannot shadow the published value.
+      for (Operation &topLevel : f.getBody().front()) {
+        auto comb = dyn_cast<pyc::CombOp>(topLevel);
+        auto resultNames =
+            comb ? comb->getAttrOfType<ArrayAttr>(kCombResultNamesAttr)
+                 : ArrayAttr();
+        if (!resultNames)
+          continue;
+        for (auto [index, result] : llvm::enumerate(comb.getResults())) {
+          if (index >= resultNames.size())
+            break;
+          if (auto name = dyn_cast<StringAttr>(resultNames[index]))
+            recordNamedProbe(name.getValue(), result);
+        }
+      }
+      f.walk([&](Operation *op) {
+        auto nameAttr = op->getAttrOfType<StringAttr>("pyc.name");
+        if (!nameAttr || op->getNumResults() != 1)
+          return;
+        recordNamedProbe(nameAttr.getValue(), op->getResult(0));
       });
       std::sort(namedProbes.begin(), namedProbes.end(), [](const NamedProbeInfo &a, const NamedProbeInfo &b) {
         return a.fieldPath < b.fieldPath;

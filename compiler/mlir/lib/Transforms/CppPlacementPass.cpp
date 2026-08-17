@@ -470,14 +470,13 @@ static bool pinToStruct(Value v) {
           pyc::AsyncFifoOp, pyc::CdcSyncOp>(def))
     return true;
 
-  // Values defined inside a comb but used outside it must be struct members.
-  if (def->getParentOfType<pyc::CombOp>()) {
-    for (OpOperand &use : v.getUses()) {
-      Operation *user = use.getOwner();
-      if (!user->getParentOfType<pyc::CombOp>())
-        return true;
-    }
-  }
+  // The wrapper eval_comb_N publishes pyc.yield operands after all chunk
+  // methods return.  A yielded value therefore crosses a C++ method boundary
+  // even though YieldOp is lexically inside the same region.  Reuse the exact
+  // locality predicate from Phase A so yield/external uses can never be
+  // annotated Local and referenced out of scope by the wrapper.
+  if (auto comb = def->getParentOfType<pyc::CombOp>())
+    return !isLocalizableCombValue(v, comb);
   return false;
 }
 

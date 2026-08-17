@@ -58,6 +58,7 @@ static void forceLinkPycPasses() {
   (void)pyc::createEliminateDeadStatePass();
   (void)pyc::createEliminateDeadInstancesPass();
   (void)pyc::createCheckNoDynamicPass();
+  (void)pyc::createCheckWireDriversPass();
   (void)pyc::createCheckCombCyclesPass();
   (void)pyc::createCheckClockDomainsPass();
   (void)pyc::createCheckLogicDepthPass(0);

@@ -11,7 +11,8 @@ std::unique_ptr<::mlir::Pass> createInlineFunctionsPass();
 std::unique_ptr<::mlir::Pass> createFuseCombPass();
 /// Reject pyc.comb bodies that are not safe for input-change memoization.
 std::unique_ptr<::mlir::Pass> createCheckCombMemoizablePass();
-/// Materialize runtime scheduling units as sibling pyc.comb operations.
+/// Build the function-level CombDepGraph and directly materialize final
+/// runtime scheduling units as sibling pyc.comb operations.
 /// A value of zero disables partitioning.
 std::unique_ptr<::mlir::Pass> createPartitionCombPass(unsigned maxNodes = 35);
 /// Verify the structural metadata and forward-only dependencies produced by
@@ -23,6 +24,10 @@ std::unique_ptr<::mlir::Pass> createLowerSCFToPYCStaticPass();
 std::unique_ptr<::mlir::Pass> createCheckFrontendContractPass();
 std::unique_ptr<::mlir::Pass> createCheckHierarchyDisciplinePass();
 std::unique_ptr<::mlir::Pass> createCheckNoDynamicPass();
+/// Enforce the current single-driver pyc.wire contract before wire
+/// elimination.  Observable/read wires require exactly one pyc.assign driver;
+/// multiple drivers are illegal until an explicit resolved-net op exists.
+std::unique_ptr<::mlir::Pass> createCheckWireDriversPass();
 std::unique_ptr<::mlir::Pass> createCheckCombCyclesPass();
 std::unique_ptr<::mlir::Pass> createCheckClockDomainsPass();
 std::unique_ptr<::mlir::Pass> createCheckFlatTypesPass();

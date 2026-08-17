@@ -23,11 +23,23 @@ ninja -C /tmp/pyc-mlir-build pyc-opt pycc
 
 ## Passes (prototype)
 
+### `pyc-check-wire-drivers`
+
+Enforces the dialect-level connectivity contract before wire elimination can
+erase the evidence. `pyc.wire` is single-driver SSA/backedge plumbing, not an
+implicit resolved Verilog net: every multi-driver wire is rejected, as is an
+undriven wire that is read, named, or explicitly debug-kept. A legal late
+single driver is accepted. Unnamed, unread placeholders may be removed as dead
+IR; named single-driver wires remain storage-backed observation roots in both
+emitters.
+
 ### `pyc-eliminate-wires`
 
 Eliminates trivial `pyc.wire` + `pyc.assign` pairs when safe (single driver that
 dominates all reads), and removes dead wires. This reduces netlist noise and
-helps subsequent CSE/constprop.
+helps subsequent CSE/constprop. Named/debug-kept wires without SSA readers are
+retained together with their driver so ProbeRegistry and Verilog observe the
+same value.
 
 `pycc` runs this pass by default before emission.
 
@@ -48,14 +60,57 @@ Fuses consecutive pure combinational ops (`pyc.add/mux/and/or/xor/not/constant`)
 - flattened Verilog emission (`assign` instead of many tiny module instantiations)
 - inlined C++ combinational evaluation (fewer tiny objects / calls)
 
-`pycc` runs this pass by default before emission.
+This is the legacy `--comb-partition=none` path. The default
+`--comb-partition=static` path deliberately skips this pass so temporary fused
+region boundaries cannot bias the unified plan. It is also skipped by
+`--sim-mode=cpp-only --cpp-only-preserve-ops`.
+
+### `pyc-partition-comb`
+
+Builds the canonical value-level `CombDepGraph` for each non-structural
+function, projects memoizable operations from that graph, applies the
+GSIM-style `mergeOut1`, `mergeIn1`, and `mergeSiblings` coarsening phases, and
+uses a stable-topological contiguous DP to respect `max-nodes`. It directly
+emits the final `gsim-unified-v2` sibling `pyc.comb` runtime units; it does not
+partition an earlier FuseComb result.
+
+This is a module pass because instance edges need a stable caller/callee view.
+Its three phases are:
+
+1. Read-only preflight every function against the original module. Once every
+   graph succeeds, the A-to-B normalization step transparently unfolds valid
+   pre-existing comb regions across the module.
+2. Build and freeze every function plan against the same immutable unfolded
+   module, without rewriting IR.
+3. Materialize all final sibling comb regions from the frozen plans in one
+   rewrite phase.
+
+The cycle checker, logic-depth checker, and partitioner all use the same
+`CombDepGraph` semantics. An instance or asynchronous primitive can be a
+physical placement barrier without being a same-tick semantic cut; sequential
+state is a cut. Declaration-only callees in split builds therefore require an
+exact validated `pyc.comb_dep_summary.v1` produced from the full design.
+Graph construction and summary/depth propagation consume one shared
+per-result transfer resolver (operand dependencies, edge kind, base depth, and
+edge cost). A result-producing operation without a registered transfer fails
+closed instead of receiving a conservative all-input/all-output guess.
+
+`pycc` runs this pass by default through `--comb-partition=static`; use
+`--comb-partition=none` to retain the legacy FuseComb behavior. The surrounding
+`pyc-check-comb-memoizable` and `pyc-check-comb-partitions` gates validate both
+incoming and final plans.
+
+The C++ `--comb-update=dirty` policy consumes these final partitions with a
+static topological scan. Inactive units take a fast return; a producer whose
+outputs do not change neither stores those outputs nor activates direct
+fanout. Boundary inputs use exact snapshots. This is not a dynamic work queue.
 
 ### `pyc-check-flat-types`
 
-Verifies that the IR is fully lowered to flat hardware-carrying types
-(integers + `!pyc.clock`/`!pyc.reset`) before emission. This is a safety net
-similar in spirit to FIRRTL's type-lowering: pyCircuit's Python frontend packs
-bundles/vectors into integers, so aggregate types should never reach the PYC IR.
+Verifies that the IR is fully lowered to emission-supported hardware types:
+integers, recursively nested vectors of integers, `!pyc.clock`, and
+`!pyc.reset`. This rejects unsupported aggregate or dynamic types before either
+backend sees them while retaining PYC's native vector representation.
 
 `pycc` runs this check by default.
 

@@ -19,8 +19,14 @@ def build(m: CycleAwareCircuit, domain: CycleAwareDomain) -> None:
     mask = m.input("mask", width=8)
     b = m.input("b", width=8)
     c = m.input("c", width=8)
+    assert_ok = m.input("assert_ok", width=1)
 
     producer = a & mask
+    # This side-effecting operation deliberately interrupts the two runs that
+    # legacy FuseComb sees.  The static partition path must ignore physical
+    # run boundaries and recover the producer -> consumers relation from the
+    # unified function-level SSA CombDepGraph.
+    m.assert_(assert_ok, msg="unified-comb-boundary")
     left = (producer + b) ^ c
     right = (producer + c) ^ b
     result = left ^ right

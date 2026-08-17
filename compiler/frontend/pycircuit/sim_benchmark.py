@@ -1152,6 +1152,55 @@ def _cpu_model() -> str:
     return platform.processor() or "unknown"
 
 
+_COMB_POLICY_PRESETS: dict[str, tuple[str, str]] = {
+    "legacy": ("guarded", "none"),
+    "gsim": ("dirty", "static"),
+}
+
+
+def resolve_comb_policy(args: argparse.Namespace) -> str:
+    """Resolve the benchmark's high-level comb policy into pycc controls.
+
+    Low-level controls remain available for experiments, but an explicitly
+    selected preset may only be combined with matching low-level values. This
+    keeps a recorded ``legacy`` or ``gsim`` result unambiguous.
+    """
+
+    requested_policy = getattr(args, "comb_policy", None)
+    requested_update = getattr(args, "comb_update", None)
+    requested_partition = getattr(args, "comb_partition", None)
+
+    if requested_policy is not None:
+        if requested_policy not in _COMB_POLICY_PRESETS:
+            choices = "|".join(_COMB_POLICY_PRESETS)
+            raise BenchmarkError(
+                f"invalid --comb-policy: {requested_policy!r} "
+                f"(expected: {choices})"
+            )
+        expected_update, expected_partition = _COMB_POLICY_PRESETS[requested_policy]
+        if requested_update is not None and requested_update != expected_update:
+            raise BenchmarkError(
+                f"--comb-policy={requested_policy} requires "
+                f"--comb-update={expected_update}, got {requested_update}"
+            )
+        if requested_partition is not None and requested_partition != expected_partition:
+            raise BenchmarkError(
+                f"--comb-policy={requested_policy} requires "
+                f"--comb-partition={expected_partition}, got {requested_partition}"
+            )
+        args.comb_update = expected_update
+        args.comb_partition = expected_partition
+        return requested_policy
+
+    args.comb_update = requested_update or "dirty"
+    args.comb_partition = requested_partition or "static"
+    resolved_pair = (args.comb_update, args.comb_partition)
+    for name, pair in _COMB_POLICY_PRESETS.items():
+        if resolved_pair == pair:
+            return name
+    return "custom"
+
+
 def _validate_args(args: argparse.Namespace) -> None:
     positive = {
         "--iterations": args.iterations,
@@ -1259,6 +1308,7 @@ def _run_native(
 
 
 def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
+    resolved_comb_policy = resolve_comb_policy(args)
     _validate_args(args)
     source = Path(args.python_file).resolve()
     if not source.is_file():
@@ -1685,6 +1735,7 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
             "workload_scope": "public-port drive + DUT evaluation + sampled output digest",
         },
         "comb_policy": {
+            "preset": resolved_comb_policy,
             "update": args.comb_update,
             "partition": args.comb_partition,
             "partition_max_nodes": args.comb_partition_max_nodes,
@@ -1832,16 +1883,25 @@ def add_benchmark_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--reset-settle-cycles", type=int, default=1)
     parser.add_argument("--logic-depth", type=int, default=256)
     parser.add_argument(
+        "--comb-policy",
+        choices=["legacy", "gsim"],
+        default=None,
+        help=(
+            "Comb execution preset: legacy=guarded+none, "
+            "gsim=dirty+static (default)"
+        ),
+    )
+    parser.add_argument(
         "--comb-update",
         choices=["always", "guarded", "dirty"],
-        default="dirty",
-        help="Generated C++ comb update policy",
+        default=None,
+        help="Advanced override for the generated C++ comb update policy",
     )
     parser.add_argument(
         "--comb-partition",
         choices=["none", "static"],
-        default="static",
-        help="MLIR SuperNode partition policy",
+        default=None,
+        help="Advanced override for the MLIR SuperNode partition policy",
     )
     parser.add_argument("--comb-partition-max-nodes", type=int, default=35)
     parser.add_argument("--max-port-bits", type=int, default=4096)

@@ -2286,6 +2286,7 @@ def _cmd_build(args: argparse.Namespace) -> int:
         "comb_update": comb_update,
         "comb_partition": comb_partition,
         "comb_partition_max_nodes": comb_partition_max_nodes,
+        "comb_dep_summary_schema_version": 1,
         "cpp_pch": bool(args.cpp_pch),
         "target": target,
         "tb_schedule_mode": str(args.tb_schedule_mode),
@@ -2300,7 +2301,14 @@ def _cmd_build(args: argparse.Namespace) -> int:
     design_hash = _module_hash(design_pyc_path)
     module_hashes[design_key] = design_hash
     probe_catalog_path = out_dir / "device" / "probe_catalog.json"
-    probe_catalog_ready = probe_catalog_path.is_file()
+    comb_summary_path = out_dir / "device" / "comb_dep_summary.json"
+    old_comb_summary_hash = str(cache.get("comb_dep_summary_hash", "")).strip()
+    comb_summary_cache_valid = (
+        bool(old_comb_summary_hash)
+        and comb_summary_path.is_file()
+        and _module_hash(comb_summary_path) == old_comb_summary_hash
+    )
+    probe_catalog_ready = probe_catalog_path.is_file() and comb_summary_cache_valid
     probe_unchanged = same_flags and old_hashes.get(design_key) == design_hash
     pycc_jobs: list[tuple[str, list[str]]] = []
     if not (probe_unchanged and probe_catalog_ready):
@@ -2314,6 +2322,8 @@ def _cmd_build(args: argparse.Namespace) -> int:
                     *pycc_hard_hierarchy_flags,
                     "--probe-manifest",
                     str(probe_catalog_path),
+                    "--comb-summary-out",
+                    str(comb_summary_path),
                     f"--logic-depth={logic_depth}",
                 ],
             )
@@ -2324,6 +2334,16 @@ def _cmd_build(args: argparse.Namespace) -> int:
             for fut in as_completed(futs):
                 _ = fut.result()
         pycc_jobs = []
+    if not comb_summary_path.is_file():
+        raise SystemExit(
+            f"build: expected hardened comb dependency summary not found: {comb_summary_path}"
+        )
+    comb_summary_hash = _module_hash(comb_summary_path)
+    comb_summary_unchanged = (
+        same_flags and old_comb_summary_hash == comb_summary_hash
+    )
+    manifest["comb_dep_summary"] = str(comb_summary_path.relative_to(out_dir))
+    manifest["comb_dep_summary_sha256"] = comb_summary_hash
 
     try:
         probe_manifest_obj, probe_section, probe_plan_path = _resolve_probe_outputs(
@@ -2377,7 +2397,15 @@ def _cmd_build(args: argparse.Namespace) -> int:
         mp = module_paths[sym]
         h = _module_hash(mp)
         module_hashes[sym] = h
-        unchanged = same_flags and old_hashes.get(sym) == h
+        # Partition/cycle/depth behavior of a caller depends on declaration-only
+        # callee summaries.  Conservatively rebuild module artifacts whenever
+        # the full-design summary changes, even if this module's own .pyc text
+        # is byte-identical.
+        unchanged = (
+            same_flags
+            and comb_summary_unchanged
+            and old_hashes.get(sym) == h
+        )
 
         cpp_out_dir = device_cpp_root / sym
         cpp_ready = cpp_out_dir.is_dir() and any(cpp_out_dir.glob("*.cpp")) and any(cpp_out_dir.glob("*.hpp"))
@@ -2396,6 +2424,8 @@ def _cmd_build(args: argparse.Namespace) -> int:
                         "--cpp-split=module",
                         "--probe-plan",
                         str(probe_plan_path),
+                        "--comb-summary-in",
+                        str(comb_summary_path),
                         f"--logic-depth={logic_depth}",
                     ],
                 )
@@ -2415,6 +2445,8 @@ def _cmd_build(args: argparse.Namespace) -> int:
                         *pycc_hard_hierarchy_flags,
                         "--out-dir",
                         str(verilog_out_dir),
+                        "--comb-summary-in",
+                        str(comb_summary_path),
                         f"--logic-depth={logic_depth}",
                     ],
                 )
@@ -2634,6 +2666,7 @@ def _cmd_build(args: argparse.Namespace) -> int:
     cache_out.update(
         {
             "module_hashes": module_hashes,
+            "comb_dep_summary_hash": comb_summary_hash,
             "pycc": str(pycc),
             "build_flags": build_flags,
             "build_flags_hash": build_flags_hash,

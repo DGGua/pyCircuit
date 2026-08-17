@@ -1,6 +1,9 @@
 #include "pyc/Transforms/Passes.h"
 
 #include "pyc/Dialect/PYC/PYCOps.h"
+#include "pyc/Transforms/CombDepGraph.h"
+#include "pyc/Transforms/CombMemoization.h"
+#include "pyc/Transforms/CombPartition.h"
 
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/Builders.h"
@@ -26,66 +29,94 @@ using namespace mlir;
 namespace pyc {
 namespace {
 
-constexpr llvm::StringLiteral kParentIdAttr = "pyc.partition.parent_id";
-constexpr llvm::StringLiteral kPartIdAttr = "pyc.partition.part_id";
-constexpr llvm::StringLiteral kPartCountAttr = "pyc.partition.part_count";
-constexpr llvm::StringLiteral kPlanVersionAttr = "pyc.partition.plan_version";
-constexpr llvm::StringLiteral kWorkAttr = "pyc.partition.work";
-constexpr llvm::StringLiteral kMaxNodesAttr = "pyc.partition.max_nodes";
-constexpr llvm::StringLiteral kPlanVersion = "gsim-contiguous-dp-v1";
+/// Operation-level view derived from the canonical value graph.  All GSIM
+/// coarsening and DP decisions consume this projection; no partition stage is
+/// allowed to invent a second, subtly different dependence graph.
+struct CandidateDepProjection {
+  llvm::SmallVector<Operation *> operations;
+  llvm::DenseMap<Operation *, unsigned> index;
+  std::vector<llvm::DenseSet<unsigned>> predecessors;
+  std::vector<llvm::DenseSet<unsigned>> successors;
+};
 
-static bool hasAnyPartitionAttribute(Operation *op) {
-  return op->hasAttr(kParentIdAttr) || op->hasAttr(kPartIdAttr) ||
-         op->hasAttr(kPartCountAttr) || op->hasAttr(kPlanVersionAttr) ||
-         op->hasAttr(kWorkAttr) || op->hasAttr(kMaxNodesAttr);
+// Project paths through non-materializable value nodes (wire/assign,
+// primitive and instance boundaries) onto the next materializable operation.
+// This is deliberately function-level: a barrier constrains placement but
+// never erases a same-TICK semantic dependency.
+static CandidateDepProjection
+buildCandidateProjection(ArrayRef<Operation *> operations,
+                         const FunctionCombDepGraph &graph) {
+  CandidateDepProjection projection;
+  projection.operations.assign(operations.begin(), operations.end());
+  for (auto [i, op] : llvm::enumerate(operations))
+    projection.index[op] = static_cast<unsigned>(i);
+
+  projection.predecessors.resize(operations.size());
+  projection.successors.resize(operations.size());
+  ArrayRef<CombDepValueNode> nodes = graph.getNodes();
+  ArrayRef<CombDepEdge> edges = graph.getEdges();
+  for (auto [sourceIndex, sourceOperation] : llvm::enumerate(operations)) {
+    llvm::SmallVector<unsigned> worklist;
+    llvm::DenseSet<unsigned> visited;
+    for (unsigned nodeId = 0; nodeId < nodes.size(); ++nodeId) {
+      if (nodes[nodeId].producer != sourceOperation)
+        continue;
+      worklist.push_back(nodeId);
+      visited.insert(nodeId);
+    }
+    while (!worklist.empty()) {
+      unsigned nodeId = worklist.pop_back_val();
+      for (unsigned edgeId : nodes[nodeId].outgoingEdges) {
+        unsigned targetNode = edges[edgeId].target;
+        if (!visited.insert(targetNode).second)
+          continue;
+        Operation *targetOperation = nodes[targetNode].producer;
+        auto target = projection.index.find(targetOperation);
+        if (target != projection.index.end() &&
+            target->second != sourceIndex) {
+          projection.successors[sourceIndex].insert(target->second);
+          projection.predecessors[target->second].insert(
+              static_cast<unsigned>(sourceIndex));
+          continue;
+        }
+        worklist.push_back(targetNode);
+      }
+    }
+  }
+  return projection;
 }
 
-// pyc.comb bodies are already SSA-ordered, but compute the order explicitly so
-// the partition algorithm has a deterministic graph contract.  Original body
-// order breaks ties, matching GSIM's ordered topological traversal.
 static FailureOr<llvm::SmallVector<Operation *>>
-stableTopologicalOrder(pyc::CombOp comb) {
-  llvm::SmallVector<Operation *> operations;
-  for (Operation &op : comb.getBody().front().without_terminator())
-    operations.push_back(&op);
-
-  llvm::DenseMap<Operation *, unsigned> index;
-  for (auto [i, op] : llvm::enumerate(operations))
-    index[op] = static_cast<unsigned>(i);
-
-  llvm::SmallVector<llvm::SmallVector<unsigned>> successors(operations.size());
-  llvm::SmallVector<unsigned> indegree(operations.size(), 0);
-  for (auto [i, op] : llvm::enumerate(operations)) {
-    llvm::DenseSet<unsigned> dependencies;
-    for (Value operand : op->getOperands()) {
-      auto it = index.find(operand.getDefiningOp());
-      if (it != index.end())
-        dependencies.insert(it->second);
-    }
-    indegree[i] = dependencies.size();
-    for (unsigned dependency : dependencies)
-      successors[dependency].push_back(static_cast<unsigned>(i));
+stableTopologicalOrder(const CandidateDepProjection &projection) {
+  const unsigned operationCount = projection.operations.size();
+  llvm::SmallVector<llvm::SmallVector<unsigned>> successors(operationCount);
+  llvm::SmallVector<unsigned> indegree(operationCount, 0);
+  for (unsigned i = 0; i < operationCount; ++i) {
+    indegree[i] = projection.predecessors[i].size();
+    successors[i].append(projection.successors[i].begin(),
+                         projection.successors[i].end());
   }
+  for (auto &list : successors)
+    llvm::sort(list);
 
   std::priority_queue<unsigned, std::vector<unsigned>, std::greater<unsigned>>
       ready;
-  for (unsigned i = 0; i < operations.size(); ++i)
+  for (unsigned i = 0; i < operationCount; ++i)
     if (indegree[i] == 0)
       ready.push(i);
 
   llvm::SmallVector<Operation *> ordered;
-  ordered.reserve(operations.size());
+  ordered.reserve(operationCount);
   while (!ready.empty()) {
     unsigned current = ready.top();
     ready.pop();
-    ordered.push_back(operations[current]);
+    ordered.push_back(projection.operations[current]);
     for (unsigned successor : successors[current])
       if (--indegree[successor] == 0)
         ready.push(successor);
   }
 
-  if (ordered.size() != operations.size()) {
-    comb.emitOpError("cannot partition a cyclic pyc.comb dependence graph");
+  if (ordered.size() != operationCount) {
     return failure();
   }
   return ordered;
@@ -137,7 +168,8 @@ struct CoarsenedGraph {
 // the tie-breaker for Kahn's algorithm, so pointer addresses and DenseSet
 // iteration order never affect the plan.
 static FailureOr<CoarsenedGraph>
-buildCoarsenedGraph(ArrayRef<Operation *> order, CoarsenedGroups &groups) {
+buildCoarsenedGraph(ArrayRef<Operation *> order, CoarsenedGroups &groups,
+                    const CandidateDepProjection &projection) {
   const unsigned n = order.size();
   CoarsenedGraph graph;
   graph.predecessors.resize(n);
@@ -149,17 +181,20 @@ buildCoarsenedGraph(ArrayRef<Operation *> order, CoarsenedGroups &groups) {
 
   for (auto [i, op] : llvm::enumerate(order)) {
     unsigned source = groups.find(static_cast<unsigned>(i));
-    for (Value result : op->getResults()) {
-      for (OpOperand &use : result.getUses()) {
-        auto it = position.find(use.getOwner());
-        if (it == position.end())
-          continue;
-        unsigned target = groups.find(it->second);
-        if (source == target)
-          continue;
-        graph.successors[source].insert(target);
-        graph.predecessors[target].insert(source);
-      }
+    auto projectedSource = projection.index.find(op);
+    if (projectedSource == projection.index.end())
+      return failure();
+    for (unsigned projectedTarget :
+         projection.successors[projectedSource->second]) {
+      Operation *targetOperation = projection.operations[projectedTarget];
+      auto it = position.find(targetOperation);
+      if (it == position.end())
+        continue;
+      unsigned target = groups.find(it->second);
+      if (source == target)
+        continue;
+      graph.successors[source].insert(target);
+      graph.predecessors[target].insert(source);
     }
   }
 
@@ -225,14 +260,15 @@ struct CoarsenedOrder {
 // counterpart inside a pure pyc.comb region.  Quotient-graph cycle checks make
 // the reordering contract explicit rather than relying on construction luck.
 static FailureOr<CoarsenedOrder>
-coarsenOperations(ArrayRef<Operation *> initialOrder, unsigned maxNodes) {
+coarsenOperations(ArrayRef<Operation *> initialOrder, unsigned maxNodes,
+                  const CandidateDepProjection &projection) {
   CoarsenedGroups groups(initialOrder.size());
   if (initialOrder.empty())
     return CoarsenedOrder{};
 
   // mergeOut1: reverse topological order, folding a single-fanout producer into
   // its consumer when the combined atom stays within the runtime work cap.
-  auto graphOr = buildCoarsenedGraph(initialOrder, groups);
+  auto graphOr = buildCoarsenedGraph(initialOrder, groups, projection);
   if (failed(graphOr))
     return failure();
   CoarsenedGraph graph = std::move(*graphOr);
@@ -255,7 +291,7 @@ coarsenOperations(ArrayRef<Operation *> initialOrder, unsigned maxNodes) {
 
   // mergeIn1: rebuild after out-degree folding, then fold a single-input
   // consumer into its producer in forward topological order.
-  graphOr = buildCoarsenedGraph(initialOrder, groups);
+  graphOr = buildCoarsenedGraph(initialOrder, groups, projection);
   if (failed(graphOr))
     return failure();
   graph = std::move(*graphOr);
@@ -279,7 +315,7 @@ coarsenOperations(ArrayRef<Operation *> initialOrder, unsigned maxNodes) {
   // mergeSiblings: groups with an identical non-empty predecessor set are
   // packed greedily in stable topological order.  The path check corresponds
   // to GSIM's dependency-order safety checks and prevents quotient cycles.
-  graphOr = buildCoarsenedGraph(initialOrder, groups);
+  graphOr = buildCoarsenedGraph(initialOrder, groups, projection);
   if (failed(graphOr))
     return failure();
   graph = std::move(*graphOr);
@@ -312,7 +348,7 @@ coarsenOperations(ArrayRef<Operation *> initialOrder, unsigned maxNodes) {
       representatives.push_back(groups.find(root));
   }
 
-  graphOr = buildCoarsenedGraph(initialOrder, groups);
+  graphOr = buildCoarsenedGraph(initialOrder, groups, projection);
   if (failed(graphOr))
     return failure();
   graph = std::move(*graphOr);
@@ -338,13 +374,29 @@ coarsenOperations(ArrayRef<Operation *> initialOrder, unsigned maxNodes) {
 static uint64_t
 intervalBoundaryCost(ArrayRef<Operation *> order,
                      const llvm::DenseMap<Operation *, unsigned> &position,
-                     unsigned begin, unsigned end) {
+                     unsigned begin, unsigned end,
+                     const CandidateDepProjection &projection) {
   uint64_t cost = 0;
   for (unsigned i = begin; i < end; ++i) {
-    for (Value result : order[i]->getResults()) {
+    Operation *sourceOperation = order[i];
+    auto source = projection.index.find(sourceOperation);
+    if (source != projection.index.end()) {
+      for (unsigned target : projection.successors[source->second]) {
+        auto targetPosition =
+            position.find(projection.operations[target]);
+        if (targetPosition == position.end() || targetPosition->second < begin ||
+            targetPosition->second >= end)
+          ++cost;
+      }
+    }
+    for (Value result : sourceOperation->getResults()) {
       llvm::DenseSet<Operation *> outsideUsers;
       for (OpOperand &use : result.getUses()) {
         Operation *owner = use.getOwner();
+        // Candidate-to-candidate dependencies were counted from the canonical
+        // projection above, including paths through placement barriers.
+        if (projection.index.count(owner))
+          continue;
         auto it = position.find(owner);
         if (it == position.end() || it->second < begin || it->second >= end)
           outsideUsers.insert(owner);
@@ -360,7 +412,8 @@ intervalBoundaryCost(ArrayRef<Operation *> order,
 // cut, making output stable across runs.
 static FailureOr<llvm::SmallVector<unsigned>>
 choosePartEnds(ArrayRef<Operation *> order, ArrayRef<unsigned> atomEnds,
-               unsigned maxNodes) {
+               unsigned maxNodes,
+               const CandidateDepProjection &projection) {
   const unsigned n = order.size();
   if (n == 0)
     return llvm::SmallVector<unsigned>{0};
@@ -389,7 +442,8 @@ choosePartEnds(ArrayRef<Operation *> order, ArrayRef<unsigned> atomEnds,
         break;
       if (bestCost[beginAtom] == infinity)
         continue;
-      uint64_t boundary = intervalBoundaryCost(order, position, begin, end);
+      uint64_t boundary =
+          intervalBoundaryCost(order, position, begin, end, projection);
       uint64_t candidateCost = bestCost[beginAtom] + boundary;
       unsigned candidateParts = bestParts[beginAtom] + 1;
       bool better = candidateCost < bestCost[endAtom];
@@ -425,45 +479,302 @@ static void stampPartition(pyc::CombOp comb, uint64_t parentId, uint64_t partId,
   auto integer = [&](uint64_t value) {
     return IntegerAttr::get(i64, static_cast<int64_t>(value));
   };
-  comb->setAttr(kParentIdAttr, integer(parentId));
-  comb->setAttr(kPartIdAttr, integer(partId));
-  comb->setAttr(kPartCountAttr, integer(partCount));
-  comb->setAttr(kPlanVersionAttr, StringAttr::get(context, kPlanVersion));
-  comb->setAttr(kWorkAttr, integer(work));
-  comb->setAttr(kMaxNodesAttr, integer(maxNodes));
+  comb->setAttr(kCombPartitionParentIdAttr, integer(parentId));
+  comb->setAttr(kCombPartitionPartIdAttr, integer(partId));
+  comb->setAttr(kCombPartitionPartCountAttr, integer(partCount));
+  comb->setAttr(kCombPartitionPlanVersionAttr,
+                StringAttr::get(context, kCombPartitionPlanVersion));
+  comb->setAttr(kCombPartitionWorkAttr, integer(work));
+  comb->setAttr(kCombPartitionMaxNodesAttr, integer(maxNodes));
 }
 
-static LogicalResult materializePartitions(pyc::CombOp original,
-                                           ArrayRef<Operation *> order,
-                                           ArrayRef<unsigned> ends,
-                                           uint64_t parentId,
-                                           uint64_t maxNodes) {
-  if (ends.size() == 1) {
-    stampPartition(original, parentId, 0, 1, order.size(), maxNodes);
-    return success();
+struct StagePlan {
+  llvm::SmallVector<Operation *> order;
+  llvm::SmallVector<unsigned> ends;
+  Operation *anchor = nullptr;
+  uint64_t parentId = 0;
+};
+
+struct FunctionPartitionPlan {
+  func::FuncOp function;
+  llvm::SmallVector<Operation *> candidates;
+  llvm::SmallVector<StagePlan> stages;
+};
+
+static bool isStructuralFunction(func::FuncOp function) {
+  auto structural =
+      function->getAttrOfType<StringAttr>("pyc.emit.structural");
+  if (!structural)
+    return false;
+  StringRef value = structural.getValue();
+  return value.equals_insensitive("true") || value == "1";
+}
+
+static LogicalResult verifyMemoizableOperation(Operation *op) {
+  if (!isMemoizableCombOperation(op)) {
+    op->emitError("operation is not in the deterministic pyc.comb contract");
+    return failure();
+  }
+  for (Type type : op->getOperandTypes()) {
+    if (isMemoizableCombType(type))
+      continue;
+    op->emitError("operand type cannot be compared exactly by pyc.comb: ")
+        << type;
+    return failure();
+  }
+  for (Type type : op->getResultTypes()) {
+    if (isMemoizableCombType(type))
+      continue;
+    op->emitError("result type cannot be compared exactly by pyc.comb: ")
+        << type;
+    return failure();
+  }
+  return success();
+}
+
+// Validate and transparently unfold all existing comb regions.  This is done
+// inside the unified pass, rather than running FuseComb followed by a second
+// partitioning pass, so old region/run boundaries cannot bias the final plan.
+static LogicalResult unfoldExistingCombs(func::FuncOp function) {
+  Block &block = function.getBody().front();
+  llvm::SmallVector<pyc::CombOp> combs;
+  for (Operation &op : block)
+    if (auto comb = dyn_cast<pyc::CombOp>(op))
+      combs.push_back(comb);
+
+  for (pyc::CombOp comb : combs) {
+    if (comb.getBody().empty() || !llvm::hasSingleElement(comb.getBody())) {
+      comb.emitOpError("unified partitioning requires a single-block body");
+      return failure();
+    }
+    Block &body = comb.getBody().front();
+    auto yield = dyn_cast_or_null<pyc::YieldOp>(body.getTerminator());
+    if (!yield || yield.getNumOperands() != comb.getNumResults()) {
+      comb.emitOpError("unified partitioning requires a matching pyc.yield");
+      return failure();
+    }
+    for (Operation &nested : body.without_terminator())
+      if (failed(verifyMemoizableOperation(&nested)))
+        return failure();
+
+    OpBuilder builder(comb);
+    IRMapping mapping;
+    for (auto [argument, input] : llvm::zip(body.getArguments(),
+                                            comb.getInputs()))
+      mapping.map(argument, input);
+    for (Operation &nested : body.without_terminator()) {
+      Operation *clone = builder.clone(nested, mapping);
+      for (auto [oldResult, newResult] :
+           llvm::zip(nested.getResults(), clone->getResults()))
+        mapping.map(oldResult, newResult);
+    }
+    ArrayAttr resultNames =
+        comb->getAttrOfType<ArrayAttr>(kCombResultNamesAttr);
+    if (resultNames && resultNames.size() != comb.getNumResults()) {
+      comb.emitOpError("'")
+          << kCombResultNamesAttr << "' length must match result arity";
+      return failure();
+    }
+    StringAttr singleWrapperName =
+        comb.getNumResults() == 1
+            ? comb->getAttrOfType<StringAttr>("pyc.name")
+            : StringAttr();
+    llvm::SmallVector<Value> replacements;
+    llvm::SmallVector<StringAttr> promotedNames;
+    replacements.reserve(comb.getNumResults());
+    promotedNames.reserve(comb.getNumResults());
+    for (auto [index, pair] :
+         llvm::enumerate(llvm::zip(comb.getResults(), yield.getValues()))) {
+      auto [unusedResult, yielded] = pair;
+      (void)unusedResult;
+      Value replacement = mapping.lookupOrNull(yielded);
+      if (!replacement) {
+        comb.emitOpError("failed to map an unfolded pyc.comb result");
+        return failure();
+      }
+      StringAttr promotedName;
+      if (resultNames && index < resultNames.size())
+        promotedName = dyn_cast<StringAttr>(resultNames[index]);
+      if ((!promotedName || promotedName.getValue().empty()) && index == 0)
+        promotedName = singleWrapperName;
+      replacements.push_back(replacement);
+      promotedNames.push_back(promotedName);
+    }
+
+    for (auto [result, replacement, promotedName] :
+         llvm::zip(comb.getResults(), replacements, promotedNames)) {
+      if (promotedName && !promotedName.getValue().empty()) {
+        Operation *definition = replacement.getDefiningOp();
+        StringAttr existingName =
+            definition && definition->getNumResults() == 1
+                ? definition->getAttrOfType<StringAttr>("pyc.name")
+                : StringAttr();
+        if (!definition || definition->getNumResults() != 1 ||
+            (existingName && existingName != promotedName)) {
+          // A wrapper result is an independently observable SSA value.  If
+          // two named results yield the same body value, the first name stays
+          // on that definition and later distinct names get aliases.  If the
+          // body already carries a different name, retain both identities
+          // instead of overwriting one with another.  On a subsequent
+          // replan these aliases already have matching one-to-one names, so
+          // the rewrite is stable rather than growing an alias chain.
+          auto alias = builder.create<pyc::AliasOp>(
+              comb.getLoc(), replacement.getType(), replacement);
+          alias->setAttr("pyc.name", promotedName);
+          replacement = alias.getResult();
+        } else if (!existingName) {
+          definition->setAttr("pyc.name", promotedName);
+        }
+      }
+      result.replaceAllUsesWith(replacement);
+    }
+    comb.erase();
+  }
+  return success();
+}
+
+static Operation *topLevelOwner(Operation *operation, Block *block) {
+  while (operation && operation->getBlock() != block)
+    operation = operation->getParentOp();
+  return operation;
+}
+
+// Return the earliest legal insertion anchor for a group.  A pure group can
+// move after all external definitions and before all external uses.  Empty
+// intervals expose state/instance/wire barriers that require a separate
+// parent plan.
+static FailureOr<Operation *>
+findPlacementAnchor(ArrayRef<Operation *> operations, Block &block,
+                    const llvm::DenseMap<Operation *, unsigned> &position) {
+  llvm::DenseSet<Operation *> group(operations.begin(), operations.end());
+  int64_t latestDefinition = -1;
+  uint64_t earliestUse = std::numeric_limits<uint64_t>::max();
+
+  for (Operation *op : operations) {
+    for (Value input : op->getOperands()) {
+      Operation *definition = topLevelOwner(input.getDefiningOp(), &block);
+      if (!definition || group.contains(definition))
+        continue;
+      auto found = position.find(definition);
+      if (found != position.end())
+        latestDefinition = std::max<int64_t>(latestDefinition, found->second);
+      // pyc.wire is declared at one position but obtains its same-TICK value
+      // from pyc.assign drivers elsewhere in the block.  Treat the latest
+      // driver as the real availability boundary; otherwise a producer and a
+      // wire consumer could be folded into one Comb around the AssignOp and
+      // force a backend fixed-point fallback.
+      if (isa<pyc::WireOp>(definition)) {
+        for (Operation &candidateDriver : block) {
+          auto assign = dyn_cast<pyc::AssignOp>(candidateDriver);
+          if (!assign || assign.getDst() != input)
+            continue;
+          auto driverPosition = position.find(&candidateDriver);
+          if (driverPosition != position.end())
+            latestDefinition = std::max<int64_t>(latestDefinition,
+                                                 driverPosition->second);
+        }
+      }
+    }
+    for (Value output : op->getResults()) {
+      // A named value is externally observable through the probe/public-value
+      // contract even when it has no SSA user.  Model that observation as a
+      // terminator endpoint so DCE/placement cannot silently localize it.
+      if (op->getNumResults() == 1) {
+        if (auto name = op->getAttrOfType<StringAttr>("pyc.name");
+            name && !name.getValue().empty()) {
+          auto terminator = position.find(block.getTerminator());
+          if (terminator != position.end())
+            earliestUse =
+                std::min<uint64_t>(earliestUse, terminator->second);
+        }
+      }
+      for (OpOperand &use : output.getUses()) {
+        Operation *owner = topLevelOwner(use.getOwner(), &block);
+        if (!owner || group.contains(owner))
+          continue;
+        auto found = position.find(owner);
+        if (found != position.end())
+          earliestUse = std::min<uint64_t>(earliestUse, found->second);
+      }
+    }
   }
 
-  Block &originalBody = original.getBody().front();
-  auto originalYield = cast<pyc::YieldOp>(originalBody.getTerminator());
+  if (earliestUse == std::numeric_limits<uint64_t>::max())
+    return static_cast<Operation *>(nullptr);
+  if (latestDefinition >= static_cast<int64_t>(earliestUse))
+    return failure();
+  for (Operation &op : block)
+    if (position.lookup(&op) == earliestUse)
+      return &op;
+  return failure();
+}
 
-  // Maps values in the original isolated region to values visible at the
-  // sibling-comb level.  Block arguments start as the original comb operands;
-  // each partition adds its live-outs for subsequent partitions.
-  IRMapping outerMapping;
-  for (auto [argument, input] :
-       llvm::zip(originalBody.getArguments(), original.getInputs()))
-    outerMapping.map(argument, input);
+static FailureOr<llvm::SmallVector<StagePlan>>
+planStages(ArrayRef<Operation *> topologicalOrder, Block &block,
+           unsigned maxNodes, const CandidateDepProjection &projection) {
+  llvm::DenseMap<Operation *, unsigned> position;
+  for (auto [index, op] : llvm::enumerate(block))
+    position[&op] = static_cast<unsigned>(index);
 
+  llvm::SmallVector<llvm::SmallVector<Operation *>> rawStages;
+  llvm::SmallVector<Operation *> current;
+  for (Operation *op : topologicalOrder) {
+    current.push_back(op);
+    if (succeeded(findPlacementAnchor(current, block, position)))
+      continue;
+    current.pop_back();
+    if (current.empty()) {
+      op->emitError("memoizable operation has no legal materialization point");
+      return failure();
+    }
+    rawStages.push_back(current);
+    current.clear();
+    current.push_back(op);
+    if (failed(findPlacementAnchor(current, block, position))) {
+      op->emitError("memoizable operation crosses an unsplittable barrier");
+      return failure();
+    }
+  }
+  if (!current.empty())
+    rawStages.push_back(current);
+
+  llvm::SmallVector<StagePlan> plans;
+  uint64_t parentId = 0;
+  for (ArrayRef<Operation *> stage : rawStages) {
+    auto anchor = findPlacementAnchor(stage, block, position);
+    if (failed(anchor))
+      return failure();
+    // A dead pure component should have been removed by DCE.  Keeping it out
+    // of the runtime plan is nevertheless safe and avoids a zero-result call.
+    if (*anchor == nullptr)
+      continue;
+    auto coarsened = coarsenOperations(stage, maxNodes, projection);
+    if (failed(coarsened))
+      return failure();
+    auto ends = choosePartEnds(coarsened->operations, coarsened->atomEnds,
+                               maxNodes, projection);
+    if (failed(ends))
+      return failure();
+    plans.push_back(StagePlan{std::move(coarsened->operations),
+                              std::move(*ends), *anchor, parentId++});
+  }
+  return plans;
+}
+
+static LogicalResult
+materializeStage(const StagePlan &plan, uint64_t maxNodes,
+                 const llvm::DenseSet<Operation *> &allCandidates,
+                 IRMapping &outerMapping) {
   unsigned begin = 0;
-  for (auto [partId, end] : llvm::enumerate(ends)) {
+  for (auto [partId, end] : llvm::enumerate(plan.ends)) {
     llvm::DenseSet<Operation *> interval;
     for (unsigned i = begin; i < end; ++i)
-      interval.insert(order[i]);
+      interval.insert(plan.order[i]);
 
     llvm::SmallVector<Value> originalInputs;
     llvm::DenseSet<Value> seenInputs;
     for (unsigned i = begin; i < end; ++i) {
-      for (Value operand : order[i]->getOperands()) {
+      for (Value operand : plan.order[i]->getOperands()) {
         if (interval.contains(operand.getDefiningOp()))
           continue;
         if (seenInputs.insert(operand).second)
@@ -473,11 +784,16 @@ static LogicalResult materializePartitions(pyc::CombOp original,
 
     llvm::SmallVector<Value> originalOutputs;
     for (unsigned i = begin; i < end; ++i) {
-      for (Value result : order[i]->getResults()) {
+      for (Value result : plan.order[i]->getResults()) {
+        StringAttr observableName;
+        if (Operation *definition = result.getDefiningOp();
+            definition && definition->getNumResults() == 1)
+          observableName =
+              definition->getAttrOfType<StringAttr>("pyc.name");
         bool liveOut = llvm::any_of(result.getUses(), [&](OpOperand &use) {
           return !interval.contains(use.getOwner());
         });
-        if (liveOut)
+        if (liveOut || (observableName && !observableName.getValue().empty()))
           originalOutputs.push_back(result);
       }
     }
@@ -487,9 +803,13 @@ static LogicalResult materializePartitions(pyc::CombOp original,
     for (Value input : originalInputs) {
       Value mapped = outerMapping.lookupOrNull(input);
       if (!mapped) {
-        original.emitOpError("partition input is not available from an earlier "
-                             "topological part");
-        return failure();
+        Operation *definition = input.getDefiningOp();
+        if (definition && allCandidates.contains(definition)) {
+          definition->emitError(
+              "partition input is not available from an earlier plan");
+          return failure();
+        }
+        mapped = input;
       }
       inputs.push_back(mapped);
     }
@@ -498,15 +818,31 @@ static LogicalResult materializePartitions(pyc::CombOp original,
     for (Value output : originalOutputs)
       resultTypes.push_back(output.getType());
 
-    OpBuilder builder(original);
+    OpBuilder builder(plan.anchor);
     auto part =
-        builder.create<pyc::CombOp>(original.getLoc(), resultTypes, inputs);
-    stampPartition(part, parentId, partId, ends.size(), end - begin, maxNodes);
+        builder.create<pyc::CombOp>(plan.anchor->getLoc(), resultTypes, inputs);
+    llvm::SmallVector<Attribute> promotedNames;
+    bool hasPromotedName = false;
+    promotedNames.reserve(originalOutputs.size());
+    for (Value output : originalOutputs) {
+      StringAttr name;
+      if (Operation *definition = output.getDefiningOp();
+          definition && definition->getNumResults() == 1)
+        name = definition->getAttrOfType<StringAttr>("pyc.name");
+      hasPromotedName |= name && !name.getValue().empty();
+      promotedNames.push_back(name ? Attribute(name)
+                                   : Attribute(builder.getStringAttr("")));
+    }
+    if (hasPromotedName)
+      part->setAttr(kCombResultNamesAttr,
+                    builder.getArrayAttr(promotedNames));
+    stampPartition(part, plan.parentId, partId, plan.ends.size(), end - begin,
+                   maxNodes);
 
     Block *body = new Block();
     part.getBody().push_back(body);
     for (Value input : inputs)
-      body->addArgument(input.getType(), original.getLoc());
+      body->addArgument(input.getType(), plan.anchor->getLoc());
 
     IRMapping localMapping;
     for (auto [input, argument] :
@@ -515,37 +851,26 @@ static LogicalResult materializePartitions(pyc::CombOp original,
 
     builder.setInsertionPointToStart(body);
     for (unsigned i = begin; i < end; ++i) {
-      Operation *cloned = builder.clone(*order[i], localMapping);
+      Operation *cloned = builder.clone(*plan.order[i], localMapping);
       for (auto [oldResult, newResult] :
-           llvm::zip(order[i]->getResults(), cloned->getResults()))
+           llvm::zip(plan.order[i]->getResults(), cloned->getResults()))
         localMapping.map(oldResult, newResult);
     }
 
     llvm::SmallVector<Value> yielded;
     for (Value output : originalOutputs)
       yielded.push_back(localMapping.lookup(output));
-    builder.create<pyc::YieldOp>(original.getLoc(), yielded);
+    builder.create<pyc::YieldOp>(plan.anchor->getLoc(), yielded);
 
     for (auto [output, result] : llvm::zip(originalOutputs, part.getResults()))
       outerMapping.map(output, result);
     begin = end;
   }
-
-  for (auto [oldResult, yielded] :
-       llvm::zip(original.getResults(), originalYield.getValues())) {
-    Value replacement = outerMapping.lookupOrNull(yielded);
-    if (!replacement) {
-      original.emitOpError("partition plan did not publish an original output");
-      return failure();
-    }
-    oldResult.replaceAllUsesWith(replacement);
-  }
-  original.erase();
   return success();
 }
 
 struct PartitionCombPass
-    : public PassWrapper<PartitionCombPass, OperationPass<func::FuncOp>> {
+    : public PassWrapper<PartitionCombPass, OperationPass<ModuleOp>> {
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(PartitionCombPass)
 
   Option<unsigned> maxNodes{
@@ -561,55 +886,141 @@ struct PartitionCombPass
 
   StringRef getArgument() const override { return "pyc-partition-comb"; }
   StringRef getDescription() const override {
-    return "Partition pyc.comb into GSIM-style contiguous-topological runtime "
-           "units";
+    return "Build one function-level CombDepGraph and directly materialize "
+           "GSIM-style sibling pyc.comb runtime units";
   }
 
   void runOnOperation() override {
     if (maxNodes == 0)
       return;
 
-    func::FuncOp function = getOperation();
-    llvm::SmallVector<pyc::CombOp> candidates;
-    function.walk([&](pyc::CombOp comb) {
-      if (!hasAnyPartitionAttribute(comb))
-        candidates.push_back(comb);
-    });
-
-    uint64_t nextParentId = 0;
-    function.walk([&](pyc::CombOp comb) {
-      if (auto id = comb->getAttrOfType<IntegerAttr>(kParentIdAttr)) {
-        if (id.getInt() >= 0)
-          nextParentId =
-              std::max(nextParentId, static_cast<uint64_t>(id.getInt()) + 1);
+    ModuleOp module = getOperation();
+    llvm::SmallVector<func::FuncOp> functions;
+    for (func::FuncOp function : module.getOps<func::FuncOp>()) {
+      if (function.isDeclaration() || isStructuralFunction(function))
+        continue;
+      if (!llvm::hasSingleElement(function.getBody())) {
+        function.emitOpError(
+            "unified comb partitioning requires a single-block function");
+        signalPassFailure();
+        return;
       }
-    });
+      functions.push_back(function);
+    }
 
-    for (pyc::CombOp comb : candidates) {
-      auto order = stableTopologicalOrder(comb);
+    // Phase A is read-only.  Freeze the hierarchical semantic contract while
+    // every callee still has its original body.  Running this as one module
+    // pass is essential: a nested FuncOp pass is allowed to execute in
+    // parallel and must not inspect a sibling function that another worker is
+    // rewriting.
+    {
+      CombDepGraphCache preflightCache(module);
+      for (func::FuncOp function : functions) {
+        auto graph = FunctionCombDepGraph::build(function, preflightCache);
+        if (failed(graph) || failed((*graph)->stableTopologicalOrder())) {
+          function.emitOpError(
+              "cannot partition an invalid or cyclic CombDepGraph");
+          signalPassFailure();
+          return;
+        }
+      }
+    }
+
+    // Old combs are transparent input syntax.  Unfold every function before
+    // constructing any final plan, so an earlier materialization can never
+    // perturb a later caller/callee analysis.
+    for (func::FuncOp function : functions) {
+      if (failed(unfoldExistingCombs(function))) {
+        signalPassFailure();
+        return;
+      }
+    }
+
+    // Phase B builds and freezes every function plan against one immutable
+    // unfolded module.  No IR is materialized until this loop has completed.
+    llvm::SmallVector<FunctionPartitionPlan> frozenPlans;
+    CombDepGraphCache graphCache(module);
+    for (func::FuncOp function : functions) {
+      Block &block = function.getBody().front();
+      llvm::SmallVector<Operation *> candidates;
+      for (Operation &op : block) {
+        if (!isMemoizableCombOperation(&op))
+          continue;
+        if (failed(verifyMemoizableOperation(&op))) {
+          signalPassFailure();
+          return;
+        }
+        candidates.push_back(&op);
+      }
+
+      auto graph = FunctionCombDepGraph::build(function, graphCache);
+      if (failed(graph)) {
+        function.emitOpError("failed to build the unified CombDepGraph");
+        signalPassFailure();
+        return;
+      }
+      llvm::SmallVector<unsigned> cycle;
+      if (failed((*graph)->stableTopologicalOrder(&cycle))) {
+        function.emitOpError("unified CombDepGraph contains a cycle");
+        signalPassFailure();
+        return;
+      }
+      CandidateDepProjection projection =
+          buildCandidateProjection(candidates, **graph);
+      auto order = stableTopologicalOrder(projection);
       if (failed(order)) {
+        function.emitOpError(
+            "memoizable projection of CombDepGraph is cyclic");
         signalPassFailure();
         return;
       }
-      auto coarsened = coarsenOperations(*order, maxNodes);
-      if (failed(coarsened)) {
-        comb.emitOpError(
-            "GSIM-style coarsening produced a cyclic quotient graph");
+      auto stages = planStages(*order, block, maxNodes, projection);
+      if (failed(stages)) {
+        function.emitOpError("failed to find a legal unified partition plan");
         signalPassFailure();
         return;
       }
-      auto ends =
-          choosePartEnds(coarsened->operations, coarsened->atomEnds, maxNodes);
-      if (failed(ends)) {
-        comb.emitOpError("failed to find a legal contiguous partition plan");
-        signalPassFailure();
-        return;
+      frozenPlans.push_back(FunctionPartitionPlan{
+          function, std::move(candidates), std::move(*stages)});
+    }
+
+    // Phase C performs the only rewrite.  Each final sibling pyc.comb is
+    // emitted directly from its frozen interval; there is no intermediate
+    // FuseComb partition boundary and no backend-side semantic recovery.
+    for (FunctionPartitionPlan &functionPlan : frozenPlans) {
+      func::FuncOp function = functionPlan.function;
+      llvm::DenseSet<Operation *> candidateSet(
+          functionPlan.candidates.begin(), functionPlan.candidates.end());
+      IRMapping outerMapping;
+      uint64_t totalParts = 0;
+      uint64_t totalWork = 0;
+      for (const StagePlan &stage : functionPlan.stages) {
+        if (failed(materializeStage(stage, maxNodes, candidateSet,
+                                    outerMapping))) {
+          signalPassFailure();
+          return;
+        }
+        totalParts += stage.ends.size();
+        totalWork += stage.order.size();
       }
-      if (failed(materializePartitions(comb, coarsened->operations, *ends,
-                                       nextParentId++, maxNodes))) {
-        signalPassFailure();
-        return;
+
+      for (Operation *op : functionPlan.candidates) {
+        for (Value result : op->getResults()) {
+          if (Value replacement = outerMapping.lookupOrNull(result))
+            result.replaceAllUsesWith(replacement);
+        }
       }
+      for (Operation *op : llvm::reverse(functionPlan.candidates))
+        op->erase();
+
+      MLIRContext *context = function.getContext();
+      Type i64 = IntegerType::get(context, 64);
+      function->setAttr(kCombPartitionFunctionPlanAttr,
+                        StringAttr::get(context, kCombPartitionPlanVersion));
+      function->setAttr(kCombPartitionFunctionPartsAttr,
+                        IntegerAttr::get(i64, totalParts));
+      function->setAttr(kCombPartitionFunctionWorkAttr,
+                        IntegerAttr::get(i64, totalWork));
     }
   }
 };

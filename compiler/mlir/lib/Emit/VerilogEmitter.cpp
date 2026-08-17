@@ -2,6 +2,7 @@
 
 #include "pyc/Dialect/PYC/PYCOps.h"
 #include "pyc/Dialect/PYC/PYCTypes.h"
+#include "pyc/Transforms/CombPartition.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -263,6 +264,22 @@ struct NameTable {
     if (auto it = names.find(v); it != names.end())
       return it->second;
     if (Operation *def = v.getDefiningOp()) {
+      if (auto comb = dyn_cast<pyc::CombOp>(def)) {
+        if (auto result = dyn_cast<OpResult>(v)) {
+          if (auto resultNames =
+                  comb->getAttrOfType<ArrayAttr>(kCombResultNamesAttr)) {
+            unsigned index = result.getResultNumber();
+            if (index < resultNames.size()) {
+              if (auto name = dyn_cast<StringAttr>(resultNames[index]);
+                  name && !name.getValue().empty()) {
+                std::string candidate = unique(sanitizeId(name.getValue()));
+                names.try_emplace(v, candidate);
+                return candidate;
+              }
+            }
+          }
+        }
+      }
       if (auto nAttr = def->getAttrOfType<StringAttr>("pyc.name")) {
         std::string cand = unique(sanitizeId(nAttr.getValue()));
         names.try_emplace(v, cand);

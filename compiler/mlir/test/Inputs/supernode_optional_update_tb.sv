@@ -3,6 +3,7 @@
 module supernode_optional_update_tb;
   logic clk = 1'b0;
   logic rst = 1'b0;
+  logic assert_ok = 1'b1;
   logic [7:0] a, mask, b, c;
   logic [129:0] wide, wide_mask, wide_bias;
   logic [7:0] vec_a0, vec_a1, vec_a2, vec_a3;
@@ -15,6 +16,7 @@ module supernode_optional_update_tb;
 
   supernode_optional_update dut (
     .clk(clk), .rst(rst), .a(a), .mask(mask), .b(b), .c(c),
+    .assert_ok(assert_ok),
     .wide(wide), .wide_mask(wide_mask), .wide_bias(wide_bias),
     .vec_a0(vec_a0), .vec_a1(vec_a1), .vec_a2(vec_a2), .vec_a3(vec_a3),
     .vec_mask0(vec_mask0), .vec_mask1(vec_mask1),
@@ -39,6 +41,7 @@ module supernode_optional_update_tb;
     mask = 8'h00;
     b = 8'h03;
     c = 8'h05;
+    assert_ok = 1'b1;
     wide = 130'h100000000000000020000000000001234;
     wide_mask = '0;
     wide_bias = 130'h000000000000000010000000000000055;
