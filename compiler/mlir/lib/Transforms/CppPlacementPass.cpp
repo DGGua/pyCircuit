@@ -444,6 +444,31 @@ static void assignCombOpMethods(pyc::CombOp comb, unsigned combIdx, unsigned com
       }
     }
   }
+
+  // The comb terminator (pyc.yield) lives in the main eval_comb_N method, not
+  // in any _part_K shard (combOps breaks at yield, so yield is absent from
+  // partIndexOfOp). Each yield operand is read by the main method after every
+  // part has run. If such an operand is defined inside a part shard, it
+  // crosses the part->main boundary and must be promoted to a struct member —
+  // otherwise the emitter references an undeclared method-local Wire<> and the
+  // generated C++ fails to compile
+  //
+  // NOTE: isLocalizableCombValue() returns false for any value consumed by
+  // yield (it treats yield as an escaping use), so we cannot use it here.
+  // The test we need is narrower: the value is defined by an op that was
+  // assigned to a part shard (i.e. present in partIndexOfOp) and lives inside
+  // this comb.
+  if (auto yield = dyn_cast_or_null<pyc::YieldOp>(b.getTerminator())) {
+    for (mlir::Value v : yield.getOperands()) {
+      Operation *def = v.getDefiningOp();
+      if (!def)
+        continue;
+      if (def->getParentOfType<pyc::CombOp>() != comb)
+        continue;
+      if (partIndexOfOp.count(def))
+        crossPartValues.insert(v);
+    }
+  }
 }
 
 // Top-level Combs in body order; indices match emitFunc's comb enumeration.
