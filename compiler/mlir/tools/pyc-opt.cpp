@@ -43,6 +43,9 @@ static void forceLinkPycPasses() {
   // Touch each pass factory to force-link the implementations.
   (void)pyc::createCombCanonicalizePass();
   (void)pyc::createFuseCombPass();
+  (void)pyc::createCheckCombMemoizablePass();
+  (void)pyc::createPartitionCombPass(35);
+  (void)pyc::createCheckCombPartitionsPass();
   (void)pyc::createEliminateWiresPass();
   (void)pyc::createPackI1RegsPass();
   (void)pyc::createLowerSCFToPYCStaticPass();

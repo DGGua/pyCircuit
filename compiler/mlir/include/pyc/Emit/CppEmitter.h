@@ -65,6 +65,18 @@ struct CppEmitterOptions {
     Module,
   };
 
+  /// Runtime update policy for top-level `pyc.comb` regions.
+  ///
+  /// Always is the reference path: evaluate and publish every result on every
+  /// static schedule visit. Guarded memoizes each comb from complete direct
+  /// input snapshots. Dirty additionally uses producer-driven activity bits;
+  /// only inputs whose producer is not another top-level comb need polling.
+  enum class CombUpdateMode {
+    Always,
+    Guarded,
+    Dirty,
+  };
+
   /// Default comb/eval chunk size (pycc placement pass and emitter both use this).
   static constexpr unsigned kDefaultCombChunkNodes = 256;
 
@@ -77,6 +89,7 @@ struct CppEmitterOptions {
   // Chunk fused comb helpers to avoid single mega-functions that dominate
   // downstream C++ TU cost even after file sharding.
   unsigned combChunkNodes = kDefaultCombChunkNodes;
+  CombUpdateMode combUpdateMode = CombUpdateMode::Dirty;
   std::string probePlanPath{};
 };
 

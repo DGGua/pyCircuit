@@ -9,6 +9,14 @@ namespace pyc {
 std::unique_ptr<::mlir::Pass> createCombCanonicalizePass();
 std::unique_ptr<::mlir::Pass> createInlineFunctionsPass();
 std::unique_ptr<::mlir::Pass> createFuseCombPass();
+/// Reject pyc.comb bodies that are not safe for input-change memoization.
+std::unique_ptr<::mlir::Pass> createCheckCombMemoizablePass();
+/// Materialize runtime scheduling units as sibling pyc.comb operations.
+/// A value of zero disables partitioning.
+std::unique_ptr<::mlir::Pass> createPartitionCombPass(unsigned maxNodes = 35);
+/// Verify the structural metadata and forward-only dependencies produced by
+/// createPartitionCombPass().
+std::unique_ptr<::mlir::Pass> createCheckCombPartitionsPass();
 std::unique_ptr<::mlir::Pass> createEliminateWiresPass();
 std::unique_ptr<::mlir::Pass> createPackI1RegsPass();
 std::unique_ptr<::mlir::Pass> createLowerSCFToPYCStaticPass();

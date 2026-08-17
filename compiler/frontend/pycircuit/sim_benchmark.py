@@ -1166,6 +1166,10 @@ def _validate_args(args: argparse.Namespace) -> None:
     for name, value in positive.items():
         if int(value) <= 0:
             raise BenchmarkError(f"{name} must be > 0")
+    if args.comb_partition == "static" and int(args.comb_partition_max_nodes) <= 0:
+        raise BenchmarkError(
+            "--comb-partition-max-nodes must be > 0 when --comb-partition=static"
+        )
     for name in ("warmup_iterations", "reset_cycles", "reset_settle_cycles"):
         if int(getattr(args, name)) < 0:
             raise BenchmarkError(f"--{name.replace('_', '-')} must be >= 0")
@@ -1312,6 +1316,12 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
         str(args.jobs),
         "--logic-depth",
         str(args.logic_depth),
+        "--comb-update",
+        str(args.comb_update),
+        "--comb-partition",
+        str(args.comb_partition),
+        "--comb-partition-max-nodes",
+        str(args.comb_partition_max_nodes),
         "--project-root",
         str(project_root),
     ]
@@ -1366,6 +1376,9 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
             str(module_out),
             "--cpp-split=module",
             f"--logic-depth={args.logic_depth}",
+            f"--comb-update={args.comb_update}",
+            f"--comb-partition={args.comb_partition}",
+            f"--comb-partition-max-nodes={args.comb_partition_max_nodes}",
         ]
         if probe_plan_path.is_file():
             command.extend(["--probe-plan", str(probe_plan_path)])
@@ -1671,6 +1684,11 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
             "value_domain": "2-state top-level port transcript",
             "workload_scope": "public-port drive + DUT evaluation + sampled output digest",
         },
+        "comb_policy": {
+            "update": args.comb_update,
+            "partition": args.comb_partition,
+            "partition_max_nodes": args.comb_partition_max_nodes,
+        },
         "workload": {
             "iterations": args.iterations,
             "warmup_iterations": args.warmup_iterations,
@@ -1813,6 +1831,19 @@ def add_benchmark_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--reset-cycles", type=int, default=2)
     parser.add_argument("--reset-settle-cycles", type=int, default=1)
     parser.add_argument("--logic-depth", type=int, default=256)
+    parser.add_argument(
+        "--comb-update",
+        choices=["always", "guarded", "dirty"],
+        default="dirty",
+        help="Generated C++ comb update policy",
+    )
+    parser.add_argument(
+        "--comb-partition",
+        choices=["none", "static"],
+        default="static",
+        help="MLIR SuperNode partition policy",
+    )
+    parser.add_argument("--comb-partition-max-nodes", type=int, default=35)
     parser.add_argument("--max-port-bits", type=int, default=4096)
     parser.add_argument("--jobs", type=int, default=max(1, os.cpu_count() or 1))
     parser.add_argument("--cpu", type=int, default=None, help="Pin timed child processes to one logical CPU (Linux)")

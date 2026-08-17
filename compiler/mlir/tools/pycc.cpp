@@ -185,6 +185,21 @@ static llvm::cl::opt<bool> cppOnlyPreserveOps(
     llvm::cl::desc("Preserve operation-granular C++ scheduling in --sim-mode=cpp-only (disables comb fusion)"),
     llvm::cl::init(false));
 
+static llvm::cl::opt<std::string> combUpdateMode(
+    "comb-update",
+    llvm::cl::desc("C++ comb update policy: always|guarded|dirty"),
+    llvm::cl::init("dirty"));
+
+static llvm::cl::opt<std::string> combPartitionMode(
+    "comb-partition",
+    llvm::cl::desc("MLIR comb partition policy: none|static"),
+    llvm::cl::init("static"));
+
+static llvm::cl::opt<unsigned> combPartitionMaxNodes(
+    "comb-partition-max-nodes",
+    llvm::cl::desc("Maximum operation count per static SuperNode partition"),
+    llvm::cl::init(35));
+
 static llvm::cl::opt<bool> unrollVector(
     "unroll-vector",
     llvm::cl::desc("Unroll vector operations to scalars at IR level before optimization passes"),
@@ -2096,6 +2111,37 @@ int main(int argc, char **argv) {
   }
   const bool isDevFastProfile = (buildProfileNorm == "dev-fast");
 
+  std::string combUpdateNorm = llvm::StringRef(combUpdateMode).lower();
+  pyc::CppEmitterOptions::CombUpdateMode cppCombUpdatePolicy;
+  if (combUpdateNorm == "always") {
+    cppCombUpdatePolicy = pyc::CppEmitterOptions::CombUpdateMode::Always;
+  } else if (combUpdateNorm == "guarded") {
+    cppCombUpdatePolicy = pyc::CppEmitterOptions::CombUpdateMode::Guarded;
+  } else if (combUpdateNorm == "dirty") {
+    cppCombUpdatePolicy = pyc::CppEmitterOptions::CombUpdateMode::Dirty;
+  } else {
+    llvm::errs() << "error: unknown --comb-update: " << combUpdateMode
+                 << " (expected: always|guarded|dirty)\n";
+    return 1;
+  }
+
+  std::string combPartitionNorm = llvm::StringRef(combPartitionMode).lower();
+  bool enableStaticCombPartition = false;
+  if (combPartitionNorm == "none") {
+    enableStaticCombPartition = false;
+  } else if (combPartitionNorm == "static") {
+    enableStaticCombPartition = true;
+  } else {
+    llvm::errs() << "error: unknown --comb-partition: " << combPartitionMode
+                 << " (expected: none|static)\n";
+    return 1;
+  }
+  if (enableStaticCombPartition && combPartitionMaxNodes == 0) {
+    llvm::errs() << "error: --comb-partition-max-nodes must be positive when "
+                    "--comb-partition=static\n";
+    return 1;
+  }
+
   // Dev-fast defaults to smaller C++ shards unless explicitly overridden.
   if (isDevFastProfile && cppShardThresholdLines.getNumOccurrences() == 0)
     cppShardThresholdLines = 16000;
@@ -2358,6 +2404,17 @@ int main(int argc, char **argv) {
   addRemoveDeadValuesPassIfSupported(pm);
   pm.addNestedPass<func::FuncOp>(pyc::createEliminateDeadInstancesPass());
   pm.addPass(createSymbolDCEPass());
+  // Establish the memoization legality contract before materializing
+  // independently activatable SuperNode partitions. The structural gate and
+  // cycle gate run immediately after the rewrite so both C++ and Verilog
+  // consume the same checked semantic IR. This is a GSIM-style static activity
+  // scheme; it does not claim the versioned-slot scheduler from Decision 0104.
+  pm.addNestedPass<func::FuncOp>(pyc::createCheckCombMemoizablePass());
+  if (enableStaticCombPartition)
+    pm.addNestedPass<func::FuncOp>(
+        pyc::createPartitionCombPass(combPartitionMaxNodes));
+  pm.addNestedPass<func::FuncOp>(pyc::createCheckCombPartitionsPass());
+  pm.addPass(pyc::createCheckCombCyclesPass());
   pm.addNestedPass<func::FuncOp>(pyc::createCheckFlatTypesPass());
   pm.addNestedPass<func::FuncOp>(pyc::createCheckNoDynamicPass());
   pm.addPass(pyc::createCheckLogicDepthPass(logicDepthLimit));
@@ -2434,6 +2491,10 @@ int main(int argc, char **argv) {
     obj["cpp_shard_threshold_lines"] = static_cast<int64_t>(cppShardThresholdLines);
     obj["cpp_shard_threshold_bytes"] = static_cast<int64_t>(cppShardThresholdBytes);
     obj["cpp_shard_max_ast_nodes"] = static_cast<int64_t>(cppShardMaxAstNodes);
+    obj["comb_update"] = combUpdateNorm;
+    obj["comb_partition"] = combPartitionNorm;
+    obj["comb_partition_max_nodes"] =
+        static_cast<int64_t>(combPartitionMaxNodes);
     obj["cpp_pch"] = cppPch.getValue();
     obj["profile_pass_timing"] = collectPassTiming;
     {
@@ -2612,6 +2673,9 @@ int main(int argc, char **argv) {
       std::vector<CppManifestSource> cppManifestSources;
       pyc::CppEmitterOptions cppEmitOpts;
       cppEmitOpts.probePlanPath = probePlanPath;
+      cppEmitOpts.combUpdateMode = cppCombUpdatePolicy;
+      cppEmitOpts.combChunkNodes = cppCombChunkNodes;
+      cppEmitOpts.evalTopoChunkNodes = cppCombChunkNodes;
 
       // Collect direct dependencies per module for header includes.
       llvm::StringMap<llvm::SmallVector<std::string>> deps;
@@ -2969,6 +3033,9 @@ int main(int argc, char **argv) {
   if (emitKind == "cpp") {
     pyc::CppEmitterOptions cppEmitOpts;
     cppEmitOpts.probePlanPath = probePlanPath;
+    cppEmitOpts.combUpdateMode = cppCombUpdatePolicy;
+    cppEmitOpts.combChunkNodes = cppCombChunkNodes;
+    cppEmitOpts.evalTopoChunkNodes = cppCombChunkNodes;
     if (failed(pyc::emitCpp(*module, os, cppEmitOpts)))
       return 1;
     if (failed(writeSingleOutputStats()))

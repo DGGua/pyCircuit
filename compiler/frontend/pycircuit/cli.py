@@ -2248,6 +2248,13 @@ def _cmd_build(args: argparse.Namespace) -> int:
     if int(args.logic_depth) <= 0:
         raise SystemExit("--logic-depth must be > 0")
     logic_depth = int(args.logic_depth)
+    comb_update = str(args.comb_update)
+    comb_partition = str(args.comb_partition)
+    comb_partition_max_nodes = int(args.comb_partition_max_nodes)
+    if comb_partition == "static" and comb_partition_max_nodes <= 0:
+        raise SystemExit(
+            "--comb-partition-max-nodes must be > 0 when --comb-partition=static"
+        )
 
     device_cpp_root = out_dir / "device" / "cpp"
     device_v_root = out_dir / "device" / "verilog"
@@ -2262,6 +2269,9 @@ def _cmd_build(args: argparse.Namespace) -> int:
         f"--build-profile={pycc_build_profile}",
         "--inline-policy=off",
         "--hierarchy-policy=strict",
+        f"--comb-update={comb_update}",
+        f"--comb-partition={comb_partition}",
+        f"--comb-partition-max-nodes={comb_partition_max_nodes}",
     ]
     if args.cpp_pch:
         pycc_hard_hierarchy_flags.append("--cpp-pch")
@@ -2273,6 +2283,9 @@ def _cmd_build(args: argparse.Namespace) -> int:
         "pycc_build_profile": pycc_build_profile,
         "inline_policy": "off",
         "hierarchy_policy": "strict",
+        "comb_update": comb_update,
+        "comb_partition": comb_partition,
+        "comb_partition_max_nodes": comb_partition_max_nodes,
         "cpp_pch": bool(args.cpp_pch),
         "target": target,
         "tb_schedule_mode": str(args.tb_schedule_mode),
@@ -2745,6 +2758,24 @@ def main(argv: list[str] | None = None) -> int:
         help="Backend targets to generate/build",
     )
     build.add_argument("--logic-depth", type=int, default=32, help="Max combinational logic depth for pycc")
+    build.add_argument(
+        "--comb-update",
+        choices=["always", "guarded", "dirty"],
+        default="dirty",
+        help="C++ comb update policy (always is the forced-recompute oracle)",
+    )
+    build.add_argument(
+        "--comb-partition",
+        choices=["none", "static"],
+        default="static",
+        help="MLIR SuperNode partition policy",
+    )
+    build.add_argument(
+        "--comb-partition-max-nodes",
+        type=int,
+        default=35,
+        help="Maximum operation count per static SuperNode partition",
+    )
     build.add_argument(
         "--cpp-pch",
         action="store_true",

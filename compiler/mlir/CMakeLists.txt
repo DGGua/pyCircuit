@@ -76,8 +76,11 @@ add_library(pyc_transforms
   lib/Transforms/CheckLogicDepthPass.cpp
   lib/Transforms/CheckNoDynamicPass.cpp
   lib/Transforms/CheckCombCyclesPass.cpp
+  lib/Transforms/CheckCombMemoizablePass.cpp
+  lib/Transforms/CheckCombPartitionsPass.cpp
   lib/Transforms/CheckClockDomainsPass.cpp
   lib/Transforms/CombCanonicalizePass.cpp
+  lib/Transforms/CombMemoization.cpp
   lib/Transforms/CollectCompileStatsPass.cpp
   lib/Transforms/EliminateDeadInstancesPass.cpp
   lib/Transforms/EliminateDeadStatePass.cpp
@@ -86,6 +89,7 @@ add_library(pyc_transforms
   lib/Transforms/InlineFunctionsPass.cpp
   lib/Transforms/PackI1RegsPass.cpp
   lib/Transforms/FuseCombPass.cpp
+  lib/Transforms/PartitionCombPass.cpp
   lib/Transforms/CppPlacementPass.cpp
   lib/Transforms/LowerSCFToPYCStaticPass.cpp
   lib/Transforms/PrunePortsPass.cpp

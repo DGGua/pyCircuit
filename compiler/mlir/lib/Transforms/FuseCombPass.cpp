@@ -1,8 +1,8 @@
+#include "pyc/Transforms/CombMemoization.h"
 #include "pyc/Transforms/Passes.h"
 
 #include "pyc/Dialect/PYC/PYCOps.h"
 
-#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/IRMapping.h"
@@ -15,45 +15,6 @@ using namespace mlir;
 
 namespace pyc {
 namespace {
-
-static bool isFusableCombOp(Operation *op) {
-  return isa<pyc::ConstantOp,
-             pyc::AddOp,
-             pyc::SubOp,
-             pyc::MulOp,
-             pyc::UdivOp,
-             pyc::UremOp,
-             pyc::SdivOp,
-             pyc::SremOp,
-             pyc::MuxOp,
-             pyc::AndOp,
-             pyc::OrOp,
-             pyc::XorOp,
-             pyc::NotOp,
-             pyc::ConcatOp,
-             pyc::AliasOp,
-             pyc::ResetActiveOp,
-             pyc::EqOp,
-             pyc::UltOp,
-             pyc::SltOp,
-             pyc::TruncOp,
-             pyc::ZextOp,
-             pyc::SextOp,
-             pyc::ExtractOp,
-             pyc::ShliOp,
-             pyc::LshriOp,
-             pyc::AshriOp,
-             pyc::ShlOp,
-             pyc::LshrOp,
-             pyc::AshrOp,
-             pyc::VGetOp,
-             pyc::VCreateOp,
-             pyc::VBroadcastOp,
-             pyc::VOrReduceOp,
-             pyc::VAndReduceOp,
-             pyc::VAddReduceOp,
-             arith::SelectOp>(op);
-}
 
 struct FuseCombPass : public PassWrapper<FuseCombPass, OperationPass<func::FuncOp>> {
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(FuseCombPass)
@@ -87,7 +48,7 @@ struct FuseCombPass : public PassWrapper<FuseCombPass, OperationPass<func::FuncO
     };
 
     for (Operation &op : llvm::make_early_inc_range(block)) {
-      if (isFusableCombOp(&op)) {
+      if (isMemoizableCombOperation(&op)) {
         run.push_back(&op);
         continue;
       }
