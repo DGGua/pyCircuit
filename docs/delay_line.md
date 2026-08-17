@@ -287,11 +287,61 @@ pyc_delay_line #(.WIDTH(8), .DEPTH(128)) delay_inst (...);
 | Cleanup/stats | [`EliminateDeadStatePass.cpp`](../compiler/mlir/lib/Transforms/EliminateDeadStatePass.cpp)、[`EliminateWiresPass.cpp`](../compiler/mlir/lib/Transforms/EliminateWiresPass.cpp)、[`CollectCompileStatsPass.cpp`](../compiler/mlir/lib/Transforms/CollectCompileStatsPass.cpp) | dead state、marker 保留、按 depth 统计状态 |
 | C++ | [`CppEmitter.cpp`](../compiler/mlir/lib/Emit/CppEmitter.cpp)、[`pyc_primitives.hpp`](../runtime/cpp/pyc_primitives.hpp) | 声明/构造/调度 scalar/vector ring primitive |
 | Verilog | [`VerilogEmitter.cpp`](../compiler/mlir/lib/Emit/VerilogEmitter.cpp)、[`pyc_delay_line.v`](../runtime/verilog/pyc_delay_line.v) | 参数化 scalar/vector-leaf lowering |
-| Tests | [`delay_line_combine.mlir`](../compiler/mlir/test/delay_line_combine.mlir)、[`delay_line_verify_valid.mlir`](../compiler/mlir/test/delay_line_verify_valid.mlir)、[`delay_line_verify_invalid.mlir`](../compiler/mlir/test/delay_line_verify_invalid.mlir)、[`test_delay_line_combine.py`](../tests/v5/test_delay_line_combine.py) | Dialect、Pass 正反例和 marker 回归 |
+| Tests | [`delay_line_combine.mlir`](../compiler/mlir/test/delay_line_combine.mlir)、[`delay_line_diagnostics_smoke.sh`](../compiler/mlir/test/delay_line_diagnostics_smoke.sh)、[`delay_line_verify_valid.mlir`](../compiler/mlir/test/delay_line_verify_valid.mlir)、[`delay_line_verify_invalid.mlir`](../compiler/mlir/test/delay_line_verify_invalid.mlir)、[`test_delay_line_combine.py`](../tests/v5/test_delay_line_combine.py) | Dialect、Pass 正反例、优化统计和 marker 回归 |
 | Verification | [`verification/delay_line_combine/`](../verification/delay_line_combine/README.md) | runtime、Icarus、Verilator、sharing、性能和 artifacts |
 
 Probe manifest/C++ probe registry 会过滤 `_v5_bal_*` 生成临时名，但仍将最终
 delay-backed 输出分类为 state。
+
+### 8.1 如何查看一次优化做了什么
+
+`pyc-combine-delay-chains` 会直接在新结点上保留优化来源，因此通过 pass IR dump
+即可定位具体的改写结果：
+
+```mlir
+%q = pyc.delay_line %clk, %rst, %en, %a, %init {
+  depth = 4 : i64,
+  pyc.generated = "cycle_balance",
+  pyc.optimized_by = "combine_delay_chains",
+  pyc.shared_chain_count = 2 : i64,
+  pyc.source_reg_count = 8 : i64
+} : i8
+```
+
+这个例子表示两条相同的 depth=4 链共享为一个 delay line，survivor 一共代表 8 个
+原始 `pyc.reg`。查看某次编译的 before/after：
+
+```bash
+pycc input.pyc --emit=none \
+  --dump-pass-ir=/tmp/delay_ir \
+  --dump-pass-ir-filter='combine-delay-chains' \
+  --dump-pass-ir-phase=both
+```
+
+Pass 同时在函数上写入 `pyc.stats.delay_chain_*` 优化账本，`pycc` 会将其跨函数
+汇总到 stderr、单文件 `<output>.stats.json`、out-dir `compile_stats.json` 和
+`--profile-json` 的 `compile_stats` 对象：
+
+| JSON 字段 | 含义 |
+|---|---|
+| `delay_chains_combined` | 成功改写的最大 generated 链数量 |
+| `delay_chain_regs_combined` | 被这些链替代的 `pyc.reg` 数量 |
+| `delay_chain_aliases_removed` | 随链删除的 generated alias 数量 |
+| `delay_chain_delay_lines_created` | sharing 前创建的 delay line 数量 |
+| `delay_chain_delay_lines_merged` | 因完整时序 key 相同而合并的 delay line 数量 |
+| `delay_chain_state_reads_before/after` | C++ 模型 compute/sample 阶段的状态 primitive 静态调度数 |
+| `delay_chain_state_writes_before/after` | C++ 模型 commit/update 阶段的状态 primitive 静态调度数 |
+
+例如两条共享的 depth=2 链会报告：
+
+```text
+delay_chain={chains:2, regs:4, aliases:2, created:2, merged:1,
+             reads:4->1, writes:4->1}
+```
+
+这里的 read/write 不是 CPU load/store 指令数，不是 MLIR `MemoryEffects` 数量，也不是
+Yosys 综合后的物理读写端口；它描述的是生成 C++ model 每拍需要调度多少个状态
+primitive。实际 CPU 指令和耗时仍应使用 `perf`，综合资源仍应使用 Yosys `stat`。
 
 ## 9. 优化前后示例
 
@@ -307,7 +357,10 @@ delay-backed 输出分类为 state。
 
 // after：一个保留深度的状态操作
 %q = pyc.delay_line %clk, %rst, %en, %a, %init
-     {depth = 4 : i64, pyc.generated = "cycle_balance"} : i8
+     {depth = 4 : i64, pyc.generated = "cycle_balance",
+      pyc.optimized_by = "combine_delay_chains",
+      pyc.shared_chain_count = 1 : i64,
+      pyc.source_reg_count = 4 : i64} : i8
 ```
 
 实际快照：
