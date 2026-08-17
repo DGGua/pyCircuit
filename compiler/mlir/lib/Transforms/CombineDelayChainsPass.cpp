@@ -22,6 +22,29 @@ namespace {
 
 constexpr llvm::StringLiteral kGeneratedAttr = "pyc.generated";
 constexpr llvm::StringLiteral kCycleBalance = "cycle_balance";
+constexpr llvm::StringLiteral kOptimizedByAttr = "pyc.optimized_by";
+constexpr llvm::StringLiteral kCombineDelayChains = "combine_delay_chains";
+constexpr llvm::StringLiteral kSourceRegCountAttr = "pyc.source_reg_count";
+constexpr llvm::StringLiteral kSharedChainCountAttr = "pyc.shared_chain_count";
+
+struct CombineStats {
+  int64_t chainsCombined = 0;
+  int64_t regsCombined = 0;
+  int64_t aliasesRemoved = 0;
+  int64_t delayLinesCreated = 0;
+  int64_t delayLinesMerged = 0;
+};
+
+static int64_t getI64Attr(Operation *op, llvm::StringRef name, int64_t fallback) {
+  if (auto value = op->getAttrOfType<IntegerAttr>(name))
+    return value.getInt();
+  return fallback;
+}
+
+static void setI64Attr(Operation *op, llvm::StringRef name, int64_t value) {
+  OpBuilder builder(op->getContext());
+  op->setAttr(name, builder.getI64IntegerAttr(value));
+}
 
 static bool isCycleBalanceGenerated(Operation *op) {
   if (!op)
@@ -110,6 +133,116 @@ static bool sameDelayKey(pyc::DelayLineOp lhs, pyc::DelayLineOp rhs) {
          equivalentValue(lhs.getInit(), rhs.getInit());
 }
 
+static void combineGeneratedChains(func::FuncOp function, CombineStats &stats) {
+  llvm::SmallVector<pyc::RegOp> regs;
+  function.walk([&](pyc::RegOp reg) {
+    if (isCycleBalanceGenerated(reg) && !shouldKeep(reg))
+      regs.push_back(reg);
+  });
+
+  llvm::DenseSet<Operation *> erased;
+  for (pyc::RegOp tail : llvm::reverse(regs)) {
+    if (erased.contains(tail.getOperation()))
+      continue;
+
+    llvm::SmallVector<pyc::RegOp> chainFromTail;
+    llvm::SmallVector<ChainLink> linksFromTail;
+    chainFromTail.push_back(tail);
+    pyc::RegOp cursor = tail;
+    while (auto link = matchPredecessor(cursor, tail)) {
+      if (erased.contains(link->predecessor.getOperation()))
+        break;
+      linksFromTail.push_back(*link);
+      cursor = link->predecessor;
+      chainFromTail.push_back(cursor);
+    }
+    if (chainFromTail.size() < 2)
+      continue;
+
+    const int64_t depth = static_cast<int64_t>(chainFromTail.size());
+    pyc::RegOp head = chainFromTail.back();
+    OpBuilder builder(tail);
+    auto delay = builder.create<pyc::DelayLineOp>(
+        tail.getLoc(), tail.getQ().getType(), head.getClk(), head.getRst(), head.getEn(),
+        stripGeneratedAliases(head.getNext()), head.getInit());
+    delay->setAttr("depth", builder.getI64IntegerAttr(depth));
+    delay->setAttr(kGeneratedAttr, builder.getStringAttr(kCycleBalance));
+    delay->setAttr(kOptimizedByAttr, builder.getStringAttr(kCombineDelayChains));
+    delay->setAttr(kSourceRegCountAttr, builder.getI64IntegerAttr(depth));
+    delay->setAttr(kSharedChainCountAttr, builder.getI64IntegerAttr(1));
+
+    ++stats.chainsCombined;
+    stats.regsCombined += depth;
+    ++stats.delayLinesCreated;
+    for (const ChainLink &link : linksFromTail)
+      stats.aliasesRemoved += static_cast<int64_t>(link.aliasesFromConsumerToProducer.size());
+
+    tail.getQ().replaceAllUsesWith(delay.getQ());
+
+    // Erase from the consumer end. Erasing the consumer releases the closest
+    // alias; erasing that alias chain releases the predecessor register.
+    for (unsigned i = 0; i < linksFromTail.size(); ++i) {
+      pyc::RegOp reg = chainFromTail[i];
+      erased.insert(reg.getOperation());
+      reg.erase();
+      for (pyc::AliasOp alias : linksFromTail[i].aliasesFromConsumerToProducer)
+        alias.erase();
+    }
+    erased.insert(head.getOperation());
+    head.erase();
+  }
+}
+
+static void shareEquivalentDelayLines(func::FuncOp function, CombineStats &stats) {
+  // Stateful operations are intentionally not ordinary CSE candidates. Share
+  // generated delay lines explicitly when all semantic operands match.
+  llvm::SmallVector<pyc::DelayLineOp> delays;
+  function.walk([&](pyc::DelayLineOp delay) {
+    if (isCycleBalanceGenerated(delay) && !shouldKeep(delay))
+      delays.push_back(delay);
+  });
+  for (unsigned i = 0; i < delays.size(); ++i) {
+    if (!delays[i])
+      continue;
+    for (unsigned j = i + 1; j < delays.size(); ++j) {
+      if (!delays[j] || !sameDelayKey(delays[i], delays[j]))
+        continue;
+
+      const int64_t lhsRegs = getI64Attr(delays[i], kSourceRegCountAttr, 0);
+      const int64_t rhsRegs = getI64Attr(delays[j], kSourceRegCountAttr, 0);
+      const int64_t lhsChains = getI64Attr(delays[i], kSharedChainCountAttr, 0);
+      const int64_t rhsChains = getI64Attr(delays[j], kSharedChainCountAttr, 0);
+      if (lhsRegs || rhsRegs)
+        setI64Attr(delays[i], kSourceRegCountAttr, lhsRegs + rhsRegs);
+      if (lhsChains || rhsChains)
+        setI64Attr(delays[i], kSharedChainCountAttr, lhsChains + rhsChains);
+
+      delays[j].getQ().replaceAllUsesWith(delays[i].getQ());
+      delays[j].erase();
+      delays[j] = nullptr;
+      ++stats.delayLinesMerged;
+    }
+  }
+}
+
+static void writeCombineStats(func::FuncOp function, const CombineStats &stats) {
+  // A re-optimized intermediate file may merge delay lines created by an
+  // earlier pipeline run. Those merges are observable, but cannot make this
+  // run's state-primitive count negative.
+  const int64_t stateOpsAfter = stats.delayLinesCreated > stats.delayLinesMerged
+                                    ? stats.delayLinesCreated - stats.delayLinesMerged
+                                    : 0;
+  setI64Attr(function, "pyc.stats.delay_chains_combined", stats.chainsCombined);
+  setI64Attr(function, "pyc.stats.delay_chain_regs_combined", stats.regsCombined);
+  setI64Attr(function, "pyc.stats.delay_chain_aliases_removed", stats.aliasesRemoved);
+  setI64Attr(function, "pyc.stats.delay_chain_delay_lines_created", stats.delayLinesCreated);
+  setI64Attr(function, "pyc.stats.delay_chain_delay_lines_merged", stats.delayLinesMerged);
+  setI64Attr(function, "pyc.stats.delay_chain_state_reads_before", stats.regsCombined);
+  setI64Attr(function, "pyc.stats.delay_chain_state_reads_after", stateOpsAfter);
+  setI64Attr(function, "pyc.stats.delay_chain_state_writes_before", stats.regsCombined);
+  setI64Attr(function, "pyc.stats.delay_chain_state_writes_after", stateOpsAfter);
+}
+
 struct CombineDelayChainsPass
     : public PassWrapper<CombineDelayChainsPass, OperationPass<func::FuncOp>> {
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(CombineDelayChainsPass)
@@ -121,72 +254,10 @@ struct CombineDelayChainsPass
 
   void runOnOperation() override {
     func::FuncOp function = getOperation();
-    llvm::SmallVector<pyc::RegOp> regs;
-    function.walk([&](pyc::RegOp reg) {
-      if (isCycleBalanceGenerated(reg) && !shouldKeep(reg))
-        regs.push_back(reg);
-    });
-
-    llvm::DenseSet<Operation *> erased;
-    for (pyc::RegOp tail : llvm::reverse(regs)) {
-      if (erased.contains(tail.getOperation()))
-        continue;
-
-      llvm::SmallVector<pyc::RegOp> chainFromTail;
-      llvm::SmallVector<ChainLink> linksFromTail;
-      chainFromTail.push_back(tail);
-      pyc::RegOp cursor = tail;
-      while (auto link = matchPredecessor(cursor, tail)) {
-        if (erased.contains(link->predecessor.getOperation()))
-          break;
-        linksFromTail.push_back(*link);
-        cursor = link->predecessor;
-        chainFromTail.push_back(cursor);
-      }
-      if (chainFromTail.size() < 2)
-        continue;
-
-      pyc::RegOp head = chainFromTail.back();
-      OpBuilder builder(tail);
-      auto delay = builder.create<pyc::DelayLineOp>(
-          tail.getLoc(), tail.getQ().getType(), head.getClk(), head.getRst(), head.getEn(),
-          stripGeneratedAliases(head.getNext()), head.getInit());
-      delay->setAttr("depth", builder.getI64IntegerAttr(chainFromTail.size()));
-      delay->setAttr(kGeneratedAttr, builder.getStringAttr(kCycleBalance));
-
-      tail.getQ().replaceAllUsesWith(delay.getQ());
-
-      // Erase from the consumer end. Erasing the consumer releases the closest
-      // alias; erasing that alias chain releases the predecessor register.
-      for (unsigned i = 0; i < linksFromTail.size(); ++i) {
-        pyc::RegOp reg = chainFromTail[i];
-        erased.insert(reg.getOperation());
-        reg.erase();
-        for (pyc::AliasOp alias : linksFromTail[i].aliasesFromConsumerToProducer)
-          alias.erase();
-      }
-      erased.insert(head.getOperation());
-      head.erase();
-    }
-
-    // Stateful operations are intentionally not ordinary CSE candidates. Share
-    // generated delay lines explicitly when all semantic operands match.
-    llvm::SmallVector<pyc::DelayLineOp> delays;
-    function.walk([&](pyc::DelayLineOp delay) {
-      if (isCycleBalanceGenerated(delay) && !shouldKeep(delay))
-        delays.push_back(delay);
-    });
-    for (unsigned i = 0; i < delays.size(); ++i) {
-      if (!delays[i])
-        continue;
-      for (unsigned j = i + 1; j < delays.size(); ++j) {
-        if (!delays[j] || !sameDelayKey(delays[i], delays[j]))
-          continue;
-        delays[j].getQ().replaceAllUsesWith(delays[i].getQ());
-        delays[j].erase();
-        delays[j] = nullptr;
-      }
-    }
+    CombineStats stats;
+    combineGeneratedChains(function, stats);
+    shareEquivalentDelayLines(function, stats);
+    writeCombineStats(function, stats);
   }
 };
 

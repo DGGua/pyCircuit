@@ -1954,6 +1954,15 @@ struct CompileStatsSummary {
   int64_t regBits = 0;
   int64_t delayLineCount = 0;
   int64_t delayLineDepthTotal = 0;
+  int64_t delayChainsCombined = 0;
+  int64_t delayChainRegsCombined = 0;
+  int64_t delayChainAliasesRemoved = 0;
+  int64_t delayChainDelayLinesCreated = 0;
+  int64_t delayChainDelayLinesMerged = 0;
+  int64_t delayChainStateReadsBefore = 0;
+  int64_t delayChainStateReadsAfter = 0;
+  int64_t delayChainStateWritesBefore = 0;
+  int64_t delayChainStateWritesAfter = 0;
   int64_t memCount = 0;
   int64_t memBits = 0;
   int64_t maxLogicDepth = 0;
@@ -1990,6 +1999,30 @@ static CompileStatsSummary collectCompileStats(ModuleOp module, int64_t depthLim
     s.delayLineCount = satAdd(s.delayLineCount, getI64Attr(f, "pyc.stats.delay_line_count", 0));
     s.delayLineDepthTotal =
         satAdd(s.delayLineDepthTotal, getI64Attr(f, "pyc.stats.delay_line_depth_total", 0));
+    s.delayChainsCombined =
+        satAdd(s.delayChainsCombined, getI64Attr(f, "pyc.stats.delay_chains_combined", 0));
+    s.delayChainRegsCombined = satAdd(
+        s.delayChainRegsCombined, getI64Attr(f, "pyc.stats.delay_chain_regs_combined", 0));
+    s.delayChainAliasesRemoved = satAdd(
+        s.delayChainAliasesRemoved, getI64Attr(f, "pyc.stats.delay_chain_aliases_removed", 0));
+    s.delayChainDelayLinesCreated =
+        satAdd(s.delayChainDelayLinesCreated,
+               getI64Attr(f, "pyc.stats.delay_chain_delay_lines_created", 0));
+    s.delayChainDelayLinesMerged =
+        satAdd(s.delayChainDelayLinesMerged,
+               getI64Attr(f, "pyc.stats.delay_chain_delay_lines_merged", 0));
+    s.delayChainStateReadsBefore =
+        satAdd(s.delayChainStateReadsBefore,
+               getI64Attr(f, "pyc.stats.delay_chain_state_reads_before", 0));
+    s.delayChainStateReadsAfter =
+        satAdd(s.delayChainStateReadsAfter,
+               getI64Attr(f, "pyc.stats.delay_chain_state_reads_after", 0));
+    s.delayChainStateWritesBefore =
+        satAdd(s.delayChainStateWritesBefore,
+               getI64Attr(f, "pyc.stats.delay_chain_state_writes_before", 0));
+    s.delayChainStateWritesAfter =
+        satAdd(s.delayChainStateWritesAfter,
+               getI64Attr(f, "pyc.stats.delay_chain_state_writes_after", 0));
     s.memCount = satAdd(s.memCount, getI64Attr(f, "pyc.stats.mem_count", 0));
     s.memBits = satAdd(s.memBits, getI64Attr(f, "pyc.stats.mem_bits", 0));
 
@@ -2013,18 +2046,36 @@ static CompileStatsSummary collectCompileStats(ModuleOp module, int64_t depthLim
 static void printCompileStats(const CompileStatsSummary &s) {
   llvm::errs() << "stats: regs=" << s.regCount << " (" << s.regBits << " bits)"
                << ", delay_lines=" << s.delayLineCount << " (depth_total=" << s.delayLineDepthTotal << ")"
+               << ", delay_chain={chains:" << s.delayChainsCombined
+               << ", regs:" << s.delayChainRegsCombined
+               << ", aliases:" << s.delayChainAliasesRemoved
+               << ", created:" << s.delayChainDelayLinesCreated
+               << ", merged:" << s.delayChainDelayLinesMerged
+               << ", reads:" << s.delayChainStateReadsBefore << "->"
+               << s.delayChainStateReadsAfter
+               << ", writes:" << s.delayChainStateWritesBefore << "->"
+               << s.delayChainStateWritesAfter << "}"
                << ", mems=" << s.memCount << " (" << s.memBits << " bits)"
                << ", max_depth=" << s.maxLogicDepth << "/" << s.logicDepthLimit
                << ", WNS=" << s.wns << ", TNS=" << s.tns
                << ", fuse_comb=" << (s.fuseCombEnabled ? "on" : "off") << "\n";
 }
 
-static LogicalResult writeCompileStatsJson(llvm::StringRef outPath, const CompileStatsSummary &s) {
+static llvm::json::Object compileStatsToJson(const CompileStatsSummary &s) {
   llvm::json::Object obj;
   obj["reg_count"] = s.regCount;
   obj["reg_bits"] = s.regBits;
   obj["delay_line_count"] = s.delayLineCount;
   obj["delay_line_depth_total"] = s.delayLineDepthTotal;
+  obj["delay_chains_combined"] = s.delayChainsCombined;
+  obj["delay_chain_regs_combined"] = s.delayChainRegsCombined;
+  obj["delay_chain_aliases_removed"] = s.delayChainAliasesRemoved;
+  obj["delay_chain_delay_lines_created"] = s.delayChainDelayLinesCreated;
+  obj["delay_chain_delay_lines_merged"] = s.delayChainDelayLinesMerged;
+  obj["delay_chain_state_reads_before"] = s.delayChainStateReadsBefore;
+  obj["delay_chain_state_reads_after"] = s.delayChainStateReadsAfter;
+  obj["delay_chain_state_writes_before"] = s.delayChainStateWritesBefore;
+  obj["delay_chain_state_writes_after"] = s.delayChainStateWritesAfter;
   obj["mem_count"] = s.memCount;
   obj["mem_bits"] = s.memBits;
   obj["logic_depth_limit"] = s.logicDepthLimit;
@@ -2032,11 +2083,14 @@ static LogicalResult writeCompileStatsJson(llvm::StringRef outPath, const Compil
   obj["wns"] = s.wns;
   obj["tns"] = s.tns;
   obj["fuse_comb_enabled"] = s.fuseCombEnabled;
+  return obj;
+}
 
+static LogicalResult writeCompileStatsJson(llvm::StringRef outPath, const CompileStatsSummary &s) {
   std::string buf;
   llvm::raw_string_ostream ss(buf);
   llvm::json::OStream j(ss, 2);
-  llvm::json::Value v(std::move(obj));
+  llvm::json::Value v(compileStatsToJson(s));
   j.value(v);
   ss << "\n";
   ss.flush();
@@ -2470,19 +2524,7 @@ int main(int argc, char **argv) {
     root["hierarchy"] = std::move(hierarchyObj);
     root["canonicalize_budget"] = static_cast<int64_t>(effectiveCanonicalizeBudget);
 
-    llvm::json::Object stats;
-    stats["reg_count"] = compileStats.regCount;
-    stats["reg_bits"] = compileStats.regBits;
-    stats["delay_line_count"] = compileStats.delayLineCount;
-    stats["delay_line_depth_total"] = compileStats.delayLineDepthTotal;
-    stats["mem_count"] = compileStats.memCount;
-    stats["mem_bits"] = compileStats.memBits;
-    stats["logic_depth_limit"] = compileStats.logicDepthLimit;
-    stats["max_logic_depth"] = compileStats.maxLogicDepth;
-    stats["wns"] = compileStats.wns;
-    stats["tns"] = compileStats.tns;
-    stats["fuse_comb_enabled"] = compileStats.fuseCombEnabled;
-    root["compile_stats"] = std::move(stats);
+    root["compile_stats"] = compileStatsToJson(compileStats);
 
     if (passTimingCollector)
       root["passes"] = passTimingCollector->toJson();
