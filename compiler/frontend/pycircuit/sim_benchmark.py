@@ -1152,9 +1152,9 @@ def _cpu_model() -> str:
     return platform.processor() or "unknown"
 
 
-_COMB_POLICY_PRESETS: dict[str, tuple[str, str]] = {
-    "legacy": ("guarded", "none"),
-    "gsim": ("dirty", "static"),
+_COMB_POLICY_PRESETS: dict[str, tuple[str, str, str]] = {
+    "legacy": ("guarded", "none", "poll"),
+    "gsim": ("dirty", "static", "poll"),
 }
 
 
@@ -1169,6 +1169,7 @@ def resolve_comb_policy(args: argparse.Namespace) -> str:
     requested_policy = getattr(args, "comb_policy", None)
     requested_update = getattr(args, "comb_update", None)
     requested_partition = getattr(args, "comb_partition", None)
+    requested_reg_update = getattr(args, "comb_reg_update", None)
 
     if requested_policy is not None:
         if requested_policy not in _COMB_POLICY_PRESETS:
@@ -1177,7 +1178,9 @@ def resolve_comb_policy(args: argparse.Namespace) -> str:
                 f"invalid --comb-policy: {requested_policy!r} "
                 f"(expected: {choices})"
             )
-        expected_update, expected_partition = _COMB_POLICY_PRESETS[requested_policy]
+        expected_update, expected_partition, expected_reg_update = (
+            _COMB_POLICY_PRESETS[requested_policy]
+        )
         if requested_update is not None and requested_update != expected_update:
             raise BenchmarkError(
                 f"--comb-policy={requested_policy} requires "
@@ -1188,15 +1191,26 @@ def resolve_comb_policy(args: argparse.Namespace) -> str:
                 f"--comb-policy={requested_policy} requires "
                 f"--comb-partition={expected_partition}, got {requested_partition}"
             )
+        if requested_reg_update is not None and requested_reg_update != expected_reg_update:
+            raise BenchmarkError(
+                f"--comb-policy={requested_policy} requires "
+                f"--comb-reg-update={expected_reg_update}, got {requested_reg_update}"
+            )
         args.comb_update = expected_update
         args.comb_partition = expected_partition
+        args.comb_reg_update = expected_reg_update
         return requested_policy
 
     args.comb_update = requested_update or "dirty"
     args.comb_partition = requested_partition or "static"
-    resolved_pair = (args.comb_update, args.comb_partition)
-    for name, pair in _COMB_POLICY_PRESETS.items():
-        if resolved_pair == pair:
+    args.comb_reg_update = requested_reg_update or "poll"
+    resolved_policy = (
+        args.comb_update,
+        args.comb_partition,
+        args.comb_reg_update,
+    )
+    for name, policy in _COMB_POLICY_PRESETS.items():
+        if resolved_policy == policy:
             return name
     return "custom"
 
@@ -1368,6 +1382,8 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
         str(args.logic_depth),
         "--comb-update",
         str(args.comb_update),
+        "--comb-reg-update",
+        str(args.comb_reg_update),
         "--comb-partition",
         str(args.comb_partition),
         "--comb-partition-max-nodes",
@@ -1427,6 +1443,7 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
             "--cpp-split=module",
             f"--logic-depth={args.logic_depth}",
             f"--comb-update={args.comb_update}",
+            f"--comb-reg-update={args.comb_reg_update}",
             f"--comb-partition={args.comb_partition}",
             f"--comb-partition-max-nodes={args.comb_partition_max_nodes}",
         ]
@@ -1737,6 +1754,7 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
         "comb_policy": {
             "preset": resolved_comb_policy,
             "update": args.comb_update,
+            "reg_update": args.comb_reg_update,
             "partition": args.comb_partition,
             "partition_max_nodes": args.comb_partition_max_nodes,
         },
@@ -1896,6 +1914,12 @@ def add_benchmark_arguments(parser: argparse.ArgumentParser) -> None:
         choices=["always", "guarded", "dirty"],
         default=None,
         help="Advanced override for the generated C++ comb update policy",
+    )
+    parser.add_argument(
+        "--comb-reg-update",
+        choices=["poll", "commit"],
+        default=None,
+        help="Advanced local-register invalidation policy for dirty C++ updates",
     )
     parser.add_argument(
         "--comb-partition",

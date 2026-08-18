@@ -121,6 +121,11 @@ C++/Verilator，以降低固定顺序偏差；每个 timed run 的 digest 和 fi
 | `--sample-every` | 256 | timed workload 的 digest 间隔；必须是 2 的幂。 |
 | `--reset-cycles` / `--reset-settle-cycles` | 2 / 1 | clocked reset 序列；不计入 timed interval。 |
 | `--logic-depth` | 256 | 传给 `pycc` 的 MLIR logic-depth gate。 |
+| `--comb-policy` | 无 | `legacy` 或 `gsim` 预设；显式低层参数必须与预设一致。 |
+| `--comb-update` | 由预设决定 | `always`、`guarded` 或 `dirty`。 |
+| `--comb-reg-update` | `poll` | `poll` 保留本地寄存器输入 snapshot；`commit` 在寄存器实际改值时唤醒直接 consumer。 |
+| `--comb-partition` | `static` | `none` 或静态 SuperNode 划分。 |
+| `--comb-partition-max-nodes` | 35 | 静态 SuperNode 的最大 operation 数。 |
 | `--max-port-bits` | 4096 | 单个允许的 top-level `iN` port 最大宽度。 |
 | `--jobs` | 逻辑 CPU 数 | 构建并行度。 |
 | `--cpu` | 无 | Linux 上将 native 子进程绑到一个 logical CPU。 |
@@ -133,6 +138,10 @@ C++/Verilator，以降低固定顺序偏差；每个 timed run 的 digest 和 fi
 `--iterations`、`--verify-iterations`、`--repeats`、`--input-table-size`、
 `--sample-every`、`--jobs`、`--logic-depth` 和 `--max-port-bits` 必须大于零；
 reset/warmup 可为零。
+
+结果 JSON 的 `comb_policy` 同时记录 `update`、`reg_update`、`partition`
+和 `partition_max_nodes`，因此 `dirty+poll` 与 `dirty+commit` 的 A/B 结果
+不会被误归为同一种调度配置。
 
 ## JSON 结果与日志
 

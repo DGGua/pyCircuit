@@ -12,6 +12,8 @@ PYCC="${PYCC:-${ROOT}/.pycircuit_out/toolchain/build/bin/pycc}"
 INPUT_PY="${ROOT}/compiler/mlir/test/Inputs/supernode_optional_update.py"
 INSTANCE_BOUNDARY_PY="${ROOT}/compiler/mlir/test/Inputs/supernode_instance_boundary.py"
 STATE_BOUNDARY_PY="${ROOT}/compiler/mlir/test/Inputs/supernode_state_boundary.py"
+STATE_BOUNDARY_DRIVER="${ROOT}/compiler/mlir/test/Inputs/supernode_state_boundary_driver.cpp"
+REG_COMMIT_DRIVER="${ROOT}/compiler/mlir/test/Inputs/pyc_reg_commit_driver.cpp"
 DRIVER="${ROOT}/compiler/mlir/test/Inputs/supernode_optional_update_driver.cpp"
 SV_TB="${ROOT}/compiler/mlir/test/Inputs/supernode_optional_update_tb.sv"
 CHECK_PARTITION="${ROOT}/compiler/mlir/test/check_supernode_partition.py"
@@ -30,7 +32,7 @@ if [[ ! -x "${PYCC}" ]]; then
   exit 0
 fi
 
-for flag in comb-update comb-partition comb-partition-max-nodes; do
+for flag in comb-update comb-reg-update comb-partition comb-partition-max-nodes; do
   if ! "${PYCC}" --help 2>&1 | grep -q -- "--${flag}"; then
     echo "fail: pycc missing --${flag}" >&2
     exit 1
@@ -52,12 +54,15 @@ mkdir -p "${OUT}"
 export PYTHONPATH="${ROOT}/compiler/frontend:${PYTHONPATH:-}"
 export PYTHONDONTWRITEBYTECODE=1
 frontend_help=$(python3 -m pycircuit.cli build --help 2>&1)
-for flag in comb-update comb-partition comb-partition-max-nodes; do
+for flag in comb-update comb-reg-update comb-partition comb-partition-max-nodes; do
   if ! grep -q -- "--${flag}" <<<"${frontend_help}"; then
     echo "fail: pycircuit build CLI missing --${flag}" >&2
     exit 1
   fi
 done
+c++ -std=c++17 -O0 -I"${ROOT}/runtime" \
+  "${REG_COMMIT_DRIVER}" -o "${OUT}/run_reg_commit"
+"${OUT}/run_reg_commit"
 python3 -m pycircuit.cli emit "${INPUT_PY}" -o "${OUT}/supernode_optional_update.pyc"
 
 common_flags=(
@@ -306,6 +311,72 @@ compile_boundary_backends \
 compile_boundary_backends \
   instance "${OUT}/instance_boundary.pyc" supernode_instance_boundary
 echo "ok: state/instance boundary IR compiled in C++ and Verilog backends"
+
+# Compare the current per-consumer register polling path with commit-driven
+# direct-RegOp fanout. Both lanes execute the same state transition sequence.
+for reg_update in poll commit; do
+  state_cpp_dir="${OUT}/cpp_state_reg_${reg_update}"
+  "${PYCC}" "${OUT}/state_boundary.pyc" \
+    --emit=cpp --out-dir="${state_cpp_dir}" --cpp-split=module \
+    --comb-update=dirty --comb-reg-update="${reg_update}" \
+    --comb-partition=static --comb-partition-max-nodes=3 \
+    --logic-depth=256 --build-profile=dev-fast \
+    --inline-policy=off --hierarchy-policy=strict
+
+  if [[ "${reg_update}" == "commit" ]]; then
+    if grep -q '_pyc_comb_1_input_0' \
+        "${state_cpp_dir}/supernode_state_boundary.hpp"; then
+      echo "fail: commit mode retained the direct register input snapshot" >&2
+      exit 1
+    fi
+    if ! grep -q 'reg_commit_checks' \
+        "${state_cpp_dir}/supernode_state_boundary.hpp" || \
+       ! grep -q '_pyc_comb_mark_active(1u)' \
+        "${state_cpp_dir}/supernode_state_boundary.cpp"; then
+      echo "fail: commit mode did not emit register change fanout" >&2
+      exit 1
+    fi
+    reg_update_id=1
+  else
+    if ! grep -q '_pyc_comb_1_input_0' \
+        "${state_cpp_dir}/supernode_state_boundary.hpp"; then
+      echo "fail: poll mode removed the direct register input snapshot" >&2
+      exit 1
+    fi
+    reg_update_id=0
+  fi
+
+  c++ -std=c++17 -O0 \
+    -DPYC_EXPECT_REG_UPDATE="${reg_update_id}" \
+    -I"${state_cpp_dir}" -I"${ROOT}/runtime" \
+    "${state_cpp_dir}/supernode_state_boundary.cpp" \
+    "${STATE_BOUNDARY_DRIVER}" \
+    -o "${OUT}/run_state_reg_${reg_update}"
+  "${OUT}/run_state_reg_${reg_update}"
+done
+echo "ok: poll and commit-driven register invalidation are equivalent"
+
+# The register mode only changes dirty scheduling. Guarded+commit must retain
+# complete input snapshots and must not consume register commit fanout.
+state_guarded_dir="${OUT}/cpp_state_guarded_commit"
+"${PYCC}" "${OUT}/state_boundary.pyc" \
+  --emit=cpp --out-dir="${state_guarded_dir}" --cpp-split=module \
+  --comb-update=guarded --comb-reg-update=commit \
+  --comb-partition=static --comb-partition-max-nodes=3 \
+  --logic-depth=256 --build-profile=dev-fast \
+  --inline-policy=off --hierarchy-policy=strict
+if ! grep -q '_pyc_comb_1_input_0' \
+    "${state_guarded_dir}/supernode_state_boundary.hpp"; then
+  echo "fail: guarded+commit removed a required register snapshot" >&2
+  exit 1
+fi
+c++ -std=c++17 -O0 -DPYC_EXPECT_REG_UPDATE=0 \
+  -I"${state_guarded_dir}" -I"${ROOT}/runtime" \
+  "${state_guarded_dir}/supernode_state_boundary.cpp" \
+  "${STATE_BOUNDARY_DRIVER}" \
+  -o "${OUT}/run_state_guarded_commit"
+"${OUT}/run_state_guarded_commit"
+echo "ok: guarded+commit remains on complete snapshot semantics"
 
 # A named value that remains semantically live at the unified-pass boundary
 # must retain its identity when its defining op becomes local to a sibling

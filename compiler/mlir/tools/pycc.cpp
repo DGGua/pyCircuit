@@ -203,6 +203,11 @@ static llvm::cl::opt<std::string> combUpdateMode(
     llvm::cl::desc("C++ comb update policy: always|guarded|dirty"),
     llvm::cl::init("dirty"));
 
+static llvm::cl::opt<std::string> combRegUpdateMode(
+    "comb-reg-update",
+    llvm::cl::desc("C++ local-register comb invalidation: poll|commit"),
+    llvm::cl::init("poll"));
+
 static llvm::cl::opt<std::string> combPartitionMode(
     "comb-partition",
     llvm::cl::desc("MLIR comb partition policy: none|static"),
@@ -2271,6 +2276,21 @@ int main(int argc, char **argv) {
     return 1;
   }
 
+  std::string combRegUpdateNorm =
+      llvm::StringRef(combRegUpdateMode).lower();
+  pyc::CppEmitterOptions::CombRegUpdateMode cppCombRegUpdatePolicy;
+  if (combRegUpdateNorm == "poll") {
+    cppCombRegUpdatePolicy =
+        pyc::CppEmitterOptions::CombRegUpdateMode::Poll;
+  } else if (combRegUpdateNorm == "commit") {
+    cppCombRegUpdatePolicy =
+        pyc::CppEmitterOptions::CombRegUpdateMode::Commit;
+  } else {
+    llvm::errs() << "error: unknown --comb-reg-update: "
+                 << combRegUpdateMode << " (expected: poll|commit)\n";
+    return 1;
+  }
+
   std::string combPartitionNorm = llvm::StringRef(combPartitionMode).lower();
   bool enableStaticCombPartition = false;
   if (combPartitionNorm == "none") {
@@ -2846,6 +2866,7 @@ int main(int argc, char **argv) {
       pyc::CppEmitterOptions cppEmitOpts;
       cppEmitOpts.probePlanPath = probePlanPath;
       cppEmitOpts.combUpdateMode = cppCombUpdatePolicy;
+      cppEmitOpts.combRegUpdateMode = cppCombRegUpdatePolicy;
       cppEmitOpts.combChunkNodes = cppCombChunkNodes;
       cppEmitOpts.evalTopoChunkNodes = cppCombChunkNodes;
 
@@ -3206,6 +3227,7 @@ int main(int argc, char **argv) {
     pyc::CppEmitterOptions cppEmitOpts;
     cppEmitOpts.probePlanPath = probePlanPath;
     cppEmitOpts.combUpdateMode = cppCombUpdatePolicy;
+    cppEmitOpts.combRegUpdateMode = cppCombRegUpdatePolicy;
     cppEmitOpts.combChunkNodes = cppCombChunkNodes;
     cppEmitOpts.evalTopoChunkNodes = cppCombChunkNodes;
     if (failed(pyc::emitCpp(*module, os, cppEmitOpts)))

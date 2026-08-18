@@ -97,7 +97,7 @@ comb → clk=1 → tick_posedge → transfer → comb → clk=0 → tick_negedge
 
 ### 3.1 eval() 组合逻辑求值
 
-`eval()` 是编译器生成的纯函数，按 **拓扑排序** 展开所有组合逻辑节点。
+`eval()` 是编译器生成的确定性函数，按 **拓扑排序** 扫描组合逻辑节点。
 编译器在 MLIR 层已完成数据流分析和调度，将组合逻辑分割为多个
 `eval_comb_N()` 内联函数，顺序调用：
 
@@ -114,9 +114,13 @@ void eval() {
 }
 ```
 
-**关键特性**: 默认模式下，每个周期对所有组合节点做完整求值。
-通过可选的 **信号变化检测 (Change Detection)** 机制，可以在输入未变化时
-跳过 `eval()` 调用，形成混合 compiled/event 模型（参见 §5.6）。
+**关键特性**: 默认 `dirty` 模式仍执行静态拓扑扫描，但 inactive
+`eval_comb_N()` 可快速跳过；普通边界输入通过精确 snapshot 判断变化，
+comb 输出只在语义值变化时唤醒直接 fanout。`--comb-reg-update=commit`
+进一步省略直接本地 `pyc.reg` 输入的 snapshot：`tick_commit()` 仅在
+`qNext != q` 时标记其直接 consumer active。无法直接确认的寄存器路径、
+子模块、FIFO、memory 和 CDC 仍保守轮询。`poll` 是当前默认和 A/B
+正确性基线，`always` 是强制重算 oracle。
 
 ### 3.2 tick() 时序更新
 
@@ -124,17 +128,24 @@ void eval() {
 确保寄存器间无顺序依赖：
 
 ```cpp
-void tick() {
+void tick_compute() {
     // Phase 1: 所有寄存器并行计算下一状态
     pyc_reg_271_inst.tick_compute();
     pyc_reg_272_inst.tick_compute();
     ...  // × 256 个寄存器
+}
+void tick_commit() {
     // Phase 2: 所有寄存器原子提交
-    pyc_reg_271_inst.tick_commit();
+    bool q271_changed = pyc_reg_271_inst.tick_commit();
     pyc_reg_272_inst.tick_commit();
     ...  // × 256 个寄存器
 }
 ```
+
+`tick_commit()` 的寄存器 primitive 返回语义值是否变化；忽略返回值的
+旧调用保持兼容。commit-driven 模式仅对有直接 comb consumer 的本地
+寄存器消费该返回值，并更新 `reg_commit_checks`、
+`reg_semantic_changes` 和 `reg_fanout_enqueues` 统计。
 
 ## 4. 与事件驱动仿真的对比
 

@@ -103,7 +103,12 @@ incoming and final plans.
 The C++ `--comb-update=dirty` policy consumes these final partitions with a
 static topological scan. Inactive units take a fast return; a producer whose
 outputs do not change neither stores those outputs nor activates direct
-fanout. Boundary inputs use exact snapshots. This is not a dynamic work queue.
+fanout. Boundary inputs use exact snapshots. `--comb-reg-update=commit`
+classifies only direct, same-function `pyc.reg` results: their snapshots are
+removed and `tick_commit()` activates direct consumer partitions only when
+`qNext != q`. Unclassified state, hierarchy, FIFO, memory, and CDC boundaries
+continue to use polling. `--comb-reg-update=poll` remains the default reference
+lane. This is not a dynamic work queue.
 
 ### `pyc-check-flat-types`
 

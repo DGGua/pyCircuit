@@ -940,12 +940,36 @@ static LogicalResult emitCombAssign(Operation &op, llvm::raw_ostream &os, NameTa
   return op.emitError("unsupported combinational op for C++ emission");
 }
 
+static bool isCommitDrivenLocalRegInput(
+    pyc::CombOp comb, Value input,
+    CppEmitterOptions::CombRegUpdateMode regUpdateMode) {
+  if (regUpdateMode != CppEmitterOptions::CombRegUpdateMode::Commit)
+    return false;
+  auto reg = input.getDefiningOp<pyc::RegOp>();
+  return reg && reg.getQ() == input &&
+         reg->getBlock() == comb->getBlock();
+}
+
+static bool hasPolledCombBoundaryInput(
+    pyc::CombOp comb, const CppEmitterOptions &opts) {
+  for (Value input : comb.getInputs()) {
+    if (input.getDefiningOp<pyc::CombOp>())
+      continue;
+    if (isCommitDrivenLocalRegInput(
+            comb, input, opts.combRegUpdateMode))
+      continue;
+    return true;
+  }
+  return false;
+}
+
 static void emitCombInputGuard(pyc::CombOp comb,
                                llvm::raw_ostream &os,
                                NameTable &nt,
                                unsigned idx,
-                               CppEmitterOptions::CombUpdateMode updateMode) {
+                               const CppEmitterOptions &opts) {
   using CombUpdateMode = CppEmitterOptions::CombUpdateMode;
+  const CombUpdateMode updateMode = opts.combUpdateMode;
 
   if (updateMode == CombUpdateMode::Always) {
     os << "    if (_pyc_sim_stats_enable) _pyc_sim_stats.comb_eval_calls++;\n";
@@ -979,6 +1003,9 @@ static void emitCombInputGuard(pyc::CombOp comb,
   os << "    bool _pyc_comb_boundary_changed = !_pyc_comb_" << idx << "_inputs_valid;\n";
   for (auto [inputIndex, input] : llvm::enumerate(comb.getInputs())) {
     if (input.getDefiningOp<pyc::CombOp>())
+      continue;
+    if (updateMode == CombUpdateMode::Dirty &&
+        isCommitDrivenLocalRegInput(comb, input, opts.combRegUpdateMode))
       continue;
     std::string cacheName =
         "_pyc_comb_" + std::to_string(idx) + "_input_" + std::to_string(inputIndex);
@@ -1101,7 +1128,7 @@ static LogicalResult emitCombMethod(pyc::CombOp comb,
     }
 
     os << "  inline void eval_comb_" << idx << "() {\n";
-    emitCombInputGuard(comb, os, nt, idx, opts.combUpdateMode);
+    emitCombInputGuard(comb, os, nt, idx, opts);
     for (const std::string &partName : partMethods)
       os << "    " << partName << "();\n";
 
@@ -1124,7 +1151,7 @@ static LogicalResult emitCombMethod(pyc::CombOp comb,
 
   std::string methodName = "eval_comb_" + std::to_string(idx);
   os << "  inline void " << methodName << "() {\n";
-  emitCombInputGuard(comb, os, nt, idx, opts.combUpdateMode);
+  emitCombInputGuard(comb, os, nt, idx, opts);
   placement.beginMethod(methodName);
   for (Operation *op : combOps) {
     if (failed(emitCombAssign(*op, os, nt, &placement)))
@@ -1241,9 +1268,34 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
   for (auto [i, comb] : llvm::enumerate(combs))
     combIndex.try_emplace(comb.getOperation(), static_cast<unsigned>(i));
 
+  llvm::DenseMap<Operation *, llvm::SmallVector<unsigned>>
+      localRegCombConsumers;
+  if (opts.combUpdateMode == CppEmitterOptions::CombUpdateMode::Dirty &&
+      opts.combRegUpdateMode ==
+          CppEmitterOptions::CombRegUpdateMode::Commit) {
+    for (auto [consumerIndex, comb] : llvm::enumerate(combs)) {
+      for (Value input : comb.getInputs()) {
+        if (!isCommitDrivenLocalRegInput(
+                comb, input, opts.combRegUpdateMode))
+          continue;
+        auto reg = input.getDefiningOp<pyc::RegOp>();
+        localRegCombConsumers[reg.getOperation()].push_back(
+            static_cast<unsigned>(consumerIndex));
+      }
+    }
+    for (auto &entry : localRegCombConsumers) {
+      llvm::sort(entry.second);
+      entry.second.erase(
+          std::unique(entry.second.begin(), entry.second.end()),
+          entry.second.end());
+    }
+  }
+
   // Guarded mode snapshots every direct input. Dirty mode only snapshots
   // boundary inputs: direct CombOp dependencies are represented by activity
-  // bits and woken by exact producer-output change detection.
+  // bits and woken by exact producer-output change detection. In commit-driven
+  // register mode, direct local RegOp results are similarly woken by commit.
+  unsigned combBoundarySnapshotCount = 0;
   if (!combs.empty() && opts.combUpdateMode != CppEmitterOptions::CombUpdateMode::Always) {
     os << "  // Per-comb boundary snapshots for change-driven evaluation.\n";
     for (auto [combIndex, comb] : llvm::enumerate(combs)) {
@@ -1252,12 +1304,21 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
         if (opts.combUpdateMode == CppEmitterOptions::CombUpdateMode::Dirty &&
             input.getDefiningOp<pyc::CombOp>())
           continue;
+        if (opts.combUpdateMode ==
+                CppEmitterOptions::CombUpdateMode::Dirty &&
+            isCommitDrivenLocalRegInput(
+                comb, input, opts.combRegUpdateMode))
+          continue;
         os << "  " << cppType(input.getType()) << " _pyc_comb_" << combIndex << "_input_"
            << inputIndex << "{};\n";
+        ++combBoundarySnapshotCount;
       }
     }
     os << "\n";
   }
+  os << "  static constexpr std::uint64_t "
+        "_pyc_comb_boundary_snapshot_count = "
+     << combBoundarySnapshotCount << "ull;\n\n";
 
   if (!combs.empty() && opts.combUpdateMode == CppEmitterOptions::CombUpdateMode::Dirty) {
     unsigned activityWords = (static_cast<unsigned>(combs.size()) + 63u) / 64u;
@@ -1275,6 +1336,11 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
     os << "    const bool active = (_pyc_comb_active_words[word] & mask) != 0;\n";
     os << "    _pyc_comb_active_words[word] &= ~mask;\n";
     os << "    return active;\n";
+    os << "  }\n";
+    os << "  inline bool _pyc_comb_is_active(unsigned id) const {\n";
+    os << "    const unsigned word = id >> 6u;\n";
+    os << "    const std::uint64_t mask = std::uint64_t{1} << (id & 63u);\n";
+    os << "    return (_pyc_comb_active_words[word] & mask) != 0;\n";
     os << "  }\n";
     os << "  inline bool _pyc_comb_mark_active(unsigned id) {\n";
     os << "    const unsigned word = id >> 6u;\n";
@@ -1807,6 +1873,9 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
   os << "    std::uint64_t comb_output_store_attempts = 0;\n";
   os << "    std::uint64_t comb_output_semantic_changes = 0;\n";
   os << "    std::uint64_t comb_fanout_enqueues = 0;\n";
+  os << "    std::uint64_t reg_commit_checks = 0;\n";
+  os << "    std::uint64_t reg_semantic_changes = 0;\n";
+  os << "    std::uint64_t reg_fanout_enqueues = 0;\n";
   os << "    std::uint64_t instance_eval_calls = 0;\n";
   os << "    std::uint64_t instance_cache_skips = 0;\n";
   os << "    std::uint64_t primitive_eval_calls = 0;\n";
@@ -1842,6 +1911,10 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
   os << "    os << \"comb_output_store_attempts=\" << _pyc_sim_stats.comb_output_store_attempts << \"\\n\";\n";
   os << "    os << \"comb_output_semantic_changes=\" << _pyc_sim_stats.comb_output_semantic_changes << \"\\n\";\n";
   os << "    os << \"comb_fanout_enqueues=\" << _pyc_sim_stats.comb_fanout_enqueues << \"\\n\";\n";
+  os << "    os << \"comb_boundary_snapshots=\" << _pyc_comb_boundary_snapshot_count << \"\\n\";\n";
+  os << "    os << \"reg_commit_checks=\" << _pyc_sim_stats.reg_commit_checks << \"\\n\";\n";
+  os << "    os << \"reg_semantic_changes=\" << _pyc_sim_stats.reg_semantic_changes << \"\\n\";\n";
+  os << "    os << \"reg_fanout_enqueues=\" << _pyc_sim_stats.reg_fanout_enqueues << \"\\n\";\n";
   os << "    os << \"instance_eval_calls=\" << _pyc_sim_stats.instance_eval_calls << \"\\n\";\n";
   os << "    os << \"instance_cache_skips=\" << _pyc_sim_stats.instance_cache_skips << \"\\n\";\n";
   os << "    os << \"primitive_eval_calls=\" << _pyc_sim_stats.primitive_eval_calls << \"\\n\";\n";
@@ -2095,6 +2168,18 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
     return true;
   };
 
+  auto emitCombCall = [&](pyc::CombOp comb, llvm::StringRef indent) {
+    unsigned index = combIndex.lookup(comb.getOperation());
+    if (opts.combUpdateMode ==
+            CppEmitterOptions::CombUpdateMode::Dirty &&
+        !hasPolledCombBoundaryInput(comb, opts)) {
+      os << indent << "if (_pyc_comb_is_active(" << index
+         << "u)) eval_comb_" << index << "();\n";
+      return;
+    }
+    os << indent << "eval_comb_" << index << "();\n";
+  };
+
   // eval_comb_pass(): evaluate all combinational ops/assigns.
   //
   // Note: The IR is allowed to have "late" pyc.assign ops (e.g. queue wrappers
@@ -2116,7 +2201,7 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
       continue;
     }
     if (auto comb = dyn_cast<pyc::CombOp>(*op)) {
-      os << "    eval_comb_" << combIndex.lookup(comb.getOperation()) << "();\n";
+      emitCombCall(comb, "    ");
       continue;
     }
     if (auto a = dyn_cast<pyc::AssertOp>(*op)) {
@@ -2562,7 +2647,7 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
       return success();
     }
     if (auto comb = dyn_cast<pyc::CombOp>(*op)) {
-      os << indent << "eval_comb_" << combIndex.lookup(comb.getOperation()) << "();\n";
+      emitCombCall(comb, indent);
       return success();
     }
     if (isa<pyc::ConstantOp,
@@ -3057,8 +3142,30 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
       os << "    tick_commit_part_" << i << "();\n";
   }
   os << "    // Local sequential primitives.\n";
-  for (auto r : regs)
-    os << "    " << nt.get(r.getQ()) << "_inst->tick_commit();\n";
+  for (auto r : regs) {
+    std::string regInstance = nt.get(r.getQ()) + "_inst";
+    auto consumers = localRegCombConsumers.find(r.getOperation());
+    if (opts.combUpdateMode ==
+            CppEmitterOptions::CombUpdateMode::Dirty &&
+        opts.combRegUpdateMode ==
+            CppEmitterOptions::CombRegUpdateMode::Commit &&
+        consumers != localRegCombConsumers.end() &&
+        !consumers->second.empty()) {
+      os << "    if (_pyc_sim_stats_enable && " << regInstance
+         << "->pending) _pyc_sim_stats.reg_commit_checks++;\n";
+      os << "    if (" << regInstance << "->tick_commit()) {\n";
+      os << "      if (_pyc_sim_stats_enable) "
+            "_pyc_sim_stats.reg_semantic_changes++;\n";
+      for (unsigned consumerIndex : consumers->second) {
+        os << "      if (_pyc_comb_mark_active(" << consumerIndex
+           << "u) && _pyc_sim_stats_enable) "
+              "_pyc_sim_stats.reg_fanout_enqueues++;\n";
+      }
+      os << "    }\n";
+    } else {
+      os << "    " << regInstance << "->tick_commit();\n";
+    }
+  }
   for (auto fifo : fifos)
     os << "    " << nt.get(fifo.getInReady()) << "_inst.tick_commit();\n";
   for (auto mem : byteMems)

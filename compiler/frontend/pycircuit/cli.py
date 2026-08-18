@@ -2249,6 +2249,7 @@ def _cmd_build(args: argparse.Namespace) -> int:
         raise SystemExit("--logic-depth must be > 0")
     logic_depth = int(args.logic_depth)
     comb_update = str(args.comb_update)
+    comb_reg_update = str(args.comb_reg_update)
     comb_partition = str(args.comb_partition)
     comb_partition_max_nodes = int(args.comb_partition_max_nodes)
     if comb_partition == "static" and comb_partition_max_nodes <= 0:
@@ -2270,6 +2271,7 @@ def _cmd_build(args: argparse.Namespace) -> int:
         "--inline-policy=off",
         "--hierarchy-policy=strict",
         f"--comb-update={comb_update}",
+        f"--comb-reg-update={comb_reg_update}",
         f"--comb-partition={comb_partition}",
         f"--comb-partition-max-nodes={comb_partition_max_nodes}",
     ]
@@ -2284,6 +2286,7 @@ def _cmd_build(args: argparse.Namespace) -> int:
         "inline_policy": "off",
         "hierarchy_policy": "strict",
         "comb_update": comb_update,
+        "comb_reg_update": comb_reg_update,
         "comb_partition": comb_partition,
         "comb_partition_max_nodes": comb_partition_max_nodes,
         "comb_dep_summary_schema_version": 1,
@@ -2796,6 +2799,12 @@ def main(argv: list[str] | None = None) -> int:
         choices=["always", "guarded", "dirty"],
         default="dirty",
         help="C++ comb update policy (always is the forced-recompute oracle)",
+    )
+    build.add_argument(
+        "--comb-reg-update",
+        choices=["poll", "commit"],
+        default="poll",
+        help="Local-register invalidation policy for dirty C++ comb updates",
     )
     build.add_argument(
         "--comb-partition",
