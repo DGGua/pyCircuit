@@ -6,11 +6,18 @@
 
 namespace pyc {
 
+enum class DelayChainMode {
+  Generated,
+  Structural,
+};
+
 std::unique_ptr<::mlir::Pass> createCombCanonicalizePass();
 std::unique_ptr<::mlir::Pass> createInlineFunctionsPass();
 std::unique_ptr<::mlir::Pass> createFuseCombPass();
 std::unique_ptr<::mlir::Pass> createEliminateWiresPass();
-std::unique_ptr<::mlir::Pass> createCombineDelayChainsPass();
+std::unique_ptr<::mlir::Pass> createAnalyzeStateOptimizationPass();
+std::unique_ptr<::mlir::Pass>
+createCombineDelayChainsPass(DelayChainMode mode = DelayChainMode::Generated);
 std::unique_ptr<::mlir::Pass> createPackI1RegsPass();
 std::unique_ptr<::mlir::Pass> createLowerSCFToPYCStaticPass();
 std::unique_ptr<::mlir::Pass> createCheckFrontendContractPass();

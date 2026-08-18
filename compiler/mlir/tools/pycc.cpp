@@ -192,8 +192,15 @@ static llvm::cl::opt<bool> unrollVector(
 
 static llvm::cl::opt<bool> combineDelayChains(
     "combine-delay-chains",
-    llvm::cl::desc("Combine generated cycle-balance register chains into pyc.delay_line"),
+    llvm::cl::desc(
+        "Legacy state/delay switch (explicit true selects generated; false forces off)"),
     llvm::cl::init(true));
+
+static llvm::cl::opt<std::string> stateDelayOpt(
+    "state-delay-opt",
+    llvm::cl::desc(
+        "State/delay optimization policy: off|generated|structural (default: structural)"),
+    llvm::cl::init("structural"));
 
 static llvm::cl::opt<bool> noInline(
     "noinline",
@@ -1986,6 +1993,20 @@ struct CompileStatsSummary {
   int64_t delayChainStateReadsAfter = 0;
   int64_t delayChainStateWritesBefore = 0;
   int64_t delayChainStateWritesAfter = 0;
+  int64_t stateOptRegsSeen = 0;
+  int64_t stateOptGeneratedRegs = 0;
+  int64_t stateOptPinnedRegs = 0;
+  int64_t stateOptMergeCandidates = 0;
+  int64_t stateOptGeneratedChains = 0;
+  int64_t stateOptGeneratedChainRegs = 0;
+  int64_t stateOptStructuralChains = 0;
+  int64_t stateOptStructuralChainRegs = 0;
+  int64_t stateOptStructuralOnlyChains = 0;
+  int64_t stateOptStructuralOnlyChainRegs = 0;
+  int64_t stateOptRegsMerged = 0;
+  int64_t stateOptRegBitsRemoved = 0;
+  int64_t stateOptStructuralChainsCombined = 0;
+  int64_t stateOptStructuralChainRegsCombined = 0;
   int64_t memCount = 0;
   int64_t memBits = 0;
   int64_t maxLogicDepth = 0;
@@ -2046,6 +2067,47 @@ static CompileStatsSummary collectCompileStats(ModuleOp module, int64_t depthLim
     s.delayChainStateWritesAfter =
         satAdd(s.delayChainStateWritesAfter,
                getI64Attr(f, "pyc.stats.delay_chain_state_writes_after", 0));
+    s.stateOptRegsSeen = satAdd(
+        s.stateOptRegsSeen, getI64Attr(f, "pyc.stats.state_opt_regs_seen", 0));
+    s.stateOptGeneratedRegs = satAdd(
+        s.stateOptGeneratedRegs,
+        getI64Attr(f, "pyc.stats.state_opt_generated_regs", 0));
+    s.stateOptPinnedRegs = satAdd(
+        s.stateOptPinnedRegs,
+        getI64Attr(f, "pyc.stats.state_opt_pinned_regs", 0));
+    s.stateOptMergeCandidates = satAdd(
+        s.stateOptMergeCandidates,
+        getI64Attr(f, "pyc.stats.state_opt_merge_candidates", 0));
+    s.stateOptGeneratedChains = satAdd(
+        s.stateOptGeneratedChains,
+        getI64Attr(f, "pyc.stats.state_opt_generated_chains", 0));
+    s.stateOptGeneratedChainRegs = satAdd(
+        s.stateOptGeneratedChainRegs,
+        getI64Attr(f, "pyc.stats.state_opt_generated_chain_regs", 0));
+    s.stateOptStructuralChains = satAdd(
+        s.stateOptStructuralChains,
+        getI64Attr(f, "pyc.stats.state_opt_structural_chains", 0));
+    s.stateOptStructuralChainRegs = satAdd(
+        s.stateOptStructuralChainRegs,
+        getI64Attr(f, "pyc.stats.state_opt_structural_chain_regs", 0));
+    s.stateOptStructuralOnlyChains = satAdd(
+        s.stateOptStructuralOnlyChains,
+        getI64Attr(f, "pyc.stats.state_opt_structural_only_chains", 0));
+    s.stateOptStructuralOnlyChainRegs = satAdd(
+        s.stateOptStructuralOnlyChainRegs,
+        getI64Attr(f, "pyc.stats.state_opt_structural_only_chain_regs", 0));
+    s.stateOptRegsMerged = satAdd(
+        s.stateOptRegsMerged,
+        getI64Attr(f, "pyc.stats.state_opt_regs_merged", 0));
+    s.stateOptRegBitsRemoved = satAdd(
+        s.stateOptRegBitsRemoved,
+        getI64Attr(f, "pyc.stats.state_opt_reg_bits_removed", 0));
+    s.stateOptStructuralChainsCombined = satAdd(
+        s.stateOptStructuralChainsCombined,
+        getI64Attr(f, "pyc.stats.state_opt_structural_chains_combined", 0));
+    s.stateOptStructuralChainRegsCombined = satAdd(
+        s.stateOptStructuralChainRegsCombined,
+        getI64Attr(f, "pyc.stats.state_opt_structural_chain_regs_combined", 0));
     s.memCount = satAdd(s.memCount, getI64Attr(f, "pyc.stats.mem_count", 0));
     s.memBits = satAdd(s.memBits, getI64Attr(f, "pyc.stats.mem_bits", 0));
 
@@ -2078,6 +2140,15 @@ static void printCompileStats(const CompileStatsSummary &s) {
                << s.delayChainStateReadsAfter
                << ", writes:" << s.delayChainStateWritesBefore << "->"
                << s.delayChainStateWritesAfter << "}"
+               << ", state_opt={seen:" << s.stateOptRegsSeen
+               << ", generated:" << s.stateOptGeneratedRegs
+               << ", pinned:" << s.stateOptPinnedRegs
+               << ", merge_candidates:" << s.stateOptMergeCandidates
+               << ", merged:" << s.stateOptRegsMerged
+               << ", bits_removed:" << s.stateOptRegBitsRemoved
+               << ", structural_chains:" << s.stateOptStructuralChainsCombined
+               << ", structural_regs:" << s.stateOptStructuralChainRegsCombined
+               << "}"
                << ", mems=" << s.memCount << " (" << s.memBits << " bits)"
                << ", max_depth=" << s.maxLogicDepth << "/" << s.logicDepthLimit
                << ", WNS=" << s.wns << ", TNS=" << s.tns
@@ -2099,6 +2170,21 @@ static llvm::json::Object compileStatsToJson(const CompileStatsSummary &s) {
   obj["delay_chain_state_reads_after"] = s.delayChainStateReadsAfter;
   obj["delay_chain_state_writes_before"] = s.delayChainStateWritesBefore;
   obj["delay_chain_state_writes_after"] = s.delayChainStateWritesAfter;
+  obj["state_opt_regs_seen"] = s.stateOptRegsSeen;
+  obj["state_opt_generated_regs"] = s.stateOptGeneratedRegs;
+  obj["state_opt_pinned_regs"] = s.stateOptPinnedRegs;
+  obj["state_opt_merge_candidates"] = s.stateOptMergeCandidates;
+  obj["state_opt_generated_chains"] = s.stateOptGeneratedChains;
+  obj["state_opt_generated_chain_regs"] = s.stateOptGeneratedChainRegs;
+  obj["state_opt_structural_chains"] = s.stateOptStructuralChains;
+  obj["state_opt_structural_chain_regs"] = s.stateOptStructuralChainRegs;
+  obj["state_opt_structural_only_chains"] = s.stateOptStructuralOnlyChains;
+  obj["state_opt_structural_only_chain_regs"] = s.stateOptStructuralOnlyChainRegs;
+  obj["state_opt_regs_merged"] = s.stateOptRegsMerged;
+  obj["state_opt_reg_bits_removed"] = s.stateOptRegBitsRemoved;
+  obj["state_opt_structural_chains_combined"] = s.stateOptStructuralChainsCombined;
+  obj["state_opt_structural_chain_regs_combined"] =
+      s.stateOptStructuralChainRegsCombined;
   obj["mem_count"] = s.memCount;
   obj["mem_bits"] = s.memBits;
   obj["logic_depth_limit"] = s.logicDepthLimit;
@@ -2247,6 +2333,23 @@ int main(int argc, char **argv) {
     cppOnly = true;
   } else {
     llvm::errs() << "error: unknown --sim-mode: " << simMode << " (expected: default|cpp-only)\n";
+    return 1;
+  }
+
+  std::string stateDelayOptNorm = llvm::StringRef(stateDelayOpt).lower();
+  if (stateDelayOpt.getNumOccurrences() == 0 &&
+      combineDelayChains.getNumOccurrences() != 0 && combineDelayChains)
+    stateDelayOptNorm = "generated";
+  const bool enableStateDelayOptimization =
+      combineDelayChains && stateDelayOptNorm != "off";
+  pyc::DelayChainMode stateDelayMode = pyc::DelayChainMode::Generated;
+  if (stateDelayOptNorm == "generated" || stateDelayOptNorm == "off") {
+    stateDelayMode = pyc::DelayChainMode::Generated;
+  } else if (stateDelayOptNorm == "structural") {
+    stateDelayMode = pyc::DelayChainMode::Structural;
+  } else {
+    llvm::errs() << "error: unknown --state-delay-opt: " << stateDelayOpt
+                 << " (expected: off|generated|structural)\n";
     return 1;
   }
 
@@ -2420,10 +2523,14 @@ int main(int argc, char **argv) {
     pm.addNestedPass<func::FuncOp>(pyc::createVectorUnrollPass());
   pm.addNestedPass<func::FuncOp>(pyc::createEliminateWiresPass());
   pm.addNestedPass<func::FuncOp>(pyc::createEliminateDeadStatePass());
+  // Stage 0 is diagnostics-only and runs for all policies, including off, so
+  // baselines retain visibility into missed optimization opportunities.
+  pm.addNestedPass<func::FuncOp>(pyc::createAnalyzeStateOptimizationPass());
   // Match normalized frontend-owned chains before downstream analyses and
   // emitters consume the first-class sequential operation.
-  if (combineDelayChains)
-    pm.addNestedPass<func::FuncOp>(pyc::createCombineDelayChainsPass());
+  if (enableStateDelayOptimization)
+    pm.addNestedPass<func::FuncOp>(
+        pyc::createCombineDelayChainsPass(stateDelayMode));
   if (!unrollVector)
     pm.addNestedPass<func::FuncOp>(pyc::createSLPPackWiresPass());
   pm.addNestedPass<func::FuncOp>(pyc::createCombCanonicalizePass());

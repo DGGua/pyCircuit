@@ -103,6 +103,33 @@ pyc.delay_line {depth=N}
 之后和组合规范化、clock/comb/logic-depth gates 之前。`--combine-delay-chains`
 默认开启；用 `--combine-delay-chains=false` 可生成 baseline。
 
+### 3.1 Stage 0/1 状态优化策略
+
+状态优化分成“只分析”和“可重写”两层。`pyc-analyze-state-optimization` 只在函数
+上写入候选统计，不改变状态或数据流；它在 `off`、`generated` 和 `structural`
+三种模式都会运行，因此 baseline 也能显示被错过的机会。
+
+`pycc` 提供分级开关：
+
+```text
+--state-delay-opt=off         只运行 Stage 0 分析，不重写状态
+--state-delay-opt=generated   保持原有 cycle_balance delay-line 行为（保守回退）
+--state-delay-opt=structural  允许安全的 provenance-independent 状态优化（默认）
+```
+
+`generated` 模式仍要求 `pyc.generated = "cycle_balance"`，用于兼容已有产物。
+`structural` 模式首先合并完全等价且不可独立观测的 `pyc.reg`，再识别严格串行的
+固定深度寄存器链；链的 clock/reset/enable/init、类型和 one-use 关系必须满足同一套
+MLIR 证明。`pyc.debug_keep`、`pyc.probe*`、`pyc.trace*`、`pyc.observable` 以及
+稳定的非 cycle-balance `pyc.name` 都是硬 pin，不能被合并或隐藏在 delay-line 中。
+legacy `--combine-delay-chains=true` 在没有分级策略参数时选择 `generated`，`false`
+始终强制 `off`；显式 `true` 与 `--state-delay-opt=...` 同时出现时，新的分级策略参数
+优先。不传任何策略参数时默认 `structural`。
+
+Stage 1 不改变组合逻辑拓扑，也不做重定时；它只消除状态机等价副本和已经存在的
+串行状态链。将来要实现 `f(delay(x)) -> delay(f(x))`，必须另加组合 op 白名单、
+初值求值和时序等价 verifier，不能由当前结构化模式隐式完成。
+
 这符合 gate-first 原则：状态语义先进入 Dialect 和 MLIR Pass，各项分析显式认识
 新操作，后端只负责 lowering，而不是根据私有名字修补语义。
 
@@ -280,14 +307,14 @@ pyc_delay_line #(.WIDTH(8), .DEPTH(128)) delay_inst (...);
 | Frontend | [`v5.py`](../compiler/frontend/pycircuit/v5.py) | `delay_to()` 标记自动周期平衡状态 |
 | Frontend | [`dsl.py`](../compiler/frontend/pycircuit/dsl.py)、[`hw.py`](../compiler/frontend/pycircuit/hw.py) | wire/reg/alias 接收并传播 `pyc.generated` |
 | Dialect | [`PYCOps.td`](../compiler/mlir/include/pyc/Dialect/PYC/PYCOps.td)、[`PYCOps.cpp`](../compiler/mlir/lib/Dialect/PYC/PYCOps.cpp) | 定义 `pyc.delay_line` 并验证 type/depth |
-| Transform | [`CombineDelayChainsPass.cpp`](../compiler/mlir/lib/Transforms/CombineDelayChainsPass.cpp) | 模式识别、最大链改写和 duplicate sharing |
+| Transform | [`AnalyzeStateOptimizationPass.cpp`](../compiler/mlir/lib/Transforms/AnalyzeStateOptimizationPass.cpp)、[`StateOptimization.cpp`](../compiler/mlir/lib/Transforms/StateOptimization.cpp)、[`CombineDelayChainsPass.cpp`](../compiler/mlir/lib/Transforms/CombineDelayChainsPass.cpp) | Stage 0 候选分析、可观测性契约、等价状态合并、最大链改写和 duplicate sharing |
 | Registration | [`Passes.h`](../compiler/mlir/include/pyc/Transforms/Passes.h)、[`CMakeLists.txt`](../compiler/mlir/CMakeLists.txt)、[`pyc-opt.cpp`](../compiler/mlir/tools/pyc-opt.cpp) | 声明、构建和注册 Pass |
 | Pipeline | [`pycc.cpp`](../compiler/mlir/tools/pycc.cpp) | 默认启用 Pass，输出 primitive、probe 和统计 |
 | Gates | [`CheckClockDomainsPass.cpp`](../compiler/mlir/lib/Transforms/CheckClockDomainsPass.cpp)、[`CheckCombCyclesPass.cpp`](../compiler/mlir/lib/Transforms/CheckCombCyclesPass.cpp)、[`CheckLogicDepthPass.cpp`](../compiler/mlir/lib/Transforms/CheckLogicDepthPass.cpp)、[`CombDepGraph.cpp`](../compiler/mlir/lib/Transforms/CombDepGraph.cpp) | 把 delay-line 作为时序边界并检查 clock sampling |
 | Cleanup/stats | [`EliminateDeadStatePass.cpp`](../compiler/mlir/lib/Transforms/EliminateDeadStatePass.cpp)、[`EliminateWiresPass.cpp`](../compiler/mlir/lib/Transforms/EliminateWiresPass.cpp)、[`CollectCompileStatsPass.cpp`](../compiler/mlir/lib/Transforms/CollectCompileStatsPass.cpp) | dead state、marker 保留、按 depth 统计状态 |
 | C++ | [`CppEmitter.cpp`](../compiler/mlir/lib/Emit/CppEmitter.cpp)、[`pyc_primitives.hpp`](../runtime/cpp/pyc_primitives.hpp) | 声明/构造/调度 scalar/vector ring primitive |
 | Verilog | [`VerilogEmitter.cpp`](../compiler/mlir/lib/Emit/VerilogEmitter.cpp)、[`pyc_delay_line.v`](../runtime/verilog/pyc_delay_line.v) | 参数化 scalar/vector-leaf lowering |
-| Tests | [`delay_line_combine.mlir`](../compiler/mlir/test/delay_line_combine.mlir)、[`delay_line_diagnostics_smoke.sh`](../compiler/mlir/test/delay_line_diagnostics_smoke.sh)、[`delay_line_verify_valid.mlir`](../compiler/mlir/test/delay_line_verify_valid.mlir)、[`delay_line_verify_invalid.mlir`](../compiler/mlir/test/delay_line_verify_invalid.mlir)、[`test_delay_line_combine.py`](../tests/v5/test_delay_line_combine.py) | Dialect、Pass 正反例、优化统计和 marker 回归 |
+| Tests | [`delay_line_combine.mlir`](../compiler/mlir/test/delay_line_combine.mlir)、[`state_delay_optimization.mlir`](../compiler/mlir/test/state_delay_optimization.mlir)、[`state_delay_optimization_smoke.sh`](../compiler/mlir/test/state_delay_optimization_smoke.sh)、[`delay_line_diagnostics_smoke.sh`](../compiler/mlir/test/delay_line_diagnostics_smoke.sh)、[`delay_line_verify_valid.mlir`](../compiler/mlir/test/delay_line_verify_valid.mlir)、[`delay_line_verify_invalid.mlir`](../compiler/mlir/test/delay_line_verify_invalid.mlir)、[`test_delay_line_combine.py`](../tests/v5/test_delay_line_combine.py) | Dialect、Stage 0/1 正反例、优化统计和 marker 回归 |
 | Verification | [`verification/delay_line_combine/`](../verification/delay_line_combine/README.md) | runtime、Icarus、Verilator、sharing、性能和 artifacts |
 
 Probe manifest/C++ probe registry 会过滤 `_v5_bal_*` 生成临时名，但仍将最终
@@ -331,6 +358,10 @@ Pass 同时在函数上写入 `pyc.stats.delay_chain_*` 优化账本，`pycc` �
 | `delay_chain_delay_lines_merged` | 因完整时序 key 相同而合并的 delay line 数量 |
 | `delay_chain_state_reads_before/after` | C++ 模型 compute/sample 阶段的状态 primitive 静态调度数 |
 | `delay_chain_state_writes_before/after` | C++ 模型 commit/update 阶段的状态 primitive 静态调度数 |
+| `state_opt_regs_seen/generated/pinned` | Stage 0 看到的寄存器、cycle-balance 寄存器和被可观测性 pin 的数量 |
+| `state_opt_merge_candidates` | 完全等价状态合并候选数量 |
+| `state_opt_regs_merged`, `state_opt_reg_bits_removed` | Stage 1 实际合并的寄存器和移除的逻辑 state bits |
+| `state_opt_structural_chains(_combined)` | structural 模式发现和实际形成的链数量 |
 
 例如两条共享的 depth=2 链会报告：
 
@@ -486,7 +517,8 @@ C++/Verilog 完整四值一致性属于 pyc4.0 value-model hardening 总体工�
 
 ### 12.4 更一般的 delay 网络
 
-当前只合并 frontend-owned、串行、控制完全相同且仅末端可观测的链。若需要多个
+当前只合并串行、控制完全相同且仅末端可观测的链，并合并完全等价的不可观测状态。
+若需要多个
 中间 tap，应设计 first-class multi-tap delay 或拆成多个最大安全段，而不是放松
 one-use 证明。只有在 O(M²) sharing 比较成为可测编译热点后，才需要 DenseMap key。
 
