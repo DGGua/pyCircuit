@@ -2809,7 +2809,7 @@ def main(argv: list[str] | None = None) -> int:
     build.add_argument(
         "--comb-partition",
         choices=["none", "static"],
-        default="static",
+        default="none",
         help="MLIR SuperNode partition policy",
     )
     build.add_argument(

@@ -211,7 +211,7 @@ static llvm::cl::opt<std::string> combRegUpdateMode(
 static llvm::cl::opt<std::string> combPartitionMode(
     "comb-partition",
     llvm::cl::desc("MLIR comb partition policy: none|static"),
-    llvm::cl::init("static"));
+    llvm::cl::init("none"));
 
 static llvm::cl::opt<unsigned> combPartitionMaxNodes(
     "comb-partition-max-nodes",

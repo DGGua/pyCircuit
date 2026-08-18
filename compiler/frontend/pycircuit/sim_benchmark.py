@@ -1202,7 +1202,7 @@ def resolve_comb_policy(args: argparse.Namespace) -> str:
         return requested_policy
 
     args.comb_update = requested_update or "dirty"
-    args.comb_partition = requested_partition or "static"
+    args.comb_partition = requested_partition or "none"
     args.comb_reg_update = requested_reg_update or "poll"
     resolved_policy = (
         args.comb_update,
@@ -1906,7 +1906,7 @@ def add_benchmark_arguments(parser: argparse.ArgumentParser) -> None:
         default=None,
         help=(
             "Comb execution preset: legacy=guarded+none, "
-            "gsim=dirty+static (default)"
+            "gsim=dirty+static"
         ),
     )
     parser.add_argument(

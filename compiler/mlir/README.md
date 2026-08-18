@@ -95,8 +95,9 @@ per-result transfer resolver (operand dependencies, edge kind, base depth, and
 edge cost). A result-producing operation without a registered transfer fails
 closed instead of receiving a conservative all-input/all-output guess.
 
-`pycc` runs this pass by default through `--comb-partition=static`; use
-`--comb-partition=none` to retain the legacy FuseComb behavior. The surrounding
+`pycc` currently defaults to `--comb-partition=none`, retaining FuseComb while
+the static planner's late-wire placement limitation is resolved. Use
+`--comb-partition=static` to opt into SuperNode partitioning. The surrounding
 `pyc-check-comb-memoizable` and `pyc-check-comb-partitions` gates validate both
 incoming and final plans.
 

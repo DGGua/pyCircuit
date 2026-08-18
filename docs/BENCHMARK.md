@@ -124,7 +124,7 @@ C++/Verilator，以降低固定顺序偏差；每个 timed run 的 digest 和 fi
 | `--comb-policy` | 无 | `legacy` 或 `gsim` 预设；显式低层参数必须与预设一致。 |
 | `--comb-update` | 由预设决定 | `always`、`guarded` 或 `dirty`。 |
 | `--comb-reg-update` | `poll` | `poll` 保留本地寄存器输入 snapshot；`commit` 在寄存器实际改值时唤醒直接 consumer。 |
-| `--comb-partition` | `static` | `none` 或静态 SuperNode 划分。 |
+| `--comb-partition` | `none` | `none` 或显式启用静态 SuperNode 划分。 |
 | `--comb-partition-max-nodes` | 35 | 静态 SuperNode 的最大 operation 数。 |
 | `--max-port-bits` | 4096 | 单个允许的 top-level `iN` port 最大宽度。 |
 | `--jobs` | 逻辑 CPU 数 | 构建并行度。 |
