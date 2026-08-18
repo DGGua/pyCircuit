@@ -2638,9 +2638,17 @@ def _cmd_build(args: argparse.Namespace) -> int:
             run_env["CCACHE_DISABLE"] = "1"
             run_env["OBJCACHE"] = ""
 
+            # On Windows/MSYS2 the CMake build above forces `mingw32-make`;
+            # Verilator's `--binary` path invokes `$MAKE` (or plain `make`)
+            # for its generated build, so mirror that selection here.
+            if os.name == "nt":
+                run_env.setdefault("MAKE", "mingw32-make")
+
             cmd = [
                 verilator_exe,
                 "--binary",
+                "-j",
+                str(jobs),
                 "-Wall",
                 "-Wno-fatal",
                 "-Wno-DECLFILENAME",
