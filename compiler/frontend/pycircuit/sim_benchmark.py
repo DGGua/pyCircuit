@@ -1155,6 +1155,7 @@ def _cpu_model() -> str:
 _COMB_POLICY_PRESETS: dict[str, tuple[str, str, str]] = {
     "legacy": ("guarded", "none", "poll"),
     "gsim": ("dirty", "static", "poll"),
+    "gsim-local": ("dirty", "local", "poll"),
 }
 
 
@@ -1229,9 +1230,12 @@ def _validate_args(args: argparse.Namespace) -> None:
     for name, value in positive.items():
         if int(value) <= 0:
             raise BenchmarkError(f"{name} must be > 0")
-    if args.comb_partition == "static" and int(args.comb_partition_max_nodes) <= 0:
+    if args.comb_partition in {"local", "static"} and int(
+        args.comb_partition_max_nodes
+    ) <= 0:
         raise BenchmarkError(
-            "--comb-partition-max-nodes must be > 0 when --comb-partition=static"
+            "--comb-partition-max-nodes must be > 0 when "
+            "--comb-partition is local or static"
         )
     for name in ("warmup_iterations", "reset_cycles", "reset_settle_cycles"):
         if int(getattr(args, name)) < 0:
@@ -1923,7 +1927,7 @@ def add_benchmark_arguments(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument(
         "--comb-partition",
-        choices=["none", "static"],
+        choices=["none", "local", "static"],
         default=None,
         help="Advanced override for the MLIR SuperNode partition policy",
     )

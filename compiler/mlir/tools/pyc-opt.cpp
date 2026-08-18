@@ -45,6 +45,7 @@ static void forceLinkPycPasses() {
   (void)pyc::createFuseCombPass();
   (void)pyc::createCheckCombMemoizablePass();
   (void)pyc::createPartitionCombPass(35);
+  (void)pyc::createPartitionFusedCombPass(35);
   (void)pyc::createCheckCombPartitionsPass();
   (void)pyc::createEliminateWiresPass();
   (void)pyc::createPackI1RegsPass();

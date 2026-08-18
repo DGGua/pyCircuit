@@ -205,6 +205,7 @@ struct PartitionInfo {
   uint64_t partCount;
   uint64_t work;
   uint64_t maxNodes;
+  bool local;
 };
 
 struct CheckCombPartitionsPass
@@ -231,6 +232,8 @@ struct CheckCombPartitionsPass
     uint64_t observedWork = 0;
     bool hasObservedMaxNodes = false;
     uint64_t observedMaxNodes = 0;
+    bool sawUnifiedPlan = false;
+    bool sawLocalPlan = false;
     llvm::SmallVector<CanonicalProbePattern, 16> canonicalProbePatterns;
     llvm::StringMap<SanitizedStorageOwner> sanitizedStorageOwners;
     llvm::DenseMap<Value, uint64_t> valueStorageIdentities;
@@ -527,13 +530,20 @@ struct CheckCombPartitionsPass
         anyFailure = true;
         return;
       }
-      if (!plan || plan.getValue() != kCombPartitionPlanVersion) {
+      const bool isUnified =
+          plan && plan.getValue() == kCombPartitionPlanVersion;
+      const bool isLocal =
+          plan && plan.getValue() == kFusedCombPartitionPlanVersion;
+      if (!isUnified && !isLocal) {
         comb.emitOpError("partition attribute '")
-            << kCombPartitionPlanVersionAttr << "' must equal '"
-            << kCombPartitionPlanVersion << "'";
+            << kCombPartitionPlanVersionAttr << "' must equal either '"
+            << kCombPartitionPlanVersion << "' or '"
+            << kFusedCombPartitionPlanVersion << "'";
         anyFailure = true;
         return;
       }
+      sawUnifiedPlan |= isUnified;
+      sawLocalPlan |= isLocal;
       if (comb->getParentOp() != function.getOperation()) {
         comb.emitOpError(
             "unified sibling partition must be directly nested in its "
@@ -541,10 +551,16 @@ struct CheckCombPartitionsPass
         anyFailure = true;
         return;
       }
-      if (!hasFunctionMetadata) {
+      if (isUnified && !hasFunctionMetadata) {
         comb.emitOpError("partition plan '")
             << kCombPartitionPlanVersion
             << "' requires matching function partition metadata";
+        anyFailure = true;
+        return;
+      }
+      if (isLocal && hasFunctionMetadata) {
+        comb.emitOpError("local fused-comb partitions cannot coexist with "
+                         "function-level unified partition metadata");
         anyFailure = true;
         return;
       }
@@ -666,9 +682,14 @@ struct CheckCombPartitionsPass
         return;
       }
       observedWork += *work;
-      groups[*parentId].push_back(PartitionInfo{comb, *parentId, *partId,
-                                                *partCount, *work, *maxNodes});
+      groups[*parentId].push_back(PartitionInfo{
+          comb, *parentId, *partId, *partCount, *work, *maxNodes, isLocal});
     });
+    if (sawUnifiedPlan && sawLocalPlan) {
+      function.emitOpError(
+          "cannot mix unified and local fused-comb partition plans");
+      anyFailure = true;
+    }
     if (anyFailure) {
       signalPassFailure();
       return;
@@ -733,6 +754,7 @@ struct CheckCombPartitionsPass
         continue;
       uint64_t count = parts.front().partCount;
       uint64_t maxNodes = parts.front().maxNodes;
+      bool local = parts.front().local;
       if (parts.size() != count) {
         parts.front().comb.emitOpError("partition parent_id ")
             << entry.first << " declares " << count << " parts but has "
@@ -743,7 +765,8 @@ struct CheckCombPartitionsPass
 
       llvm::SmallVector<pyc::CombOp> byId(count);
       for (PartitionInfo &part : parts) {
-        if (part.partCount != count || part.maxNodes != maxNodes) {
+        if (part.partCount != count || part.maxNodes != maxNodes ||
+            part.local != local) {
           part.comb.emitOpError("partition siblings disagree on plan metadata");
           anyFailure = true;
           continue;
@@ -786,6 +809,8 @@ struct CheckCombPartitionsPass
           auto producerPart =
               producer->getAttrOfType<IntegerAttr>(kCombPartitionPartIdAttr);
           if (!producerParent || !producerPart) {
+            if (local)
+              continue;
             comb.emitOpError(
                 "partition dependency originates from an unstamped pyc.comb");
             anyFailure = true;
@@ -793,6 +818,8 @@ struct CheckCombPartitionsPass
           }
           uint64_t producerParentId =
               static_cast<uint64_t>(producerParent.getInt());
+          if (local && producerParentId != entry.first)
+            continue;
           if (producerParentId > entry.first) {
             comb.emitOpError(
                 "cross-parent partition dependency must advance parent_id");

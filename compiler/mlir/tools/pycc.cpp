@@ -210,12 +210,12 @@ static llvm::cl::opt<std::string> combRegUpdateMode(
 
 static llvm::cl::opt<std::string> combPartitionMode(
     "comb-partition",
-    llvm::cl::desc("MLIR comb partition policy: none|static"),
+    llvm::cl::desc("MLIR comb partition policy: none|local|static"),
     llvm::cl::init("none"));
 
 static llvm::cl::opt<unsigned> combPartitionMaxNodes(
     "comb-partition-max-nodes",
-    llvm::cl::desc("Maximum operation count per static SuperNode partition"),
+    llvm::cl::desc("Maximum operation count per local/static SuperNode partition"),
     llvm::cl::init(35));
 
 static llvm::cl::opt<bool> unrollVector(
@@ -2293,18 +2293,25 @@ int main(int argc, char **argv) {
 
   std::string combPartitionNorm = llvm::StringRef(combPartitionMode).lower();
   bool enableStaticCombPartition = false;
+  bool enableLocalCombPartition = false;
   if (combPartitionNorm == "none") {
     enableStaticCombPartition = false;
+    enableLocalCombPartition = false;
+  } else if (combPartitionNorm == "local") {
+    enableStaticCombPartition = false;
+    enableLocalCombPartition = true;
   } else if (combPartitionNorm == "static") {
     enableStaticCombPartition = true;
+    enableLocalCombPartition = false;
   } else {
     llvm::errs() << "error: unknown --comb-partition: " << combPartitionMode
-                 << " (expected: none|static)\n";
+                 << " (expected: none|local|static)\n";
     return 1;
   }
-  if (enableStaticCombPartition && combPartitionMaxNodes == 0) {
+  if ((enableStaticCombPartition || enableLocalCombPartition) &&
+      combPartitionMaxNodes == 0) {
     llvm::errs() << "error: --comb-partition-max-nodes must be positive when "
-                    "--comb-partition=static\n";
+                    "--comb-partition is local or static\n";
     return 1;
   }
 
@@ -2388,11 +2395,11 @@ int main(int argc, char **argv) {
     llvm::errs() << "error: unknown --sim-mode: " << simMode << " (expected: default|cpp-only)\n";
     return 1;
   }
-  if (enableStaticCombPartition && cppOnly && cppOnlyPreserveOps) {
-    llvm::errs()
-        << "error: --comb-partition=static is incompatible with "
-           "--cpp-only-preserve-ops; use --comb-partition=none when raw "
-           "operation granularity must be preserved\n";
+  if ((enableStaticCombPartition || enableLocalCombPartition) && cppOnly &&
+      cppOnlyPreserveOps) {
+    llvm::errs() << "error: comb partitioning is incompatible with "
+                    "--cpp-only-preserve-ops; use --comb-partition=none when raw "
+                    "operation granularity must be preserved\n";
     return 1;
   }
 
@@ -2584,6 +2591,9 @@ int main(int argc, char **argv) {
       (((!cppOnly) || !cppOnlyPreserveOps) && !enableStaticCombPartition);
   if (enableFuseComb)
     pm.addNestedPass<func::FuncOp>(pyc::createFuseCombPass());
+  if (enableLocalCombPartition)
+    pm.addNestedPass<func::FuncOp>(
+        pyc::createPartitionFusedCombPass(combPartitionMaxNodes));
   pm.addPass(createCanonicalizerPass(canonicalizeCfg));
   pm.addPass(createCSEPass());
   addRemoveDeadValuesPassIfSupported(pm);

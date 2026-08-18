@@ -538,6 +538,22 @@ for idx in "${!modes[@]}"; do
   "${OUT}/run_${mode}"
 done
 
+# The local policy must preserve the same dirty producer-change propagation
+# while partitioning only inside FuseComb-created regions.
+local_dir="${OUT}/cpp_dirty_local"
+"${PYCC}" "${OUT}/supernode_optional_update.pyc" \
+  --emit=cpp --out-dir="${local_dir}" --cpp-split=module \
+  --comb-update=dirty --comb-partition=local \
+  --comb-partition-max-nodes=1 \
+  --logic-depth=256 --build-profile=dev-fast \
+  --inline-policy=off --hierarchy-policy=strict
+c++ -std=c++17 -O0 -DPYC_EXPECT_COMB_MODE=2 \
+  -I"${local_dir}" -I"${ROOT}/runtime" \
+  "${local_dir}/supernode_optional_update.cpp" "${DRIVER}" \
+  -o "${OUT}/run_dirty_local"
+"${OUT}/run_dirty_local"
+echo "ok: local fused-comb partitions preserve dirty activity propagation"
+
 # Execute the coarsened max=3 plan too.  Its first scalar partition has two
 # live-outs, so the masked-input phase verifies that a multi-output producer
 # can run without publishing either unchanged output or waking its consumer.

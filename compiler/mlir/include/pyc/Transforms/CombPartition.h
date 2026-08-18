@@ -18,6 +18,8 @@ inline constexpr llvm::StringLiteral kCombPartitionMaxNodesAttr =
     "pyc.partition.max_nodes";
 inline constexpr llvm::StringLiteral kCombPartitionPlanVersion =
     "gsim-unified-v2";
+inline constexpr llvm::StringLiteral kFusedCombPartitionPlanVersion =
+    "local-fused-v1";
 
 inline constexpr llvm::StringLiteral kCombPartitionFunctionPlanAttr =
     "pyc.partition.function_plan";

@@ -2252,9 +2252,10 @@ def _cmd_build(args: argparse.Namespace) -> int:
     comb_reg_update = str(args.comb_reg_update)
     comb_partition = str(args.comb_partition)
     comb_partition_max_nodes = int(args.comb_partition_max_nodes)
-    if comb_partition == "static" and comb_partition_max_nodes <= 0:
+    if comb_partition in {"local", "static"} and comb_partition_max_nodes <= 0:
         raise SystemExit(
-            "--comb-partition-max-nodes must be > 0 when --comb-partition=static"
+            "--comb-partition-max-nodes must be > 0 when "
+            "--comb-partition is local or static"
         )
 
     device_cpp_root = out_dir / "device" / "cpp"
@@ -2817,7 +2818,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     build.add_argument(
         "--comb-partition",
-        choices=["none", "static"],
+        choices=["none", "local", "static"],
         default="none",
         help="MLIR SuperNode partition policy",
     )

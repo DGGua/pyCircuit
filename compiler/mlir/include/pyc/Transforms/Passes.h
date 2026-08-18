@@ -15,6 +15,11 @@ std::unique_ptr<::mlir::Pass> createCheckCombMemoizablePass();
 /// runtime scheduling units as sibling pyc.comb operations.
 /// A value of zero disables partitioning.
 std::unique_ptr<::mlir::Pass> createPartitionCombPass(unsigned maxNodes = 35);
+/// Independently split each top-level fused pyc.comb into placement-free local
+/// DAG partitions. Already partitioned combs are left unchanged.
+/// A value of zero disables partitioning.
+std::unique_ptr<::mlir::Pass>
+createPartitionFusedCombPass(unsigned maxNodes = 35);
 /// Verify the structural metadata and forward-only dependencies produced by
 /// createPartitionCombPass().
 std::unique_ptr<::mlir::Pass> createCheckCombPartitionsPass();

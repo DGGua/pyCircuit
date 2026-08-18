@@ -121,15 +121,30 @@ C++/Verilator，以降低固定顺序偏差；每个 timed run 的 digest 和 fi
 | `--sample-every` | 256 | timed workload 的 digest 间隔；必须是 2 的幂。 |
 | `--reset-cycles` / `--reset-settle-cycles` | 2 / 1 | clocked reset 序列；不计入 timed interval。 |
 | `--logic-depth` | 256 | 传给 `pycc` 的 MLIR logic-depth gate。 |
-| `--comb-policy` | 无 | `legacy` 或 `gsim` 预设；显式低层参数必须与预设一致。 |
+| `--comb-policy` | 无 | `legacy`、`gsim-local` 或 `gsim` 预设；显式低层参数必须与预设一致。 |
 | `--comb-update` | 由预设决定 | `always`、`guarded` 或 `dirty`。 |
 | `--comb-reg-update` | `poll` | `poll` 保留本地寄存器输入 snapshot；`commit` 在寄存器实际改值时唤醒直接 consumer。 |
-| `--comb-partition` | `none` | `none` 或显式启用静态 SuperNode 划分。 |
-| `--comb-partition-max-nodes` | 35 | 静态 SuperNode 的最大 operation 数。 |
+| `--comb-partition` | `none` | `none`、基于 FuseComb 边界的 `local`，或旧的全函数 `static` SuperNode 划分。 |
+| `--comb-partition-max-nodes` | 35 | `local`/`static` SuperNode 的最大 operation 数。 |
 | `--max-port-bits` | 4096 | 单个允许的 top-level `iN` port 最大宽度。 |
 | `--jobs` | 逻辑 CPU 数 | 构建并行度。 |
 | `--cpu` | 无 | Linux 上将 native 子进程绑到一个 logical CPU。 |
 | `--native` | off | 两个 native harness 都使用 `-march=native`；跨机器结果不可直接比较。 |
+
+## Per-Comb local rollout smoke（2026-08-18）
+
+`digital_filter` 在相同 workload 下完成了 `none`/`local`/`static` 三路
+逐周期 preflight。3 次、每次 500,000 cycles 的 C++ 中位吞吐分别为
+9.478/9.259/9.887 Mcycles/s；`local` 相对 `none` 回退约 2.3%，低于 3%
+门槛。该设计的 fused comb 均未超过 35 nodes，因此 `none` 与 `local`
+均生成 3 个 comb、9 个 boundary snapshots 和 77,760-byte executable；
+`static` 为 2/8/73,600。
+
+IssueQueue 的 `local` 路径已通过 partition contract 和完整 Verilator
+testbench，不再触发旧 static planner 的 `unsplittable barrier`。完整
+`run_examples.sh` 也已通过。普通 build 暂时仍默认 `none`：`run_sims.sh`
+继续在 BypassUnit 的重复 frontend `pyc.name` probe 路径处失败，而且该失败
+可用显式 `--comb-partition=none` 重现；在该独立命名问题修复前不执行默认切换。
 | `--min-sample-seconds` | 0.1 | 任一内部 timed sample 低于该值时写 warning。 |
 | `--timeout-seconds` | 300 | 每个 build/run stage 的 timeout。 |
 | `--param name=value` | 无 | 重复传递 JIT 参数覆盖。 |

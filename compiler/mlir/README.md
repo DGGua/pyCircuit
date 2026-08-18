@@ -60,10 +60,22 @@ Fuses consecutive pure combinational ops (`pyc.add/mux/and/or/xor/not/constant`)
 - flattened Verilog emission (`assign` instead of many tiny module instantiations)
 - inlined C++ combinational evaluation (fewer tiny objects / calls)
 
-This is the legacy `--comb-partition=none` path. The default
-`--comb-partition=static` path deliberately skips this pass so temporary fused
-region boundaries cannot bias the unified plan. It is also skipped by
+This pass feeds both `--comb-partition=none` and
+`--comb-partition=local`. The legacy function-level
+`--comb-partition=static` path deliberately skips it so temporary fused-region
+boundaries cannot bias the unified plan. It is also skipped by
 `--sim-mode=cpp-only --cpp-only-preserve-ops`.
+
+### `pyc-partition-fused-comb`
+
+Independently builds a deterministic SSA dependency graph inside each
+single-block fused `pyc.comb`, applies bounded GSIM-style coarsening, and
+materializes `local-fused-v1` sibling combs at the original comb position.
+It never unfolds the complete function or moves operations across register,
+wire/assign, primitive, or instance boundaries. Fused combs at or below
+`--comb-partition-max-nodes` remain unchanged.
+
+Select this placement-safe policy with `--comb-partition=local`.
 
 ### `pyc-partition-comb`
 
@@ -95,11 +107,11 @@ per-result transfer resolver (operand dependencies, edge kind, base depth, and
 edge cost). A result-producing operation without a registered transfer fails
 closed instead of receiving a conservative all-input/all-output guess.
 
-`pycc` currently defaults to `--comb-partition=none`, retaining FuseComb while
-the static planner's late-wire placement limitation is resolved. Use
-`--comb-partition=static` to opt into SuperNode partitioning. The surrounding
-`pyc-check-comb-memoizable` and `pyc-check-comb-partitions` gates validate both
-incoming and final plans.
+`pycc` currently defaults to `--comb-partition=none`, retaining FuseComb
+without subdividing its regions. Use `--comb-partition=local` for the
+placement-safe per-comb SuperNode policy or `--comb-partition=static` for the
+legacy function-level planner. The surrounding `pyc-check-comb-memoizable` and
+`pyc-check-comb-partitions` gates validate both incoming and final plans.
 
 The C++ `--comb-update=dirty` policy consumes these final partitions with a
 static topological scan. Inactive units take a fast return; a producer whose
