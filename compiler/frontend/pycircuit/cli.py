@@ -2630,25 +2630,25 @@ def _cmd_build(args: argparse.Namespace) -> int:
                     prefix = Path(vb).resolve().parents[1]
                     run_env["VERILATOR_ROOT"] = str(prefix / "share" / "verilator")
 
-            # verilated.mk wraps g++ with ccache. Generated Slow.cpp constructors
-            # are nearly identical across designs; without a per-top namespace
-            # and the root header in the cache key, preprocessor-mode hits can
-            # reuse an object compiled against a different class layout and
-            # SIGSEGV in VL_MURMUR64_HASH during construction.
-            run_env["CCACHE_NAMESPACE"] = f"pyc-verilator-{tb_name}"
-            run_env["CCACHE_COMPILERCHECK"] = "content"
+            # verilated.mk defaults to OBJCACHE=ccache. Caching Verilator PCH
+            # objects is unsafe: Slow.cpp constructors are nearly identical
+            # across designs, so a hit can mix class layouts and SIGSEGV in
+            # VL_MURMUR64_HASH during construction. Disable the wrapper here
+            # and keep --binary so generate+link stay on Verilator's path.
+            run_env["CCACHE_DISABLE"] = "1"
+            run_env["OBJCACHE"] = ""
 
             cmd = [
                 verilator_exe,
-                "--cc",
-                "--exe",
-                "--main",
+                "--binary",
                 "-Wall",
                 "-Wno-fatal",
                 "-Wno-DECLFILENAME",
                 "-Wno-UNUSEDSIGNAL",
                 "-Wno-WIDTHEXPAND",
                 "--quiet",
+                "-MAKEFLAGS",
+                "OBJCACHE=",
             ]
             cmd.extend(
                 [
@@ -2663,37 +2663,6 @@ def _cmd_build(args: argparse.Namespace) -> int:
                 ]
             )
             subprocess.run(cmd, check=True, env=run_env)
-            extra_files = [
-                path
-                for path in (
-                    vbuild / f"V{tb_name}___024root.h",
-                    vbuild / f"V{tb_name}__pch.h",
-                )
-                if path.is_file()
-            ]
-            if extra_files:
-                previous = str(run_env.get("CCACHE_EXTRAFILES", "")).strip()
-                joined = os.pathsep.join(
-                    [previous, *[str(path) for path in extra_files]]
-                    if previous
-                    else [str(path) for path in extra_files]
-                )
-                run_env["CCACHE_EXTRAFILES"] = joined
-            make_exe = "mingw32-make" if os.name == "nt" else "make"
-            subprocess.run(
-                [
-                    make_exe,
-                    "-C",
-                    str(vbuild),
-                    "-f",
-                    f"V{tb_name}.mk",
-                    "-j",
-                    str(jobs),
-                    f"V{tb_name}",
-                ],
-                check=True,
-                env=run_env,
-            )
             vbin = vbuild / f"V{tb_name}"
             if os.name == "nt" and not vbin.is_file():
                 vbin_exe = vbin.with_suffix(".exe")
