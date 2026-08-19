@@ -2358,6 +2358,8 @@ int main(int argc, char **argv) {
   addRemoveDeadValuesPassIfSupported(pm);
   pm.addNestedPass<func::FuncOp>(pyc::createEliminateDeadInstancesPass());
   pm.addPass(createSymbolDCEPass());
+  if (enableFuseComb && emitKind == "cpp")
+    pm.addNestedPass<func::FuncOp>(pyc::createCombHostBoundaryPass());
   pm.addNestedPass<func::FuncOp>(pyc::createCheckFlatTypesPass());
   pm.addNestedPass<func::FuncOp>(pyc::createCheckNoDynamicPass());
   pm.addPass(pyc::createCheckLogicDepthPass(logicDepthLimit));
