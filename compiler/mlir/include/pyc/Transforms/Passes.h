@@ -16,8 +16,15 @@ std::unique_ptr<::mlir::Pass> createInlineFunctionsPass();
 std::unique_ptr<::mlir::Pass> createFuseCombPass();
 std::unique_ptr<::mlir::Pass> createEliminateWiresPass();
 std::unique_ptr<::mlir::Pass> createAnalyzeStateOptimizationPass();
+std::unique_ptr<::mlir::Pass> createStripStateObservabilityPass();
 std::unique_ptr<::mlir::Pass>
-createCombineDelayChainsPass(DelayChainMode mode = DelayChainMode::Generated);
+createCombineDelayChainsPass(DelayChainMode mode = DelayChainMode::Generated,
+                             bool accumulateStats = false,
+                             bool cascadeRound = false,
+                             bool preserveObservability = false);
+std::unique_ptr<::mlir::Pass>
+createPackStateLanesPass(unsigned maxWidth = 192,
+                         bool preserveObservability = false);
 std::unique_ptr<::mlir::Pass> createPackI1RegsPass();
 std::unique_ptr<::mlir::Pass> createLowerSCFToPYCStaticPass();
 std::unique_ptr<::mlir::Pass> createCheckFrontendContractPass();

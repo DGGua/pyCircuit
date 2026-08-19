@@ -24,6 +24,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <functional>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -283,43 +284,68 @@ static std::vector<ProbeAliasEntry> loadProbeAliasesForTop(llvm::StringRef planP
   return out;
 }
 
-static Value findRegQFromValue(Value v) {
+struct StateProbeSource {
+  Value q;
+  unsigned lsb = 0;
+};
+
+static std::optional<StateProbeSource> findRegQFromValue(Value v) {
   llvm::SmallVector<Value, 8> seen;
+  unsigned lsb = 0;
   while (true) {
     for (Value prev : seen) {
       if (prev == v)
-        return Value();
+        return std::nullopt;
     }
     seen.push_back(v);
     while (auto a = v.getDefiningOp<pyc::AliasOp>())
       v = a.getIn();
     if (auto rop = v.getDefiningOp<pyc::RegOp>())
-      return rop.getQ();
+      return StateProbeSource{rop.getQ(), lsb};
     if (auto delay = v.getDefiningOp<pyc::DelayLineOp>())
-      return delay.getQ();
+      return StateProbeSource{delay.getQ(), lsb};
+    if (auto extract = v.getDefiningOp<pyc::ExtractOp>()) {
+      auto packedLsb =
+          extract->getAttrOfType<IntegerAttr>("pyc.state_pack_lsb");
+      if (!packedLsb || packedLsb.getInt() < 0)
+        return std::nullopt;
+      lsb += static_cast<unsigned>(packedLsb.getInt());
+      v = extract.getIn();
+      continue;
+    }
     auto comb = v.getDefiningOp<pyc::CombOp>();
     if (!comb)
-      return Value();
+      return std::nullopt;
 
     auto res = dyn_cast<OpResult>(v);
     if (!res)
-      return Value();
+      return std::nullopt;
     auto yield = dyn_cast_or_null<pyc::YieldOp>(comb.getBody().front().getTerminator());
     if (!yield)
-      return Value();
+      return std::nullopt;
     if (res.getResultNumber() >= yield.getNumOperands())
-      return Value();
+      return std::nullopt;
 
     Value y = yield.getOperand(res.getResultNumber());
     while (auto a = y.getDefiningOp<pyc::AliasOp>())
       y = a.getIn();
+    if (auto extract = y.getDefiningOp<pyc::ExtractOp>()) {
+      auto packedLsb =
+          extract->getAttrOfType<IntegerAttr>("pyc.state_pack_lsb");
+      if (!packedLsb || packedLsb.getInt() < 0)
+        return std::nullopt;
+      lsb += static_cast<unsigned>(packedLsb.getInt());
+      y = extract.getIn();
+      while (auto alias = y.getDefiningOp<pyc::AliasOp>())
+        y = alias.getIn();
+    }
     auto barg = dyn_cast<BlockArgument>(y);
     if (!barg)
-      return Value();
+      return std::nullopt;
     if (barg.getOwner() != &comb.getBody().front())
-      return Value();
+      return std::nullopt;
     if (barg.getArgNumber() >= comb.getNumOperands())
-      return Value();
+      return std::nullopt;
     v = comb.getOperand(barg.getArgNumber());
   }
 }
@@ -1315,15 +1341,16 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
       std::string cppValue;
       std::string cppRegInst;
       unsigned width = 0;
+      unsigned stateLsb = 0;
+      unsigned stateStorageWidth = 0;
       bool isReg = false;
       Type type;
     };
 
     // Decision 0003 / 0051-0052: infer probe kind for ports and named internal
-    // objects. A value is considered stateful iff it directly returns the q
-    // output of a local pyc.reg (through optional pyc.alias wrappers).
+    // objects. Packed state extracts retain the logical lane's q/pending view.
     std::vector<bool> outIsReg(f.getNumResults(), false);
-    std::vector<Value> outRegQ(f.getNumResults(), Value());
+    std::vector<std::optional<StateProbeSource>> outRegQ(f.getNumResults());
     std::vector<NamedProbeInfo> namedProbes;
     if (!f.isDeclaration()) {
       auto ret = dyn_cast_or_null<func::ReturnOp>(f.getBody().front().getTerminator());
@@ -1352,12 +1379,14 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
         std::string fieldPath = nameAttr.getValue().str();
         if (!seenNamedFields.insert(fieldPath).second)
           return;
-        Value regQ = findRegQFromValue(value);
+        auto regQ = findRegQFromValue(value);
         namedProbes.push_back(NamedProbeInfo{
             fieldPath,
             nt.get(value),
-            static_cast<bool>(regQ) ? (nt.get(regQ) + "_inst") : std::string(),
+            regQ ? (nt.get(regQ->q) + "_inst") : std::string(),
             width,
+            regQ ? regQ->lsb : 0,
+            regQ ? bitWidth(regQ->q.getType()) : 0,
             static_cast<bool>(regQ),
             value.getType(),
         });
@@ -1378,16 +1407,36 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
 		    if (w == 0)
 		      return f.emitError("invalid output port width for ProbeRegistry: ") << getPortCanonicalFieldPath(f, i, /*isResult=*/true);
 		    if (outIsReg[i] && !isa<VectorType>(f.getResultTypes()[i])) {
-		      os << "    reg.addReg<" << w << ">(reg_path(" << cppStringLiteral(outCanon[i]) << "), &" << outNames[i]
-		         << ", &" << nt.get(outRegQ[i]) << "_inst->pending, &" << nt.get(outRegQ[i]) << "_inst->qNext);\n";
+		      const auto &source = *outRegQ[i];
+		      const unsigned storageWidth = bitWidth(source.q.getType());
+		      if (source.lsb != 0 || storageWidth != w) {
+		        os << "    reg.addRegSlice<" << w << ", " << storageWidth
+		           << ">(reg_path(" << cppStringLiteral(outCanon[i]) << "), &"
+		           << outNames[i] << ", &" << nt.get(source.q)
+		           << "_inst->pending, &" << nt.get(source.q)
+		           << "_inst->qNext, " << source.lsb << "u);\n";
+		      } else {
+		        os << "    reg.addReg<" << w << ">(reg_path(" << cppStringLiteral(outCanon[i]) << "), &" << outNames[i]
+		           << ", &" << nt.get(source.q) << "_inst->pending, &" << nt.get(source.q) << "_inst->qNext);\n";
+		      }
 		    } else {
 		      emitWireProbes(os, f.getResultTypes()[i], w, outCanon[i], outNames[i]);
 		    }
 		  }
       for (const auto &named : namedProbes) {
         if (named.isReg && !isa<VectorType>(named.type)) {
-          os << "    reg.addReg<" << named.width << ">(reg_path(" << cppStringLiteral(named.fieldPath) << "), &"
-             << named.cppValue << ", &" << named.cppRegInst << "->pending, &" << named.cppRegInst << "->qNext);\n";
+          if (named.stateLsb != 0 ||
+              named.stateStorageWidth != named.width) {
+            os << "    reg.addRegSlice<" << named.width << ", "
+               << named.stateStorageWidth << ">(reg_path("
+               << cppStringLiteral(named.fieldPath) << "), &"
+               << named.cppValue << ", &" << named.cppRegInst
+               << "->pending, &" << named.cppRegInst << "->qNext, "
+               << named.stateLsb << "u);\n";
+          } else {
+            os << "    reg.addReg<" << named.width << ">(reg_path(" << cppStringLiteral(named.fieldPath) << "), &"
+               << named.cppValue << ", &" << named.cppRegInst << "->pending, &" << named.cppRegInst << "->qNext);\n";
+          }
         } else {
           emitWireProbes(os, named.type, named.width, named.fieldPath, named.cppValue);
         }

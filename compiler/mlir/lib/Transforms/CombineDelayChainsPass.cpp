@@ -1,7 +1,7 @@
 // Form compact delay-line state from proven serial register chains. The
 // generated mode preserves the original cycle-balance-only policy; structural
-// mode additionally merges equivalent unobservable state and admits untagged
-// chains after the same sequential and observability proof.
+// mode additionally merges equivalent state and admits untagged chains after
+// the same sequential proof. Explicit state identity is an opt-in boundary.
 
 #include "pyc/Transforms/Passes.h"
 #include "pyc/Transforms/StateOptimization.h"
@@ -69,9 +69,10 @@ static int64_t stateBitWidth(Type type) {
   return 0;
 }
 
-static Value stripChainAliases(Value value, DelayChainMode mode) {
+static Value stripChainAliases(Value value, DelayChainMode mode,
+                               bool preserveObservability) {
   while (auto alias = value.getDefiningOp<pyc::AliasOp>()) {
-    if (!isTransparentChainAlias(alias, mode))
+    if (!isTransparentChainAlias(alias, mode, preserveObservability))
       break;
     value = alias.getIn();
   }
@@ -80,9 +81,12 @@ static Value stripChainAliases(Value value, DelayChainMode mode) {
 
 static bool isDelayCandidate(
     pyc::DelayLineOp delay, DelayChainMode mode,
-    const StateObservabilityAnalysis &observability) {
-  if (!delay || shouldKeepStateOptimization(delay) ||
-      hasStableStateName(delay) || observability.isPinned(delay.getOperation()))
+    const StateObservabilityAnalysis &observability,
+    bool preserveObservability) {
+  if (!delay ||
+      (preserveObservability &&
+       (shouldKeepStateOptimization(delay) || hasStableStateName(delay) ||
+        observability.isPinned(delay.getOperation()))))
     return false;
   if (mode == DelayChainMode::Generated)
     return isCycleBalanceGenerated(delay);
@@ -91,14 +95,16 @@ static bool isDelayCandidate(
 
 static void mergeEquivalentStates(
     func::FuncOp function, CombineStats &stats,
-    const StateObservabilityAnalysis &observability) {
+    const StateObservabilityAnalysis &observability,
+    bool preserveObservability) {
   llvm::SmallVector<pyc::RegOp> regs;
   function.walk([&](pyc::RegOp reg) { regs.push_back(reg); });
 
   llvm::DenseMap<std::size_t, llvm::SmallVector<pyc::RegOp>> buckets;
   for (pyc::RegOp reg : regs) {
     if (!isStateOptimizationCandidate(reg, DelayChainMode::Structural,
-                                      observability))
+                                      observability,
+                                      preserveObservability))
       continue;
 
     auto &bucket = buckets[registerStateHash(reg)];
@@ -129,10 +135,12 @@ static void mergeEquivalentStates(
 
 static void combineStateChains(
     func::FuncOp function, CombineStats &stats, DelayChainMode mode,
-    const StateObservabilityAnalysis &observability) {
+    const StateObservabilityAnalysis &observability,
+    bool preserveObservability) {
   llvm::SmallVector<pyc::RegOp> regs;
   function.walk([&](pyc::RegOp reg) {
-    if (isStateOptimizationCandidate(reg, mode, observability))
+    if (isStateOptimizationCandidate(reg, mode, observability,
+                                     preserveObservability))
       regs.push_back(reg);
   });
 
@@ -145,7 +153,7 @@ static void combineStateChains(
     llvm::SmallVector<StateChainLink> linksFromTail;
     pyc::RegOp cursor = tail;
     while (auto link = matchStateChainPredecessor(
-               cursor, tail, mode, observability)) {
+               cursor, tail, mode, observability, preserveObservability)) {
       if (erased.contains(link->predecessor.getOperation()))
         break;
       linksFromTail.push_back(*link);
@@ -164,7 +172,9 @@ static void combineStateChains(
     OpBuilder builder(tail);
     auto delay = builder.create<pyc::DelayLineOp>(
         tail.getLoc(), tail.getQ().getType(), head.getClk(), head.getRst(),
-        head.getEn(), stripChainAliases(head.getNext(), mode), head.getInit());
+        head.getEn(),
+        stripChainAliases(head.getNext(), mode, preserveObservability),
+        head.getInit());
     delay->setAttr("depth", builder.getI64IntegerAttr(depth));
     if (allGenerated)
       delay->setAttr("pyc.generated",
@@ -207,10 +217,11 @@ static void combineStateChains(
 
 static void shareEquivalentDelayLines(
     func::FuncOp function, CombineStats &stats, DelayChainMode mode,
-    const StateObservabilityAnalysis &observability) {
+    const StateObservabilityAnalysis &observability,
+    bool preserveObservability) {
   llvm::SmallVector<pyc::DelayLineOp> delays;
   function.walk([&](pyc::DelayLineOp delay) {
-    if (isDelayCandidate(delay, mode, observability))
+    if (isDelayCandidate(delay, mode, observability, preserveObservability))
       delays.push_back(delay);
   });
 
@@ -247,38 +258,37 @@ static void shareEquivalentDelayLines(
   }
 }
 
-static void writeCombineStats(func::FuncOp function,
-                              const CombineStats &stats) {
+static void writeCombineStats(func::FuncOp function, const CombineStats &stats,
+                              bool accumulate, bool cascadeRound,
+                              DelayChainMode mode) {
+  auto write = [&](llvm::StringRef name, int64_t value) {
+    if (accumulate)
+      value += getI64Attr(function, name, 0);
+    setI64Attr(function, name, value);
+  };
   const int64_t stateOpsAfter =
       stats.delayLinesCreated > stats.delayLinesMerged
           ? stats.delayLinesCreated - stats.delayLinesMerged
           : 0;
-  setI64Attr(function, "pyc.stats.delay_chains_combined",
-             stats.chainsCombined);
-  setI64Attr(function, "pyc.stats.delay_chain_regs_combined",
-             stats.regsCombined);
-  setI64Attr(function, "pyc.stats.delay_chain_aliases_removed",
-             stats.aliasesRemoved);
-  setI64Attr(function, "pyc.stats.delay_chain_delay_lines_created",
-             stats.delayLinesCreated);
-  setI64Attr(function, "pyc.stats.delay_chain_delay_lines_merged",
-             stats.delayLinesMerged);
-  setI64Attr(function, "pyc.stats.delay_chain_state_reads_before",
-             stats.regsCombined);
-  setI64Attr(function, "pyc.stats.delay_chain_state_reads_after",
-             stateOpsAfter);
-  setI64Attr(function, "pyc.stats.delay_chain_state_writes_before",
-             stats.regsCombined);
-  setI64Attr(function, "pyc.stats.delay_chain_state_writes_after",
-             stateOpsAfter);
-  setI64Attr(function, "pyc.stats.state_opt_regs_merged",
-             stats.stateRegsMerged);
-  setI64Attr(function, "pyc.stats.state_opt_reg_bits_removed",
-             stats.stateRegBitsRemoved);
-  setI64Attr(function, "pyc.stats.state_opt_structural_chains_combined",
-             stats.structuralChainsCombined);
-  setI64Attr(function, "pyc.stats.state_opt_structural_chain_regs_combined",
-             stats.structuralRegsCombined);
+  write("pyc.stats.delay_chains_combined", stats.chainsCombined);
+  write("pyc.stats.delay_chain_regs_combined", stats.regsCombined);
+  write("pyc.stats.delay_chain_aliases_removed", stats.aliasesRemoved);
+  write("pyc.stats.delay_chain_delay_lines_created", stats.delayLinesCreated);
+  write("pyc.stats.delay_chain_delay_lines_merged", stats.delayLinesMerged);
+  write("pyc.stats.delay_chain_state_reads_before", stats.regsCombined);
+  write("pyc.stats.delay_chain_state_reads_after", stateOpsAfter);
+  write("pyc.stats.delay_chain_state_writes_before", stats.regsCombined);
+  write("pyc.stats.delay_chain_state_writes_after", stateOpsAfter);
+  write("pyc.stats.state_opt_regs_merged", stats.stateRegsMerged);
+  write("pyc.stats.state_opt_reg_bits_removed", stats.stateRegBitsRemoved);
+  write("pyc.stats.state_opt_structural_chains_combined",
+        stats.structuralChainsCombined);
+  write("pyc.stats.state_opt_structural_chain_regs_combined",
+        stats.structuralRegsCombined);
+  write("pyc.stats.state_opt_cascade_regs_merged",
+        cascadeRound ? stats.stateRegsMerged : 0);
+  write("pyc.stats.state_opt_merge_rounds",
+        mode == DelayChainMode::Structural ? 1 : 0);
 }
 
 struct CombineDelayChainsPass
@@ -289,8 +299,12 @@ struct CombineDelayChainsPass
   CombineDelayChainsPass() = default;
   CombineDelayChainsPass(const CombineDelayChainsPass &other)
       : PassWrapper(other) {}
-  explicit CombineDelayChainsPass(DelayChainMode mode) {
+  CombineDelayChainsPass(DelayChainMode mode, bool accumulateStats,
+                         bool cascadeRound, bool preserveObservability) {
     modeOption = stringifyDelayChainMode(mode).str();
+    accumulateStatsOption = accumulateStats;
+    cascadeRoundOption = cascadeRound;
+    preserveObservabilityOption = preserveObservability;
   }
 
   StringRef getArgument() const override { return "pyc-combine-delay-chains"; }
@@ -302,6 +316,18 @@ struct CombineDelayChainsPass
       *this, "mode",
       llvm::cl::desc("Candidate policy: generated|structural"),
       llvm::cl::init("generated")};
+  Option<bool> accumulateStatsOption{
+      *this, "accumulate-stats",
+      llvm::cl::desc("Add rewrite statistics to an earlier optimization round"),
+      llvm::cl::init(false)};
+  Option<bool> cascadeRoundOption{
+      *this, "cascade-round",
+      llvm::cl::desc("Attribute equivalent-state merges to cascade refinement"),
+      llvm::cl::init(false)};
+  Option<bool> preserveObservabilityOption{
+      *this, "preserve-observability",
+      llvm::cl::desc("Keep named/debug/probe/trace state identities"),
+      llvm::cl::init(false)};
 
   void runOnOperation() override {
     auto mode = parseDelayChainMode(modeOption);
@@ -314,21 +340,35 @@ struct CombineDelayChainsPass
     }
 
     func::FuncOp function = getOperation();
-    StateObservabilityAnalysis observability(function);
+    // Generated mode is the compatibility policy and always retains its
+    // historical observability boundaries. Structural mode is performance-
+    // first unless preservation is explicitly requested.
+    const bool preserveObservability =
+        *mode == DelayChainMode::Generated || preserveObservabilityOption;
+    StateObservabilityAnalysis observability(function,
+                                              preserveObservability);
     CombineStats stats;
     if (*mode == DelayChainMode::Structural)
-      mergeEquivalentStates(function, stats, observability);
-    combineStateChains(function, stats, *mode, observability);
-    shareEquivalentDelayLines(function, stats, *mode, observability);
-    writeCombineStats(function, stats);
+      mergeEquivalentStates(function, stats, observability,
+                            preserveObservability);
+    combineStateChains(function, stats, *mode, observability,
+                       preserveObservability);
+    shareEquivalentDelayLines(function, stats, *mode, observability,
+                              preserveObservability);
+    writeCombineStats(function, stats, accumulateStatsOption,
+                      cascadeRoundOption, *mode);
   }
 };
 
 } // namespace
 
 std::unique_ptr<::mlir::Pass>
-createCombineDelayChainsPass(DelayChainMode mode) {
-  return std::make_unique<CombineDelayChainsPass>(mode);
+createCombineDelayChainsPass(DelayChainMode mode, bool accumulateStats,
+                             bool cascadeRound,
+                             bool preserveObservability) {
+  return std::make_unique<CombineDelayChainsPass>(mode, accumulateStats,
+                                                   cascadeRound,
+                                                   preserveObservability);
 }
 
 static PassRegistration<CombineDelayChainsPass> pass;

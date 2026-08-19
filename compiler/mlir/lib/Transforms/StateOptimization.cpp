@@ -78,7 +78,11 @@ bool hasStableStateName(Operation *op) {
   return !isCycleBalanceGenerated(op);
 }
 
-StateObservabilityAnalysis::StateObservabilityAnalysis(func::FuncOp function) {
+StateObservabilityAnalysis::StateObservabilityAnalysis(func::FuncOp function,
+                                                       bool analyze) {
+  if (!analyze)
+    return;
+
   auto inspectState = [&](Operation *state, Value q) {
     if (shouldKeepStateOptimization(state) || hasStableStateName(state))
       pinned.insert(state);
@@ -132,16 +136,21 @@ bool equivalentStateValue(Value lhs, Value rhs) {
 
 bool isStateOptimizationCandidate(
     pyc::RegOp reg, DelayChainMode mode,
-    const StateObservabilityAnalysis &observability) {
-  if (!reg || observability.isPinned(reg.getOperation()))
+    const StateObservabilityAnalysis &observability,
+    bool preserveObservability) {
+  if (!reg ||
+      (preserveObservability && observability.isPinned(reg.getOperation())))
     return false;
   if (mode == DelayChainMode::Generated)
     return isCycleBalanceGenerated(reg);
   return true;
 }
 
-bool isTransparentChainAlias(pyc::AliasOp alias, DelayChainMode mode) {
-  if (!alias || shouldKeepStateOptimization(alias) || hasStableStateName(alias))
+bool isTransparentChainAlias(pyc::AliasOp alias, DelayChainMode mode,
+                             bool preserveObservability) {
+  if (!alias ||
+      (preserveObservability &&
+       (shouldKeepStateOptimization(alias) || hasStableStateName(alias))))
     return false;
   if (mode == DelayChainMode::Generated)
     return isCycleBalanceGenerated(alias);
@@ -151,11 +160,12 @@ bool isTransparentChainAlias(pyc::AliasOp alias, DelayChainMode mode) {
 std::optional<StateChainLink>
 matchStateChainPredecessor(pyc::RegOp consumer, pyc::RegOp keyReg,
                            DelayChainMode mode,
-                           const StateObservabilityAnalysis &observability) {
+                           const StateObservabilityAnalysis &observability,
+                           bool preserveObservability) {
   Value value = consumer.getNext();
   StateChainLink link;
   while (auto alias = value.getDefiningOp<pyc::AliasOp>()) {
-    if (!isTransparentChainAlias(alias, mode))
+    if (!isTransparentChainAlias(alias, mode, preserveObservability))
       return std::nullopt;
     link.aliasesFromConsumerToProducer.push_back(alias);
     value = alias.getIn();
@@ -163,11 +173,12 @@ matchStateChainPredecessor(pyc::RegOp consumer, pyc::RegOp keyReg,
 
   auto predecessor = value.getDefiningOp<pyc::RegOp>();
   if (!predecessor ||
-      !isStateOptimizationCandidate(predecessor, mode, observability))
+      !isStateOptimizationCandidate(predecessor, mode, observability,
+                                    preserveObservability))
     return std::nullopt;
   if (predecessor.getQ().getType() != keyReg.getQ().getType() ||
-      predecessor.getClk() != keyReg.getClk() ||
-      predecessor.getRst() != keyReg.getRst() ||
+      !equivalentStateValue(predecessor.getClk(), keyReg.getClk()) ||
+      !equivalentStateValue(predecessor.getRst(), keyReg.getRst()) ||
       !equivalentStateValue(predecessor.getEn(), keyReg.getEn()) ||
       !equivalentStateValue(predecessor.getInit(), keyReg.getInit()))
     return std::nullopt;
@@ -190,7 +201,8 @@ matchStateChainPredecessor(pyc::RegOp consumer, pyc::RegOp keyReg,
 
 bool equivalentRegisterState(pyc::RegOp lhs, pyc::RegOp rhs) {
   return lhs.getQ().getType() == rhs.getQ().getType() &&
-         lhs.getClk() == rhs.getClk() && lhs.getRst() == rhs.getRst() &&
+         equivalentStateValue(lhs.getClk(), rhs.getClk()) &&
+         equivalentStateValue(lhs.getRst(), rhs.getRst()) &&
          equivalentStateValue(lhs.getEn(), rhs.getEn()) &&
          equivalentStateValue(lhs.getNext(), rhs.getNext()) &&
          equivalentStateValue(lhs.getInit(), rhs.getInit());
@@ -201,7 +213,8 @@ bool equivalentDelayLineState(pyc::DelayLineOp lhs, pyc::DelayLineOp rhs) {
   auto rhsDepth = rhs->getAttrOfType<IntegerAttr>("depth");
   return lhsDepth && rhsDepth && lhsDepth == rhsDepth &&
          lhs.getQ().getType() == rhs.getQ().getType() &&
-         lhs.getClk() == rhs.getClk() && lhs.getRst() == rhs.getRst() &&
+         equivalentStateValue(lhs.getClk(), rhs.getClk()) &&
+         equivalentStateValue(lhs.getRst(), rhs.getRst()) &&
          equivalentStateValue(lhs.getEn(), rhs.getEn()) &&
          equivalentStateValue(lhs.getNext(), rhs.getNext()) &&
          equivalentStateValue(lhs.getInit(), rhs.getInit());
@@ -210,8 +223,7 @@ bool equivalentDelayLineState(pyc::DelayLineOp lhs, pyc::DelayLineOp rhs) {
 std::size_t registerStateHash(pyc::RegOp reg) {
   return static_cast<std::size_t>(llvm::hash_combine(
       opaqueHash(reg.getQ().getType().getAsOpaquePointer()),
-      opaqueHash(reg.getClk().getAsOpaquePointer()),
-      opaqueHash(reg.getRst().getAsOpaquePointer()),
+      semanticValueHash(reg.getClk()), semanticValueHash(reg.getRst()),
       semanticValueHash(reg.getEn()), semanticValueHash(reg.getNext()),
       semanticValueHash(reg.getInit())));
 }
@@ -221,8 +233,7 @@ std::size_t delayLineStateHash(pyc::DelayLineOp delay) {
   return static_cast<std::size_t>(llvm::hash_combine(
       opaqueHash(delay.getQ().getType().getAsOpaquePointer()),
       depth ? depth.getInt() : 0,
-      opaqueHash(delay.getClk().getAsOpaquePointer()),
-      opaqueHash(delay.getRst().getAsOpaquePointer()),
+      semanticValueHash(delay.getClk()), semanticValueHash(delay.getRst()),
       semanticValueHash(delay.getEn()), semanticValueHash(delay.getNext()),
       semanticValueHash(delay.getInit())));
 }

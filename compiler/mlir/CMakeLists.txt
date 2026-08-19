@@ -87,12 +87,14 @@ add_library(pyc_transforms
   lib/Transforms/FlattenInstancesPass.cpp
   lib/Transforms/InlineFunctionsPass.cpp
   lib/Transforms/PackI1RegsPass.cpp
+  lib/Transforms/PackStateLanesPass.cpp
   lib/Transforms/FuseCombPass.cpp
   lib/Transforms/CppPlacementPass.cpp
   lib/Transforms/LowerSCFToPYCStaticPass.cpp
   lib/Transforms/PrunePortsPass.cpp
   lib/Transforms/SLPPackWiresPass.cpp
   lib/Transforms/StateOptimization.cpp
+  lib/Transforms/StripStateObservabilityPass.cpp
   lib/Support/PassIRDumper.cpp
   lib/Transforms/VectorUnrollPass.cpp
 )
