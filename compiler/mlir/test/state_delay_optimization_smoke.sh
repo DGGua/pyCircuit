@@ -221,4 +221,7 @@ for name in ("out0", "out1", "lane0_state", "lane1_state"):
         raise AssertionError(f"preservation mode lost state probe {name}")
 PY
 
+python3 "${ROOT}/compiler/mlir/test/check_state_delay_tap_models.py" \
+  --pycc "${PYCC}" --cxx "${CXX:-c++}"
+
 echo "state_delay_optimization_smoke: PASS"

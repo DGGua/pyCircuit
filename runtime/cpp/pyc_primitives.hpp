@@ -163,6 +163,20 @@ public:
     pending = false;
   }
 
+  // Return the value at a fixed enabled-edge distance from the input.  The
+  // caller must pass 1..Depth; the verifier guarantees this for generated IR.
+  inline Wire<Width> tap(unsigned depth) const {
+    return stages[(head + Depth - depth) % Depth];
+  }
+
+  inline Wire<Width> tap_next(unsigned depth) const {
+    if (pendingReset)
+      return init;
+    if (!pending)
+      return tap(depth);
+    return depth == 1 ? sampledInput : tap(depth - 1);
+  }
+
   inline void tick_commit() {
     if (__builtin_expect(!pending, 1))
       return;
@@ -314,6 +328,18 @@ public:
     }
     q = qNext;
     pending = false;
+  }
+
+  inline T tap(unsigned depth) const {
+    return stages[(head + Depth - depth) % Depth];
+  }
+
+  inline T tap_next(unsigned depth) const {
+    if (pendingReset)
+      return init;
+    if (!pending)
+      return tap(depth);
+    return depth == 1 ? sampledInput : tap(depth - 1);
   }
 
 private:

@@ -470,6 +470,26 @@ static std::optional<LogicalResult> emitScalarOpAssign(Operation &op, raw_ostrea
          << lsb << "];\n";
     return success();
   }
+  if (auto tap = dyn_cast<pyc::DelayTapOp>(op)) {
+    auto delay = tap.getLine().getDefiningOp<pyc::DelayLineOp>();
+    auto depth = tap->getAttrOfType<IntegerAttr>("depth");
+    auto width = delay ? leafWidth(delay.getQ().getType()) : std::nullopt;
+    auto outTy = leafIntType(tap.getTap().getType());
+    if (!delay || !depth || !width || !outTy)
+      return {tap.emitError("invalid delay tap source or depth")};
+    std::string lineName = nt.get(tap.getLine());
+    std::string baseName = nt.get(delay.getQ());
+    std::string suffix;
+    if (llvm::StringRef(lineName).starts_with(baseName))
+      suffix = lineName.substr(baseName.size());
+    const auto bit = (depth.getInt() - 1) * static_cast<int64_t>(*width);
+    std::string history = baseName + "__history" + suffix;
+    emitConnectAssign(nt.get(tap.getTap()),
+                      history + "[" + std::to_string(bit + *width - 1) + ":" +
+                          std::to_string(bit) + "]",
+                      tap.getTap().getType(), os);
+    return success();
+  }
   if (auto sh = dyn_cast<pyc::ShliOp>(op)) {
     os << "assign " << nt.get(sh.getResult()) << " = (" << nt.get(sh.getIn()) << " << " << sh.getAmountAttr().getInt()
        << ");\n";
@@ -991,6 +1011,24 @@ static LogicalResult emitFunc(func::FuncOp f, raw_ostream &os, const VerilogEmit
   }
   os << "\n";
 
+  // Expose existing delay stages as a read-only packed history bus for taps.
+  f.walk([&](pyc::DelayLineOp delay) {
+    bool hasTaps = llvm::any_of(delay.getQ().getUsers(),
+                                [](Operation *user) {
+                                  return isa<pyc::DelayTapOp>(user);
+                                });
+    if (!hasTaps)
+      return;
+    auto width = leafWidth(delay.getQ().getType());
+    auto depth = delay->getAttrOfType<IntegerAttr>("depth");
+    if (!width || !depth)
+      return;
+    os << "wire [" << (*width * depth.getInt() - 1) << ":0] "
+       << nt.get(delay.getQ()) << "__history"
+       << vUnpacked(delay.getQ().getType()) << ";\n";
+  });
+  os << "\n";
+
   // Collect top-level ops for netlist-friendly emission.
   llvm::SmallVector<Operation *> combAssignOps;
   llvm::SmallVector<Operation *> instOps;
@@ -1036,6 +1074,7 @@ static LogicalResult emitFunc(func::FuncOp f, raw_ostream &os, const VerilogEmit
               pyc::LshrOp,
               pyc::AshrOp,
               pyc::ConcatOp,
+              pyc::DelayTapOp,
               pyc::VGetOp,
               pyc::VCreateOp,
               pyc::VBroadcastOp,
@@ -1243,6 +1282,10 @@ static LogicalResult emitFunc(func::FuncOp f, raw_ostream &os, const VerilogEmit
         if (!depthAttr)
           return delay.emitError("missing integer attribute `depth`");
         auto depth = depthAttr.getValue().getZExtValue();
+        const bool hasTaps = llvm::any_of(
+            delay.getQ().getUsers(), [](Operation *user) {
+              return isa<pyc::DelayTapOp>(user);
+            });
 
         auto emitDelay = [&](llvm::StringRef suffix, llvm::StringRef instanceSuffix) {
           os << "pyc_delay_line #(.WIDTH(" << *width << "), .DEPTH(" << depth << ")) "
@@ -1252,7 +1295,11 @@ static LogicalResult emitFunc(func::FuncOp f, raw_ostream &os, const VerilogEmit
           os << "  .en(" << nt.get(delay.getEn()) << "),\n";
           os << "  .d(" << nt.get(delay.getNext()) << suffix << "),\n";
           os << "  .init(" << nt.get(delay.getInit()) << suffix << "),\n";
-          os << "  .q(" << nt.get(delay.getQ()) << suffix << ")\n";
+          os << "  .q(" << nt.get(delay.getQ()) << suffix << ")";
+          if (hasTaps)
+            os << ",\n  .history(" << nt.get(delay.getQ()) << "__history"
+               << suffix << ")";
+          os << "\n";
           os << ");\n";
         };
 

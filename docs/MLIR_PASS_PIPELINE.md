@@ -32,36 +32,45 @@
 | 14 | `pyc-unroll-vector` | function | 将 Vector 计算、连接和状态展开为标量 lane 操作。 | `--unroll-vector` |
 | 15 | `pyc-eliminate-wires` | function | 消除可直接替换的 `pyc.wire` / `pyc.assign` 中间连接。 | 始终 |
 | 16 | `pyc-eliminate-dead-state` | function | 删除对可观察行为无影响的寄存器、存储等状态。 | 始终 |
-| 17 | `pyc-slp-pack-wires` | function | 将可识别的同构标量 lane 重新打包成 Vector 操作。 | 未启用 `--unroll-vector` |
-| 18 | `pyc-comb-canonicalize` | function | PYC 组合图结构化简（mux、wire、get/create 重建）并将结构化 Vec 拆成 lane 级运算，使 dialect folder 能折叠可知 lane。 | 始终 |
-| 19 | `pyc-check-comb-cycles` | module | 构建组合依赖图并拒绝组合环。 | 始终 |
-| 20 | `pyc-check-clock-domains` | module | 检查跨时钟域连接、时钟/复位使用和 CDC 合法性。 | 始终 |
-| 21 | `pyc-pack-i1-regs` | function | 将可合并的标量 `i1` 寄存器压缩为 packed 寄存器。 | 始终 |
-| 22 | `pyc-fuse-comb` | function | 将连续组合逻辑融合为 `pyc.comb` 区域，减少 emitter 调度开销。 | 默认启用；仅当同时设置 `--sim-mode=cpp-only` 与 `--cpp-only-preserve-ops` 时跳过 |
-| 23 | `canonicalize` | module | 对前面 lowering/fusion 产生的新模式再次规范化。 | 始终 |
-| 24 | `cse` | module | 再次消除公共子表达式。 | 始终 |
-| 25 | `remove-dead-values` | module | 清理二次优化后的无用 SSA value。 | LLVM < 19；LLVM 19+ 跳过 |
-| 26 | `pyc-eliminate-dead-instances` | function | 再次删除优化后变得不可观察的实例。 | 始终 |
-| 27 | `symbol-dce` | module | 删除无用符号。 | 始终 |
-| 28 | `pyc-check-flat-types` | function | 验证所有 operand/result 类型均可被目标 emitter 表示。 | 始终 |
-| 29 | `pyc-check-no-dynamic` | function | 拒绝残留的 `scf.*`、`index` 等动态结构。 | 始终 |
-| 30 | `pyc-check-logic-depth` | module | 计算组合逻辑深度并按 `--logic-depth` 限制拒绝超限设计。 | 始终 |
-| 31 | `pyc-collect-compile-stats` | function | 写入寄存器、存储和硬件位数等编译统计属性。 | 始终 |
+| 17 | `pyc-analyze-state-optimization` | function | 记录状态候选、pin 和控制边界统计。 | 始终 |
+| 17a | `pyc-strip-state-observability` | function | 性能模式移除状态 debug/probe/trace/name 身份，保留功能数据流；Stage 0 统计已在此前完成。 | structural 且未开启 `--state-opt-preserve-observability` |
+| 17b | `pyc-eliminate-dead-state` | function | 清理观测身份移除后不再有功能用途的状态。 | 同上 |
+| 18 | `pyc-combine-delay-chains` | function | Stage 1：等价状态合并、结构化串行链和 duplicate sharing。 | `--state-delay-opt` 非 `off` |
+| 19 | `canonicalize` + `cse` | module | Stage 1.5：让第一轮状态合并暴露的组合锥共享一次。 | structural 模式 |
+| 20 | `pyc-combine-delay-chains` | function | Stage 1.5 第二轮有界 merge/form/share。 | structural 模式 |
+| 21 | `pyc-pack-state-lanes` | function | Stage 2：将控制兼容的整数 reg/delay-line lanes 打包到上限宽度。 | structural 且 `--state-pack-width != 0` |
+| 22 | `pyc-slp-pack-wires` | function | 将可识别的同构标量 lane 重新打包成 Vector 操作。 | 未启用 `--unroll-vector` |
+| 23 | `pyc-comb-canonicalize` | function | PYC 组合图结构化简（mux、wire、get/create 重建）并将结构化 Vec 拆成 lane 级运算，使 dialect folder 能折叠可知 lane。 | 始终 |
+| 24 | `pyc-check-comb-cycles` | module | 构建组合依赖图并拒绝组合环。 | 始终 |
+| 25 | `pyc-check-clock-domains` | module | 检查跨时钟域连接、时钟/复位使用和 CDC 合法性。 | 始终 |
+| 26 | `pyc-pack-i1-regs` | function | 收集通用 state pack 留下的可合并标量 `i1` 寄存器。 | 默认性能模式；structural 显式观测保留模式跳过 |
+| 27 | `pyc-fuse-comb` | function | 将连续组合逻辑融合为 `pyc.comb` 区域，减少 emitter 调度开销；稳定命名/观测状态是 fusion barrier。 | 默认启用；仅当同时设置 `--sim-mode=cpp-only` 与 `--cpp-only-preserve-ops` 时跳过 |
+| 28 | `canonicalize` | module | 对前面 lowering/fusion 产生的新模式再次规范化。 | 始终 |
+| 29 | `cse` | module | 再次消除公共子表达式。 | 始终 |
+| 30 | `remove-dead-values` | module | 清理二次优化后的无用 SSA value。 | LLVM < 19；LLVM 19+ 跳过 |
+| 31 | `pyc-eliminate-dead-instances` | function | 再次删除优化后变得不可观察的实例。 | 始终 |
+| 32 | `symbol-dce` | module | 删除无用符号。 | 始终 |
+| 33 | `pyc-check-flat-types` | function | 验证所有 operand/result 类型均可被目标 emitter 表示。 | 始终 |
+| 34 | `pyc-check-no-dynamic` | function | 拒绝残留的 `scf.*`、`index` 等动态结构。 | 始终 |
+| 35 | `pyc-check-logic-depth` | module | 计算组合逻辑深度并按 `--logic-depth` 限制拒绝超限设计。 | 始终 |
+| 36 | `pyc-collect-compile-stats` | function | 写入寄存器、存储和硬件位数等编译统计属性。 | 始终 |
 
-通过第 28–30 项 legality gate 后，`pycc` 才调用 C++ 或 Verilog emitter。
+通过第 33–35 项 legality gate 后，`pycc` 才调用 C++ 或 Verilog emitter。
 
 ## Vector 分支
 
-第 14–17 项是 Vector 处理相关步骤。`pyc-eliminate-wires`（15）与
-`pyc-eliminate-dead-state`（16）**始终执行**；互斥的只有 unroll（14）与 SLP（17）：
+第 14–16、22 项是 Vector 处理相关步骤。`pyc-eliminate-wires`（15）与
+`pyc-eliminate-dead-state`（16）**始终执行**；性能 structural 模式还会在 17a/17b
+再次清理已放弃观测身份的 dead state；互斥的只有 unroll（14）与 SLP（22）：
 
 ```text
 --unroll-vector
     └─ 14 pyc-unroll-vector → 15 eliminate-wires → 16 eliminate-dead-state
-                                                    （跳过 17 slp-pack-wires）
+       → 17-21 state optimization                 （跳过 22 slp-pack-wires）
 
 默认（未开 --unroll-vector）
-    └─ （跳过 14）→ 15 eliminate-wires → 16 eliminate-dead-state → 17 slp-pack-wires
+    └─ （跳过 14）→ 15 eliminate-wires → 16 eliminate-dead-state
+       → 17-21 state optimization → 22 slp-pack-wires
 ```
 
 `pyc-unroll-vector` 与 `pyc-slp-pack-wires` 不会同时执行。启用 unroll 时，
@@ -90,4 +99,3 @@ PYC dialect folder 是常量语义的唯一来源：它折叠标量运算、全�
 - 自定义 pass 声明：`compiler/mlir/include/pyc/Transforms/Passes.h`
 - pass 实现：`compiler/mlir/lib/Transforms/`
 - 可单独运行 pass 的工具：`compiler/mlir/tools/pyc-opt.cpp`
-

@@ -287,6 +287,7 @@ static std::vector<ProbeAliasEntry> loadProbeAliasesForTop(llvm::StringRef planP
 struct StateProbeSource {
   Value q;
   unsigned lsb = 0;
+  Value tap;
 };
 
 static std::optional<StateProbeSource> findRegQFromValue(Value v) {
@@ -304,6 +305,12 @@ static std::optional<StateProbeSource> findRegQFromValue(Value v) {
       return StateProbeSource{rop.getQ(), lsb};
     if (auto delay = v.getDefiningOp<pyc::DelayLineOp>())
       return StateProbeSource{delay.getQ(), lsb};
+    if (auto tap = v.getDefiningOp<pyc::DelayTapOp>()) {
+      auto delay = tap.getLine().getDefiningOp<pyc::DelayLineOp>();
+      if (!delay)
+        return std::nullopt;
+      return StateProbeSource{delay.getQ(), lsb, tap.getTap()};
+    }
     if (auto extract = v.getDefiningOp<pyc::ExtractOp>()) {
       auto packedLsb =
           extract->getAttrOfType<IntegerAttr>("pyc.state_pack_lsb");
@@ -685,6 +692,19 @@ static LogicalResult emitCombAssign(Operation &op, llvm::raw_ostream &os, NameTa
                [&](llvm::raw_ostream &e) {
                  e << "pyc::cpp::extract<" << ow << ", " << iw << ">(" << nt.get(ex.getIn()) << ", "
                    << ex.getLsbAttr().getInt() << "u)";
+               },
+               ps);
+    return success();
+  }
+  if (auto tap = dyn_cast<pyc::DelayTapOp>(op)) {
+    auto delay = tap.getLine().getDefiningOp<pyc::DelayLineOp>();
+    auto depth = tap->getAttrOfType<IntegerAttr>("depth");
+    if (!delay || !depth)
+      return tap.emitError("invalid delay tap source or depth");
+    assignExpr(tap.getTap(), tap.getTap().getType(), os, nt,
+               [&](llvm::raw_ostream &e) {
+                 e << nt.get(delay.getQ()) << "_inst->tap("
+                   << depth.getInt() << "u)";
                },
                ps);
     return success();
@@ -1108,6 +1128,7 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
   // Sequential primitive instances.
   llvm::SmallVector<pyc::RegOp> regs;
   llvm::SmallVector<pyc::DelayLineOp> delayLines;
+  llvm::SmallVector<pyc::DelayTapOp> delayTaps;
   llvm::SmallVector<pyc::FifoOp> fifos;
   llvm::SmallVector<pyc::ByteMemOp> byteMems;
   llvm::SmallVector<pyc::SyncMemOp> syncMems;
@@ -1122,6 +1143,8 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
       regs.push_back(r);
     else if (auto delay = dyn_cast<pyc::DelayLineOp>(op))
       delayLines.push_back(delay);
+    else if (auto tap = dyn_cast<pyc::DelayTapOp>(op))
+      delayTaps.push_back(tap);
     else if (auto fifo = dyn_cast<pyc::FifoOp>(op))
       fifos.push_back(fifo);
     else if (auto mem = dyn_cast<pyc::ByteMemOp>(op))
@@ -1139,9 +1162,13 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
     else if (auto comb = dyn_cast<pyc::CombOp>(op))
       combs.push_back(comb);
   }
+  for (pyc::DelayTapOp tap : delayTaps)
+    os << "  " << cppType(tap.getTap().getType()) << " " << nt.get(tap.getTap())
+       << "_qNext{};\n";
 
   auto regKey = [&](pyc::RegOp r) { return nt.get(r.getQ()); };
   auto delayKey = [&](pyc::DelayLineOp delay) { return nt.get(delay.getQ()); };
+  auto delayTapKey = [&](pyc::DelayTapOp tap) { return nt.get(tap.getTap()); };
   auto fifoKey = [&](pyc::FifoOp f) { return nt.get(f.getInReady()); };
   auto memKey = [&](pyc::ByteMemOp m) -> std::string {
     if (auto nameAttr = m->getAttrOfType<StringAttr>("name"))
@@ -1164,6 +1191,9 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
   std::sort(regs.begin(), regs.end(), [&](pyc::RegOp a, pyc::RegOp b) { return regKey(a) < regKey(b); });
   std::sort(delayLines.begin(), delayLines.end(), [&](pyc::DelayLineOp a, pyc::DelayLineOp b) {
     return delayKey(a) < delayKey(b);
+  });
+  std::sort(delayTaps.begin(), delayTaps.end(), [&](pyc::DelayTapOp a, pyc::DelayTapOp b) {
+    return delayTapKey(a) < delayTapKey(b);
   });
   std::sort(fifos.begin(), fifos.end(), [&](pyc::FifoOp a, pyc::FifoOp b) { return fifoKey(a) < fifoKey(b); });
   std::sort(byteMems.begin(), byteMems.end(), [&](pyc::ByteMemOp a, pyc::ByteMemOp b) { return memKey(a) < memKey(b); });
@@ -1340,6 +1370,7 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
       std::string fieldPath;
       std::string cppValue;
       std::string cppRegInst;
+      std::string cppRegNext;
       unsigned width = 0;
       unsigned stateLsb = 0;
       unsigned stateStorageWidth = 0;
@@ -1380,10 +1411,17 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
         if (!seenNamedFields.insert(fieldPath).second)
           return;
         auto regQ = findRegQFromValue(value);
+        std::string regInst =
+            regQ ? (nt.get(regQ->q) + "_inst") : std::string();
+        std::string regNext;
+        if (regQ)
+          regNext = regQ->tap ? (nt.get(regQ->tap) + "_qNext")
+                              : (regInst + "->qNext");
         namedProbes.push_back(NamedProbeInfo{
             fieldPath,
             nt.get(value),
-            regQ ? (nt.get(regQ->q) + "_inst") : std::string(),
+            regInst,
+            regNext,
             width,
             regQ ? regQ->lsb : 0,
             regQ ? bitWidth(regQ->q.getType()) : 0,
@@ -1406,18 +1444,23 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
 		    unsigned w = bitWidth(f.getResultTypes()[i]);
 		    if (w == 0)
 		      return f.emitError("invalid output port width for ProbeRegistry: ") << getPortCanonicalFieldPath(f, i, /*isResult=*/true);
-		    if (outIsReg[i] && !isa<VectorType>(f.getResultTypes()[i])) {
+			    if (outIsReg[i] && !isa<VectorType>(f.getResultTypes()[i])) {
 		      const auto &source = *outRegQ[i];
 		      const unsigned storageWidth = bitWidth(source.q.getType());
 		      if (source.lsb != 0 || storageWidth != w) {
-		        os << "    reg.addRegSlice<" << w << ", " << storageWidth
-		           << ">(reg_path(" << cppStringLiteral(outCanon[i]) << "), &"
-		           << outNames[i] << ", &" << nt.get(source.q)
-		           << "_inst->pending, &" << nt.get(source.q)
-		           << "_inst->qNext, " << source.lsb << "u);\n";
-		      } else {
-		        os << "    reg.addReg<" << w << ">(reg_path(" << cppStringLiteral(outCanon[i]) << "), &" << outNames[i]
-		           << ", &" << nt.get(source.q) << "_inst->pending, &" << nt.get(source.q) << "_inst->qNext);\n";
+			        os << "    reg.addRegSlice<" << w << ", " << storageWidth
+			           << ">(reg_path(" << cppStringLiteral(outCanon[i]) << "), &"
+			           << outNames[i] << ", &" << nt.get(source.q)
+			           << "_inst->pending, &"
+                       << (source.tap ? nt.get(source.tap) + "_qNext"
+                                      : nt.get(source.q) + "_inst->qNext")
+                       << ", " << source.lsb << "u);\n";
+			      } else {
+			        os << "    reg.addReg<" << w << ">(reg_path(" << cppStringLiteral(outCanon[i]) << "), &" << outNames[i]
+			           << ", &" << nt.get(source.q) << "_inst->pending, &"
+                       << (source.tap ? nt.get(source.tap) + "_qNext"
+                                      : nt.get(source.q) + "_inst->qNext")
+                       << ");\n";
 		      }
 		    } else {
 		      emitWireProbes(os, f.getResultTypes()[i], w, outCanon[i], outNames[i]);
@@ -1431,11 +1474,11 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
                << named.stateStorageWidth << ">(reg_path("
                << cppStringLiteral(named.fieldPath) << "), &"
                << named.cppValue << ", &" << named.cppRegInst
-               << "->pending, &" << named.cppRegInst << "->qNext, "
+               << "->pending, &" << named.cppRegNext << ", "
                << named.stateLsb << "u);\n";
           } else {
             os << "    reg.addReg<" << named.width << ">(reg_path(" << cppStringLiteral(named.fieldPath) << "), &"
-               << named.cppValue << ", &" << named.cppRegInst << "->pending, &" << named.cppRegInst << "->qNext);\n";
+               << named.cppValue << ", &" << named.cppRegInst << "->pending, &" << named.cppRegNext << ");\n";
           }
         } else {
           emitWireProbes(os, named.type, named.width, named.fieldPath, named.cppValue);
@@ -2037,6 +2080,7 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
             pyc::ZextOp,
             pyc::SextOp,
             pyc::ExtractOp,
+            pyc::DelayTapOp,
             pyc::ShliOp,
             pyc::LshriOp,
             pyc::AshriOp,
@@ -2460,6 +2504,7 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
             pyc::ZextOp,
             pyc::SextOp,
             pyc::ExtractOp,
+            pyc::DelayTapOp,
             pyc::ShliOp,
             pyc::LshriOp,
             pyc::AshriOp,
@@ -2904,6 +2949,15 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
     os << "    " << nt.get(r.getQ()) << "_inst->tick_compute();\n";
   for (auto delay : delayLines)
     os << "    " << nt.get(delay.getQ()) << "_inst->tick_compute();\n";
+  for (auto tap : delayTaps) {
+    auto delay = tap.getLine().getDefiningOp<pyc::DelayLineOp>();
+    auto depth = tap->getAttrOfType<IntegerAttr>("depth");
+    if (!delay || !depth)
+      return tap.emitError("invalid delay tap source or depth");
+    os << "    " << nt.get(tap.getTap()) << "_qNext = "
+       << nt.get(delay.getQ()) << "_inst->tap_next(" << depth.getInt()
+       << "u);\n";
+  }
   for (auto fifo : fifos)
     os << "    " << nt.get(fifo.getInReady()) << "_inst.tick_compute();\n";
   for (auto mem : byteMems)

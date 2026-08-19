@@ -12,6 +12,7 @@
 #endif
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Tools/mlir-opt/MlirOptMain.h"
+#include "mlir/Transforms/Passes.h"
 
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/FileSystem.h"
@@ -49,7 +50,9 @@ static void forceLinkPycPasses() {
   (void)pyc::createFuseCombPass();
   (void)pyc::createEliminateWiresPass();
   (void)pyc::createAnalyzeStateOptimizationPass();
+  (void)pyc::createStripStateObservabilityPass();
   (void)pyc::createCombineDelayChainsPass();
+  (void)pyc::createPackStateLanesPass();
   (void)pyc::createPackI1RegsPass();
   (void)pyc::createLowerSCFToPYCStaticPass();
   (void)pyc::createCheckFlatTypesPass();
@@ -76,6 +79,8 @@ int main(int argc, char **argv) {
   mlir::func::registerInlinerExtension(registry);
 #ifdef PYC_HAVE_MLIR_REGISTER_ALL_PASSES
   registerAllPasses();
+#else
+  registerCSEPass();
 #endif
   forceLinkPycPasses();
 
