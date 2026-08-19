@@ -42,6 +42,8 @@ struct CombineStats {
   int64_t stateRegBitsRemoved = 0;
   int64_t structuralChainsCombined = 0;
   int64_t structuralRegsCombined = 0;
+  int64_t delayTapsCreated = 0;
+  int64_t delayTapUsesRewritten = 0;
 };
 
 static int64_t getI64Attr(Operation *op, llvm::StringRef name,
@@ -67,6 +69,12 @@ static int64_t stateBitWidth(Type type) {
       return lanes * static_cast<int64_t>(element.getWidth());
   }
   return 0;
+}
+
+static bool isStatefulTapConsumer(Operation *op) {
+  return isa<pyc::RegOp, pyc::DelayLineOp, pyc::FifoOp,
+             pyc::ByteMemOp, pyc::SyncMemOp, pyc::SyncMemDPOp,
+             pyc::AsyncFifoOp, pyc::CdcSyncOp, pyc::InstanceOp>(op);
 }
 
 static Value stripChainAliases(Value value, DelayChainMode mode,
@@ -145,6 +153,8 @@ static void combineStateChains(
   });
 
   llvm::DenseSet<Operation *> erased;
+  const bool allowReadOnlyFanout =
+      mode == DelayChainMode::Structural && !preserveObservability;
   for (pyc::RegOp tail : llvm::reverse(regs)) {
     if (erased.contains(tail.getOperation()))
       continue;
@@ -153,7 +163,8 @@ static void combineStateChains(
     llvm::SmallVector<StateChainLink> linksFromTail;
     pyc::RegOp cursor = tail;
     while (auto link = matchStateChainPredecessor(
-               cursor, tail, mode, observability, preserveObservability)) {
+               cursor, tail, mode, observability, preserveObservability,
+               allowReadOnlyFanout)) {
       if (erased.contains(link->predecessor.getOperation()))
         break;
       linksFromTail.push_back(*link);
@@ -163,13 +174,58 @@ static void combineStateChains(
     if (chainFromTail.size() < 2)
       continue;
 
+    // Preflight all intermediate fanout before creating the replacement. A
+    // second stateful consumer cannot be represented by a read-only tap.
+    bool hasIllegalFanout = false;
+    for (unsigned i = 1; i < chainFromTail.size() && !hasIllegalFanout; ++i) {
+      pyc::RegOp reg = chainFromTail[i];
+      const StateChainLink &link = linksFromTail[i - 1];
+      Operation *requiredUser = nullptr;
+      if (link.aliasesFromConsumerToProducer.empty()) {
+        requiredUser = chainFromTail[i - 1].getOperation();
+      } else {
+        pyc::AliasOp requiredAlias =
+            link.aliasesFromConsumerToProducer.back();
+        requiredUser = requiredAlias.getOperation();
+      }
+      for (Operation *user : reg.getQ().getUsers()) {
+        if (user != requiredUser && isStatefulTapConsumer(user)) {
+          hasIllegalFanout = true;
+          break;
+        }
+      }
+      for (auto aliasIt = link.aliasesFromConsumerToProducer.rbegin();
+           aliasIt != link.aliasesFromConsumerToProducer.rend() &&
+           !hasIllegalFanout;
+           ++aliasIt) {
+        pyc::AliasOp alias = *aliasIt;
+        auto nextAlias = std::next(aliasIt);
+        if (nextAlias == link.aliasesFromConsumerToProducer.rend()) {
+          requiredUser = chainFromTail[i - 1].getOperation();
+        } else {
+          pyc::AliasOp nextAliasOp = *nextAlias;
+          requiredUser = nextAliasOp.getOperation();
+        }
+        for (Operation *user : alias.getResult().getUsers()) {
+          if (user != requiredUser && isStatefulTapConsumer(user)) {
+            hasIllegalFanout = true;
+            break;
+          }
+        }
+      }
+    }
+    if (hasIllegalFanout)
+      continue;
+
     const int64_t depth = static_cast<int64_t>(chainFromTail.size());
     pyc::RegOp head = chainFromTail.back();
     const bool allGenerated = llvm::all_of(
         chainFromTail,
         [](pyc::RegOp reg) { return isCycleBalanceGenerated(reg); });
 
-    OpBuilder builder(tail);
+    // Insert at the original head so the delay and its taps dominate every use
+    // that was previously dominated by any state in the chain.
+    OpBuilder builder(head);
     auto delay = builder.create<pyc::DelayLineOp>(
         tail.getLoc(), tail.getQ().getType(), head.getClk(), head.getRst(),
         head.getEn(),
@@ -188,6 +244,54 @@ static void combineStateChains(
     delay->setAttr(kSourceRegCountAttr,
                    builder.getI64IntegerAttr(depth));
     delay->setAttr(kSharedChainCountAttr, builder.getI64IntegerAttr(1));
+
+    // A non-tail state may have read-only fanout. Replace each such direct
+    // read with a fixed-depth view of the new history, while preserving the
+    // unique state-to-state edge that defines the chain. Alias bridges are
+    // only accepted when they remain one-use, so they can be erased safely.
+    for (unsigned i = 1; i < chainFromTail.size(); ++i) {
+      pyc::RegOp reg = chainFromTail[i];
+      llvm::SmallVector<OpOperand *, 8> sideUses;
+      const StateChainLink &link = linksFromTail[i - 1];
+      pyc::AliasOp requiredAlias;
+      Operation *requiredUser = nullptr;
+      if (link.aliasesFromConsumerToProducer.empty()) {
+        requiredUser = chainFromTail[i - 1].getOperation();
+      } else {
+        requiredAlias = link.aliasesFromConsumerToProducer.back();
+        requiredUser = requiredAlias.getOperation();
+      }
+      for (OpOperand &use : reg.getQ().getUses())
+        if (use.getOwner() != requiredUser)
+          sideUses.push_back(&use);
+      for (auto aliasIt = link.aliasesFromConsumerToProducer.rbegin();
+           aliasIt != link.aliasesFromConsumerToProducer.rend(); ++aliasIt) {
+        pyc::AliasOp alias = *aliasIt;
+        auto nextAlias = std::next(aliasIt);
+        if (nextAlias == link.aliasesFromConsumerToProducer.rend()) {
+          requiredUser = chainFromTail[i - 1].getOperation();
+        } else {
+          pyc::AliasOp nextAliasOp = *nextAlias;
+          requiredUser = nextAliasOp.getOperation();
+        }
+        for (OpOperand &use : alias.getResult().getUses())
+          if (use.getOwner() != requiredUser)
+            sideUses.push_back(&use);
+      }
+      if (sideUses.empty())
+        continue;
+      const int64_t tapDepth = static_cast<int64_t>(chainFromTail.size() - i);
+      auto tap = builder.create<pyc::DelayTapOp>(
+          tail.getLoc(), delay.getQ().getType(), delay.getQ());
+      tap->setAttr("depth", builder.getI64IntegerAttr(tapDepth));
+      tap->setAttr("pyc.optimized_by",
+                   builder.getStringAttr("combine_delay_chain_tap"));
+      ++stats.delayTapsCreated;
+      for (OpOperand *use : sideUses) {
+        use->set(tap.getTap());
+        ++stats.delayTapUsesRewritten;
+      }
+    }
 
     ++stats.chainsCombined;
     stats.regsCombined += depth;
@@ -289,6 +393,9 @@ static void writeCombineStats(func::FuncOp function, const CombineStats &stats,
         cascadeRound ? stats.stateRegsMerged : 0);
   write("pyc.stats.state_opt_merge_rounds",
         mode == DelayChainMode::Structural ? 1 : 0);
+  write("pyc.stats.delay_chain_taps_created", stats.delayTapsCreated);
+  write("pyc.stats.delay_chain_tap_uses_rewritten",
+        stats.delayTapUsesRewritten);
 }
 
 struct CombineDelayChainsPass

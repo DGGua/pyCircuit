@@ -51,7 +51,8 @@ std::optional<StateChainLink>
 matchStateChainPredecessor(pyc::RegOp consumer, pyc::RegOp keyReg,
                            DelayChainMode mode,
                            const StateObservabilityAnalysis &observability,
-                           bool preserveObservability = true);
+                           bool preserveObservability = true,
+                           bool allowReadOnlyFanout = false);
 
 bool equivalentRegisterState(pyc::RegOp lhs, pyc::RegOp rhs);
 bool equivalentDelayLineState(pyc::DelayLineOp lhs, pyc::DelayLineOp rhs);

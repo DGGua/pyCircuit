@@ -370,6 +370,10 @@ private:
         lane.init = delay.getInit();
         lane.depth = depth.getInt();
         lane.isDelay = true;
+        if (llvm::any_of(delay.getQ().getUsers(), [](Operation *user) {
+              return isa<pyc::DelayTapOp>(user);
+            }))
+          continue;
       } else {
         continue;
       }

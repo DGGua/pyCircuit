@@ -75,7 +75,7 @@ static int64_t opCost(Operation *op) {
   if (isHardSequentialCut(op))
     return 0;
   if (isa<pyc::WireOp, pyc::AliasOp, pyc::ResetActiveOp, pyc::ConstantOp, pyc::CombOp, pyc::YieldOp,
-          arith::ConstantOp>(op))
+          pyc::DelayTapOp, arith::ConstantOp>(op))
     return 0;
   if (isa<pyc::VGetOp, pyc::VCreateOp, pyc::VBroadcastOp,
           pyc::VBroadcastDimOp>(op))

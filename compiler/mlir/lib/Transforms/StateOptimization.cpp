@@ -35,6 +35,15 @@ static std::size_t semanticValueHash(Value value) {
       value.getType().getAsOpaquePointer(), value.getAsOpaquePointer(), 0));
 }
 
+// A delay tap may replace only a read of an intermediate state.  A second
+// stateful consumer would impose another write/hold boundary and cannot be
+// represented by a read-only view of the compact history.
+static bool isStatefulConsumer(Operation *op) {
+  return isa<pyc::RegOp, pyc::DelayLineOp, pyc::FifoOp,
+             pyc::ByteMemOp, pyc::SyncMemOp, pyc::SyncMemDPOp,
+             pyc::AsyncFifoOp, pyc::CdcSyncOp, pyc::InstanceOp>(op);
+}
+
 } // namespace
 
 std::optional<DelayChainMode> parseDelayChainMode(llvm::StringRef value) {
@@ -161,7 +170,8 @@ std::optional<StateChainLink>
 matchStateChainPredecessor(pyc::RegOp consumer, pyc::RegOp keyReg,
                            DelayChainMode mode,
                            const StateObservabilityAnalysis &observability,
-                           bool preserveObservability) {
+                           bool preserveObservability,
+                           bool allowReadOnlyFanout) {
   Value value = consumer.getNext();
   StateChainLink link;
   while (auto alias = value.getDefiningOp<pyc::AliasOp>()) {
@@ -184,15 +194,22 @@ matchStateChainPredecessor(pyc::RegOp consumer, pyc::RegOp keyReg,
     return std::nullopt;
 
   Value expectedProducer = predecessor.getQ();
+  auto hasRequiredUser = [&](Value value, Operation *required) {
+    if (!allowReadOnlyFanout)
+      return value.hasOneUse() && *value.user_begin() == required;
+    for (Operation *user : value.getUsers()) {
+      if (user != required && isStatefulConsumer(user))
+        return false;
+    }
+    return llvm::is_contained(value.getUsers(), required);
+  };
   for (pyc::AliasOp alias :
        llvm::reverse(link.aliasesFromConsumerToProducer)) {
-    if (!expectedProducer.hasOneUse() ||
-        *expectedProducer.user_begin() != alias.getOperation())
+    if (!hasRequiredUser(expectedProducer, alias.getOperation()))
       return std::nullopt;
     expectedProducer = alias.getResult();
   }
-  if (!expectedProducer.hasOneUse() ||
-      *expectedProducer.user_begin() != consumer.getOperation())
+  if (!hasRequiredUser(expectedProducer, consumer.getOperation()))
     return std::nullopt;
 
   link.predecessor = predecessor;

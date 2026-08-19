@@ -310,6 +310,17 @@ def PYC_DelayLineOp : PYC_Op<"delay_line", [MemoryEffects<[MemRead, MemWrite]>, 
   let assemblyFormat = "$clk `,` $rst `,` $en `,` $next `,` $init attr-dict `:` type($q)";
 }
 
+// Read-only view of an internal stage of a fixed-depth delay line.  The
+// producer remains the owner of the storage; this op only exposes the value
+// that would be present after `depth` enabled edges.
+def PYC_DelayTapOp : PYC_Op<"delay_tap", [Pure, AllTypesMatch<["line", "tap"]>]> {
+  let summary = "Read-only fixed-depth delay-line tap";
+  let arguments = (ins AnyIntegerOrV:$line);
+  let results = (outs AnyIntegerOrV:$tap);
+  let hasVerifier = 1;
+  let assemblyFormat = "$line attr-dict `:` type($tap)";
+}
+
 def PYC_FifoOp : PYC_Op<"fifo", [MemoryEffects<[MemRead, MemWrite]>, AllTypesMatch<["in_data", "out_data"]>]> {
   let summary = "Ready/valid FIFO (single-clock, strict handshake)";
   let arguments = (ins PYC_ClockType:$clk, PYC_ResetType:$rst, I1:$in_valid, AnyInteger:$in_data, I1:$out_ready);

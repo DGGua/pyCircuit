@@ -13,12 +13,19 @@ module pyc_delay_line #(
   input  wire                 en,
   input  wire [WIDTH-1:0]     d,
   input  wire [WIDTH-1:0]     init,
-  output wire [WIDTH-1:0]     q
+  output wire [WIDTH-1:0]     q,
+  output wire [WIDTH*DEPTH-1:0] history
 );
   reg [WIDTH-1:0] stages [0:DEPTH-1];
   integer i;
 
   assign q = stages[DEPTH-1];
+  genvar tap_i;
+  generate
+    for (tap_i = 0; tap_i < DEPTH; tap_i = tap_i + 1) begin : gen_history
+      assign history[tap_i*WIDTH +: WIDTH] = stages[tap_i];
+    end
+  endgenerate
 
   always @(posedge clk) begin
     if (rst) begin
