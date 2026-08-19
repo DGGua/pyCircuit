@@ -259,3 +259,24 @@ docs/gates
 verification
 docs/superpowers
 reports
+
+# Tracked Stage 1.5/2 state-optimization gates and report.
+!verification/
+verification/*
+!verification/delay_line_combine/
+verification/delay_line_combine/*
+!verification/delay_line_combine/cascade_state_model.mlir
+!verification/delay_line_combine/cascade_state_cpp_main.cpp
+!verification/delay_line_combine/cascade_state_verilator_main.cpp
+!verification/delay_line_combine/check_cascade_state_models.py
+!verification/delay_line_combine/state_lane_pack_model.mlir
+!verification/delay_line_combine/state_lane_pack_cpp_main.cpp
+!verification/delay_line_combine/state_lane_pack_verilator_main.cpp
+!verification/delay_line_combine/check_state_lane_pack_models.py
+!verification/delay_line_combine/state_pack_benchmark_cpp_main.cpp
+!verification/delay_line_combine/run_state_pack_benchmark.py
+!reports/
+reports/*
+!reports/delay_line/
+reports/delay_line/*
+!reports/delay_line/stage15_stage2_results.md

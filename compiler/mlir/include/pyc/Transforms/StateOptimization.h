@@ -24,7 +24,8 @@ bool hasStableStateName(mlir::Operation *op);
 /// observability is handled separately by the rewrite's use/fanout proof.
 class StateObservabilityAnalysis {
 public:
-  explicit StateObservabilityAnalysis(mlir::func::FuncOp function);
+  explicit StateObservabilityAnalysis(mlir::func::FuncOp function,
+                                      bool analyze = true);
 
   bool isPinned(mlir::Operation *op) const { return pinned.contains(op); }
 
@@ -36,8 +37,10 @@ mlir::Value stripStateAliases(mlir::Value value);
 bool equivalentStateValue(mlir::Value lhs, mlir::Value rhs);
 
 bool isStateOptimizationCandidate(pyc::RegOp reg, DelayChainMode mode,
-                                  const StateObservabilityAnalysis &observability);
-bool isTransparentChainAlias(pyc::AliasOp alias, DelayChainMode mode);
+                                  const StateObservabilityAnalysis &observability,
+                                  bool preserveObservability = true);
+bool isTransparentChainAlias(pyc::AliasOp alias, DelayChainMode mode,
+                             bool preserveObservability = true);
 
 struct StateChainLink {
   pyc::RegOp predecessor;
@@ -47,7 +50,8 @@ struct StateChainLink {
 std::optional<StateChainLink>
 matchStateChainPredecessor(pyc::RegOp consumer, pyc::RegOp keyReg,
                            DelayChainMode mode,
-                           const StateObservabilityAnalysis &observability);
+                           const StateObservabilityAnalysis &observability,
+                           bool preserveObservability = true);
 
 bool equivalentRegisterState(pyc::RegOp lhs, pyc::RegOp rhs);
 bool equivalentDelayLineState(pyc::DelayLineOp lhs, pyc::DelayLineOp rhs);
