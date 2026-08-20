@@ -16,12 +16,21 @@ std::unique_ptr<::mlir::Pass> createInlineFunctionsPass();
 std::unique_ptr<::mlir::Pass> createFuseCombPass();
 std::unique_ptr<::mlir::Pass> createEliminateWiresPass();
 std::unique_ptr<::mlir::Pass> createAnalyzeStateOptimizationPass();
+std::unique_ptr<::mlir::Pass> createAnalyzeRetimingPass();
 std::unique_ptr<::mlir::Pass> createStripStateObservabilityPass();
+std::unique_ptr<::mlir::Pass>
+createRetimePipelinesPass(unsigned maxStages = 0,
+                          unsigned maxExtraCombOps = 32,
+                          unsigned maxCombDepth = 32,
+                          bool preserveObservability = false,
+                          bool accumulateStats = false);
 std::unique_ptr<::mlir::Pass>
 createCombineDelayChainsPass(DelayChainMode mode = DelayChainMode::Generated,
                              bool accumulateStats = false,
                              bool cascadeRound = false,
-                             bool preserveObservability = false);
+                             bool preserveObservability = false,
+                             bool mergeOnly = false,
+                             bool skipMerge = false);
 std::unique_ptr<::mlir::Pass>
 createPackStateLanesPass(unsigned maxWidth = 192,
                          bool preserveObservability = false);

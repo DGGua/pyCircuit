@@ -32,12 +32,14 @@
 | 14 | `pyc-unroll-vector` | function | 将 Vector 计算、连接和状态展开为标量 lane 操作。 | `--unroll-vector` |
 | 15 | `pyc-eliminate-wires` | function | 消除可直接替换的 `pyc.wire` / `pyc.assign` 中间连接。 | 始终 |
 | 16 | `pyc-eliminate-dead-state` | function | 删除对可观察行为无影响的寄存器、存储等状态。 | 始终 |
-| 17 | `pyc-analyze-state-optimization` | function | 记录状态候选、pin 和控制边界统计。 | 始终 |
+| 17 | `pyc-analyze-state-optimization` + `pyc-analyze-retiming` | function | 记录状态候选、pin、控制边界和保守 retiming 机会统计；不改 IR。 | 始终 |
 | 17a | `pyc-strip-state-observability` | function | 性能模式移除状态 debug/probe/trace/name 身份，保留功能数据流；Stage 0 统计已在此前完成。 | structural 且未开启 `--state-opt-preserve-observability` |
 | 17b | `pyc-eliminate-dead-state` | function | 清理观测身份移除后不再有功能用途的状态。 | 同上 |
-| 18 | `pyc-combine-delay-chains` | function | Stage 1：等价状态合并、结构化串行链和 duplicate sharing。 | `--state-delay-opt` 非 `off` |
+| 18 | `pyc-combine-delay-chains{merge-only=true}` | function | Stage 1：第一轮等价状态合并；generated 兼容模式仍执行原 all-in-one pass。 | `--state-delay-opt` 非 `off` |
 | 19 | `canonicalize` + `cse` | module | Stage 1.5：让第一轮状态合并暴露的组合锥共享一次。 | structural 模式 |
-| 20 | `pyc-combine-delay-chains` | function | Stage 1.5 第二轮有界 merge/form/share。 | structural 模式 |
+| 20 | `pyc-combine-delay-chains{merge-only=true}` | function | Stage 1.5 第二轮有界 equivalent-state merge。 | structural 模式 |
+| 20a | `pyc-retime-pipelines` | function | 把合法 computed pipeline 集中为 history，或将同深度多 operand delay 下沉到组合结果；执行 init、反馈、状态位和组合深度证明。 | structural 且 `--state-retime=pipeline`（默认） |
+| 20b | `pyc-combine-delay-chains{skip-merge=true}` | function | 在 retiming 之后形成普通直连 delay-line/tap，并共享等价 history。 | structural 模式 |
 | 21 | `pyc-pack-state-lanes` | function | Stage 2：将控制兼容的整数 reg/delay-line lanes 打包到上限宽度。 | structural 且 `--state-pack-width != 0` |
 | 22 | `pyc-slp-pack-wires` | function | 将可识别的同构标量 lane 重新打包成 Vector 操作。 | 未启用 `--unroll-vector` |
 | 23 | `pyc-comb-canonicalize` | function | PYC 组合图结构化简（mux、wire、get/create 重建）并将结构化 Vec 拆成 lane 级运算，使 dialect folder 能折叠可知 lane。 | 始终 |
@@ -66,11 +68,11 @@
 ```text
 --unroll-vector
     └─ 14 pyc-unroll-vector → 15 eliminate-wires → 16 eliminate-dead-state
-       → 17-21 state optimization                 （跳过 22 slp-pack-wires）
+       → 17-21 state optimization/retiming        （跳过 22 slp-pack-wires）
 
 默认（未开 --unroll-vector）
     └─ （跳过 14）→ 15 eliminate-wires → 16 eliminate-dead-state
-       → 17-21 state optimization → 22 slp-pack-wires
+       → 17-21 state optimization/retiming → 22 slp-pack-wires
 ```
 
 `pyc-unroll-vector` 与 `pyc-slp-pack-wires` 不会同时执行。启用 unroll 时，

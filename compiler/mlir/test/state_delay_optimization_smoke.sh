@@ -10,6 +10,7 @@ DEFAULT_INPUT="${ROOT}/compiler/mlir/test/state_delay_default_structural.mlir"
 STAGE15_STAGE2_INPUT="${ROOT}/compiler/mlir/test/state_optimization_stage15_stage2.mlir"
 PACK_PROBE_INPUT="${ROOT}/compiler/mlir/test/state_pack_probe.mlir"
 OBSERVABILITY_INPUT="${ROOT}/compiler/mlir/test/state_observability_performance.mlir"
+RETIME_INPUT="${ROOT}/compiler/mlir/test/state_retime_pipeline.mlir"
 
 if [[ ! -x "${PYC_OPT}" || ! -x "${PYCC}" ]]; then
   echo "fail: build pyc-opt and pycc before running this gate" >&2
@@ -222,6 +223,27 @@ for name in ("out0", "out1", "lane0_state", "lane1_state"):
 PY
 
 python3 "${ROOT}/compiler/mlir/test/check_state_delay_tap_models.py" \
+  --pycc "${PYCC}" --cxx "${CXX:-c++}"
+
+"${PYC_OPT}" "${RETIME_INPUT}" \
+  --pass-pipeline='builtin.module(func.func(pyc-analyze-retiming))' \
+  -o "${TMP_DIR}/retime-analyze.mlir"
+"${FILECHECK_BIN}" "${RETIME_INPUT}" --check-prefix=ANALYZE \
+  --input-file="${TMP_DIR}/retime-analyze.mlir"
+
+"${PYC_OPT}" "${RETIME_INPUT}" \
+  --pass-pipeline='builtin.module(func.func(pyc-retime-pipelines))' \
+  -o "${TMP_DIR}/retimed.mlir"
+"${FILECHECK_BIN}" "${RETIME_INPUT}" --check-prefix=RETIME \
+  --input-file="${TMP_DIR}/retimed.mlir"
+
+"${PYC_OPT}" "${RETIME_INPUT}" \
+  --pass-pipeline='builtin.module(func.func(pyc-retime-pipelines{preserve-observability=true}))' \
+  -o "${TMP_DIR}/retime-preserved.mlir"
+"${FILECHECK_BIN}" "${RETIME_INPUT}" --check-prefix=PRESERVE \
+  --input-file="${TMP_DIR}/retime-preserved.mlir"
+
+python3 "${ROOT}/compiler/mlir/test/check_state_retime_models.py" \
   --pycc "${PYCC}" --cxx "${CXX:-c++}"
 
 echo "state_delay_optimization_smoke: PASS"

@@ -202,6 +202,27 @@ static llvm::cl::opt<std::string> stateDelayOpt(
         "State/delay optimization policy: off|generated|structural (default: structural)"),
     llvm::cl::init("structural"));
 
+static llvm::cl::opt<std::string> stateRetimeOpt(
+    "state-retime",
+    llvm::cl::desc(
+        "Pipeline retiming policy: off|pipeline (default: pipeline in structural mode)"),
+    llvm::cl::init("pipeline"));
+
+static llvm::cl::opt<unsigned> stateRetimeMaxStages(
+    "state-retime-max-stages",
+    llvm::cl::desc("Maximum registers per retimed region (0 is unlimited)"),
+    llvm::cl::init(0));
+
+static llvm::cl::opt<unsigned> stateRetimeMaxExtraCombOps(
+    "state-retime-max-extra-comb-ops",
+    llvm::cl::desc("Maximum duplicated combinational operations from retiming"),
+    llvm::cl::init(32));
+
+static llvm::cl::opt<unsigned> stateRetimeMaxCombDepth(
+    "state-retime-max-comb-depth",
+    llvm::cl::desc("Maximum rebuilt prefix depth from retiming"),
+    llvm::cl::init(32));
+
 static llvm::cl::opt<unsigned> statePackWidth(
     "state-pack-width",
     llvm::cl::desc(
@@ -2023,6 +2044,7 @@ static LogicalResult writeCppCompileManifest(llvm::StringRef path,
 
 struct CompileStatsSummary {
   std::string stateOptimizationPolicy;
+  std::string stateRetimePolicy;
   bool stateOptPreserveObservability = false;
   int64_t stateOptPackWidth = 0;
   int64_t regCount = 0;
@@ -2040,6 +2062,22 @@ struct CompileStatsSummary {
   int64_t delayChainStateWritesAfter = 0;
   int64_t delayChainTapsCreated = 0;
   int64_t delayChainTapUsesRewritten = 0;
+  int64_t retimeRegsSeen = 0;
+  int64_t retimeCandidateRegions = 0;
+  int64_t retimeCandidateRegs = 0;
+  int64_t retimeCandidateCombOps = 0;
+  int64_t retimeRegionsRewritten = 0;
+  int64_t retimeRegsRewritten = 0;
+  int64_t retimeStatePrimitivesRemoved = 0;
+  int64_t retimeTapsCreated = 0;
+  int64_t retimeCombOpsCloned = 0;
+  int64_t retimeCommonDelayCandidates = 0;
+  int64_t retimeCommonDelaySinks = 0;
+  int64_t retimeCommonDelaySourceStates = 0;
+  int64_t retimeCombOpsMoved = 0;
+  int64_t retimeStateBitsRemoved = 0;
+  int64_t retimeBlockedInit = 0;
+  int64_t retimeBlockedCost = 0;
   int64_t stateOptRegsSeen = 0;
   int64_t stateOptGeneratedRegs = 0;
   int64_t stateOptPinnedRegs = 0;
@@ -2130,6 +2168,53 @@ static CompileStatsSummary collectCompileStats(ModuleOp module, int64_t depthLim
     s.delayChainTapUsesRewritten = satAdd(
         s.delayChainTapUsesRewritten,
         getI64Attr(f, "pyc.stats.delay_chain_tap_uses_rewritten", 0));
+    s.retimeRegsSeen = satAdd(
+        s.retimeRegsSeen, getI64Attr(f, "pyc.stats.retime_regs_seen", 0));
+    s.retimeCandidateRegions = satAdd(
+        s.retimeCandidateRegions,
+        getI64Attr(f, "pyc.stats.retime_candidate_regions", 0));
+    s.retimeCandidateRegs = satAdd(
+        s.retimeCandidateRegs,
+        getI64Attr(f, "pyc.stats.retime_candidate_regs", 0));
+    s.retimeCandidateCombOps = satAdd(
+        s.retimeCandidateCombOps,
+        getI64Attr(f, "pyc.stats.retime_candidate_comb_ops", 0));
+    s.retimeRegionsRewritten = satAdd(
+        s.retimeRegionsRewritten,
+        getI64Attr(f, "pyc.stats.retime_regions_rewritten", 0));
+    s.retimeRegsRewritten = satAdd(
+        s.retimeRegsRewritten,
+        getI64Attr(f, "pyc.stats.retime_regs_rewritten", 0));
+    s.retimeStatePrimitivesRemoved = satAdd(
+        s.retimeStatePrimitivesRemoved,
+        getI64Attr(f, "pyc.stats.retime_state_primitives_removed", 0));
+    s.retimeTapsCreated = satAdd(
+        s.retimeTapsCreated,
+        getI64Attr(f, "pyc.stats.retime_taps_created", 0));
+    s.retimeCombOpsCloned = satAdd(
+        s.retimeCombOpsCloned,
+        getI64Attr(f, "pyc.stats.retime_comb_ops_cloned", 0));
+    s.retimeCommonDelayCandidates = satAdd(
+        s.retimeCommonDelayCandidates,
+        getI64Attr(f, "pyc.stats.retime_common_delay_candidates", 0));
+    s.retimeCommonDelaySinks = satAdd(
+        s.retimeCommonDelaySinks,
+        getI64Attr(f, "pyc.stats.retime_common_delay_sinks", 0));
+    s.retimeCommonDelaySourceStates = satAdd(
+        s.retimeCommonDelaySourceStates,
+        getI64Attr(f, "pyc.stats.retime_common_delay_source_states", 0));
+    s.retimeCombOpsMoved = satAdd(
+        s.retimeCombOpsMoved,
+        getI64Attr(f, "pyc.stats.retime_comb_ops_moved", 0));
+    s.retimeStateBitsRemoved = satAdd(
+        s.retimeStateBitsRemoved,
+        getI64Attr(f, "pyc.stats.retime_state_bits_removed", 0));
+    s.retimeBlockedInit = satAdd(
+        s.retimeBlockedInit,
+        getI64Attr(f, "pyc.stats.retime_blocked_init", 0));
+    s.retimeBlockedCost = satAdd(
+        s.retimeBlockedCost,
+        getI64Attr(f, "pyc.stats.retime_blocked_cost", 0));
     s.stateOptRegsSeen = satAdd(
         s.stateOptRegsSeen, getI64Attr(f, "pyc.stats.state_opt_regs_seen", 0));
     s.stateOptGeneratedRegs = satAdd(
@@ -2223,6 +2308,7 @@ static CompileStatsSummary collectCompileStats(ModuleOp module, int64_t depthLim
 
 static void printCompileStats(const CompileStatsSummary &s) {
   llvm::errs() << "stats: state_policy=" << s.stateOptimizationPolicy
+               << ", retime=" << s.stateRetimePolicy
                << ", preserve_observability="
                << (s.stateOptPreserveObservability ? "true" : "false")
                << ", pack_width=" << s.stateOptPackWidth
@@ -2239,6 +2325,21 @@ static void printCompileStats(const CompileStatsSummary &s) {
                << s.delayChainStateWritesAfter
                << ", taps:" << s.delayChainTapsCreated
                << ", tap_uses:" << s.delayChainTapUsesRewritten << "}"
+               << ", retime_opt={candidates:" << s.retimeCandidateRegions
+               << "/" << s.retimeCandidateRegs
+               << ", candidate_comb:" << s.retimeCandidateCombOps
+               << ", rewritten:" << s.retimeRegionsRewritten
+               << "/" << s.retimeRegsRewritten
+               << ", primitives_removed:"
+               << s.retimeStatePrimitivesRemoved
+               << ", taps:" << s.retimeTapsCreated
+               << ", comb_cloned:" << s.retimeCombOpsCloned
+               << ", common_sinks:" << s.retimeCommonDelaySinks
+               << "/" << s.retimeCommonDelaySourceStates
+               << ", comb_moved:" << s.retimeCombOpsMoved
+               << ", bits_removed:" << s.retimeStateBitsRemoved
+               << ", blocked_init:" << s.retimeBlockedInit
+               << ", blocked_cost:" << s.retimeBlockedCost << "}"
                << ", state_opt={seen:" << s.stateOptRegsSeen
                << ", generated:" << s.stateOptGeneratedRegs
                << ", pinned:" << s.stateOptPinnedRegs
@@ -2268,6 +2369,7 @@ static void printCompileStats(const CompileStatsSummary &s) {
 static llvm::json::Object compileStatsToJson(const CompileStatsSummary &s) {
   llvm::json::Object obj;
   obj["state_opt_policy"] = s.stateOptimizationPolicy;
+  obj["state_retime_policy"] = s.stateRetimePolicy;
   obj["state_opt_preserve_observability"] =
       s.stateOptPreserveObservability;
   obj["state_opt_pack_width"] = s.stateOptPackWidth;
@@ -2287,6 +2389,25 @@ static llvm::json::Object compileStatsToJson(const CompileStatsSummary &s) {
   obj["delay_chain_taps_created"] = s.delayChainTapsCreated;
   obj["delay_chain_tap_uses_rewritten"] =
       s.delayChainTapUsesRewritten;
+  obj["retime_regs_seen"] = s.retimeRegsSeen;
+  obj["retime_candidate_regions"] = s.retimeCandidateRegions;
+  obj["retime_candidate_regs"] = s.retimeCandidateRegs;
+  obj["retime_candidate_comb_ops"] = s.retimeCandidateCombOps;
+  obj["retime_regions_rewritten"] = s.retimeRegionsRewritten;
+  obj["retime_regs_rewritten"] = s.retimeRegsRewritten;
+  obj["retime_state_primitives_removed"] =
+      s.retimeStatePrimitivesRemoved;
+  obj["retime_taps_created"] = s.retimeTapsCreated;
+  obj["retime_comb_ops_cloned"] = s.retimeCombOpsCloned;
+  obj["retime_common_delay_candidates"] =
+      s.retimeCommonDelayCandidates;
+  obj["retime_common_delay_sinks"] = s.retimeCommonDelaySinks;
+  obj["retime_common_delay_source_states"] =
+      s.retimeCommonDelaySourceStates;
+  obj["retime_comb_ops_moved"] = s.retimeCombOpsMoved;
+  obj["retime_state_bits_removed"] = s.retimeStateBitsRemoved;
+  obj["retime_blocked_init"] = s.retimeBlockedInit;
+  obj["retime_blocked_cost"] = s.retimeBlockedCost;
   obj["state_opt_regs_seen"] = s.stateOptRegsSeen;
   obj["state_opt_generated_regs"] = s.stateOptGeneratedRegs;
   obj["state_opt_pinned_regs"] = s.stateOptPinnedRegs;
@@ -2472,6 +2593,12 @@ int main(int argc, char **argv) {
     stateDelayOptNorm = "generated";
   const bool enableStateDelayOptimization =
       combineDelayChains && stateDelayOptNorm != "off";
+  std::string stateRetimeNorm = llvm::StringRef(stateRetimeOpt).lower();
+  if (stateRetimeNorm != "off" && stateRetimeNorm != "pipeline") {
+    llvm::errs() << "error: unknown --state-retime: " << stateRetimeOpt
+                 << " (expected: off|pipeline)\n";
+    return 1;
+  }
   pyc::DelayChainMode stateDelayMode = pyc::DelayChainMode::Generated;
   if (stateDelayOptNorm == "generated" || stateDelayOptNorm == "off") {
     stateDelayMode = pyc::DelayChainMode::Generated;
@@ -2656,6 +2783,7 @@ int main(int argc, char **argv) {
   // Stage 0 is diagnostics-only and runs for all policies, including off, so
   // baselines retain visibility into missed optimization opportunities.
   pm.addNestedPass<func::FuncOp>(pyc::createAnalyzeStateOptimizationPass());
+  pm.addNestedPass<func::FuncOp>(pyc::createAnalyzeRetimingPass());
   if (enableStateDelayOptimization &&
       stateDelayMode == pyc::DelayChainMode::Structural &&
       !stateOptPreserveObservability) {
@@ -2665,8 +2793,9 @@ int main(int argc, char **argv) {
         pyc::createStripStateObservabilityPass());
     pm.addNestedPass<func::FuncOp>(pyc::createEliminateDeadStatePass());
   }
-  // Match normalized frontend-owned chains before downstream analyses and
-  // emitters consume the first-class sequential operation.
+  // Structural mode gives exact equivalent-state merging priority over
+  // retiming and direct chain formation. Generated compatibility mode keeps
+  // the original all-in-one behavior.
   if (enableStateDelayOptimization)
     pm.addNestedPass<func::FuncOp>(
         pyc::createCombineDelayChainsPass(
@@ -2674,17 +2803,40 @@ int main(int argc, char **argv) {
             /*cascadeRound=*/false,
             /*preserveObservability=*/
                 stateDelayMode == pyc::DelayChainMode::Generated ||
-                    stateOptPreserveObservability));
+                    stateOptPreserveObservability,
+            /*mergeOnly=*/
+                stateDelayMode == pyc::DelayChainMode::Structural,
+            /*skipMerge=*/false));
   if (enableStateDelayOptimization &&
       stateDelayMode == pyc::DelayChainMode::Structural) {
     // Stage 1.5: the first state merge can expose equivalent combinational
-    // cones. Canonicalize/CSE once, then run one bounded refinement round.
+    // cones. Canonicalize/CSE once, then run one bounded merge refinement.
     pm.addPass(createCanonicalizerPass(canonicalizeCfg));
     pm.addPass(createCSEPass());
     pm.addNestedPass<func::FuncOp>(pyc::createCombineDelayChainsPass(
         stateDelayMode, /*accumulateStats=*/true,
         /*cascadeRound=*/true,
-        /*preserveObservability=*/stateOptPreserveObservability));
+        /*preserveObservability=*/stateOptPreserveObservability,
+        /*mergeOnly=*/true, /*skipMerge=*/false));
+    if (stateRetimeNorm == "pipeline") {
+      // Run retiming after the two low-risk merge/form rounds. This prevents
+      // a local retime from consuming a state that has a more profitable
+      // global equivalent-state or direct-chain rewrite.
+      const unsigned retimeCombDepth = std::min<unsigned>(
+          stateRetimeMaxCombDepth, logicDepthLimit);
+      pm.addNestedPass<func::FuncOp>(pyc::createRetimePipelinesPass(
+          stateRetimeMaxStages, stateRetimeMaxExtraCombOps,
+          retimeCombDepth, stateOptPreserveObservability,
+          /*accumulateStats=*/false));
+      pm.addNestedPass<func::FuncOp>(pyc::createEliminateDeadStatePass());
+    }
+    // Form ordinary direct chains only after retiming has selected the more
+    // general computed pipelines. Also share equivalent histories here.
+    pm.addNestedPass<func::FuncOp>(pyc::createCombineDelayChainsPass(
+        stateDelayMode, /*accumulateStats=*/true,
+        /*cascadeRound=*/false,
+        /*preserveObservability=*/stateOptPreserveObservability,
+        /*mergeOnly=*/false, /*skipMerge=*/true));
     if (statePackWidth != 0)
       pm.addNestedPass<func::FuncOp>(
           pyc::createPackStateLanesPass(
@@ -2755,6 +2907,11 @@ int main(int argc, char **argv) {
           ? (stateDelayMode == pyc::DelayChainMode::Structural
                  ? "structural"
                  : "generated")
+          : "off";
+  compileStats.stateRetimePolicy =
+      enableStateDelayOptimization &&
+              stateDelayMode == pyc::DelayChainMode::Structural
+          ? stateRetimeNorm
           : "off";
   compileStats.stateOptPreserveObservability =
       enableStateDelayOptimization &&
