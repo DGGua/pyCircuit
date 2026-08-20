@@ -364,7 +364,7 @@ static void shareEquivalentDelayLines(
 
 static void writeCombineStats(func::FuncOp function, const CombineStats &stats,
                               bool accumulate, bool cascadeRound,
-                              DelayChainMode mode) {
+                              DelayChainMode mode, bool performedMergeRound) {
   auto write = [&](llvm::StringRef name, int64_t value) {
     if (accumulate)
       value += getI64Attr(function, name, 0);
@@ -390,9 +390,9 @@ static void writeCombineStats(func::FuncOp function, const CombineStats &stats,
   write("pyc.stats.state_opt_structural_chain_regs_combined",
         stats.structuralRegsCombined);
   write("pyc.stats.state_opt_cascade_regs_merged",
-        cascadeRound ? stats.stateRegsMerged : 0);
+        cascadeRound && performedMergeRound ? stats.stateRegsMerged : 0);
   write("pyc.stats.state_opt_merge_rounds",
-        mode == DelayChainMode::Structural ? 1 : 0);
+        mode == DelayChainMode::Structural && performedMergeRound ? 1 : 0);
   write("pyc.stats.delay_chain_taps_created", stats.delayTapsCreated);
   write("pyc.stats.delay_chain_tap_uses_rewritten",
         stats.delayTapUsesRewritten);
@@ -407,11 +407,14 @@ struct CombineDelayChainsPass
   CombineDelayChainsPass(const CombineDelayChainsPass &other)
       : PassWrapper(other) {}
   CombineDelayChainsPass(DelayChainMode mode, bool accumulateStats,
-                         bool cascadeRound, bool preserveObservability) {
+                         bool cascadeRound, bool preserveObservability,
+                         bool mergeOnly, bool skipMerge) {
     modeOption = stringifyDelayChainMode(mode).str();
     accumulateStatsOption = accumulateStats;
     cascadeRoundOption = cascadeRound;
     preserveObservabilityOption = preserveObservability;
+    mergeOnlyOption = mergeOnly;
+    skipMergeOption = skipMerge;
   }
 
   StringRef getArgument() const override { return "pyc-combine-delay-chains"; }
@@ -435,6 +438,14 @@ struct CombineDelayChainsPass
       *this, "preserve-observability",
       llvm::cl::desc("Keep named/debug/probe/trace state identities"),
       llvm::cl::init(false)};
+  Option<bool> mergeOnlyOption{
+      *this, "merge-only",
+      llvm::cl::desc("Only merge equivalent registers; do not form histories"),
+      llvm::cl::init(false)};
+  Option<bool> skipMergeOption{
+      *this, "skip-merge",
+      llvm::cl::desc("Form/share histories without equivalent-register merge"),
+      llvm::cl::init(false)};
 
   void runOnOperation() override {
     auto mode = parseDelayChainMode(modeOption);
@@ -455,15 +466,25 @@ struct CombineDelayChainsPass
     StateObservabilityAnalysis observability(function,
                                               preserveObservability);
     CombineStats stats;
-    if (*mode == DelayChainMode::Structural)
+    if (mergeOnlyOption && skipMergeOption) {
+      function.emitError()
+          << "merge-only and skip-merge cannot both be enabled";
+      signalPassFailure();
+      return;
+    }
+    if (*mode == DelayChainMode::Structural && !skipMergeOption)
       mergeEquivalentStates(function, stats, observability,
                             preserveObservability);
-    combineStateChains(function, stats, *mode, observability,
-                       preserveObservability);
-    shareEquivalentDelayLines(function, stats, *mode, observability,
-                              preserveObservability);
+    if (!mergeOnlyOption) {
+      combineStateChains(function, stats, *mode, observability,
+                         preserveObservability);
+      shareEquivalentDelayLines(function, stats, *mode, observability,
+                                preserveObservability);
+    }
     writeCombineStats(function, stats, accumulateStatsOption,
-                      cascadeRoundOption, *mode);
+                      cascadeRoundOption, *mode,
+                      *mode == DelayChainMode::Structural &&
+                          !skipMergeOption);
   }
 };
 
@@ -472,10 +493,12 @@ struct CombineDelayChainsPass
 std::unique_ptr<::mlir::Pass>
 createCombineDelayChainsPass(DelayChainMode mode, bool accumulateStats,
                              bool cascadeRound,
-                             bool preserveObservability) {
+                             bool preserveObservability, bool mergeOnly,
+                             bool skipMerge) {
   return std::make_unique<CombineDelayChainsPass>(mode, accumulateStats,
                                                    cascadeRound,
-                                                   preserveObservability);
+                                                   preserveObservability,
+                                                   mergeOnly, skipMerge);
 }
 
 static PassRegistration<CombineDelayChainsPass> pass;

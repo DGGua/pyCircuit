@@ -82,7 +82,7 @@ for key, value in expected.items():
 stderr = stderr_path.read_text(encoding="utf-8")
 needle = (
     "delay_chain={chains:2, regs:4, aliases:2, created:2, merged:1, "
-    "reads:4->1, writes:4->1}"
+    "reads:4->1, writes:4->1"
 )
 if needle not in stderr:
     raise AssertionError(f"missing stderr summary: {needle}\nactual stderr:\n{stderr}")
