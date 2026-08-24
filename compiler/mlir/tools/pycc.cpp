@@ -2819,7 +2819,7 @@ int main(int argc, char **argv) {
         /*preserveObservability=*/stateOptPreserveObservability,
         /*mergeOnly=*/true, /*skipMerge=*/false));
     if (stateRetimeNorm == "pipeline") {
-      // Run retiming after the two low-risk merge/form rounds. This prevents
+      // Run retiming after the two low-risk merge-only rounds. This prevents
       // a local retime from consuming a state that has a more profitable
       // global equivalent-state or direct-chain rewrite.
       const unsigned retimeCombDepth = std::min<unsigned>(

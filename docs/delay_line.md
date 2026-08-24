@@ -440,14 +440,21 @@ after first state merge:
 因此流水线执行：
 
 ```text
-first merge/form/share
+first equivalent-state merge (merge-only)
         ↓
 canonicalize + CSE
         ↓
-second merge/form/share
+second equivalent-state merge (merge-only)
+        ↓
+retiming
+        ↓
+direct chain form/share/tap
 ```
 
-第二轮可识别下游级联的等价状态或新暴露的链。流水线固定两轮，不跑到 fixed point。
+第二轮可识别下游级联的等价状态；两轮 merge 后再运行 retiming，最后才形成普通直连
+chain、共享 history 和生成 tap。这样既不会让局部 retiming 抢占更有收益的等价状态，
+也不会让短直连链提前抢走 computed-pipeline 的 head。merge 流水线固定两轮，不跑到
+fixed point。
 统计字段：
 
 - `state_opt_merge_rounds`：structural 模式实际合并轮数；
