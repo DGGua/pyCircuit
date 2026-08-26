@@ -162,6 +162,12 @@ static llvm::cl::opt<std::string> probePlanPath(
     llvm::cl::desc("Resolved @probe alias plan JSON to embed into generated ProbeRegistry registration"),
     llvm::cl::init(""));
 
+static llvm::cl::opt<std::string> traceCodegenPlanPath(
+    "trace-codegen-plan",
+    llvm::cl::desc(
+        "Resolved per-module internal trace fields used by C++ placement"),
+    llvm::cl::init(""));
+
 static llvm::cl::opt<std::string> targetKind("target", llvm::cl::desc("Target: default|fpga"),
                                              llvm::cl::init("default"));
 
@@ -2362,7 +2368,8 @@ int main(int argc, char **argv) {
   pm.addNestedPass<func::FuncOp>(pyc::createCheckNoDynamicPass());
   pm.addPass(pyc::createCheckLogicDepthPass(logicDepthLimit));
   if (emitKind == "cpp")
-    pm.addPass(pyc::createCppPlacementPass(cppCombChunkNodes));
+    pm.addPass(
+        pyc::createCppPlacementPass(cppCombChunkNodes, traceCodegenPlanPath));
   pm.addNestedPass<func::FuncOp>(pyc::createCollectCompileStatsPass());
   const auto tPassStart = Clock::now();
   if (failed(pm.run(*module))) {
