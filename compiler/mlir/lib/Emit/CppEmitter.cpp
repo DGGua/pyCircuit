@@ -1659,6 +1659,61 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
     os << "\n";
   }
 
+  struct NamedProbeInfo {
+    std::string fieldPath;
+    std::string cppValue;
+    std::string cppRegInst;
+    unsigned width = 0;
+    bool isReg = false;
+    Type type;
+  };
+
+  // Decision 0003 / 0051-0052: infer probe kind for ports and named internal
+  // objects. Trace-selected comb locals have already been pinned to stable
+  // struct storage by pyc-cpp-placement.
+  std::vector<bool> outIsReg(f.getNumResults(), false);
+  std::vector<Value> outRegQ(f.getNumResults(), Value());
+  std::vector<NamedProbeInfo> namedProbes;
+  if (!f.isDeclaration()) {
+    auto ret =
+        dyn_cast_or_null<func::ReturnOp>(f.getBody().front().getTerminator());
+    if (!ret)
+      return f.emitError("missing return");
+    for (unsigned i = 0; i < f.getNumResults() && i < ret.getNumOperands(); ++i)
+      outRegQ[i] = findRegQFromValue(ret.getOperand(i));
+    for (unsigned i = 0; i < f.getNumResults(); ++i)
+      outIsReg[i] = static_cast<bool>(outRegQ[i]);
+
+    llvm::StringSet<> seenNamedFields;
+    f.walk([&](Operation *op) {
+      auto nameAttr = op->getAttrOfType<StringAttr>("pyc.name");
+      if (!nameAttr || op->getNumResults() != 1)
+        return;
+      Value value = op->getResult(0);
+      if (getValueCppStorage(value) == CppStorageKind::Local)
+        return;
+      unsigned width = bitWidth(value.getType());
+      if (width == 0)
+        return;
+      std::string fieldPath = nameAttr.getValue().str();
+      if (!seenNamedFields.insert(fieldPath).second)
+        return;
+      Value regQ = findRegQFromValue(value);
+      namedProbes.push_back(NamedProbeInfo{
+          fieldPath,
+          nt.get(value),
+          static_cast<bool>(regQ) ? (nt.get(regQ) + "_inst") : std::string(),
+          width,
+          static_cast<bool>(regQ),
+          value.getType(),
+      });
+    });
+    std::sort(namedProbes.begin(), namedProbes.end(),
+              [](const NamedProbeInfo &a, const NamedProbeInfo &b) {
+                return a.fieldPath < b.fieldPath;
+              });
+  }
+
 	  // DFX trace registration (Decision 0145).
 	  os << "  template <typename TbT, typename EnabledInstT, typename EnabledSigT>\n";
 	  os << "  void pyc_trace_vcd(TbT &tb, const std::string &prefix, EnabledInstT &&enabledInst, EnabledSigT &&enabledSig) {\n";
@@ -1674,6 +1729,9 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
 	    os << "    trace_port(" << inNames[i] << ", " << cppStringLiteral(inCanon[i]) << ");\n";
 	  for (unsigned i = 0; i < outNames.size(); ++i)
 	    os << "    trace_port(" << outNames[i] << ", " << cppStringLiteral(outCanon[i]) << ");\n";
+	  for (const auto &named : namedProbes)
+	    os << "    trace_port(" << named.cppValue << ", "
+	       << cppStringLiteral(named.fieldPath) << ");\n";
 	  if (!instInfos.empty()) {
 	    os << "    auto trace_child = [&](auto &child, const char *seg) {\n";
 	    os << "      std::string full = prefix;\n";
