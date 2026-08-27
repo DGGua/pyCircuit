@@ -9,6 +9,7 @@
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Types.h"
+#include "mlir/IR/Visitors.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/SmallSet.h"
@@ -1067,8 +1068,28 @@ static LogicalResult emitCombMethod(pyc::CombOp comb,
   return success();
 }
 
+static LogicalResult rejectMultipleWireDrivers(func::FuncOp f) {
+  llvm::DenseMap<Value, pyc::AssignOp> firstAssign;
+  LogicalResult result = success();
+  f.walk([&](pyc::AssignOp assign) {
+    auto [it, inserted] = firstAssign.try_emplace(assign.getDst(), assign);
+    if (inserted)
+      return WalkResult::advance();
+    // Decision 0137: wire/assign is a single driver. Successive Reg.set
+    // updates must already have been folded in the frontend.
+    result = assign.emitOpError(
+        "has multiple drivers for the same wire; fold successive updates "
+        "into one assign (Reg.set / assign(when=)) or use an explicit net");
+    return WalkResult::interrupt();
+  });
+  return result;
+}
+
 static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEmitterOptions &opts) {
   NameTable nt;
+
+  if (failed(rejectMultipleWireDrivers(f)))
+    return failure();
 
   if (!f.isDeclaration() && !getFuncPlacementSummary(f))
       return f.emitError(
@@ -1327,45 +1348,6 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
     os << "\n";
   }
 
-	  // DFX trace registration (Decision 0145).
-	  os << "  template <typename TbT, typename EnabledInstT, typename EnabledSigT>\n";
-	  os << "  void pyc_trace_vcd(TbT &tb, const std::string &prefix, EnabledInstT &&enabledInst, EnabledSigT &&enabledSig) {\n";
-	  os << "    std::string inst = pyc::cpp::shortenInstancePath(prefix);\n";
-	  os << "    auto trace_port = [&](auto &sig, const char *leaf) {\n";
-  os << "      std::string p = inst;\n";
-  // Decision 0023: canonical_path uses <instance_path>:<field_path>.
-  os << "      p += \":\";\n";
-  os << "      p += leaf;\n";
-		  os << "      if (enabledSig(p)) tb.vcdTrace(sig, p);\n";
-	  os << "    };\n";
-	  for (unsigned i = 0; i < inNames.size(); ++i)
-	    os << "    trace_port(" << inNames[i] << ", " << cppStringLiteral(inCanon[i]) << ");\n";
-	  for (unsigned i = 0; i < outNames.size(); ++i)
-	    os << "    trace_port(" << outNames[i] << ", " << cppStringLiteral(outCanon[i]) << ");\n";
-	  if (!instInfos.empty()) {
-	    os << "    auto trace_child = [&](auto &child, const char *seg) {\n";
-	    os << "      std::string full = prefix;\n";
-	    os << "      full += \".\";\n";
-    os << "      full += seg;\n";
-    os << "      std::string inst_path = pyc::cpp::shortenInstancePath(full);\n";
-    os << "      if (enabledInst(inst_path) && child) child->pyc_trace_vcd(tb, full, enabledInst, enabledSig);\n";
-    os << "    };\n";
-    for (const auto &ii : instInfos)
-      os << "    trace_child(" << ii.member << ", \"" << ii.seg << "\");\n";
-  }
-	  os << "  }\n\n";
-
-	  // ProbeRegistry registration (Decisions 0004, 0018-0021).
-	  os << "  void pyc_register_probes(pyc::cpp::ProbeRegistry &reg, const std::string &prefix) {\n";
-	  os << "    std::string inst = pyc::cpp::shortenInstancePath(prefix);\n";
-	  os << "    auto reg_path = [&](const char *leaf) {\n";
-	  os << "      std::string p = inst;\n";
-	  // Decision 0023: canonical_path uses <instance_path>:<field_path>.
-	  os << "      p += \":\";\n";
-	  os << "      p += leaf;\n";
-	  os << "      return p;\n";
-	  os << "    };\n";
-
     struct NamedProbeInfo {
       std::string fieldPath;
       std::string cppValue;
@@ -1433,7 +1415,47 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
         return a.fieldPath < b.fieldPath;
       });
     }
+    // DFX trace registration (Decision 0145).
+	  os << "  template <typename TbT, typename EnabledInstT, typename EnabledSigT>\n";
+	  os << "  void pyc_trace_vcd(TbT &tb, const std::string &prefix, EnabledInstT &&enabledInst, EnabledSigT &&enabledSig) {\n";
+	  os << "    std::string inst = pyc::cpp::shortenInstancePath(prefix);\n";
+	  os << "    auto trace_port = [&](auto &sig, const char *leaf) {\n";
+    os << "      std::string p = inst;\n";
+    // Decision 0023: canonical_path uses <instance_path>:<field_path>.
+    os << "      p += \":\";\n";
+    os << "      p += leaf;\n";
+    os << "      if (enabledSig(p)) tb.vcdTrace(sig, p);\n";
+	  os << "    };\n";
+	  for (unsigned i = 0; i < inNames.size(); ++i)
+	    os << "    trace_port(" << inNames[i] << ", " << cppStringLiteral(inCanon[i]) << ");\n";
+	  for (unsigned i = 0; i < outNames.size(); ++i)
+	    os << "    trace_port(" << outNames[i] << ", " << cppStringLiteral(outCanon[i]) << ");\n";
+	  for (const auto &named : namedProbes)
+	    os << "    trace_port(" << named.cppValue << ", "
+	       << cppStringLiteral(named.fieldPath) << ");\n";
+	  if (!instInfos.empty()) {
+	    os << "    auto trace_child = [&](auto &child, const char *seg) {\n";
+	    os << "      std::string full = prefix;\n";
+	    os << "      full += \".\";\n";
+      os << "      full += seg;\n";
+      os << "      std::string inst_path = pyc::cpp::shortenInstancePath(full);\n";
+      os << "      if (enabledInst(inst_path) && child) child->pyc_trace_vcd(tb, full, enabledInst, enabledSig);\n";
+      os << "    };\n";
+      for (const auto &ii : instInfos)
+        os << "    trace_child(" << ii.member << ", \"" << ii.seg << "\");\n";
+    }
+	  os << "  }\n\n";
 
+	  // ProbeRegistry registration (Decisions 0004, 0018-0021).
+	  os << "  void pyc_register_probes(pyc::cpp::ProbeRegistry &reg, const std::string &prefix) {\n";
+	  os << "    std::string inst = pyc::cpp::shortenInstancePath(prefix);\n";
+	  os << "    auto reg_path = [&](const char *leaf) {\n";
+	  os << "      std::string p = inst;\n";
+	  // Decision 0023: canonical_path uses <instance_path>:<field_path>.
+	  os << "      p += \":\";\n";
+	  os << "      p += leaf;\n";
+	  os << "      return p;\n";
+	  os << "    };\n";
 		  for (auto [i, arg] : llvm::enumerate(f.getArguments())) {
 		    unsigned w = bitWidth(arg.getType());
 		    if (w == 0)
