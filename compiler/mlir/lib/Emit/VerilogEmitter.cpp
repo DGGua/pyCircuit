@@ -485,10 +485,23 @@ static std::optional<LogicalResult> emitScalarOpAssign(Operation &op, raw_ostrea
       suffix = lineName.substr(baseName.size());
     const auto bit = (depth.getInt() - 1) * static_cast<int64_t>(*width);
     std::string history = baseName + "__history" + suffix;
-    emitConnectAssign(nt.get(tap.getTap()),
-                      history + "[" + std::to_string(bit + *width - 1) + ":" +
-                          std::to_string(bit) + "]",
-                      tap.getTap().getType(), os);
+    std::string bitSelect = "[" + std::to_string(bit + *width - 1) + ":" +
+                            std::to_string(bit) + "]";
+    Type tapTy = tap.getTap().getType();
+    // Vector delay lines declare `history` as unpacked-per-lane packed buses,
+    // so the stage bit-select must sit after each lane index rather than on
+    // the whole array.
+    if (auto vt = dyn_cast<VectorType>(tapTy)) {
+      SmallVector<int64_t> shape = vectorShape(vt);
+      walkVectorIndices(shape, [&](ArrayRef<int64_t> indices) {
+        std::string idx = indexSuffix(indices);
+        os << "assign " << nt.get(tap.getTap()) << idx << " = " << history
+           << idx << bitSelect << ";\n";
+      });
+    } else {
+      os << "assign " << nt.get(tap.getTap()) << " = " << history << bitSelect
+         << ";\n";
+    }
     return success();
   }
   if (auto sh = dyn_cast<pyc::ShliOp>(op)) {

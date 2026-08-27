@@ -2431,6 +2431,11 @@ def _cmd_build(args: argparse.Namespace) -> int:
                 [
                     "--trace-codegen-plan",
                     str(trace_codegen_plan_path),
+                    # Named registers/state aliases listed in the plan must
+                    # survive the default structural state optimizer, whose
+                    # StripStateObservabilityPass would otherwise drop the
+                    # pyc.name attributes CppPlacementPass looks up.
+                    "--state-opt-preserve-observability=true",
                 ]
                 if trace_codegen_plan_path is not None
                 else []
