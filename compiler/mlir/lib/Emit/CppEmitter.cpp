@@ -10,6 +10,7 @@
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Types.h"
+#include "mlir/IR/Visitors.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/SmallSet.h"
@@ -1174,8 +1175,28 @@ static LogicalResult emitCombMethod(pyc::CombOp comb,
   return success();
 }
 
+static LogicalResult rejectMultipleWireDrivers(func::FuncOp f) {
+  llvm::DenseMap<Value, pyc::AssignOp> firstAssign;
+  LogicalResult result = success();
+  f.walk([&](pyc::AssignOp assign) {
+    auto [it, inserted] = firstAssign.try_emplace(assign.getDst(), assign);
+    if (inserted)
+      return WalkResult::advance();
+    // Decision 0137: wire/assign is a single driver. Successive Reg.set
+    // updates must already have been folded in the frontend.
+    result = assign.emitOpError(
+        "has multiple drivers for the same wire; fold successive updates "
+        "into one assign (Reg.set / assign(when=)) or use an explicit net");
+    return WalkResult::interrupt();
+  });
+  return result;
+}
+
 static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEmitterOptions &opts) {
   NameTable nt;
+
+  if (failed(rejectMultipleWireDrivers(f)))
+    return failure();
 
   if (!f.isDeclaration() && !getFuncPlacementSummary(f))
       return f.emitError(
@@ -1504,6 +1525,82 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
     os << "\n";
   }
 
+  struct NamedProbeInfo {
+    std::string fieldPath;
+    std::string cppValue;
+    std::string cppRegInst;
+    unsigned width = 0;
+    bool isReg = false;
+    Type type;
+  };
+
+  // Decision 0003 / 0051-0052: infer probe kind for ports and named internal
+  // objects. Trace-selected comb locals have already been pinned to stable
+  // struct storage by pyc-cpp-placement.
+  std::vector<bool> outIsReg(f.getNumResults(), false);
+  std::vector<Value> outRegQ(f.getNumResults(), Value());
+  std::vector<NamedProbeInfo> namedProbes;
+  if (!f.isDeclaration()) {
+    auto ret =
+        dyn_cast_or_null<func::ReturnOp>(f.getBody().front().getTerminator());
+    if (!ret)
+      return f.emitError("missing return");
+    for (unsigned i = 0; i < f.getNumResults() && i < ret.getNumOperands(); ++i)
+      outRegQ[i] = findRegQFromValue(ret.getOperand(i));
+    for (unsigned i = 0; i < f.getNumResults(); ++i)
+      outIsReg[i] = static_cast<bool>(outRegQ[i]);
+
+    llvm::StringSet<> seenNamedFields;
+    auto recordNamedProbe = [&](StringRef fieldPathRef, Value value) {
+      if (fieldPathRef.empty() ||
+          getValueCppStorage(value) == CppStorageKind::Local)
+        return;
+      std::string fieldPath = fieldPathRef.str();
+      if (!seenNamedFields.insert(fieldPath).second)
+        return;
+      unsigned width = bitWidth(value.getType());
+      if (width == 0)
+        return;
+      Value regQ = findRegQFromValue(value);
+      namedProbes.push_back(NamedProbeInfo{
+          fieldPath,
+          nt.get(value),
+          static_cast<bool>(regQ) ? (nt.get(regQ) + "_inst") : std::string(),
+          width,
+          static_cast<bool>(regQ),
+          value.getType(),
+      });
+    };
+
+    // Unified partitioning promotes per-result probe names to the sibling
+    // Comb boundary. Register those storage-backed values before walking the
+    // nested body, so a local cloned alias cannot shadow the published value.
+    for (Operation &topLevel : f.getBody().front()) {
+      auto comb = dyn_cast<pyc::CombOp>(topLevel);
+      auto resultNames =
+          comb ? comb->getAttrOfType<ArrayAttr>(kCombResultNamesAttr)
+               : ArrayAttr();
+      if (!resultNames)
+        continue;
+      for (auto [index, result] : llvm::enumerate(comb.getResults())) {
+        if (index >= resultNames.size())
+          break;
+        if (auto name = dyn_cast<StringAttr>(resultNames[index]))
+          recordNamedProbe(name.getValue(), result);
+      }
+    }
+    f.walk([&](Operation *op) {
+      auto nameAttr = op->getAttrOfType<StringAttr>("pyc.name");
+      if (!nameAttr || op->getNumResults() != 1)
+        return;
+      recordNamedProbe(nameAttr.getValue(), op->getResult(0));
+    });
+    std::sort(namedProbes.begin(), namedProbes.end(),
+              [](const NamedProbeInfo &a, const NamedProbeInfo &b) {
+                return a.fieldPath < b.fieldPath;
+              });
+  }
+
 	  // DFX trace registration (Decision 0145).
 	  os << "  template <typename TbT, typename EnabledInstT, typename EnabledSigT>\n";
 	  os << "  void pyc_trace_vcd(TbT &tb, const std::string &prefix, EnabledInstT &&enabledInst, EnabledSigT &&enabledSig) {\n";
@@ -1519,6 +1616,9 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
 	    os << "    trace_port(" << inNames[i] << ", " << cppStringLiteral(inCanon[i]) << ");\n";
 	  for (unsigned i = 0; i < outNames.size(); ++i)
 	    os << "    trace_port(" << outNames[i] << ", " << cppStringLiteral(outCanon[i]) << ");\n";
+	  for (const auto &named : namedProbes)
+	    os << "    trace_port(" << named.cppValue << ", "
+	       << cppStringLiteral(named.fieldPath) << ");\n";
 	  if (!instInfos.empty()) {
 	    os << "    auto trace_child = [&](auto &child, const char *seg) {\n";
 	    os << "      std::string full = prefix;\n";
@@ -1542,81 +1642,6 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
 	  os << "      p += leaf;\n";
 	  os << "      return p;\n";
 	  os << "    };\n";
-
-    struct NamedProbeInfo {
-      std::string fieldPath;
-      std::string cppValue;
-      std::string cppRegInst;
-      unsigned width = 0;
-      bool isReg = false;
-      Type type;
-    };
-
-    // Decision 0003 / 0051-0052: infer probe kind for ports and named internal
-    // objects. A value is considered stateful iff it directly returns the q
-    // output of a local pyc.reg (through optional pyc.alias wrappers).
-    std::vector<bool> outIsReg(f.getNumResults(), false);
-    std::vector<Value> outRegQ(f.getNumResults(), Value());
-    std::vector<NamedProbeInfo> namedProbes;
-    if (!f.isDeclaration()) {
-      auto ret = dyn_cast_or_null<func::ReturnOp>(f.getBody().front().getTerminator());
-      if (!ret)
-        return f.emitError("missing return");
-      for (unsigned i = 0; i < f.getNumResults() && i < ret.getNumOperands(); ++i)
-        outRegQ[i] = findRegQFromValue(ret.getOperand(i));
-      for (unsigned i = 0; i < f.getNumResults(); ++i)
-        outIsReg[i] = static_cast<bool>(outRegQ[i]);
-
-      llvm::StringSet<> seenNamedFields;
-      auto recordNamedProbe = [&](StringRef fieldPathRef, Value value) {
-        if (fieldPathRef.empty() ||
-            getValueCppStorage(value) == CppStorageKind::Local)
-          return;
-        std::string fieldPath = fieldPathRef.str();
-        if (!seenNamedFields.insert(fieldPath).second)
-          return;
-        unsigned width = bitWidth(value.getType());
-        if (width == 0)
-          return;
-        Value regQ = findRegQFromValue(value);
-        namedProbes.push_back(NamedProbeInfo{
-            fieldPath,
-            nt.get(value),
-            static_cast<bool>(regQ) ? (nt.get(regQ) + "_inst")
-                                    : std::string(),
-            width,
-            static_cast<bool>(regQ),
-            value.getType(),
-        });
-      };
-
-      // Unified partitioning promotes per-result probe names to the sibling
-      // Comb boundary. Register those storage-backed values before walking the
-      // nested body, so a local cloned alias cannot shadow the published value.
-      for (Operation &topLevel : f.getBody().front()) {
-        auto comb = dyn_cast<pyc::CombOp>(topLevel);
-        auto resultNames =
-            comb ? comb->getAttrOfType<ArrayAttr>(kCombResultNamesAttr)
-                 : ArrayAttr();
-        if (!resultNames)
-          continue;
-        for (auto [index, result] : llvm::enumerate(comb.getResults())) {
-          if (index >= resultNames.size())
-            break;
-          if (auto name = dyn_cast<StringAttr>(resultNames[index]))
-            recordNamedProbe(name.getValue(), result);
-        }
-      }
-      f.walk([&](Operation *op) {
-        auto nameAttr = op->getAttrOfType<StringAttr>("pyc.name");
-        if (!nameAttr || op->getNumResults() != 1)
-          return;
-        recordNamedProbe(nameAttr.getValue(), op->getResult(0));
-      });
-      std::sort(namedProbes.begin(), namedProbes.end(), [](const NamedProbeInfo &a, const NamedProbeInfo &b) {
-        return a.fieldPath < b.fieldPath;
-      });
-    }
 
 		  for (auto [i, arg] : llvm::enumerate(f.getArguments())) {
 		    unsigned w = bitWidth(arg.getType());

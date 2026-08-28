@@ -1,6 +1,7 @@
 #pragma once
 
 #include <memory>
+#include <string>
 
 #include "mlir/Pass/Pass.h"
 
@@ -44,7 +45,11 @@ std::unique_ptr<::mlir::Pass> createCheckLogicDepthPass(unsigned logicDepth);
 std::unique_ptr<::mlir::Pass> createCollectCompileStatsPass();
 std::unique_ptr<::mlir::Pass> createFlattenInstancesPass();
 /// C++ emit prep: sets module comb chunk size and runs member placement.
-std::unique_ptr<::mlir::Pass> createCppPlacementPass(unsigned combChunkNodes);
+/// The optional trace codegen plan pins selected named values to stable
+/// struct storage so generated VCD registration can sample them.
+std::unique_ptr<::mlir::Pass>
+createCppPlacementPass(unsigned combChunkNodes,
+                       std::string traceCodegenPlanPath = {});
 std::unique_ptr<::mlir::Pass> createVectorUnrollPass();
 
 } // namespace pyc
