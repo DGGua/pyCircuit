@@ -1,5 +1,6 @@
 #include "pyc/Dialect/PYC/PYCOps.h"
 #include "pyc/Emit/CppEmitter.h"
+#include "pyc/Transforms/CombPartition.h"
 #include "pyc/Transforms/Passes.h"
 
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -776,11 +777,28 @@ struct CppPlacementPass
           }
         }
       }
+      // After FuseComb/PartitionComb, a `.named()` alias promoted to the comb
+      // boundary is recorded in the CombOp's `pyc.comb.result_names` array
+      // rather than a nested `pyc.name` attribute. Treat both as sources of
+      // observable field names so a trace selection of that internal is not
+      // rejected as missing even though the emitter would register the comb
+      // result as struct storage.
       llvm::StringSet<> foundTraceFields;
       f.walk([&](Operation *op) {
         if (auto name = op->getAttrOfType<StringAttr>("pyc.name");
             name && traceSelectedFields.contains(name.getValue()))
           foundTraceFields.insert(name.getValue());
+        if (auto comb = dyn_cast<pyc::CombOp>(op)) {
+          if (auto resultNames =
+                  comb->getAttrOfType<ArrayAttr>(kCombResultNamesAttr)) {
+            for (Attribute entry : resultNames) {
+              auto name = dyn_cast<StringAttr>(entry);
+              if (name && !name.getValue().empty() &&
+                  traceSelectedFields.contains(name.getValue()))
+                foundTraceFields.insert(name.getValue());
+            }
+          }
+        }
       });
       for (const auto &field : traceSelectedFields) {
         if (!foundTraceFields.contains(field.getKey())) {
