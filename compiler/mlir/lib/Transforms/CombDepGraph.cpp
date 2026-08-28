@@ -34,7 +34,7 @@ static int64_t addReachableDepth(int64_t lhs, int64_t rhs) {
 }
 
 static bool isHardSequentialCut(Operation *op) {
-  return isa<pyc::RegOp, pyc::SyncMemOp, pyc::SyncMemDPOp,
+  return isa<pyc::RegOp, pyc::DelayLineOp, pyc::SyncMemOp, pyc::SyncMemDPOp,
              pyc::AsyncFifoOp, pyc::CdcSyncOp>(op);
 }
 
@@ -77,7 +77,7 @@ static int64_t opCost(Operation *op) {
   if (isHardSequentialCut(op))
     return 0;
   if (isa<pyc::WireOp, pyc::AliasOp, pyc::ResetActiveOp, pyc::ConstantOp, pyc::CombOp, pyc::YieldOp,
-          arith::ConstantOp>(op))
+          pyc::DelayTapOp, arith::ConstantOp>(op))
     return 0;
   if (isa<pyc::VGetOp, pyc::VCreateOp, pyc::VBroadcastOp,
           pyc::VBroadcastDimOp>(op))
@@ -122,7 +122,7 @@ static bool isKnownDirectCombOperation(Operation *op) {
              pyc::ZextOp, pyc::SextOp, pyc::ExtractOp, pyc::ShliOp,
              pyc::LshriOp, pyc::AshriOp, pyc::ShlOp, pyc::LshrOp,
              pyc::AshrOp, pyc::ConcatOp, pyc::AliasOp,
-             pyc::ResetActiveOp, pyc::VGetOp, pyc::VCreateOp,
+             pyc::ResetActiveOp, pyc::DelayTapOp, pyc::VGetOp, pyc::VCreateOp,
              pyc::VBroadcastOp, pyc::VBroadcastDimOp, pyc::VOrReduceOp,
              pyc::VAndReduceOp, pyc::VAddReduceOp, arith::SelectOp>(op);
 }

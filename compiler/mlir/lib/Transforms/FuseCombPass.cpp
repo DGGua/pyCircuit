@@ -1,5 +1,6 @@
 #include "pyc/Transforms/CombMemoization.h"
 #include "pyc/Transforms/Passes.h"
+#include "pyc/Transforms/StateOptimization.h"
 
 #include "pyc/Dialect/PYC/PYCOps.h"
 
@@ -48,7 +49,8 @@ struct FuseCombPass : public PassWrapper<FuseCombPass, OperationPass<func::FuncO
     };
 
     for (Operation &op : llvm::make_early_inc_range(block)) {
-      if (isMemoizableCombOperation(&op)) {
+      if (isMemoizableCombOperation(&op) &&
+          !shouldKeepStateOptimization(&op) && !hasStableStateName(&op)) {
         run.push_back(&op);
         continue;
       }

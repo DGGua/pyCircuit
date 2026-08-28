@@ -7,6 +7,11 @@
 
 namespace pyc {
 
+enum class DelayChainMode {
+  Generated,
+  Structural,
+};
+
 std::unique_ptr<::mlir::Pass> createCombCanonicalizePass();
 std::unique_ptr<::mlir::Pass> createInlineFunctionsPass();
 std::unique_ptr<::mlir::Pass> createFuseCombPass();
@@ -25,6 +30,25 @@ createPartitionFusedCombPass(unsigned maxNodes = 35);
 /// createPartitionCombPass().
 std::unique_ptr<::mlir::Pass> createCheckCombPartitionsPass();
 std::unique_ptr<::mlir::Pass> createEliminateWiresPass();
+std::unique_ptr<::mlir::Pass> createAnalyzeStateOptimizationPass();
+std::unique_ptr<::mlir::Pass> createAnalyzeRetimingPass();
+std::unique_ptr<::mlir::Pass> createStripStateObservabilityPass();
+std::unique_ptr<::mlir::Pass>
+createRetimePipelinesPass(unsigned maxStages = 0,
+                          unsigned maxExtraCombOps = 32,
+                          unsigned maxCombDepth = 32,
+                          bool preserveObservability = false,
+                          bool accumulateStats = false);
+std::unique_ptr<::mlir::Pass>
+createCombineDelayChainsPass(DelayChainMode mode = DelayChainMode::Generated,
+                             bool accumulateStats = false,
+                             bool cascadeRound = false,
+                             bool preserveObservability = false,
+                             bool mergeOnly = false,
+                             bool skipMerge = false);
+std::unique_ptr<::mlir::Pass>
+createPackStateLanesPass(unsigned maxWidth = 192,
+                         bool preserveObservability = false);
 std::unique_ptr<::mlir::Pass> createPackI1RegsPass();
 std::unique_ptr<::mlir::Pass> createLowerSCFToPYCStaticPass();
 std::unique_ptr<::mlir::Pass> createCheckFrontendContractPass();
