@@ -603,10 +603,14 @@ static LogicalResult emitCombAssign(Operation &op, llvm::raw_ostream &os, NameTa
     unsigned w = bitWidth(s.getLhs().getType());
     if (w == 0)
       return s.emitError("invalid slt width");
+    bool lhsIsVec = isa<VectorType>(s.getLhs().getType());
     assignExpr(s.getResult(), s.getType(), os, nt,
                [&](llvm::raw_ostream &e) {
-                 e << "pyc::cpp::Wire<1>((pyc::cpp::slt<" << w << ">(" << nt.get(s.getLhs()) << ", "
-                   << nt.get(s.getRhs()) << ")) ? 1u : 0u)";
+                 if (lhsIsVec)
+                   e << "pyc::cpp::slt<" << w << ">(" << nt.get(s.getLhs()) << ", " << nt.get(s.getRhs()) << ")";
+                 else
+                   e << "pyc::cpp::Wire<1>((pyc::cpp::slt<" << w << ">(" << nt.get(s.getLhs()) << ", "
+                     << nt.get(s.getRhs()) << ")) ? 1u : 0u)";
                },
                ps);
     return success();
@@ -616,9 +620,11 @@ static LogicalResult emitCombAssign(Operation &op, llvm::raw_ostream &os, NameTa
     unsigned ow = bitWidth(t.getResult().getType());
     if (iw == 0 || ow == 0)
       return t.emitError("invalid trunc width");
+    bool inIsVec = isa<VectorType>(t.getIn().getType());
     assignExpr(t.getResult(), t.getType(), os, nt,
                [&](llvm::raw_ostream &e) {
-                 e << "pyc::cpp::trunc<" << ow << ", " << iw << ">(" << nt.get(t.getIn()) << ")";
+                 e << "pyc::cpp::" << (inIsVec ? "trunc_vec<" : "trunc<") << ow << ", " << iw << ">("
+                   << nt.get(t.getIn()) << ")";
                },
                ps);
     return success();
@@ -628,9 +634,11 @@ static LogicalResult emitCombAssign(Operation &op, llvm::raw_ostream &os, NameTa
     unsigned ow = bitWidth(z.getResult().getType());
     if (iw == 0 || ow == 0)
       return z.emitError("invalid zext width");
+    bool inIsVec = isa<VectorType>(z.getIn().getType());
     assignExpr(z.getResult(), z.getType(), os, nt,
                [&](llvm::raw_ostream &e) {
-                 e << "pyc::cpp::zext<" << ow << ", " << iw << ">(" << nt.get(z.getIn()) << ")";
+                 e << "pyc::cpp::" << (inIsVec ? "zext_vec<" : "zext<") << ow << ", " << iw << ">("
+                   << nt.get(z.getIn()) << ")";
                },
                ps);
     return success();
@@ -640,9 +648,11 @@ static LogicalResult emitCombAssign(Operation &op, llvm::raw_ostream &os, NameTa
     unsigned ow = bitWidth(s.getResult().getType());
     if (iw == 0 || ow == 0)
       return s.emitError("invalid sext width");
+    bool inIsVec = isa<VectorType>(s.getIn().getType());
     assignExpr(s.getResult(), s.getType(), os, nt,
                [&](llvm::raw_ostream &e) {
-                 e << "pyc::cpp::sext<" << ow << ", " << iw << ">(" << nt.get(s.getIn()) << ")";
+                 e << "pyc::cpp::" << (inIsVec ? "sext_vec<" : "sext<") << ow << ", " << iw << ">("
+                   << nt.get(s.getIn()) << ")";
                },
                ps);
     return success();
@@ -652,10 +662,11 @@ static LogicalResult emitCombAssign(Operation &op, llvm::raw_ostream &os, NameTa
     unsigned ow = bitWidth(ex.getResult().getType());
     if (iw == 0 || ow == 0)
       return ex.emitError("invalid extract width");
+    bool inIsVec = isa<VectorType>(ex.getIn().getType());
     assignExpr(ex.getResult(), ex.getType(), os, nt,
                [&](llvm::raw_ostream &e) {
-                 e << "pyc::cpp::extract<" << ow << ", " << iw << ">(" << nt.get(ex.getIn()) << ", "
-                   << ex.getLsbAttr().getInt() << "u)";
+                 e << "pyc::cpp::" << (inIsVec ? "extract_vec<" : "extract<") << ow << ", " << iw << ">("
+                   << nt.get(ex.getIn()) << ", " << ex.getLsbAttr().getInt() << "u)";
                },
                ps);
     return success();

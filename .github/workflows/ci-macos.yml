@@ -51,7 +51,7 @@ jobs:
     # PR default: skip. Run on main/develop push, workflow_dispatch, or label ci-macos.
     if: >
       needs.gate.outputs.should_run == 'true' && (
-        github.event_name == 'push' ||
+        (github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop')) ||
         github.event_name == 'workflow_dispatch' ||
         (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'ci-macos'))
       )

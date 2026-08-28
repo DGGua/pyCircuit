@@ -422,17 +422,29 @@ class CycleAwareDomain:
                 raw_lanes.append((value, self.cycle_index))
             elif isinstance(value, LiteralValue):
                 lw = value.width if value.width is not None else infer_literal_width(int(value.value), signed=bool(value.signed))
+                ls = bool(value.signed)
                 if lit_width is None or lw > lit_width:
                     lit_width = lw
                 if lit_signed is None:
-                    lit_signed = bool(value.signed)
+                    lit_signed = ls
+                elif lit_signed != ls:
+                    raise TypeError(
+                        f"CycleAwareDomain.vec requires uniform lane signedness, "
+                        f"got signed={ls} vs signed={lit_signed}"
+                    )
                 raw_lanes.append((value, self.cycle_index))
             elif isinstance(value, int):
                 lw = infer_literal_width(int(value), signed=value < 0)
+                ls = value < 0
                 if lit_width is None or lw > lit_width:
                     lit_width = lw
                 if lit_signed is None:
-                    lit_signed = value < 0
+                    lit_signed = ls
+                elif lit_signed != ls:
+                    raise TypeError(
+                        f"CycleAwareDomain.vec requires uniform lane signedness, "
+                        f"got signed={ls} vs signed={lit_signed}"
+                    )
                 raw_lanes.append((value, self.cycle_index))
             else:
                 raise TypeError(f"CycleAwareDomain.vec expects signal lanes or literals, got {type(value).__name__}")

@@ -1205,6 +1205,10 @@ class Circuit(Module):
                     lit_width = lw
                 if lit_signed is None:
                     lit_signed = ls
+                elif lit_signed != ls:
+                    raise TypeError(
+                        f"vec() requires uniform lane signedness, got signed={ls} vs signed={lit_signed}"
+                    )
             elif isinstance(e, int):
                 lw = infer_literal_width(int(e), signed=int(e) < 0)
                 ls = int(e) < 0
@@ -1212,6 +1216,10 @@ class Circuit(Module):
                     lit_width = lw
                 if lit_signed is None:
                     lit_signed = ls
+                elif lit_signed != ls:
+                    raise TypeError(
+                        f"vec() requires uniform lane signedness, got signed={ls} vs signed={lit_signed}"
+                    )
             else:
                 raise TypeError(f"vec() lane must be Wire/Reg/int/LiteralValue, got {type(e).__name__}")
 
