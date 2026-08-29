@@ -3,6 +3,8 @@
 #include "pyc/Emit/CppEmitter.h"
 #include "pyc/Emit/VerilogEmitter.h"
 #include "pyc/Support/PassIRDumper.h"
+#include "pyc/Transforms/CombDepGraph.h"
+#include "pyc/Transforms/CombPartition.h"
 #include "pyc/Transforms/Passes.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -162,6 +164,23 @@ static llvm::cl::opt<std::string> probePlanPath(
     llvm::cl::desc("Resolved @probe alias plan JSON to embed into generated ProbeRegistry registration"),
     llvm::cl::init(""));
 
+static llvm::cl::opt<std::string> combSummaryInPath(
+    "comb-summary-in",
+    llvm::cl::desc("Read full-design combinational dependency summaries for "
+                   "declaration-only callee stubs"),
+    llvm::cl::init(""));
+
+static llvm::cl::opt<std::string> combSummaryOutPath(
+    "comb-summary-out",
+    llvm::cl::desc("Write full-design combinational dependency summaries"),
+    llvm::cl::init(""));
+
+static llvm::cl::opt<std::string> traceCodegenPlanPath(
+    "trace-codegen-plan",
+    llvm::cl::desc(
+        "Resolved per-module internal trace fields used by C++ placement"),
+    llvm::cl::init(""));
+
 static llvm::cl::opt<std::string> targetKind("target", llvm::cl::desc("Target: default|fpga"),
                                              llvm::cl::init("default"));
 
@@ -184,6 +203,26 @@ static llvm::cl::opt<bool> cppOnlyPreserveOps(
     "cpp-only-preserve-ops",
     llvm::cl::desc("Preserve operation-granular C++ scheduling in --sim-mode=cpp-only (disables comb fusion)"),
     llvm::cl::init(false));
+
+static llvm::cl::opt<std::string> combUpdateMode(
+    "comb-update",
+    llvm::cl::desc("C++ comb update policy: always|guarded|dirty"),
+    llvm::cl::init("dirty"));
+
+static llvm::cl::opt<std::string> combRegUpdateMode(
+    "comb-reg-update",
+    llvm::cl::desc("C++ local-register comb invalidation: poll|commit"),
+    llvm::cl::init("poll"));
+
+static llvm::cl::opt<std::string> combPartitionMode(
+    "comb-partition",
+    llvm::cl::desc("MLIR comb partition policy: none|local|static"),
+    llvm::cl::init("none"));
+
+static llvm::cl::opt<unsigned> combPartitionMaxNodes(
+    "comb-partition-max-nodes",
+    llvm::cl::desc("Maximum operation count per local/static SuperNode partition"),
+    llvm::cl::init(35));
 
 static llvm::cl::opt<bool> unrollVector(
     "unroll-vector",
@@ -784,32 +823,54 @@ static LogicalResult emitProbeManifest(ModuleOp module, llvm::StringRef outPath)
     Block &topBlock = f.getBody().front();
 
     llvm::StringSet<> localNamedFields;
+    auto addNamedValue = [&](StringRef fieldPathRef, Value value) {
+      if (fieldPathRef.empty())
+        return;
+      const unsigned width = bitWidth(value.getType());
+      if (width == 0)
+        return;
+      const std::string fieldPath = fieldPathRef.str();
+      if (!localNamedFields.insert(fieldPath).second)
+        return;
+
+      ProbeManifestEntry entry;
+      entry.instance_path = canonInstPath;
+      entry.field_path = fieldPath;
+      entry.canonical_path = canonInstPath + ":" + entry.field_path;
+      entry.module = sym;
+      const bool isReg = static_cast<bool>(findRegQ(value));
+      entry.kind = isReg ? "state" : "comb";
+      entry.subkind = isReg ? "reg" : "wire";
+      entry.dir = "internal";
+      entry.width_bits = width;
+      entry.ty = typeToString(value.getType());
+      (void)addEntry(std::move(entry));
+    };
+
+    // Promoted partition result names are the storage-backed observable
+    // values. Add them before nested body names so manifest and C++ registry
+    // choose the same representative for a canonical field path.
+    for (Operation &topLevel : topBlock) {
+      auto comb = dyn_cast<pyc::CombOp>(topLevel);
+      auto resultNames =
+          comb ? comb->getAttrOfType<ArrayAttr>(pyc::kCombResultNamesAttr)
+               : ArrayAttr();
+      if (!resultNames)
+        continue;
+      for (auto [index, result] : llvm::enumerate(comb.getResults())) {
+        if (index >= resultNames.size())
+          break;
+        if (auto name = dyn_cast<StringAttr>(resultNames[index]))
+          addNamedValue(name.getValue(), result);
+      }
+    }
     f.walk([&](Operation *op) {
       auto nameAttr = op->getAttrOfType<StringAttr>("pyc.name");
       if (!nameAttr)
         return;
       if (op->getNumResults() != 1)
         return;
-      Value value = op->getResult(0);
-      const unsigned width = bitWidth(value.getType());
-      if (width == 0)
-        return;
-      const std::string fieldPath = nameAttr.getValue().str();
-      if (!localNamedFields.insert(fieldPath).second)
-        return;
-
-      ProbeManifestEntry e;
-      e.instance_path = canonInstPath;
-      e.field_path = fieldPath;
-      e.canonical_path = canonInstPath + ":" + e.field_path;
-      e.module = sym;
-      const bool isReg = static_cast<bool>(findRegQ(value));
-      e.kind = isReg ? "state" : "comb";
-      e.subkind = isReg ? "reg" : "wire";
-      e.dir = "internal";
-      e.width_bits = width;
-      e.ty = typeToString(value.getType());
-      (void)addEntry(std::move(e));
+      addNamedValue(nameAttr.getValue(), op->getResult(0));
     });
 
     auto collectMemNames = [&](auto pred) -> std::vector<std::string> {
@@ -2056,6 +2117,117 @@ static LogicalResult writeProfileJson(llvm::StringRef outPath, const llvm::json:
   return writeFile(outPath, buf);
 }
 
+static llvm::json::Object combSummaryToJson(
+    func::FuncOp function, const pyc::FuncCombSummary &summary) {
+  llvm::json::Object object;
+  object["version"] = pyc::kCombDepSummaryVersion;
+  object["symbol"] = function.getSymName();
+  object["num_args"] = static_cast<int64_t>(summary.numArgs);
+  object["num_results"] = static_cast<int64_t>(summary.numResults);
+  llvm::json::Array argTypes;
+  for (Type type : function.getArgumentTypes())
+    argTypes.push_back(typeToString(type));
+  object["arg_types"] = std::move(argTypes);
+  llvm::json::Array resultTypes;
+  for (Type type : function.getResultTypes())
+    resultTypes.push_back(typeToString(type));
+  object["result_types"] = std::move(resultTypes);
+  llvm::json::Array results;
+  results.reserve(summary.results.size());
+  for (const pyc::CombResultSummary &result : summary.results) {
+    llvm::json::Object entry;
+    entry["base_depth"] = result.baseDepth;
+    llvm::json::Array dependencies;
+    for (unsigned index = 0; index < result.argDeps.size(); ++index)
+      if (result.argDeps.test(index))
+        dependencies.push_back(static_cast<int64_t>(index));
+    entry["arg_deps"] = std::move(dependencies);
+    llvm::json::Array depths;
+    for (int64_t depth : result.argDepth)
+      depths.push_back(depth);
+    entry["arg_depth"] = std::move(depths);
+    results.push_back(std::move(entry));
+  }
+  object["results"] = std::move(results);
+  return object;
+}
+
+static LogicalResult writeCombDepSummaries(ModuleOp module, StringRef path) {
+  pyc::CombDepGraphCache cache(module);
+  llvm::json::Object functions;
+  for (func::FuncOp function : module.getOps<func::FuncOp>()) {
+    if (function.isDeclaration())
+      continue;
+    const pyc::FuncCombSummary *summary = cache.getFuncSummary(function);
+    if (!summary) {
+      function.emitError(
+          "failed to compute full-design combinational dependency summary");
+      return failure();
+    }
+    functions[function.getSymName()] =
+        combSummaryToJson(function, *summary);
+  }
+  llvm::json::Object root;
+  root["schema"] = pyc::kCombDepSummaryFileSchema;
+  root["version"] = pyc::kCombDepSummaryVersion;
+  root["functions"] = std::move(functions);
+  std::string buffer;
+  llvm::raw_string_ostream stream(buffer);
+  llvm::json::OStream json(stream, 2);
+  json.value(llvm::json::Value(std::move(root)));
+  stream << "\n";
+  stream.flush();
+  return writeFile(path, buffer);
+}
+
+static LogicalResult applyCombDepSummaries(ModuleOp module, StringRef path) {
+  auto file = llvm::MemoryBuffer::getFile(path);
+  if (!file) {
+    module.emitError("cannot read --comb-summary-in file '") << path << "'";
+    return failure();
+  }
+  auto parsed = llvm::json::parse((*file)->getBuffer());
+  auto *root = parsed ? parsed->getAsObject() : nullptr;
+  auto schema = root ? root->getString("schema") : std::nullopt;
+  auto version = root ? root->getInteger("version") : std::nullopt;
+  auto *functions = root ? root->getObject("functions") : nullptr;
+  if (!root || !schema || *schema != pyc::kCombDepSummaryFileSchema ||
+      !version || *version != pyc::kCombDepSummaryVersion || !functions) {
+    module.emitError("invalid combinational summary file schema: ") << path;
+    return failure();
+  }
+
+  for (func::FuncOp function : module.getOps<func::FuncOp>()) {
+    if (!function.isDeclaration())
+      continue;
+    auto *summary = functions->getObject(function.getSymName());
+    if (!summary) {
+      function.emitError("missing hardened dependency summary for declaration @")
+          << function.getSymName();
+      return failure();
+    }
+    std::string encoded;
+    llvm::raw_string_ostream stream(encoded);
+    llvm::json::OStream json(stream);
+    json.value(llvm::json::Value(llvm::json::Object(*summary)));
+    stream.flush();
+    function->setAttr(pyc::kCombDepSummaryAttr,
+                      StringAttr::get(module.getContext(), encoded));
+  }
+
+  // Parse and validate every attached declaration immediately.  This prevents
+  // an unused malformed declaration from silently surviving until a later
+  // incremental build happens to instantiate it.
+  pyc::CombDepGraphCache validationCache(module);
+  for (func::FuncOp function : module.getOps<func::FuncOp>()) {
+    if (!function.isDeclaration())
+      continue;
+    if (!validationCache.getFuncSummary(function))
+      return failure();
+  }
+  return success();
+}
+
 int main(int argc, char **argv) {
   llvm::InitLLVM y(argc, argv);
   llvm::cl::ParseCommandLineOptions(argc, argv, "pycc\n");
@@ -2095,6 +2267,59 @@ int main(int argc, char **argv) {
     return 1;
   }
   const bool isDevFastProfile = (buildProfileNorm == "dev-fast");
+
+  std::string combUpdateNorm = llvm::StringRef(combUpdateMode).lower();
+  pyc::CppEmitterOptions::CombUpdateMode cppCombUpdatePolicy;
+  if (combUpdateNorm == "always") {
+    cppCombUpdatePolicy = pyc::CppEmitterOptions::CombUpdateMode::Always;
+  } else if (combUpdateNorm == "guarded") {
+    cppCombUpdatePolicy = pyc::CppEmitterOptions::CombUpdateMode::Guarded;
+  } else if (combUpdateNorm == "dirty") {
+    cppCombUpdatePolicy = pyc::CppEmitterOptions::CombUpdateMode::Dirty;
+  } else {
+    llvm::errs() << "error: unknown --comb-update: " << combUpdateMode
+                 << " (expected: always|guarded|dirty)\n";
+    return 1;
+  }
+
+  std::string combRegUpdateNorm =
+      llvm::StringRef(combRegUpdateMode).lower();
+  pyc::CppEmitterOptions::CombRegUpdateMode cppCombRegUpdatePolicy;
+  if (combRegUpdateNorm == "poll") {
+    cppCombRegUpdatePolicy =
+        pyc::CppEmitterOptions::CombRegUpdateMode::Poll;
+  } else if (combRegUpdateNorm == "commit") {
+    cppCombRegUpdatePolicy =
+        pyc::CppEmitterOptions::CombRegUpdateMode::Commit;
+  } else {
+    llvm::errs() << "error: unknown --comb-reg-update: "
+                 << combRegUpdateMode << " (expected: poll|commit)\n";
+    return 1;
+  }
+
+  std::string combPartitionNorm = llvm::StringRef(combPartitionMode).lower();
+  bool enableStaticCombPartition = false;
+  bool enableLocalCombPartition = false;
+  if (combPartitionNorm == "none") {
+    enableStaticCombPartition = false;
+    enableLocalCombPartition = false;
+  } else if (combPartitionNorm == "local") {
+    enableStaticCombPartition = false;
+    enableLocalCombPartition = true;
+  } else if (combPartitionNorm == "static") {
+    enableStaticCombPartition = true;
+    enableLocalCombPartition = false;
+  } else {
+    llvm::errs() << "error: unknown --comb-partition: " << combPartitionMode
+                 << " (expected: none|local|static)\n";
+    return 1;
+  }
+  if ((enableStaticCombPartition || enableLocalCombPartition) &&
+      combPartitionMaxNodes == 0) {
+    llvm::errs() << "error: --comb-partition-max-nodes must be positive when "
+                    "--comb-partition is local or static\n";
+    return 1;
+  }
 
   // Dev-fast defaults to smaller C++ shards unless explicitly overridden.
   if (isDevFastProfile && cppShardThresholdLines.getNumOccurrences() == 0)
@@ -2143,6 +2368,9 @@ int main(int argc, char **argv) {
     llvm::errs() << "error: failed to parse MLIR\n";
     return 1;
   }
+  if (!combSummaryInPath.empty() &&
+      failed(applyCombDepSummaries(*module, combSummaryInPath)))
+    return 1;
   parseMs = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - tParseStart).count());
   uint64_t moduleOpCount = countModuleOps(*module);
 
@@ -2171,6 +2399,13 @@ int main(int argc, char **argv) {
     cppOnly = true;
   } else {
     llvm::errs() << "error: unknown --sim-mode: " << simMode << " (expected: default|cpp-only)\n";
+    return 1;
+  }
+  if ((enableStaticCombPartition || enableLocalCombPartition) && cppOnly &&
+      cppOnlyPreserveOps) {
+    llvm::errs() << "error: comb partitioning is incompatible with "
+                    "--cpp-only-preserve-ops; use --comb-partition=none when raw "
+                    "operation granularity must be preserved\n";
     return 1;
   }
 
@@ -2325,6 +2560,10 @@ int main(int argc, char **argv) {
     pm.addInstrumentation(std::move(passIRDumperStorage));
   }
   pm.addPass(pyc::createCheckFrontendContractPass());
+  // Gate any pre-existing semantic comb plan before inlining,
+  // canonicalization, or DCE is allowed to rewrite it.
+  pm.addNestedPass<func::FuncOp>(pyc::createCheckCombPartitionsPass());
+  pm.addNestedPass<func::FuncOp>(pyc::createCheckCombMemoizablePass());
   pm.addPass(pyc::createInlineFunctionsPass());
   if (wantFlatten)
     pm.addPass(pyc::createFlattenInstancesPass());
@@ -2342,6 +2581,10 @@ int main(int argc, char **argv) {
   pm.addNestedPass<func::FuncOp>(pyc::createLowerSCFToPYCStaticPass());
   if (unrollVector)
     pm.addNestedPass<func::FuncOp>(pyc::createVectorUnrollPass());
+  // pyc.wire is single-driver plumbing, not a resolved Verilog net.  Gate the
+  // contract after vector lowering (which may create scalar wires) and before
+  // EliminateWires can erase or rewrite the evidence.
+  pm.addNestedPass<func::FuncOp>(pyc::createCheckWireDriversPass());
   pm.addNestedPass<func::FuncOp>(pyc::createEliminateWiresPass());
   pm.addNestedPass<func::FuncOp>(pyc::createEliminateDeadStatePass());
   if (!unrollVector)
@@ -2350,19 +2593,38 @@ int main(int argc, char **argv) {
   pm.addPass(pyc::createCheckCombCyclesPass());
   pm.addPass(pyc::createCheckClockDomainsPass());
   pm.addNestedPass<func::FuncOp>(pyc::createPackI1RegsPass());
-  const bool enableFuseComb = (!cppOnly) || !cppOnlyPreserveOps;
+  const bool enableFuseComb =
+      (((!cppOnly) || !cppOnlyPreserveOps) && !enableStaticCombPartition);
   if (enableFuseComb)
     pm.addNestedPass<func::FuncOp>(pyc::createFuseCombPass());
+  if (enableLocalCombPartition)
+    pm.addNestedPass<func::FuncOp>(
+        pyc::createPartitionFusedCombPass(combPartitionMaxNodes));
   pm.addPass(createCanonicalizerPass(canonicalizeCfg));
   pm.addPass(createCSEPass());
   addRemoveDeadValuesPassIfSupported(pm);
   pm.addNestedPass<func::FuncOp>(pyc::createEliminateDeadInstancesPass());
   pm.addPass(createSymbolDCEPass());
+  // Establish the memoization legality contract before materializing
+  // independently activatable SuperNode partitions. The structural gate and
+  // cycle gate run immediately after the rewrite so both C++ and Verilog
+  // consume the same checked semantic IR. This is a GSIM-style static activity
+  // scheme; it does not claim the versioned-slot scheduler from Decision 0104.
+  // Reject malformed incoming plans before the unified rewrite is allowed to
+  // unfold/replan them.  The post-gates then validate the final semantic IR.
+  pm.addNestedPass<func::FuncOp>(pyc::createCheckCombPartitionsPass());
+  pm.addNestedPass<func::FuncOp>(pyc::createCheckCombMemoizablePass());
+  if (enableStaticCombPartition)
+    pm.addPass(pyc::createPartitionCombPass(combPartitionMaxNodes));
+  pm.addNestedPass<func::FuncOp>(pyc::createCheckCombMemoizablePass());
+  pm.addNestedPass<func::FuncOp>(pyc::createCheckCombPartitionsPass());
+  pm.addPass(pyc::createCheckCombCyclesPass());
   pm.addNestedPass<func::FuncOp>(pyc::createCheckFlatTypesPass());
   pm.addNestedPass<func::FuncOp>(pyc::createCheckNoDynamicPass());
   pm.addPass(pyc::createCheckLogicDepthPass(logicDepthLimit));
   if (emitKind == "cpp")
-    pm.addPass(pyc::createCppPlacementPass(cppCombChunkNodes));
+    pm.addPass(
+        pyc::createCppPlacementPass(cppCombChunkNodes, traceCodegenPlanPath));
   pm.addNestedPass<func::FuncOp>(pyc::createCollectCompileStatsPass());
   const auto tPassStart = Clock::now();
   if (failed(pm.run(*module))) {
@@ -2401,6 +2663,10 @@ int main(int argc, char **argv) {
   compileStats.fuseCombEnabled = enableFuseComb;
   printCompileStats(compileStats);
 
+  if (!combSummaryOutPath.empty() &&
+      failed(writeCombDepSummaries(*module, combSummaryOutPath)))
+    return 1;
+
   if (!probeManifestPath.empty()) {
     if (failed(emitProbeManifest(*module, probeManifestPath)))
       return 1;
@@ -2434,6 +2700,10 @@ int main(int argc, char **argv) {
     obj["cpp_shard_threshold_lines"] = static_cast<int64_t>(cppShardThresholdLines);
     obj["cpp_shard_threshold_bytes"] = static_cast<int64_t>(cppShardThresholdBytes);
     obj["cpp_shard_max_ast_nodes"] = static_cast<int64_t>(cppShardMaxAstNodes);
+    obj["comb_update"] = combUpdateNorm;
+    obj["comb_partition"] = combPartitionNorm;
+    obj["comb_partition_max_nodes"] =
+        static_cast<int64_t>(combPartitionMaxNodes);
     obj["cpp_pch"] = cppPch.getValue();
     obj["profile_pass_timing"] = collectPassTiming;
     {
@@ -2612,6 +2882,10 @@ int main(int argc, char **argv) {
       std::vector<CppManifestSource> cppManifestSources;
       pyc::CppEmitterOptions cppEmitOpts;
       cppEmitOpts.probePlanPath = probePlanPath;
+      cppEmitOpts.combUpdateMode = cppCombUpdatePolicy;
+      cppEmitOpts.combRegUpdateMode = cppCombRegUpdatePolicy;
+      cppEmitOpts.combChunkNodes = cppCombChunkNodes;
+      cppEmitOpts.evalTopoChunkNodes = cppCombChunkNodes;
 
       // Collect direct dependencies per module for header includes.
       llvm::StringMap<llvm::SmallVector<std::string>> deps;
@@ -2969,6 +3243,10 @@ int main(int argc, char **argv) {
   if (emitKind == "cpp") {
     pyc::CppEmitterOptions cppEmitOpts;
     cppEmitOpts.probePlanPath = probePlanPath;
+    cppEmitOpts.combUpdateMode = cppCombUpdatePolicy;
+    cppEmitOpts.combRegUpdateMode = cppCombRegUpdatePolicy;
+    cppEmitOpts.combChunkNodes = cppCombChunkNodes;
+    cppEmitOpts.evalTopoChunkNodes = cppCombChunkNodes;
     if (failed(pyc::emitCpp(*module, os, cppEmitOpts)))
       return 1;
     if (failed(writeSingleOutputStats()))

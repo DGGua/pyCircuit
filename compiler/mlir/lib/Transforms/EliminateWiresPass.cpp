@@ -80,7 +80,25 @@ struct EliminateWiresPass : public PassWrapper<EliminateWiresPass, OperationPass
       reads.push_back(&use);
     }
 
-    // If the wire is never read, drop it and all of its drivers.
+    const bool isNamed = [&] {
+      if (auto name = w->getAttrOfType<StringAttr>("pyc.name"))
+        return !name.getValue().empty();
+      return false;
+    }();
+    const bool isDebugKept = [&] {
+      if (auto keep = w->getAttrOfType<BoolAttr>("pyc.debug_keep"))
+        return keep.getValue();
+      return false;
+    }();
+
+    // An otherwise unread named/debug-kept wire is still a storage-backed DFX
+    // observation root.  Keep its AssignOp so both emitters publish the same
+    // value.  Arbitrary dead pure pyc.name values require the separate
+    // first-class ProbeOp contract; this rule is deliberately wire-specific.
+    if (reads.empty() && (isNamed || isDebugKept))
+      return false;
+
+    // If the wire is never read or observed, drop it and all of its drivers.
     if (reads.empty()) {
       for (pyc::AssignOp a : assigns)
         a.erase();

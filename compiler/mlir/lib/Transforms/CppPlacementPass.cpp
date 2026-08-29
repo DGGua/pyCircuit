@@ -13,11 +13,15 @@
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringRef.h"
+#include "llvm/ADT/StringSet.h"
+#include "llvm/Support/JSON.h"
+#include "llvm/Support/MemoryBuffer.h"
 
 #include <algorithm>
 #include <cstdint>
 #include <limits>
 #include <queue>
+#include <string>
 #include <vector>
 
 using namespace mlir;
@@ -482,27 +486,32 @@ static llvm::SmallVector<pyc::CombOp> collectTopLevelCombs(func::FuncOp f) {
   return combs;
 }
 
-/// Returns true for values that must remain struct members (cannot be localized).
-static bool pinToStruct(Value v) {
+/// Returns true for values that must remain struct members (cannot be
+/// localized).
+static bool pinToStruct(Value v, const llvm::StringSet<> &traceSelectedFields) {
   Operation *def = v.getDefiningOp();
   if (!def)
+    return true;
+
+  if (auto name = def->getAttrOfType<StringAttr>("pyc.name");
+      name && traceSelectedFields.contains(name.getValue()))
     return true;
 
   // Top-level comb results and state-holding ops always live on the struct.
   if (isa<pyc::CombOp>(def))
     return true;
-  if (isa<pyc::RegOp, pyc::InstanceOp, pyc::FifoOp, pyc::ByteMemOp, pyc::SyncMemOp, pyc::SyncMemDPOp,
-          pyc::AsyncFifoOp, pyc::CdcSyncOp>(def))
+  if (isa<pyc::RegOp, pyc::InstanceOp, pyc::FifoOp, pyc::ByteMemOp,
+          pyc::SyncMemOp, pyc::SyncMemDPOp, pyc::AsyncFifoOp, pyc::CdcSyncOp>(
+          def))
     return true;
 
-  // Values defined inside a comb but used outside it must be struct members.
-  if (def->getParentOfType<pyc::CombOp>()) {
-    for (OpOperand &use : v.getUses()) {
-      Operation *user = use.getOwner();
-      if (!user->getParentOfType<pyc::CombOp>())
-        return true;
-    }
-  }
+  // The wrapper eval_comb_N publishes pyc.yield operands after all chunk
+  // methods return.  A yielded value therefore crosses a C++ method boundary
+  // even though YieldOp is lexically inside the same region.  Reuse the exact
+  // locality predicate from Phase A so yield/external uses can never be
+  // annotated Local and referenced out of scope by the wrapper.
+  if (auto comb = def->getParentOfType<pyc::CombOp>())
+    return !isLocalizableCombValue(v, comb);
   return false;
 }
 
@@ -547,7 +556,9 @@ static void setFuncPlacementSummary(func::FuncOp f, const CppPlacementSummary &s
 
 /// Decide struct vs method-local storage for every value in \p f and annotate the IR.
 /// Returns placement statistics consumed by the build profile JSON.
-static CppPlacementSummary runCppMemberPlacement(func::FuncOp f, unsigned combChunkNodes) {
+static CppPlacementSummary
+runCppMemberPlacement(func::FuncOp f, unsigned combChunkNodes,
+                      const llvm::StringSet<> &traceSelectedFields) {
   CppPlacementSummary summary;
 
   // Phase A — Comb method assignment (independent of storage decisions):
@@ -558,8 +569,8 @@ static CppPlacementSummary runCppMemberPlacement(func::FuncOp f, unsigned combCh
   llvm::DenseSet<Value> crossPartValues;
   llvm::SmallVector<pyc::CombOp> combs = collectTopLevelCombs(f);
   for (auto [i, comb] : llvm::enumerate(combs))
-    assignCombOpMethods(comb, static_cast<unsigned>(i), combChunkNodes, opToMethod,
-                        crossPartValues, summary);
+    assignCombOpMethods(comb, static_cast<unsigned>(i), combChunkNodes,
+                        opToMethod, crossPartValues, summary);
 
   llvm::SmallVector<Value> candidates;
   f.walk([&](Operation *op) {
@@ -580,6 +591,7 @@ static CppPlacementSummary runCppMemberPlacement(func::FuncOp f, unsigned combCh
   // One additional demotion applies: a value that crosses part methods cannot
   // be a method-local Wire<> (it would be invisible to the other part), so it
   // is promoted to a struct member even though it passes the boundary test.
+  llvm::StringSet<> noTraceSelectedFields;
   for (Value v : candidates) {
     Operation *def = v.getDefiningOp();
 
@@ -594,10 +606,17 @@ static CppPlacementSummary runCppMemberPlacement(func::FuncOp f, unsigned combCh
 
     // Pinned-to-struct values (block args, state ops, comb results, values
     // escaping their comb) always live on the struct.
-    if (pinToStruct(v)) {
+    bool tracePinned = false;
+    if (def) {
+      if (auto name = def->getAttrOfType<StringAttr>("pyc.name"))
+        tracePinned = traceSelectedFields.contains(name.getValue());
+    }
+    const bool tracePromoted =
+        tracePinned && !pinToStruct(v, noTraceSelectedFields);
+    if (pinToStruct(v, traceSelectedFields)) {
       annotatePlacement(v, CppStorageKind::Struct, {});
       summary.structMembers++;
-      if (!def)
+      if (!def || tracePromoted)
         summary.probePinnedStruct++;
       continue;
     }
@@ -677,15 +696,17 @@ CppPlacementSummary accumulateModulePlacementSummary(ModuleOp module) {
 // pass entry point
 // ---------------------------------------------------------------------------
 
-struct CppPlacementPass : public PassWrapper<CppPlacementPass, OperationPass<ModuleOp>> {
+struct CppPlacementPass
+    : public PassWrapper<CppPlacementPass, OperationPass<ModuleOp>> {
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(CppPlacementPass)
 
-  CppPlacementPass(unsigned chunkNodes)
-      : combChunkNodes(chunkNodes) {}
+  CppPlacementPass(unsigned chunkNodes, std::string planPath)
+      : combChunkNodes(chunkNodes), traceCodegenPlanPath(std::move(planPath)) {}
 
   StringRef getArgument() const override { return "pyc-cpp-placement"; }
   StringRef getDescription() const override {
-    return "Set pyc.cpp.comb_chunk_nodes and annotate comb member placement for C++ emit";
+    return "Set pyc.cpp.comb_chunk_nodes and annotate comb member placement "
+           "for C++ emit";
   }
 
   void runOnOperation() override {
@@ -696,19 +717,92 @@ struct CppPlacementPass : public PassWrapper<CppPlacementPass, OperationPass<Mod
     }
     setModuleCombChunkNodes(module, combChunkNodes);
 
+    std::optional<llvm::json::Value> tracePlan;
+    const llvm::json::Object *traceModules = nullptr;
+    if (!traceCodegenPlanPath.empty()) {
+      auto fileOrErr = llvm::MemoryBuffer::getFile(traceCodegenPlanPath);
+      if (!fileOrErr) {
+        module.emitError("cannot read C++ trace codegen plan: ")
+            << traceCodegenPlanPath;
+        return signalPassFailure();
+      }
+      auto parsed = llvm::json::parse(fileOrErr.get()->getBuffer());
+      if (!parsed || !parsed->getAsObject()) {
+        module.emitError("invalid C++ trace codegen plan JSON: ")
+            << traceCodegenPlanPath;
+        return signalPassFailure();
+      }
+      tracePlan.emplace(std::move(*parsed));
+      const auto *root = tracePlan->getAsObject();
+      auto version = root->getInteger("version");
+      traceModules = root->getObject("modules");
+      if (!version || *version != 1 || !traceModules) {
+        module.emitError(
+            "C++ trace codegen plan requires version=1 and object `modules`");
+        return signalPassFailure();
+      }
+      for (const auto &moduleEntry : *traceModules) {
+        const auto *fields = moduleEntry.second.getAsArray();
+        if (!fields) {
+          module.emitError("C++ trace codegen module entry must be an array: ")
+              << moduleEntry.first.str();
+          return signalPassFailure();
+        }
+        for (const llvm::json::Value &field : *fields) {
+          auto name = field.getAsString();
+          if (!name || name->empty()) {
+            module.emitError(
+                "C++ trace codegen module fields must be non-empty strings");
+            return signalPassFailure();
+          }
+        }
+      }
+    }
+
     for (auto f : module.getOps<func::FuncOp>()) {
       if (f.isDeclaration())
         continue;
-      CppPlacementSummary summary = runCppMemberPlacement(f, combChunkNodes);
+      llvm::StringSet<> traceSelectedFields;
+      if (traceModules) {
+        if (const auto *fields = traceModules->getArray(f.getSymName())) {
+          for (const llvm::json::Value &field : *fields) {
+            auto name = field.getAsString();
+            if (!name || name->empty()) {
+              f.emitError(
+                  "C++ trace codegen module fields must be non-empty strings");
+              return signalPassFailure();
+            }
+            traceSelectedFields.insert(*name);
+          }
+        }
+      }
+      llvm::StringSet<> foundTraceFields;
+      f.walk([&](Operation *op) {
+        if (auto name = op->getAttrOfType<StringAttr>("pyc.name");
+            name && traceSelectedFields.contains(name.getValue()))
+          foundTraceFields.insert(name.getValue());
+      });
+      for (const auto &field : traceSelectedFields) {
+        if (!foundTraceFields.contains(field.getKey())) {
+          f.emitError("C++ trace codegen field not found in module: ")
+              << field.getKey();
+          return signalPassFailure();
+        }
+      }
+      CppPlacementSummary summary =
+          runCppMemberPlacement(f, combChunkNodes, traceSelectedFields);
       setFuncPlacementSummary(f, summary);
     }
   }
 
   unsigned combChunkNodes;
+  std::string traceCodegenPlanPath;
 };
 
-std::unique_ptr<Pass> createCppPlacementPass(unsigned combChunkNodes) {
-  return std::make_unique<CppPlacementPass>(combChunkNodes);
+std::unique_ptr<Pass> createCppPlacementPass(unsigned combChunkNodes,
+                                             std::string traceCodegenPlanPath) {
+  return std::make_unique<CppPlacementPass>(combChunkNodes,
+                                            std::move(traceCodegenPlanPath));
 }
 
 } // namespace pyc

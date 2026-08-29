@@ -2,12 +2,14 @@
 
 #include "pyc/Dialect/PYC/PYCOps.h"
 #include "pyc/Dialect/PYC/PYCTypes.h"
+#include "pyc/Transforms/CombPartition.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Operation.h"
 #include "mlir/IR/Value.h"
+#include "mlir/IR/Visitors.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallString.h"
@@ -263,6 +265,22 @@ struct NameTable {
     if (auto it = names.find(v); it != names.end())
       return it->second;
     if (Operation *def = v.getDefiningOp()) {
+      if (auto comb = dyn_cast<pyc::CombOp>(def)) {
+        if (auto result = dyn_cast<OpResult>(v)) {
+          if (auto resultNames =
+                  comb->getAttrOfType<ArrayAttr>(kCombResultNamesAttr)) {
+            unsigned index = result.getResultNumber();
+            if (index < resultNames.size()) {
+              if (auto name = dyn_cast<StringAttr>(resultNames[index]);
+                  name && !name.getValue().empty()) {
+                std::string candidate = unique(sanitizeId(name.getValue()));
+                names.try_emplace(v, candidate);
+                return candidate;
+              }
+            }
+          }
+        }
+      }
       if (auto nAttr = def->getAttrOfType<StringAttr>("pyc.name")) {
         std::string cand = unique(sanitizeId(nAttr.getValue()));
         names.try_emplace(v, cand);
@@ -906,8 +924,27 @@ static bool topoSortCombOps(ArrayRef<Operation *> ops, NameTable &nt, llvm::Smal
   return true;
 }
 
+static LogicalResult rejectMultipleWireDrivers(func::FuncOp f) {
+  llvm::DenseMap<Value, pyc::AssignOp> firstAssign;
+  LogicalResult result = success();
+  f.walk([&](pyc::AssignOp assign) {
+    auto [it, inserted] = firstAssign.try_emplace(assign.getDst(), assign);
+    if (inserted)
+      return WalkResult::advance();
+    // Decision 0137: wire/assign is a single driver. Successive Reg.set
+    // updates must already have been folded in the frontend.
+    result = assign.emitOpError(
+        "has multiple drivers for the same wire; fold successive updates "
+        "into one assign (Reg.set / assign(when=)) or use an explicit net");
+    return WalkResult::interrupt();
+  });
+  return result;
+}
+
 static LogicalResult emitFunc(func::FuncOp f, raw_ostream &os, const VerilogEmitterOptions &opts) {
   (void)opts;
+  if (failed(rejectMultipleWireDrivers(f)))
+    return failure();
   NameTable nt;
   std::vector<std::string> outNames;
   outNames.reserve(f.getNumResults());

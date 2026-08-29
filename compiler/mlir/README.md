@@ -23,11 +23,23 @@ ninja -C /tmp/pyc-mlir-build pyc-opt pycc
 
 ## Passes (prototype)
 
+### `pyc-check-wire-drivers`
+
+Enforces the dialect-level connectivity contract before wire elimination can
+erase the evidence. `pyc.wire` is single-driver SSA/backedge plumbing, not an
+implicit resolved Verilog net: every multi-driver wire is rejected, as is an
+undriven wire that is read, named, or explicitly debug-kept. A legal late
+single driver is accepted. Unnamed, unread placeholders may be removed as dead
+IR; named single-driver wires remain storage-backed observation roots in both
+emitters.
+
 ### `pyc-eliminate-wires`
 
 Eliminates trivial `pyc.wire` + `pyc.assign` pairs when safe (single driver that
 dominates all reads), and removes dead wires. This reduces netlist noise and
-helps subsequent CSE/constprop.
+helps subsequent CSE/constprop. Named/debug-kept wires without SSA readers are
+retained together with their driver so ProbeRegistry and Verilog observe the
+same value.
 
 `pycc` runs this pass by default before emission.
 
@@ -48,14 +60,75 @@ Fuses consecutive pure combinational ops (`pyc.add/mux/and/or/xor/not/constant`)
 - flattened Verilog emission (`assign` instead of many tiny module instantiations)
 - inlined C++ combinational evaluation (fewer tiny objects / calls)
 
-`pycc` runs this pass by default before emission.
+This pass feeds both `--comb-partition=none` and
+`--comb-partition=local`. The legacy function-level
+`--comb-partition=static` path deliberately skips it so temporary fused-region
+boundaries cannot bias the unified plan. It is also skipped by
+`--sim-mode=cpp-only --cpp-only-preserve-ops`.
+
+### `pyc-partition-fused-comb`
+
+Independently builds a deterministic SSA dependency graph inside each
+single-block fused `pyc.comb`, applies bounded GSIM-style coarsening, and
+materializes `local-fused-v1` sibling combs at the original comb position.
+It never unfolds the complete function or moves operations across register,
+wire/assign, primitive, or instance boundaries. Fused combs at or below
+`--comb-partition-max-nodes` remain unchanged.
+
+Select this placement-safe policy with `--comb-partition=local`.
+
+### `pyc-partition-comb`
+
+Builds the canonical value-level `CombDepGraph` for each non-structural
+function, projects memoizable operations from that graph, applies the
+GSIM-style `mergeOut1`, `mergeIn1`, and `mergeSiblings` coarsening phases, and
+uses a stable-topological contiguous DP to respect `max-nodes`. It directly
+emits the final `gsim-unified-v2` sibling `pyc.comb` runtime units; it does not
+partition an earlier FuseComb result.
+
+This is a module pass because instance edges need a stable caller/callee view.
+Its three phases are:
+
+1. Read-only preflight every function against the original module. Once every
+   graph succeeds, the A-to-B normalization step transparently unfolds valid
+   pre-existing comb regions across the module.
+2. Build and freeze every function plan against the same immutable unfolded
+   module, without rewriting IR.
+3. Materialize all final sibling comb regions from the frozen plans in one
+   rewrite phase.
+
+The cycle checker, logic-depth checker, and partitioner all use the same
+`CombDepGraph` semantics. An instance or asynchronous primitive can be a
+physical placement barrier without being a same-tick semantic cut; sequential
+state is a cut. Declaration-only callees in split builds therefore require an
+exact validated `pyc.comb_dep_summary.v1` produced from the full design.
+Graph construction and summary/depth propagation consume one shared
+per-result transfer resolver (operand dependencies, edge kind, base depth, and
+edge cost). A result-producing operation without a registered transfer fails
+closed instead of receiving a conservative all-input/all-output guess.
+
+`pycc` currently defaults to `--comb-partition=none`, retaining FuseComb
+without subdividing its regions. Use `--comb-partition=local` for the
+placement-safe per-comb SuperNode policy or `--comb-partition=static` for the
+legacy function-level planner. The surrounding `pyc-check-comb-memoizable` and
+`pyc-check-comb-partitions` gates validate both incoming and final plans.
+
+The C++ `--comb-update=dirty` policy consumes these final partitions with a
+static topological scan. Inactive units take a fast return; a producer whose
+outputs do not change neither stores those outputs nor activates direct
+fanout. Boundary inputs use exact snapshots. `--comb-reg-update=commit`
+classifies only direct, same-function `pyc.reg` results: their snapshots are
+removed and `tick_commit()` activates direct consumer partitions only when
+`qNext != q`. Unclassified state, hierarchy, FIFO, memory, and CDC boundaries
+continue to use polling. `--comb-reg-update=poll` remains the default reference
+lane. This is not a dynamic work queue.
 
 ### `pyc-check-flat-types`
 
-Verifies that the IR is fully lowered to flat hardware-carrying types
-(integers + `!pyc.clock`/`!pyc.reset`) before emission. This is a safety net
-similar in spirit to FIRRTL's type-lowering: pyCircuit's Python frontend packs
-bundles/vectors into integers, so aggregate types should never reach the PYC IR.
+Verifies that the IR is fully lowered to emission-supported hardware types:
+integers, recursively nested vectors of integers, `!pyc.clock`, and
+`!pyc.reset`. This rejects unsupported aggregate or dynamic types before either
+backend sees them while retaining PYC's native vector representation.
 
 `pycc` runs this check by default.
 
@@ -88,13 +161,13 @@ diff /tmp/pir/0046_before_*eliminate-wires* /tmp/pir/0047_after_*eliminate-wires
 File names are `NNNN_<before|after>_<NN>_<pass>__L<level>[_FAILED].mlir`, so
 lexical order matches execution order, before/after of one pass share the same
 `<NN>`, `__L0` is a module-level pass and `__L1` is func-nested, and a failed
-pass gets an `__FAILED` suffix (the file begins with `// PASS FAILED`).
+pass gets a `_FAILED` suffix (the file begins with `// PASS FAILED`).
 
 Flags:
 
 | Flag | Default | Purpose |
 |------|---------|---------|
-| `--dump-pass-ir=<dir>` | (empty = off) | Output directory. `auto` means `<--out-dir>/pass_ir` so dumps travel with profile/gate artifacts. |
+| `--dump-pass-ir=<dir>` | (empty = off) | Output directory. On `pycc`, `auto` means `<--out-dir>/pass_ir`. `pyc-opt` requires an explicit directory (`auto` is rejected). |
 | `--dump-pass-ir-phase=before\|after\|both` | `both` | Which phase(s) to record. |
 | `--dump-pass-ir-filter=<regex>` | (empty = all) | ECMAScript-style regex on the pass short name (e.g. `eliminate-wires|fuse-comb`). |
 | `--dump-pass-ir-max-lines=<N>` | `0` (unlimited) | Truncate each file after N lines (appends `// truncated at N lines`). |

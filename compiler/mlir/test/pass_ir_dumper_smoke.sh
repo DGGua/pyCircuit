@@ -23,7 +23,7 @@ if [[ ! -x "${PYCC}" ]]; then
 fi
 
 for flag in dump-pass-ir dump-pass-ir-phase dump-pass-ir-filter dump-pass-ir-max-lines; do
-  if ! "${PYCC}" --help 2>&1 | rg -q -- "--${flag}"; then
+  if ! "${PYCC}" --help 2>&1 | grep -q -- "--${flag}"; then
     echo "fail: pycc missing --${flag} flag" >&2
     exit 1
   fi
@@ -61,9 +61,13 @@ PY
 INPUT="${OUT}/counter.pyc"
 
 # --- AC5: default behavior produces no dump ---
+# Run without --dump-pass-ir and assert no *.mlir files appear under OUT
+# (aside from the input .pyc we already wrote). The old check for a hard-coded
+# default_dump/ dir was a no-op because nothing would create that path.
 "${PYCC}" "${INPUT}" --emit=none -o /dev/null >/dev/null 2>&1
-if [[ -d "${OUT}/default_dump" ]]; then
-  echo "fail: dump created without --dump-pass-ir" >&2
+if find "${OUT}" -type f -name '*.mlir' -print -quit | grep -q .; then
+  echo "fail: dump .mlir files appeared without --dump-pass-ir:" >&2
+  find "${OUT}" -type f -name '*.mlir' >&2
   exit 1
 fi
 
@@ -89,11 +93,29 @@ if [[ "${n_before}" -ne "${n_after}" ]]; then
   exit 1
 fi
 
+# Nested passes must keep the same <NN> on before/after of the same pass.
+python3 - <<'PY' "${DUMP_BOTH}"
+import re, sys
+from pathlib import Path
+root = Path(sys.argv[1])
+pat = re.compile(r"^\d+_(before|after)_(\d+)_")
+pairs = {}
+for p in root.glob("*.mlir"):
+    m = pat.match(p.name)
+    if not m:
+        raise SystemExit(f"fail: unexpected dump name: {p.name}")
+    pairs.setdefault(m.group(2), set()).add(m.group(1))
+bad = [nn for nn, phases in pairs.items() if phases != {"before", "after"}]
+if bad:
+    raise SystemExit(f"fail: pass-index pairing broken for NN={bad[:5]}")
+print(f"ok: {len(pairs)} pass indices have matching before/after")
+PY
+
 # --- AC2 (lexical order = execution order): filenames strictly increase ---
 python3 - <<'PY' "${DUMP_BOTH}"
 import sys, pathlib
 names = sorted(p.name for p in pathlib.Path(sys.argv[1]).glob("*.mlir"))
-seqs = [int(n[:4]) for n in names]
+seqs = [int(n.split("_", 1)[0]) for n in names]
 if seqs != list(range(len(seqs))):
     raise SystemExit(f"fail: sequence numbers not contiguous: {seqs[:10]}...")
 print(f"ok: {len(names)} files in lexical order")
@@ -147,7 +169,7 @@ ml_files=("${DUMP_ML}"/*.mlir)
 shopt -u nullglob
 trunc_found=0
 for f in "${ml_files[@]}"; do
-  if rg -q '^// truncated at 3 lines' "$f"; then trunc_found=1; break; fi
+  if grep -q '^// truncated at 3 lines' "$f"; then trunc_found=1; break; fi
 done
 if [[ "${trunc_found}" -eq 0 ]]; then
   echo "fail: no file carried the truncation marker" >&2
@@ -170,7 +192,11 @@ for b in "${all_before[@]}"; do
   # `MMMM_after_<NN>_<pass>...` (same <NN>, same pass suffix).
   base=$(basename "$b")
   nn_pass=${base#*_before_}      # strip "<seq>_before_"
-  a=$(ls "${DUMP_BOTH}"/*_after_"${nn_pass}" 2>/dev/null | head -1)
+  a=""
+  shopt -s nullglob
+  after_cands=("${DUMP_BOTH}"/*_after_"${nn_pass}")
+  shopt -u nullglob
+  [[ ${#after_cands[@]} -gt 0 ]] && a="${after_cands[0]}"
   [[ -z "$a" ]] && continue
   if ! diff -q "$b" "$a" >/dev/null 2>&1; then
     diff_found=1

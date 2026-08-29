@@ -15,11 +15,11 @@ Useful when:
 
 ## Flags
 
-Available on both `pycc` and `pyc-opt`:
+Available on both `pycc` and `pyc-opt` (with one exception noted below):
 
 | Flag | Default | Purpose |
 |------|---------|---------|
-| `--dump-pass-ir=<dir>` | (empty = off) | Output directory. The special value `auto` resolves to `<--out-dir>/pass_ir` so dumps travel with profile/gate artifacts. |
+| `--dump-pass-ir=<dir>` | (empty = off) | Output directory. On **`pycc` only**, the special value `auto` resolves to `<--out-dir>/pass_ir` so dumps travel with profile/gate artifacts. `pyc-opt` has no `--out-dir` and rejects `auto` with an error — pass an explicit directory. |
 | `--dump-pass-ir-phase=before\|after\|both` | `both` | Which phase(s) to record. |
 | `--dump-pass-ir-filter=<regex>` | (empty = all) | ECMAScript-style regex on the pass short name (e.g. `eliminate-wires\|fuse-comb`). Match is performed against the short name without the `pyc-` prefix. |
 | `--dump-pass-ir-max-lines=<N>` | `0` (unlimited) | Truncate each file after N lines; the file ends with `// truncated at N lines`. |
@@ -37,7 +37,8 @@ before/after of one pass are trivial to spot and diff:
 NNNN_<before|after>_<NN>_<pass-short>__L<level>[_FAILED].mlir
 ```
 
-- `NNNN` — 4-digit zero-padded global sequence number; one per emitted file.
+- `NNNN` — global sequence number, zero-padded to at least 4 digits (grows
+  past 9999 without wrapping); one per emitted file.
 - `<before>` / `<after>` — phase marker.
 - `<NN>` — per-pass index; the before and after of the same pass share this
   number.
@@ -126,7 +127,8 @@ filterable file output.
 `pyc-opt` registers the dump flags via `MlirOptMainConfig::setPassPipelineSetupFn`,
 so they work whether you pass a single pass (`-pyc-eliminate-wires`) or a full
 `-pass-pipeline='func.func(...)'`. The flags are parsed alongside MLIR's
-standard options, so `--help` lists both.
+standard options, so `--help` lists both. Pass an explicit directory;
+`--dump-pass-ir=auto` is rejected (no `--out-dir` on `pyc-opt`).
 
 ## Gate
 

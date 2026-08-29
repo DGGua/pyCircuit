@@ -47,8 +47,8 @@ SKIP_DIRS = {
     "build-top",
 }
 
-# PYC416 removed from TEXT_RULES (mux allowed for eager/V5); keep other relaxes.
-FRONTEND_RELAX_CODES = {"PYC415", "PYC417", "PYC418", "PYC423"}
+# FRONTEND_RELAX_CODES = {"PYC415", "PYC416", "PYC417", "PYC418", "PYC423"}
+FRONTEND_RELAX_CODES = {"PYC415", "PYC417", "PYC418", "PYC423"} # remove PYC416 for "if...else" not supported after V5 Spec
 
 
 def iter_target_files(path: Path) -> list[Path]:

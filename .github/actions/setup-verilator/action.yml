@@ -6,7 +6,6 @@ inputs:
     description: Verilator version (x.yyy), matching veryl-lang/verilator-package releases
     required: false
     default: "5.048"
-
 runs:
   using: composite
   steps:
@@ -43,7 +42,8 @@ runs:
         echo "${root}/bin" >> "${GITHUB_PATH}"
         # Prebuilt kit root contains bin/ + include/ (not share/verilator).
         echo "VERILATOR_ROOT=${root}" >> "${GITHUB_ENV}"
-        # Packaged verilated.mk invokes ccache; mold is optional but cheap.
+        # Packaged verilated.mk may invoke ccache; cli.py disables it for
+        # generated models because PCH object reuse corrupts class layout.
         sudo apt-get update
         sudo apt-get install -y ccache mold
 
