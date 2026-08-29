@@ -162,6 +162,12 @@ static llvm::cl::opt<std::string> probePlanPath(
     llvm::cl::desc("Resolved @probe alias plan JSON to embed into generated ProbeRegistry registration"),
     llvm::cl::init(""));
 
+static llvm::cl::opt<std::string> traceCodegenPlanPath(
+    "trace-codegen-plan",
+    llvm::cl::desc(
+        "Resolved per-module internal trace fields used by C++ placement"),
+    llvm::cl::init(""));
+
 static llvm::cl::opt<std::string> targetKind("target", llvm::cl::desc("Target: default|fpga"),
                                              llvm::cl::init("default"));
 
@@ -188,6 +194,51 @@ static llvm::cl::opt<bool> cppOnlyPreserveOps(
 static llvm::cl::opt<bool> unrollVector(
     "unroll-vector",
     llvm::cl::desc("Unroll vector operations to scalars at IR level before optimization passes"),
+    llvm::cl::init(false));
+
+static llvm::cl::opt<bool> combineDelayChains(
+    "combine-delay-chains",
+    llvm::cl::desc(
+        "Legacy state/delay switch (explicit true selects generated; false forces off)"),
+    llvm::cl::init(true));
+
+static llvm::cl::opt<std::string> stateDelayOpt(
+    "state-delay-opt",
+    llvm::cl::desc(
+        "State/delay optimization policy: off|generated|structural (default: structural)"),
+    llvm::cl::init("structural"));
+
+static llvm::cl::opt<std::string> stateRetimeOpt(
+    "state-retime",
+    llvm::cl::desc(
+        "Pipeline retiming policy: off|pipeline (default: pipeline in structural mode)"),
+    llvm::cl::init("pipeline"));
+
+static llvm::cl::opt<unsigned> stateRetimeMaxStages(
+    "state-retime-max-stages",
+    llvm::cl::desc("Maximum registers per retimed region (0 is unlimited)"),
+    llvm::cl::init(0));
+
+static llvm::cl::opt<unsigned> stateRetimeMaxExtraCombOps(
+    "state-retime-max-extra-comb-ops",
+    llvm::cl::desc("Maximum duplicated combinational operations from retiming"),
+    llvm::cl::init(32));
+
+static llvm::cl::opt<unsigned> stateRetimeMaxCombDepth(
+    "state-retime-max-comb-depth",
+    llvm::cl::desc("Maximum rebuilt prefix depth from retiming"),
+    llvm::cl::init(32));
+
+static llvm::cl::opt<unsigned> statePackWidth(
+    "state-pack-width",
+    llvm::cl::desc(
+        "Maximum packed state-lane width in structural mode (0 disables Stage 2)"),
+    llvm::cl::init(192));
+
+static llvm::cl::opt<bool> stateOptPreserveObservability(
+    "state-opt-preserve-observability",
+    llvm::cl::desc(
+        "Preserve named/debug/probe/trace state identities (slower; default false)"),
     llvm::cl::init(false));
 
 static llvm::cl::opt<bool> noInline(
@@ -667,6 +718,16 @@ static LogicalResult emitProbeManifest(ModuleOp module, llvm::StringRef outPath)
             v = a.getIn();
           if (v.getDefiningOp<pyc::RegOp>() != nullptr)
             return true;
+          if (v.getDefiningOp<pyc::DelayLineOp>() != nullptr)
+            return true;
+          if (v.getDefiningOp<pyc::DelayTapOp>() != nullptr)
+            return true;
+          if (auto extract = v.getDefiningOp<pyc::ExtractOp>()) {
+            if (!extract->hasAttr("pyc.state_pack_lsb"))
+              return false;
+            v = extract.getIn();
+            continue;
+          }
           auto comb = v.getDefiningOp<pyc::CombOp>();
           if (!comb)
             return false;
@@ -683,6 +744,13 @@ static LogicalResult emitProbeManifest(ModuleOp module, llvm::StringRef outPath)
           Value y = yield.getOperand(res.getResultNumber());
           while (auto a = y.getDefiningOp<pyc::AliasOp>())
             y = a.getIn();
+          if (auto extract = y.getDefiningOp<pyc::ExtractOp>()) {
+            if (!extract->hasAttr("pyc.state_pack_lsb"))
+              return false;
+            y = extract.getIn();
+            while (auto alias = y.getDefiningOp<pyc::AliasOp>())
+              y = alias.getIn();
+          }
           auto barg = dyn_cast<BlockArgument>(y);
           if (!barg)
             return false;
@@ -751,6 +819,16 @@ static LogicalResult emitProbeManifest(ModuleOp module, llvm::StringRef outPath)
           v = a.getIn();
         if (auto rop = v.getDefiningOp<pyc::RegOp>())
           return rop.getQ();
+        if (auto delay = v.getDefiningOp<pyc::DelayLineOp>())
+          return delay.getQ();
+        if (auto tap = v.getDefiningOp<pyc::DelayTapOp>())
+          return tap.getLine();
+        if (auto extract = v.getDefiningOp<pyc::ExtractOp>()) {
+          if (!extract->hasAttr("pyc.state_pack_lsb"))
+            return Value();
+          v = extract.getIn();
+          continue;
+        }
         auto comb = v.getDefiningOp<pyc::CombOp>();
         if (!comb)
           return Value();
@@ -767,6 +845,13 @@ static LogicalResult emitProbeManifest(ModuleOp module, llvm::StringRef outPath)
         Value y = yield.getOperand(res.getResultNumber());
         while (auto a = y.getDefiningOp<pyc::AliasOp>())
           y = a.getIn();
+        if (auto extract = y.getDefiningOp<pyc::ExtractOp>()) {
+          if (!extract->hasAttr("pyc.state_pack_lsb"))
+            return Value();
+          y = extract.getIn();
+          while (auto alias = y.getDefiningOp<pyc::AliasOp>())
+            y = alias.getIn();
+        }
         auto barg = dyn_cast<BlockArgument>(y);
         if (!barg)
           return Value();
@@ -785,6 +870,10 @@ static LogicalResult emitProbeManifest(ModuleOp module, llvm::StringRef outPath)
 
     llvm::StringSet<> localNamedFields;
     f.walk([&](Operation *op) {
+      // Cycle-balance names are compiler temporaries, not stable user probes.
+      if (auto generated = op->getAttrOfType<StringAttr>("pyc.generated");
+          generated && generated.getValue() == "cycle_balance")
+        return;
       auto nameAttr = op->getAttrOfType<StringAttr>("pyc.name");
       if (!nameAttr)
         return;
@@ -1081,6 +1170,7 @@ static std::optional<std::string> findToolchainRoot(const char *argv0) {
 static LogicalResult emitPrimitivesFile(llvm::StringRef outPath, llvm::StringRef primDir, bool targetFpga) {
   static const char *kFiles[] = {
       "pyc_reg.v",
+      "pyc_delay_line.v",
       "pyc_fifo.v",
       "pyc_byte_mem.v",
       "pyc_sync_mem.v",
@@ -1959,8 +2049,65 @@ static LogicalResult writeCppCompileManifest(llvm::StringRef path,
 }
 
 struct CompileStatsSummary {
+  std::string stateOptimizationPolicy;
+  std::string stateRetimePolicy;
+  bool stateOptPreserveObservability = false;
+  int64_t stateOptPackWidth = 0;
   int64_t regCount = 0;
   int64_t regBits = 0;
+  int64_t delayLineCount = 0;
+  int64_t delayLineDepthTotal = 0;
+  int64_t delayChainsCombined = 0;
+  int64_t delayChainRegsCombined = 0;
+  int64_t delayChainAliasesRemoved = 0;
+  int64_t delayChainDelayLinesCreated = 0;
+  int64_t delayChainDelayLinesMerged = 0;
+  int64_t delayChainStateReadsBefore = 0;
+  int64_t delayChainStateReadsAfter = 0;
+  int64_t delayChainStateWritesBefore = 0;
+  int64_t delayChainStateWritesAfter = 0;
+  int64_t delayChainTapsCreated = 0;
+  int64_t delayChainTapUsesRewritten = 0;
+  int64_t retimeRegsSeen = 0;
+  int64_t retimeCandidateRegions = 0;
+  int64_t retimeCandidateRegs = 0;
+  int64_t retimeCandidateCombOps = 0;
+  int64_t retimeRegionsRewritten = 0;
+  int64_t retimeRegsRewritten = 0;
+  int64_t retimeStatePrimitivesRemoved = 0;
+  int64_t retimeTapsCreated = 0;
+  int64_t retimeCombOpsCloned = 0;
+  int64_t retimeCommonDelayCandidates = 0;
+  int64_t retimeCommonDelaySinks = 0;
+  int64_t retimeCommonDelaySourceStates = 0;
+  int64_t retimeCombOpsMoved = 0;
+  int64_t retimeStateBitsRemoved = 0;
+  int64_t retimeBlockedInit = 0;
+  int64_t retimeBlockedCost = 0;
+  int64_t stateOptRegsSeen = 0;
+  int64_t stateOptGeneratedRegs = 0;
+  int64_t stateOptPinnedRegs = 0;
+  int64_t stateOptMergeCandidates = 0;
+  int64_t stateOptGeneratedChains = 0;
+  int64_t stateOptGeneratedChainRegs = 0;
+  int64_t stateOptStructuralChains = 0;
+  int64_t stateOptStructuralChainRegs = 0;
+  int64_t stateOptStructuralOnlyChains = 0;
+  int64_t stateOptStructuralOnlyChainRegs = 0;
+  int64_t stateOptRegsMerged = 0;
+  int64_t stateOptRegBitsRemoved = 0;
+  int64_t stateOptStructuralChainsCombined = 0;
+  int64_t stateOptStructuralChainRegsCombined = 0;
+  int64_t stateOptMergeRounds = 0;
+  int64_t stateOptCascadeRegsMerged = 0;
+  int64_t stateOptPackGroups = 0;
+  int64_t stateOptPackRegGroups = 0;
+  int64_t stateOptPackDelayGroups = 0;
+  int64_t stateOptPackedStateOps = 0;
+  int64_t stateOptStatePrimitivesRemoved = 0;
+  int64_t stateOptPackBits = 0;
+  int64_t stateOptObservabilityAttrsStripped = 0;
+  int64_t stateOptObservationAliasesRemoved = 0;
   int64_t memCount = 0;
   int64_t memBits = 0;
   int64_t maxLogicDepth = 0;
@@ -1994,6 +2141,157 @@ static CompileStatsSummary collectCompileStats(ModuleOp module, int64_t depthLim
   for (auto f : module.getOps<func::FuncOp>()) {
     s.regCount = satAdd(s.regCount, getI64Attr(f, "pyc.stats.reg_count", 0));
     s.regBits = satAdd(s.regBits, getI64Attr(f, "pyc.stats.reg_bits", 0));
+    s.delayLineCount = satAdd(s.delayLineCount, getI64Attr(f, "pyc.stats.delay_line_count", 0));
+    s.delayLineDepthTotal =
+        satAdd(s.delayLineDepthTotal, getI64Attr(f, "pyc.stats.delay_line_depth_total", 0));
+    s.delayChainsCombined =
+        satAdd(s.delayChainsCombined, getI64Attr(f, "pyc.stats.delay_chains_combined", 0));
+    s.delayChainRegsCombined = satAdd(
+        s.delayChainRegsCombined, getI64Attr(f, "pyc.stats.delay_chain_regs_combined", 0));
+    s.delayChainAliasesRemoved = satAdd(
+        s.delayChainAliasesRemoved, getI64Attr(f, "pyc.stats.delay_chain_aliases_removed", 0));
+    s.delayChainDelayLinesCreated =
+        satAdd(s.delayChainDelayLinesCreated,
+               getI64Attr(f, "pyc.stats.delay_chain_delay_lines_created", 0));
+    s.delayChainDelayLinesMerged =
+        satAdd(s.delayChainDelayLinesMerged,
+               getI64Attr(f, "pyc.stats.delay_chain_delay_lines_merged", 0));
+    s.delayChainStateReadsBefore =
+        satAdd(s.delayChainStateReadsBefore,
+               getI64Attr(f, "pyc.stats.delay_chain_state_reads_before", 0));
+    s.delayChainStateReadsAfter =
+        satAdd(s.delayChainStateReadsAfter,
+               getI64Attr(f, "pyc.stats.delay_chain_state_reads_after", 0));
+    s.delayChainStateWritesBefore =
+        satAdd(s.delayChainStateWritesBefore,
+               getI64Attr(f, "pyc.stats.delay_chain_state_writes_before", 0));
+    s.delayChainStateWritesAfter =
+        satAdd(s.delayChainStateWritesAfter,
+               getI64Attr(f, "pyc.stats.delay_chain_state_writes_after", 0));
+    s.delayChainTapsCreated = satAdd(
+        s.delayChainTapsCreated,
+        getI64Attr(f, "pyc.stats.delay_chain_taps_created", 0));
+    s.delayChainTapUsesRewritten = satAdd(
+        s.delayChainTapUsesRewritten,
+        getI64Attr(f, "pyc.stats.delay_chain_tap_uses_rewritten", 0));
+    s.retimeRegsSeen = satAdd(
+        s.retimeRegsSeen, getI64Attr(f, "pyc.stats.retime_regs_seen", 0));
+    s.retimeCandidateRegions = satAdd(
+        s.retimeCandidateRegions,
+        getI64Attr(f, "pyc.stats.retime_candidate_regions", 0));
+    s.retimeCandidateRegs = satAdd(
+        s.retimeCandidateRegs,
+        getI64Attr(f, "pyc.stats.retime_candidate_regs", 0));
+    s.retimeCandidateCombOps = satAdd(
+        s.retimeCandidateCombOps,
+        getI64Attr(f, "pyc.stats.retime_candidate_comb_ops", 0));
+    s.retimeRegionsRewritten = satAdd(
+        s.retimeRegionsRewritten,
+        getI64Attr(f, "pyc.stats.retime_regions_rewritten", 0));
+    s.retimeRegsRewritten = satAdd(
+        s.retimeRegsRewritten,
+        getI64Attr(f, "pyc.stats.retime_regs_rewritten", 0));
+    s.retimeStatePrimitivesRemoved = satAdd(
+        s.retimeStatePrimitivesRemoved,
+        getI64Attr(f, "pyc.stats.retime_state_primitives_removed", 0));
+    s.retimeTapsCreated = satAdd(
+        s.retimeTapsCreated,
+        getI64Attr(f, "pyc.stats.retime_taps_created", 0));
+    s.retimeCombOpsCloned = satAdd(
+        s.retimeCombOpsCloned,
+        getI64Attr(f, "pyc.stats.retime_comb_ops_cloned", 0));
+    s.retimeCommonDelayCandidates = satAdd(
+        s.retimeCommonDelayCandidates,
+        getI64Attr(f, "pyc.stats.retime_common_delay_candidates", 0));
+    s.retimeCommonDelaySinks = satAdd(
+        s.retimeCommonDelaySinks,
+        getI64Attr(f, "pyc.stats.retime_common_delay_sinks", 0));
+    s.retimeCommonDelaySourceStates = satAdd(
+        s.retimeCommonDelaySourceStates,
+        getI64Attr(f, "pyc.stats.retime_common_delay_source_states", 0));
+    s.retimeCombOpsMoved = satAdd(
+        s.retimeCombOpsMoved,
+        getI64Attr(f, "pyc.stats.retime_comb_ops_moved", 0));
+    s.retimeStateBitsRemoved = satAdd(
+        s.retimeStateBitsRemoved,
+        getI64Attr(f, "pyc.stats.retime_state_bits_removed", 0));
+    s.retimeBlockedInit = satAdd(
+        s.retimeBlockedInit,
+        getI64Attr(f, "pyc.stats.retime_blocked_init", 0));
+    s.retimeBlockedCost = satAdd(
+        s.retimeBlockedCost,
+        getI64Attr(f, "pyc.stats.retime_blocked_cost", 0));
+    s.stateOptRegsSeen = satAdd(
+        s.stateOptRegsSeen, getI64Attr(f, "pyc.stats.state_opt_regs_seen", 0));
+    s.stateOptGeneratedRegs = satAdd(
+        s.stateOptGeneratedRegs,
+        getI64Attr(f, "pyc.stats.state_opt_generated_regs", 0));
+    s.stateOptPinnedRegs = satAdd(
+        s.stateOptPinnedRegs,
+        getI64Attr(f, "pyc.stats.state_opt_pinned_regs", 0));
+    s.stateOptMergeCandidates = satAdd(
+        s.stateOptMergeCandidates,
+        getI64Attr(f, "pyc.stats.state_opt_merge_candidates", 0));
+    s.stateOptGeneratedChains = satAdd(
+        s.stateOptGeneratedChains,
+        getI64Attr(f, "pyc.stats.state_opt_generated_chains", 0));
+    s.stateOptGeneratedChainRegs = satAdd(
+        s.stateOptGeneratedChainRegs,
+        getI64Attr(f, "pyc.stats.state_opt_generated_chain_regs", 0));
+    s.stateOptStructuralChains = satAdd(
+        s.stateOptStructuralChains,
+        getI64Attr(f, "pyc.stats.state_opt_structural_chains", 0));
+    s.stateOptStructuralChainRegs = satAdd(
+        s.stateOptStructuralChainRegs,
+        getI64Attr(f, "pyc.stats.state_opt_structural_chain_regs", 0));
+    s.stateOptStructuralOnlyChains = satAdd(
+        s.stateOptStructuralOnlyChains,
+        getI64Attr(f, "pyc.stats.state_opt_structural_only_chains", 0));
+    s.stateOptStructuralOnlyChainRegs = satAdd(
+        s.stateOptStructuralOnlyChainRegs,
+        getI64Attr(f, "pyc.stats.state_opt_structural_only_chain_regs", 0));
+    s.stateOptRegsMerged = satAdd(
+        s.stateOptRegsMerged,
+        getI64Attr(f, "pyc.stats.state_opt_regs_merged", 0));
+    s.stateOptRegBitsRemoved = satAdd(
+        s.stateOptRegBitsRemoved,
+        getI64Attr(f, "pyc.stats.state_opt_reg_bits_removed", 0));
+    s.stateOptStructuralChainsCombined = satAdd(
+        s.stateOptStructuralChainsCombined,
+        getI64Attr(f, "pyc.stats.state_opt_structural_chains_combined", 0));
+    s.stateOptStructuralChainRegsCombined = satAdd(
+        s.stateOptStructuralChainRegsCombined,
+        getI64Attr(f, "pyc.stats.state_opt_structural_chain_regs_combined", 0));
+    s.stateOptMergeRounds = std::max(
+        s.stateOptMergeRounds,
+        getI64Attr(f, "pyc.stats.state_opt_merge_rounds", 0));
+    s.stateOptCascadeRegsMerged = satAdd(
+        s.stateOptCascadeRegsMerged,
+        getI64Attr(f, "pyc.stats.state_opt_cascade_regs_merged", 0));
+    s.stateOptPackGroups = satAdd(
+        s.stateOptPackGroups,
+        getI64Attr(f, "pyc.stats.state_opt_pack_groups", 0));
+    s.stateOptPackRegGroups = satAdd(
+        s.stateOptPackRegGroups,
+        getI64Attr(f, "pyc.stats.state_opt_pack_reg_groups", 0));
+    s.stateOptPackDelayGroups = satAdd(
+        s.stateOptPackDelayGroups,
+        getI64Attr(f, "pyc.stats.state_opt_pack_delay_groups", 0));
+    s.stateOptPackedStateOps = satAdd(
+        s.stateOptPackedStateOps,
+        getI64Attr(f, "pyc.stats.state_opt_packed_state_ops", 0));
+    s.stateOptStatePrimitivesRemoved = satAdd(
+        s.stateOptStatePrimitivesRemoved,
+        getI64Attr(f, "pyc.stats.state_opt_state_primitives_removed", 0));
+    s.stateOptPackBits = satAdd(
+        s.stateOptPackBits,
+        getI64Attr(f, "pyc.stats.state_opt_pack_bits", 0));
+    s.stateOptObservabilityAttrsStripped = satAdd(
+        s.stateOptObservabilityAttrsStripped,
+        getI64Attr(f, "pyc.stats.state_opt_observability_attrs_stripped", 0));
+    s.stateOptObservationAliasesRemoved = satAdd(
+        s.stateOptObservationAliasesRemoved,
+        getI64Attr(f, "pyc.stats.state_opt_observation_aliases_removed", 0));
     s.memCount = satAdd(s.memCount, getI64Attr(f, "pyc.stats.mem_count", 0));
     s.memBits = satAdd(s.memBits, getI64Attr(f, "pyc.stats.mem_bits", 0));
 
@@ -2015,17 +2313,135 @@ static CompileStatsSummary collectCompileStats(ModuleOp module, int64_t depthLim
 }
 
 static void printCompileStats(const CompileStatsSummary &s) {
-  llvm::errs() << "stats: regs=" << s.regCount << " (" << s.regBits << " bits)"
+  llvm::errs() << "stats: state_policy=" << s.stateOptimizationPolicy
+               << ", retime=" << s.stateRetimePolicy
+               << ", preserve_observability="
+               << (s.stateOptPreserveObservability ? "true" : "false")
+               << ", pack_width=" << s.stateOptPackWidth
+               << ", regs=" << s.regCount << " (" << s.regBits << " bits)"
+               << ", delay_lines=" << s.delayLineCount << " (depth_total=" << s.delayLineDepthTotal << ")"
+               << ", delay_chain={chains:" << s.delayChainsCombined
+               << ", regs:" << s.delayChainRegsCombined
+               << ", aliases:" << s.delayChainAliasesRemoved
+               << ", created:" << s.delayChainDelayLinesCreated
+               << ", merged:" << s.delayChainDelayLinesMerged
+               << ", reads:" << s.delayChainStateReadsBefore << "->"
+               << s.delayChainStateReadsAfter
+               << ", writes:" << s.delayChainStateWritesBefore << "->"
+               << s.delayChainStateWritesAfter
+               << ", taps:" << s.delayChainTapsCreated
+               << ", tap_uses:" << s.delayChainTapUsesRewritten << "}"
+               << ", retime_opt={candidates:" << s.retimeCandidateRegions
+               << "/" << s.retimeCandidateRegs
+               << ", candidate_comb:" << s.retimeCandidateCombOps
+               << ", rewritten:" << s.retimeRegionsRewritten
+               << "/" << s.retimeRegsRewritten
+               << ", primitives_removed:"
+               << s.retimeStatePrimitivesRemoved
+               << ", taps:" << s.retimeTapsCreated
+               << ", comb_cloned:" << s.retimeCombOpsCloned
+               << ", common_sinks:" << s.retimeCommonDelaySinks
+               << "/" << s.retimeCommonDelaySourceStates
+               << ", comb_moved:" << s.retimeCombOpsMoved
+               << ", bits_removed:" << s.retimeStateBitsRemoved
+               << ", blocked_init:" << s.retimeBlockedInit
+               << ", blocked_cost:" << s.retimeBlockedCost << "}"
+               << ", state_opt={seen:" << s.stateOptRegsSeen
+               << ", generated:" << s.stateOptGeneratedRegs
+               << ", pinned:" << s.stateOptPinnedRegs
+               << ", merge_candidates:" << s.stateOptMergeCandidates
+               << ", merged:" << s.stateOptRegsMerged
+               << ", bits_removed:" << s.stateOptRegBitsRemoved
+               << ", structural_chains:" << s.stateOptStructuralChainsCombined
+               << ", structural_regs:" << s.stateOptStructuralChainRegsCombined
+               << ", rounds:" << s.stateOptMergeRounds
+               << ", cascade_merged:" << s.stateOptCascadeRegsMerged
+               << ", pack_groups:" << s.stateOptPackGroups
+               << ", packed_ops:" << s.stateOptPackedStateOps
+               << ", primitives_removed:"
+               << s.stateOptStatePrimitivesRemoved
+               << ", pack_bits:" << s.stateOptPackBits
+               << ", obs_attrs_stripped:"
+               << s.stateOptObservabilityAttrsStripped
+               << ", obs_aliases_removed:"
+               << s.stateOptObservationAliasesRemoved
+               << "}"
                << ", mems=" << s.memCount << " (" << s.memBits << " bits)"
                << ", max_depth=" << s.maxLogicDepth << "/" << s.logicDepthLimit
                << ", WNS=" << s.wns << ", TNS=" << s.tns
                << ", fuse_comb=" << (s.fuseCombEnabled ? "on" : "off") << "\n";
 }
 
-static LogicalResult writeCompileStatsJson(llvm::StringRef outPath, const CompileStatsSummary &s) {
+static llvm::json::Object compileStatsToJson(const CompileStatsSummary &s) {
   llvm::json::Object obj;
+  obj["state_opt_policy"] = s.stateOptimizationPolicy;
+  obj["state_retime_policy"] = s.stateRetimePolicy;
+  obj["state_opt_preserve_observability"] =
+      s.stateOptPreserveObservability;
+  obj["state_opt_pack_width"] = s.stateOptPackWidth;
   obj["reg_count"] = s.regCount;
   obj["reg_bits"] = s.regBits;
+  obj["delay_line_count"] = s.delayLineCount;
+  obj["delay_line_depth_total"] = s.delayLineDepthTotal;
+  obj["delay_chains_combined"] = s.delayChainsCombined;
+  obj["delay_chain_regs_combined"] = s.delayChainRegsCombined;
+  obj["delay_chain_aliases_removed"] = s.delayChainAliasesRemoved;
+  obj["delay_chain_delay_lines_created"] = s.delayChainDelayLinesCreated;
+  obj["delay_chain_delay_lines_merged"] = s.delayChainDelayLinesMerged;
+  obj["delay_chain_state_reads_before"] = s.delayChainStateReadsBefore;
+  obj["delay_chain_state_reads_after"] = s.delayChainStateReadsAfter;
+  obj["delay_chain_state_writes_before"] = s.delayChainStateWritesBefore;
+  obj["delay_chain_state_writes_after"] = s.delayChainStateWritesAfter;
+  obj["delay_chain_taps_created"] = s.delayChainTapsCreated;
+  obj["delay_chain_tap_uses_rewritten"] =
+      s.delayChainTapUsesRewritten;
+  obj["retime_regs_seen"] = s.retimeRegsSeen;
+  obj["retime_candidate_regions"] = s.retimeCandidateRegions;
+  obj["retime_candidate_regs"] = s.retimeCandidateRegs;
+  obj["retime_candidate_comb_ops"] = s.retimeCandidateCombOps;
+  obj["retime_regions_rewritten"] = s.retimeRegionsRewritten;
+  obj["retime_regs_rewritten"] = s.retimeRegsRewritten;
+  obj["retime_state_primitives_removed"] =
+      s.retimeStatePrimitivesRemoved;
+  obj["retime_taps_created"] = s.retimeTapsCreated;
+  obj["retime_comb_ops_cloned"] = s.retimeCombOpsCloned;
+  obj["retime_common_delay_candidates"] =
+      s.retimeCommonDelayCandidates;
+  obj["retime_common_delay_sinks"] = s.retimeCommonDelaySinks;
+  obj["retime_common_delay_source_states"] =
+      s.retimeCommonDelaySourceStates;
+  obj["retime_comb_ops_moved"] = s.retimeCombOpsMoved;
+  obj["retime_state_bits_removed"] = s.retimeStateBitsRemoved;
+  obj["retime_blocked_init"] = s.retimeBlockedInit;
+  obj["retime_blocked_cost"] = s.retimeBlockedCost;
+  obj["state_opt_regs_seen"] = s.stateOptRegsSeen;
+  obj["state_opt_generated_regs"] = s.stateOptGeneratedRegs;
+  obj["state_opt_pinned_regs"] = s.stateOptPinnedRegs;
+  obj["state_opt_merge_candidates"] = s.stateOptMergeCandidates;
+  obj["state_opt_generated_chains"] = s.stateOptGeneratedChains;
+  obj["state_opt_generated_chain_regs"] = s.stateOptGeneratedChainRegs;
+  obj["state_opt_structural_chains"] = s.stateOptStructuralChains;
+  obj["state_opt_structural_chain_regs"] = s.stateOptStructuralChainRegs;
+  obj["state_opt_structural_only_chains"] = s.stateOptStructuralOnlyChains;
+  obj["state_opt_structural_only_chain_regs"] = s.stateOptStructuralOnlyChainRegs;
+  obj["state_opt_regs_merged"] = s.stateOptRegsMerged;
+  obj["state_opt_reg_bits_removed"] = s.stateOptRegBitsRemoved;
+  obj["state_opt_structural_chains_combined"] = s.stateOptStructuralChainsCombined;
+  obj["state_opt_structural_chain_regs_combined"] =
+      s.stateOptStructuralChainRegsCombined;
+  obj["state_opt_merge_rounds"] = s.stateOptMergeRounds;
+  obj["state_opt_cascade_regs_merged"] = s.stateOptCascadeRegsMerged;
+  obj["state_opt_pack_groups"] = s.stateOptPackGroups;
+  obj["state_opt_pack_reg_groups"] = s.stateOptPackRegGroups;
+  obj["state_opt_pack_delay_groups"] = s.stateOptPackDelayGroups;
+  obj["state_opt_packed_state_ops"] = s.stateOptPackedStateOps;
+  obj["state_opt_state_primitives_removed"] =
+      s.stateOptStatePrimitivesRemoved;
+  obj["state_opt_pack_bits"] = s.stateOptPackBits;
+  obj["state_opt_observability_attrs_stripped"] =
+      s.stateOptObservabilityAttrsStripped;
+  obj["state_opt_observation_aliases_removed"] =
+      s.stateOptObservationAliasesRemoved;
   obj["mem_count"] = s.memCount;
   obj["mem_bits"] = s.memBits;
   obj["logic_depth_limit"] = s.logicDepthLimit;
@@ -2033,11 +2449,14 @@ static LogicalResult writeCompileStatsJson(llvm::StringRef outPath, const Compil
   obj["wns"] = s.wns;
   obj["tns"] = s.tns;
   obj["fuse_comb_enabled"] = s.fuseCombEnabled;
+  return obj;
+}
 
+static LogicalResult writeCompileStatsJson(llvm::StringRef outPath, const CompileStatsSummary &s) {
   std::string buf;
   llvm::raw_string_ostream ss(buf);
   llvm::json::OStream j(ss, 2);
-  llvm::json::Value v(std::move(obj));
+  llvm::json::Value v(compileStatsToJson(s));
   j.value(v);
   ss << "\n";
   ss.flush();
@@ -2171,6 +2590,29 @@ int main(int argc, char **argv) {
     cppOnly = true;
   } else {
     llvm::errs() << "error: unknown --sim-mode: " << simMode << " (expected: default|cpp-only)\n";
+    return 1;
+  }
+
+  std::string stateDelayOptNorm = llvm::StringRef(stateDelayOpt).lower();
+  if (stateDelayOpt.getNumOccurrences() == 0 &&
+      combineDelayChains.getNumOccurrences() != 0 && combineDelayChains)
+    stateDelayOptNorm = "generated";
+  const bool enableStateDelayOptimization =
+      combineDelayChains && stateDelayOptNorm != "off";
+  std::string stateRetimeNorm = llvm::StringRef(stateRetimeOpt).lower();
+  if (stateRetimeNorm != "off" && stateRetimeNorm != "pipeline") {
+    llvm::errs() << "error: unknown --state-retime: " << stateRetimeOpt
+                 << " (expected: off|pipeline)\n";
+    return 1;
+  }
+  pyc::DelayChainMode stateDelayMode = pyc::DelayChainMode::Generated;
+  if (stateDelayOptNorm == "generated" || stateDelayOptNorm == "off") {
+    stateDelayMode = pyc::DelayChainMode::Generated;
+  } else if (stateDelayOptNorm == "structural") {
+    stateDelayMode = pyc::DelayChainMode::Structural;
+  } else {
+    llvm::errs() << "error: unknown --state-delay-opt: " << stateDelayOpt
+                 << " (expected: off|generated|structural)\n";
     return 1;
   }
 
@@ -2344,12 +2786,80 @@ int main(int argc, char **argv) {
     pm.addNestedPass<func::FuncOp>(pyc::createVectorUnrollPass());
   pm.addNestedPass<func::FuncOp>(pyc::createEliminateWiresPass());
   pm.addNestedPass<func::FuncOp>(pyc::createEliminateDeadStatePass());
+  // Stage 0 is diagnostics-only and runs for all policies, including off, so
+  // baselines retain visibility into missed optimization opportunities.
+  pm.addNestedPass<func::FuncOp>(pyc::createAnalyzeStateOptimizationPass());
+  pm.addNestedPass<func::FuncOp>(pyc::createAnalyzeRetimingPass());
+  if (enableStateDelayOptimization &&
+      stateDelayMode == pyc::DelayChainMode::Structural &&
+      !stateOptPreserveObservability) {
+    // Performance mode intentionally drops explicit state identity. Run this
+    // after Stage 0 so diagnostics still report the original observation pins.
+    pm.addNestedPass<func::FuncOp>(
+        pyc::createStripStateObservabilityPass());
+    pm.addNestedPass<func::FuncOp>(pyc::createEliminateDeadStatePass());
+  }
+  // Structural mode gives exact equivalent-state merging priority over
+  // retiming and direct chain formation. Generated compatibility mode keeps
+  // the original all-in-one behavior.
+  if (enableStateDelayOptimization)
+    pm.addNestedPass<func::FuncOp>(
+        pyc::createCombineDelayChainsPass(
+            stateDelayMode, /*accumulateStats=*/false,
+            /*cascadeRound=*/false,
+            /*preserveObservability=*/
+                stateDelayMode == pyc::DelayChainMode::Generated ||
+                    stateOptPreserveObservability,
+            /*mergeOnly=*/
+                stateDelayMode == pyc::DelayChainMode::Structural,
+            /*skipMerge=*/false));
+  if (enableStateDelayOptimization &&
+      stateDelayMode == pyc::DelayChainMode::Structural) {
+    // Stage 1.5: the first state merge can expose equivalent combinational
+    // cones. Canonicalize/CSE once, then run one bounded merge refinement.
+    pm.addPass(createCanonicalizerPass(canonicalizeCfg));
+    pm.addPass(createCSEPass());
+    pm.addNestedPass<func::FuncOp>(pyc::createCombineDelayChainsPass(
+        stateDelayMode, /*accumulateStats=*/true,
+        /*cascadeRound=*/true,
+        /*preserveObservability=*/stateOptPreserveObservability,
+        /*mergeOnly=*/true, /*skipMerge=*/false));
+    if (stateRetimeNorm == "pipeline") {
+      // Run retiming after the two low-risk merge/form rounds. This prevents
+      // a local retime from consuming a state that has a more profitable
+      // global equivalent-state or direct-chain rewrite.
+      const unsigned retimeCombDepth = std::min<unsigned>(
+          stateRetimeMaxCombDepth, logicDepthLimit);
+      pm.addNestedPass<func::FuncOp>(pyc::createRetimePipelinesPass(
+          stateRetimeMaxStages, stateRetimeMaxExtraCombOps,
+          retimeCombDepth, stateOptPreserveObservability,
+          /*accumulateStats=*/false));
+      pm.addNestedPass<func::FuncOp>(pyc::createEliminateDeadStatePass());
+    }
+    // Form ordinary direct chains only after retiming has selected the more
+    // general computed pipelines. Also share equivalent histories here.
+    pm.addNestedPass<func::FuncOp>(pyc::createCombineDelayChainsPass(
+        stateDelayMode, /*accumulateStats=*/true,
+        /*cascadeRound=*/false,
+        /*preserveObservability=*/stateOptPreserveObservability,
+        /*mergeOnly=*/false, /*skipMerge=*/true));
+    if (statePackWidth != 0)
+      pm.addNestedPass<func::FuncOp>(
+          pyc::createPackStateLanesPass(
+              statePackWidth, stateOptPreserveObservability));
+  }
   if (!unrollVector)
     pm.addNestedPass<func::FuncOp>(pyc::createSLPPackWiresPass());
   pm.addNestedPass<func::FuncOp>(pyc::createCombCanonicalizePass());
   pm.addPass(pyc::createCheckCombCyclesPass());
   pm.addPass(pyc::createCheckClockDomainsPass());
-  pm.addNestedPass<func::FuncOp>(pyc::createPackI1RegsPass());
+  // Performance mode lets the legacy run-based i1 packer collect lanes that
+  // the general dependency-aware packer leaves behind. The preservation mode
+  // skips it because that legacy pass does not retain observation metadata.
+  if (!(enableStateDelayOptimization &&
+        stateDelayMode == pyc::DelayChainMode::Structural &&
+        stateOptPreserveObservability))
+    pm.addNestedPass<func::FuncOp>(pyc::createPackI1RegsPass());
   const bool enableFuseComb = (!cppOnly) || !cppOnlyPreserveOps;
   if (enableFuseComb)
     pm.addNestedPass<func::FuncOp>(pyc::createFuseCombPass());
@@ -2362,7 +2872,8 @@ int main(int argc, char **argv) {
   pm.addNestedPass<func::FuncOp>(pyc::createCheckNoDynamicPass());
   pm.addPass(pyc::createCheckLogicDepthPass(logicDepthLimit));
   if (emitKind == "cpp")
-    pm.addPass(pyc::createCppPlacementPass(cppCombChunkNodes));
+    pm.addPass(
+        pyc::createCppPlacementPass(cppCombChunkNodes, traceCodegenPlanPath));
   pm.addNestedPass<func::FuncOp>(pyc::createCollectCompileStatsPass());
   const auto tPassStart = Clock::now();
   if (failed(pm.run(*module))) {
@@ -2398,6 +2909,26 @@ int main(int argc, char **argv) {
   }
 
   CompileStatsSummary compileStats = collectCompileStats(*module, static_cast<int64_t>(logicDepthLimit));
+  compileStats.stateOptimizationPolicy =
+      enableStateDelayOptimization
+          ? (stateDelayMode == pyc::DelayChainMode::Structural
+                 ? "structural"
+                 : "generated")
+          : "off";
+  compileStats.stateRetimePolicy =
+      enableStateDelayOptimization &&
+              stateDelayMode == pyc::DelayChainMode::Structural
+          ? stateRetimeNorm
+          : "off";
+  compileStats.stateOptPreserveObservability =
+      enableStateDelayOptimization &&
+      (stateDelayMode == pyc::DelayChainMode::Generated ||
+       stateOptPreserveObservability);
+  compileStats.stateOptPackWidth =
+      enableStateDelayOptimization &&
+              stateDelayMode == pyc::DelayChainMode::Structural
+          ? static_cast<int64_t>(statePackWidth)
+          : 0;
   compileStats.fuseCombEnabled = enableFuseComb;
   printCompileStats(compileStats);
 
@@ -2489,17 +3020,7 @@ int main(int argc, char **argv) {
     root["hierarchy"] = std::move(hierarchyObj);
     root["canonicalize_budget"] = static_cast<int64_t>(effectiveCanonicalizeBudget);
 
-    llvm::json::Object stats;
-    stats["reg_count"] = compileStats.regCount;
-    stats["reg_bits"] = compileStats.regBits;
-    stats["mem_count"] = compileStats.memCount;
-    stats["mem_bits"] = compileStats.memBits;
-    stats["logic_depth_limit"] = compileStats.logicDepthLimit;
-    stats["max_logic_depth"] = compileStats.maxLogicDepth;
-    stats["wns"] = compileStats.wns;
-    stats["tns"] = compileStats.tns;
-    stats["fuse_comb_enabled"] = compileStats.fuseCombEnabled;
-    root["compile_stats"] = std::move(stats);
+    root["compile_stats"] = compileStatsToJson(compileStats);
 
     if (passTimingCollector)
       root["passes"] = passTimingCollector->toJson();

@@ -158,8 +158,10 @@ struct PackI1RegsPass : public PassWrapper<PackI1RegsPass, OperationPass<func::F
     llvm::SmallVector<Value> bits;
     bits.reserve(n);
     for (unsigned i = 0; i < n; ++i) {
-      // Extract bit i (LSB = reg[0]).
-      auto ext = builder.create<pyc::ExtractOp>(loc, bitTy, packedReg.getQ(), builder.getI64IntegerAttr(i));
+      // Extract bit i (LSB = reg[0]). Width is 1, so msb == lsb == i.
+      auto ext = builder.create<pyc::ExtractOp>(
+          loc, bitTy, packedReg.getQ(), builder.getI64IntegerAttr(i),
+          builder.getI64IntegerAttr(i));
       bits.push_back(ext.getResult());
     }
 

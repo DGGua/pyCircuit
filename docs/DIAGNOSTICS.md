@@ -30,6 +30,15 @@ All frontend-emitted `.pyc` files are stamped with a required module attribute:
 
 If the backend sees a missing/mismatched contract marker, `pycc` fails early.
 
+## Multiple wire drivers
+
+`Circuit.assign` / `Reg.set` fold successive updates in the frontend: one
+`pyc.assign` per destination (`when=` accumulates a mux chain; plain
+`m.assign` last-write-wins). A leftover multi-`pyc.assign` on the same wire
+in IR is rejected by the C++ and Verilog emitters
+(`has multiple drivers for the same wire`). Remaining true multi-drive must
+use an explicit net (Decision 0137).
+
 ## Useful commands
 
 Run hygiene scan (from repository root):
@@ -62,4 +71,4 @@ diff /tmp/pir/*_before_*eliminate-wires*.mlir \
 
 See [mlir_pass_ir_dump.md](mlir_pass_ir_dump.md) for the full flag set
 (`--dump-pass-ir-phase`, `--dump-pass-ir-filter`, `--dump-pass-ir-max-lines`,
-`--dump-pass-ir=auto`).
+and `pycc`-only `--dump-pass-ir=auto`).

@@ -913,6 +913,13 @@ LogicalResult ExtractOp::verify() {
   if (static_cast<std::uint64_t>(lsb) + static_cast<std::uint64_t>(outTy.getWidth()) >
       static_cast<std::uint64_t>(inTy.getWidth()))
     return emitOpError("slice out of range for input type");
+  if (auto msbAttr = getMsbAttr()) {
+    std::int64_t msb = msbAttr.getInt();
+    std::int64_t expected = lsb + static_cast<std::int64_t>(outTy.getWidth()) - 1;
+    if (msb != expected)
+      return emitOpError("msb must equal lsb + result_width - 1 (expected ")
+             << expected << ", got " << msb << ")";
+  }
   return success();
 }
 
@@ -992,6 +999,40 @@ LogicalResult RegOp::verify() {
     return emitOpError("init type must match next type");
   if (getQ().getType() != nextTy)
     return emitOpError("result type must match next type");
+  return success();
+}
+
+LogicalResult DelayLineOp::verify() {
+  auto nextTy = getNext().getType();
+  if (getInit().getType() != nextTy)
+    return emitOpError("init type must match next type");
+  if (getQ().getType() != nextTy)
+    return emitOpError("result type must match next type");
+  auto depthAttr = (*this)->getAttrOfType<IntegerAttr>("depth");
+  if (!depthAttr)
+    return emitOpError("requires integer attribute `depth`");
+  if (depthAttr.getValue().getSExtValue() <= 1)
+    return emitOpError("depth must be > 1");
+  return success();
+}
+
+LogicalResult DelayTapOp::verify() {
+  auto line = getLine();
+  auto delay = line.getDefiningOp<DelayLineOp>();
+  if (!delay)
+    return emitOpError("line must be defined by pyc.delay_line");
+  auto depthAttr = delay->getAttrOfType<IntegerAttr>("depth");
+  if (!depthAttr)
+    return emitOpError("line delay_line is missing integer attribute `depth`");
+  auto tapAttr = (*this)->getAttrOfType<IntegerAttr>("depth");
+  if (!tapAttr)
+    return emitOpError("requires integer attribute `depth`");
+  int64_t tapDepth = tapAttr.getInt();
+  int64_t lineDepth = depthAttr.getInt();
+  if (tapDepth <= 0)
+    return emitOpError("tap depth must be > 0");
+  if (tapDepth > lineDepth)
+    return emitOpError("tap depth must not exceed delay_line depth");
   return success();
 }
 

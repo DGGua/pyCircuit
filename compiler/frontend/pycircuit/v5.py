@@ -209,11 +209,13 @@ class CycleAwareDomain:
     def signal(
         self,
         *,
-        width: int,
+        width: int | None = None,
         reset_value: int | list[Any] = 0,
         name: str = "",
         shape: list[int] | None = None,
-    ) -> "ForwardSignal":
+        fields: Any | None = None,
+        enum: Any | None = None,
+    ) -> "ForwardSignal | Any":
         """Declare a forward-declared register with ``<<=`` / ``.assign()`` syntax.
 
         Returns a :class:`ForwardSignal` whose Q output is immediately usable
@@ -223,9 +225,47 @@ class CycleAwareDomain:
             sig.assign(next_val, when=cond)  # conditional
 
         This is sugar over :meth:`state` with a more ergonomic write syntax.
+
+        Passing ``fields=`` (a ``BitfieldSpec`` or a plain ``{name: (msb, lsb)}``
+        mapping) binds the layout and returns a ``BitfieldSignal`` supporting
+        ``x["field"]`` / ``x.field`` access plus ``x <<= ...``; when ``width`` is
+        omitted it is taken from the spec (required for a plain mapping). Passing
+        ``enum=`` (a ``PycEnum`` subclass) sizes the register to the enum width
+        and returns an ``EnumSignal`` supporting ``x.is_(E.MEMBER)`` and
+        ``x <<= E.MEMBER``.
         """
+        if enum is not None:
+            if fields is not None or shape is not None:
+                raise TypeError("signal(enum=...) cannot be combined with fields=/shape=")
+            from .enums import EnumSignal, coerce_enum_cls, enum_width
+
+            enum = coerce_enum_cls(enum)
+            ew = enum_width(enum)
+            if width is None:
+                width = ew
+            elif int(width) != ew:
+                raise ValueError(
+                    f"signal width {width} does not match enum {enum.__name__} width {ew}"
+                )
+            st = self._state(width=width, reset_value=reset_value, name=name)
+            return EnumSignal(enum, ForwardSignal(st))
+        if fields is not None:
+            if shape is not None:
+                raise TypeError("signal(fields=...) cannot be combined with shape=")
+            from .bitfield import coerce_bitfield_spec
+
+            fields = coerce_bitfield_spec(fields, width=width)
+            if width is None:
+                width = int(fields.width)
+            elif int(width) != int(fields.width):
+                raise ValueError(
+                    f"signal width {width} does not match BitfieldSpec width {fields.width}"
+                )
+        if width is None:
+            raise TypeError("signal() requires width= (or fields=)")
         st = self._state(width=width, reset_value=reset_value, name=name, shape=shape)
-        return ForwardSignal(st)
+        fwd = ForwardSignal(st)
+        return fields.bind(fwd) if fields is not None else fwd
 
     def call(
         self,
@@ -363,12 +403,15 @@ class CycleAwareDomain:
             self._delay_serial += 1
             nm = f"_v5_bal_{self._delay_serial}"
             shape = w.ty.shape() if isinstance(w.ty, Vector) else []
+            # This ownership marker lets MLIR optimize compiler-inserted state
+            # without guessing from the private `_v5_bal_*` spelling.
             r = self._m.out(
                 self._m.scoped_name(nm),
                 domain=self._cd,
                 width=w.width if width is None else int(width),
                 shape=shape,
                 init=0,
+                generated="cycle_balance",
             )
             r.set(cur)
             cur = Wire(self._m, r.q.sig, signed=cur.signed)
@@ -657,17 +700,35 @@ class StateSignal(Generic[DT]):
 
     def set(
         self,
-        next_val: "Wire | Reg | CycleAwareSignal | StateSignal",
+        next_val: "Wire | Reg | CycleAwareSignal | StateSignal | int | LiteralValue",
         *,
         when: "Wire | Reg | CycleAwareSignal | StateSignal | None" = None,
     ) -> None:
-        """Connect the D input of the register (close the feedback loop)."""
+        """Connect the D input of the register (close the feedback loop).
+
+        A plain Python ``int`` / ``LiteralValue`` is loaded as a constant of the
+        register's declared width (``reg <<= 0b1010``).
+        """
+        next_val = self._coerce_next(next_val)
         w = _to_wire(next_val)
         wh = _to_wire(when) if when is not None else None
         if wh is not None:
             self._reg.set(w, when=wh)
         else:
             self._reg.set(w)
+
+    def _coerce_next(self, next_val: object) -> object:
+        """Turn a plain ``int``/``LiteralValue`` into a const of the reg width."""
+        width = self._cas._w.width
+        m = self._domain._m
+        if isinstance(next_val, bool):
+            return m.const(int(next_val), width=width)
+        if isinstance(next_val, int):
+            return m.const(int(next_val), width=width)
+        if isinstance(next_val, LiteralValue):
+            lit_w = int(next_val.width) if next_val.width is not None else width
+            return m.const(int(next_val.value), width=lit_w)
+        return next_val
 
     @property
     def cycle(self) -> int:
@@ -979,6 +1040,9 @@ class ForwardSignal(Generic[DT]):
 
 
 def _to_wire(v: "Wire | Reg | CycleAwareSignal | StateSignal | ForwardSignal") -> Wire:
+    _unwrap = getattr(v, "__pyc_unwrap__", None)
+    if callable(_unwrap):
+        v = _unwrap()
     if isinstance(v, ForwardSignal):
         return v._state._cas._w
     if isinstance(v, StateSignal):
@@ -1056,6 +1120,9 @@ def wire_of(
     ``CycleAwareSignal`` / ``ForwardSignal`` / ``StateSignal``.
     Direct ``.wire`` access is removed from the public API.
     """
+    _unwrap = getattr(sig, "__pyc_unwrap__", None)
+    if callable(_unwrap):
+        sig = _unwrap()
     if isinstance(sig, ForwardSignal):
         return sig._state._cas._w
     if isinstance(sig, StateSignal):
@@ -1348,24 +1415,44 @@ class CycleAwareSignal(Generic[DT]):
         return self.__ge__(other)
 
     def ult(self, other: object) -> "CycleAwareSignal":
+        """Unsigned less-than (explicit signedness; result is i1, same cycle)."""
         a, b, c = self._align(other)  # type: ignore[arg-type]
         return CycleAwareSignal(self._domain, a.ult(b), c)
 
     def ugt(self, other: object) -> "CycleAwareSignal":
+        """Unsigned greater-than (explicit signedness; result is i1)."""
         a, b, c = self._align(other)  # type: ignore[arg-type]
         return CycleAwareSignal(self._domain, a.ugt(b), c)
 
     def ule(self, other: object) -> "CycleAwareSignal":
+        """Unsigned less-than-or-equal (explicit signedness; result is i1)."""
         a, b, c = self._align(other)  # type: ignore[arg-type]
         return CycleAwareSignal(self._domain, a.ule(b), c)
 
     def uge(self, other: object) -> "CycleAwareSignal":
+        """Unsigned greater-than-or-equal (explicit signedness; result is i1)."""
         a, b, c = self._align(other)  # type: ignore[arg-type]
         return CycleAwareSignal(self._domain, a.uge(b), c)
 
     def slt(self, other: object) -> "CycleAwareSignal":
+        """Signed less-than (explicit signedness; result is i1)."""
         a, b, c = self._align(other)  # type: ignore[arg-type]
         return CycleAwareSignal(self._domain, a.slt(b), c)
+
+    def sgt(self, other: object) -> "CycleAwareSignal":
+        """Signed greater-than (explicit signedness; result is i1)."""
+        a, b, c = self._align(other)  # type: ignore[arg-type]
+        return CycleAwareSignal(self._domain, a.sgt(b), c)
+
+    def sle(self, other: object) -> "CycleAwareSignal":
+        """Signed less-than-or-equal (explicit signedness; result is i1)."""
+        a, b, c = self._align(other)  # type: ignore[arg-type]
+        return CycleAwareSignal(self._domain, a.sle(b), c)
+
+    def sge(self, other: object) -> "CycleAwareSignal":
+        """Signed greater-than-or-equal (explicit signedness; result is i1)."""
+        a, b, c = self._align(other)  # type: ignore[arg-type]
+        return CycleAwareSignal(self._domain, a.sge(b), c)
 
     def __lshift__(self, amount: object) -> "CycleAwareSignal":
         if isinstance(amount, int):
@@ -1427,6 +1514,10 @@ class CycleAwareSignal(Generic[DT]):
     def extract(self, *, lsb: int, width: int) -> "CycleAwareSignal":
         """Extract a scalar bit range or the corresponding range per Vector lane."""
         return self.slice(lsb=lsb, width=width)
+
+    def lane(self, idx: int, *, width: int) -> "CycleAwareSignal":
+        """ASL scaled slice ``x[idx *: width]`` — element-granular (keeps cycle)."""
+        return CycleAwareSignal(self._domain, self._w.lane(int(idx), width=int(width)), self._cycle)
 
     def select(self, true_val: object, false_val: object) -> "CycleAwareSignal":
         return mux(self, true_val, false_val)
@@ -1549,7 +1640,87 @@ class CycleAwareSignal(Generic[DT]):
     def as_unsigned(self) -> "CycleAwareSignal":
         return CycleAwareSignal(self._domain, Wire(self._domain._m, self._w.sig, signed=False), self._cycle)
 
-    def __getitem__(self, idx: int | slice) -> "CycleAwareSignal":
+    def matches(self, pattern: str) -> "CycleAwareSignal":
+        """ASL-style bit-mask match: ``(self & mask) == value`` (i1, same cycle)."""
+        from .bitmask import parse_bitmask_checked
+
+        mask, value = parse_bitmask_checked(pattern, width=self._w.width)
+        return (self & mask) == value
+
+    def in_(self, *patterns: "str | Iterable[str]") -> "CycleAwareSignal":
+        """True iff any pattern matches (OR-reduction of :meth:`matches`).
+
+        Accepts varargs (``in_("1010", "1100")``) or a single iterable
+        (``in_(["1010", "1100"])``).
+        """
+        from .bitmask import normalize_patterns
+
+        pats = normalize_patterns(patterns)
+        result = self.matches(pats[0])
+        for p in pats[1:]:
+            result = result | self.matches(p)
+        return result
+
+    def not_in_(self, *patterns: "str | Iterable[str]") -> "CycleAwareSignal":
+        """True iff no pattern matches (ASL ``IN !{...}``)."""
+        return ~self.in_(*patterns)
+
+    def as_(
+        self,
+        *args: "int | Iterable[int]",
+        width: int | None = None,
+        range: tuple[int, int] | None = None,
+        values: "Iterable[int] | None" = None,
+        msg: str | None = None,
+    ) -> "CycleAwareSignal":
+        """ASL ``expression as ty`` — checked cast (preserves cycle). Exactly one
+        of positional value(s) / ``values=[...]`` (value assertion, returns self),
+        ``width=`` (narrowing + trunc), or ``range=(lo, hi)``. See :meth:`Wire.as_`.
+        """
+        from .hw import _normalize_as_values
+
+        val_set = _normalize_as_values(args, values)
+        given = [n for n, v in (("width", width), ("range", range), ("values", val_set)) if v is not None]
+        if len(given) != 1:
+            raise TypeError(
+                "as_ requires exactly one of: positional value(s)/values=, width=, or range="
+            )
+        if val_set is not None:
+            return self.assert_in(val_set, msg=msg)
+        if width is not None:
+            w = int(width)
+            if w <= 0:
+                raise ValueError("as_(width=) must be > 0")
+            if w > self._w.width:
+                raise ValueError(
+                    f"as_(width={w}) cannot widen a {self._w.width}-bit value; use zext/sext"
+                )
+            if w == self._w.width:
+                return self
+            high = self._w[w:self._w.width]
+            cond = high == 0
+            self._domain._m.assert_(cond, msg=msg or f"as_: value does not fit in {w} bits")
+            return CycleAwareSignal(self._domain, self._w.trunc(width=w), self._cycle)
+        lo, hi = range  # type: ignore[misc]
+        return self.assert_range(lo, hi, msg=msg)
+
+    def assert_fits(self, *, width: int, msg: str | None = None) -> "CycleAwareSignal":
+        """Alias for ``as_(width=..)``."""
+        return self.as_(width=width, msg=msg)
+
+    def assert_range(self, lo: int, hi: int, *, msg: str | None = None) -> "CycleAwareSignal":
+        """Assert (unsigned) ``lo <= self <= hi``; returns self (cycle kept)."""
+        self._w.assert_range(int(lo), int(hi), msg=msg)
+        return self
+
+    def assert_in(self, values: "Iterable[int]", *, msg: str | None = None) -> "CycleAwareSignal":
+        """Assert ``self`` equals one of ``values``; returns self (cycle kept)."""
+        self._w.assert_in(values, msg=msg)
+        return self
+
+    def __getitem__(self, idx: int | slice | tuple) -> "CycleAwareSignal":
+        # tuple ``x[i, w]`` is ASL scaled-slice sugar for ``x.lane(i, width=w)``;
+        # delegated to the underlying Wire, keeping the cycle tag.
         return CycleAwareSignal(self._domain, self._w[idx], self._cycle)
 
 
@@ -2209,5 +2380,3 @@ def _pack_lanes(leaf_w: int, lanes: list[int]) -> int:
     for i, x in enumerate(lanes):
         v |= (int(x) & mask) << (i * leaf_w)
     return v
-
-
