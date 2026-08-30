@@ -1,6 +1,7 @@
 #include "pyc/Dialect/PYC/PYCDialect.h"
 #include "pyc/Dialect/PYC/PYCOps.h"
 #include "pyc/Emit/CppEmitter.h"
+#include "pyc/Emit/RustEmitter.h"
 #include "pyc/Emit/VerilogEmitter.h"
 #include "pyc/Support/PassIRDumper.h"
 #include "pyc/Transforms/Passes.h"
@@ -104,7 +105,7 @@ static llvm::cl::opt<std::string> inputFilename(llvm::cl::Positional, llvm::cl::
 
 static llvm::cl::opt<std::string> outputFilename("o", llvm::cl::desc("Output file"), llvm::cl::init("-"));
 
-static llvm::cl::opt<std::string> emitKind("emit", llvm::cl::desc("Emission target: verilog|cpp|none"),
+static llvm::cl::opt<std::string> emitKind("emit", llvm::cl::desc("Emission target: verilog|cpp|rust|none"),
                                            llvm::cl::init("verilog"));
 
 static llvm::cl::opt<std::string> directCppOut(
@@ -115,6 +116,11 @@ static llvm::cl::opt<std::string> directCppOut(
 static llvm::cl::opt<std::string> directVerilogOut(
     "verilog",
     llvm::cl::desc("Direct Verilog output path (equivalent to --emit=verilog -o <path>)"),
+    llvm::cl::init(""));
+
+static llvm::cl::opt<std::string> directRustOut(
+    "rust",
+    llvm::cl::desc("Direct Rust output path (equivalent to --emit=rust -o <path>)"),
     llvm::cl::init(""));
 
 static llvm::cl::opt<std::string> cppSplitMode(
@@ -1024,6 +1030,49 @@ static std::optional<std::string> findPrimitivesDir(const char *argv0) {
   return std::nullopt;
 }
 
+static std::optional<std::string> findRustRuntimeDir(const char *argv0) {
+  if (const char *env = std::getenv("PYC_RUST_RUNTIME_DIR")) {
+    llvm::SmallString<256> cand(env);
+    llvm::sys::path::append(cand, "Cargo.toml");
+    if (llvm::sys::fs::exists(cand))
+      return std::string(env);
+  }
+
+  auto tryDir = [&](llvm::SmallString<256> dir) -> std::optional<std::string> {
+    llvm::SmallString<256> probe(dir);
+    llvm::sys::path::append(probe, "Cargo.toml");
+    if (llvm::sys::fs::exists(probe))
+      return dir.str().str();
+    return std::nullopt;
+  };
+
+  auto tryRoot = [&](llvm::StringRef root) -> std::optional<std::string> {
+    llvm::SmallString<256> dir(root);
+    llvm::sys::path::append(dir, "runtime", "rust");
+    return tryDir(dir);
+  };
+
+  llvm::SmallString<256> cwd;
+  if (!llvm::sys::fs::current_path(cwd)) {
+    if (auto d = tryRoot(cwd))
+      return d;
+  }
+
+  llvm::SmallString<256> exe(argv0 ? argv0 : "");
+  if (!exe.empty()) {
+    llvm::SmallString<256> rp;
+    if (!llvm::sys::fs::real_path(exe, rp)) {
+      llvm::SmallString<256> cur = llvm::sys::path::parent_path(rp);
+      for (unsigned i = 0; i < 6 && !cur.empty(); ++i) {
+        if (auto d = tryRoot(cur))
+          return d;
+        cur = llvm::sys::path::parent_path(cur);
+      }
+    }
+  }
+  return std::nullopt;
+}
+
 static const char *runtimeLibBasename() {
 #if defined(_WIN32)
   return "pyc4_runtime.lib";
@@ -1113,7 +1162,8 @@ static LogicalResult emitPrimitivesFile(llvm::StringRef outPath, llvm::StringRef
 
 static LogicalResult updateManifest(llvm::StringRef outDirPath, llvm::StringRef top,
                                    std::optional<llvm::json::Array> verilogMods,
-                                   std::optional<llvm::json::Array> cppMods) {
+                                   std::optional<llvm::json::Array> cppMods,
+                                   std::optional<llvm::json::Array> rustMods = std::nullopt) {
   llvm::SmallString<256> path(outDirPath);
   llvm::sys::path::append(path, "manifest.json");
 
@@ -1132,10 +1182,14 @@ static LogicalResult updateManifest(llvm::StringRef outDirPath, llvm::StringRef 
     manifest["verilog_modules"] = llvm::json::Array();
   if (!manifest.get("cpp_modules"))
     manifest["cpp_modules"] = llvm::json::Array();
+  if (!manifest.get("rust_modules"))
+    manifest["rust_modules"] = llvm::json::Array();
   if (verilogMods)
     manifest["verilog_modules"] = std::move(*verilogMods);
   if (cppMods)
     manifest["cpp_modules"] = std::move(*cppMods);
+  if (rustMods)
+    manifest["rust_modules"] = std::move(*rustMods);
 
   std::string buf;
   llvm::raw_string_ostream ss(buf);
@@ -2067,8 +2121,10 @@ int main(int argc, char **argv) {
 
   const bool hasDirectCpp = !directCppOut.empty();
   const bool hasDirectVerilog = !directVerilogOut.empty();
-  if (hasDirectCpp && hasDirectVerilog) {
-    llvm::errs() << "error: `-cpp` and `-verilog` are mutually exclusive\n";
+  const bool hasDirectRust = !directRustOut.empty();
+  const int directCount = int(hasDirectCpp) + int(hasDirectVerilog) + int(hasDirectRust);
+  if (directCount > 1) {
+    llvm::errs() << "error: `-cpp`, `-verilog`, and `-rust` are mutually exclusive\n";
     return 1;
   }
   if (hasDirectCpp) {
@@ -2079,11 +2135,15 @@ int main(int argc, char **argv) {
     emitKind = "verilog";
     outputFilename = std::string(directVerilogOut);
   }
-  if ((hasDirectCpp || hasDirectVerilog) && !outDir.empty()) {
-    llvm::errs() << "error: direct output mode (-cpp/-verilog) cannot be combined with --out-dir\n";
+  if (hasDirectRust) {
+    emitKind = "rust";
+    outputFilename = std::string(directRustOut);
+  }
+  if ((hasDirectCpp || hasDirectVerilog || hasDirectRust) && !outDir.empty()) {
+    llvm::errs() << "error: direct output mode (-cpp/-verilog/-rust) cannot be combined with --out-dir\n";
     return 1;
   }
-  if ((hasDirectCpp || hasDirectVerilog) && outputFilename.empty()) {
+  if ((hasDirectCpp || hasDirectVerilog || hasDirectRust) && outputFilename.empty()) {
     llvm::errs() << "error: direct output mode requires a non-empty output path\n";
     return 1;
   }
@@ -2933,6 +2993,87 @@ int main(int argc, char **argv) {
       return 0;
     }
 
+    if (emitKind == "rust") {
+      llvm::json::Array rustFiles;
+      llvm::SmallVector<std::string> rustMods;
+      for (auto f : module->getOps<func::FuncOp>()) {
+        if (f.isDeclaration())
+          continue;
+        std::string fname = (f.getSymName() + ".rs").str();
+        llvm::SmallString<256> path(outDir);
+        llvm::sys::path::append(path, fname);
+        std::error_code fe;
+        llvm::raw_fd_ostream os(path, fe, llvm::sys::fs::OF_Text);
+        if (fe) {
+          llvm::errs() << "error: cannot open " << path << ": " << fe.message() << "\n";
+          return 1;
+        }
+        if (failed(pyc::emitRustFunc(*module, f, os)))
+          return 1;
+        rustFiles.push_back(fname);
+        rustMods.push_back(f.getSymName().str());
+      }
+
+      std::string libRs;
+      llvm::raw_string_ostream lss(libRs);
+      lss << "// pyCircuit Rust emission crate root (v1 subset)\n";
+      lss << "pub use pyc_runtime::*;\n\n";
+      for (const auto &modName : rustMods) {
+        std::string rustIdent = modName;
+        for (char &c : rustIdent)
+          if (!( (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_'))
+            c = '_';
+        lss << "#[path = \"" << modName << ".rs\"]\n";
+        lss << "pub mod " << rustIdent << ";\n";
+        lss << "pub use " << rustIdent << "::*;\n";
+      }
+      lss.flush();
+      llvm::SmallString<256> libPath(outDir);
+      llvm::sys::path::append(libPath, "lib.rs");
+      if (failed(writeFile(libPath, libRs)))
+        return 1;
+
+      auto rustRt = findRustRuntimeDir(argv[0]);
+      if (!rustRt) {
+        llvm::errs() << "error: cannot locate runtime/rust; set PYC_RUST_RUNTIME_DIR\n";
+        return 1;
+      }
+      llvm::SmallString<256> rustRtAbs(*rustRt);
+      if (std::error_code ec = llvm::sys::fs::make_absolute(rustRtAbs)) {
+        llvm::errs() << "error: cannot resolve runtime/rust path: " << ec.message() << "\n";
+        return 1;
+      }
+      std::string cargo;
+      llvm::raw_string_ostream css(cargo);
+      css << "[package]\n";
+      css << "name = \"pyc_gen\"\n";
+      css << "version = \"0.1.0\"\n";
+      css << "edition = \"2021\"\n";
+      css << "publish = false\n\n";
+      css << "[lib]\n";
+      css << "path = \"lib.rs\"\n\n";
+      css << "[dependencies]\n";
+      css << "pyc_runtime = { path = \"" << rustRtAbs.c_str() << "\" }\n";
+      css.flush();
+      llvm::SmallString<256> cargoPath(outDir);
+      llvm::sys::path::append(cargoPath, "Cargo.toml");
+      if (failed(writeFile(cargoPath, cargo)))
+        return 1;
+
+      if (failed(updateManifest(outDir, top, /*verilogMods=*/std::nullopt, /*cppMods=*/std::nullopt,
+                                std::move(rustFiles))))
+        return 1;
+
+      llvm::SmallString<256> statsPath(outDir);
+      llvm::sys::path::append(statsPath, "compile_stats.json");
+      if (failed(writeCompileStatsJson(statsPath, compileStats)))
+        return 1;
+      emitMs = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - tEmitStart).count());
+      if (failed(writeProfileArtifact("out-dir:rust")))
+        return 1;
+      return 0;
+    }
+
     llvm::errs() << "error: unknown --emit kind: " << emitKind << "\n";
     return 1;
   }
@@ -2975,6 +3116,16 @@ int main(int argc, char **argv) {
       return 1;
     emitMs = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - tEmitStart).count());
     if (failed(writeProfileArtifact("single:cpp")))
+      return 1;
+    return 0;
+  }
+  if (emitKind == "rust") {
+    if (failed(pyc::emitRust(*module, os)))
+      return 1;
+    if (failed(writeSingleOutputStats()))
+      return 1;
+    emitMs = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - tEmitStart).count());
+    if (failed(writeProfileArtifact("single:rust")))
       return 1;
     return 0;
   }
