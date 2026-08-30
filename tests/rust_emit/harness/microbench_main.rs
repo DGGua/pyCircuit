@@ -1,10 +1,10 @@
 fn full_cycle(dut: &mut Microbench) {
-    dut.clk = Wire::<1>::new(1);
+    dut.clk = true;
     dut.eval();
     dut.tick();
     dut.transfer();
     dut.eval();
-    dut.clk = Wire::<1>::new(0);
+    dut.clk = false;
     dut.eval();
     dut.tick();
     dut.transfer();
@@ -13,32 +13,32 @@ fn full_cycle(dut: &mut Microbench) {
 
 fn run_functional() {
     let mut dut = Microbench::new();
-    dut.rst = Wire::<1>::new(1);
-    dut.clk = Wire::<1>::new(0);
-    dut.sel = Wire::<1>::new(1);
-    dut.addend = Wire::<16>::new(1);
+    dut.rst = true;
+    dut.clk = false;
+    dut.sel = true;
+    dut.addend = 1;
     dut.eval();
     for _ in 0..2 {
         full_cycle(&mut dut);
     }
-    dut.rst = Wire::<1>::new(0);
+    dut.rst = false;
     for _ in 0..8 {
         full_cycle(&mut dut);
     }
-    println!("acc_out={}", dut.acc_out.value());
+    println!("acc_out={}", dut.acc_out);
 }
 
 fn run_perf(cycles: u64) {
     let mut dut = Microbench::new();
-    dut.rst = Wire::<1>::new(0);
-    dut.sel = Wire::<1>::new(1);
-    dut.addend = Wire::<16>::new(1);
-    dut.clk = Wire::<1>::new(0);
+    dut.rst = false;
+    dut.sel = true;
+    dut.addend = 1;
+    dut.clk = false;
     dut.eval();
     let start = std::time::Instant::now();
     for _ in 0..cycles {
         full_cycle(&mut dut);
-        std::hint::black_box(dut.acc_out.value());
+        std::hint::black_box(dut.acc_out);
     }
     let secs = start.elapsed().as_secs_f64();
     let hz = if secs > 0.0 { (cycles as f64) / secs } else { 0.0 };

@@ -35,6 +35,10 @@ def test_emit_rust_contains_sim_api(tmp_path: Path, pycc: Path) -> None:
     assert "pub fn eval(" in text
     assert "pub fn tick(" in text
     assert "pub fn transfer(" in text
+    assert "Wire<" not in text
+    assert "clk: bool" in text
+    assert "count: u8" in text
+    assert "wrapping_add" in text
     out_dir = tmp_path / "rust_out"
     run_cmd(
         [str(pycc), str(pyc), "--emit=rust", "--out-dir", str(out_dir), "--logic-depth=256"],

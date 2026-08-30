@@ -1,21 +1,21 @@
 fn run_functional() {
     let mut dut = Arith::new();
-    dut.a = Wire::<19>::new(3);
-    dut.b = Wire::<19>::new(4);
+    dut.a = 3;
+    dut.b = 4;
     dut.eval();
-    assert_eq!(dut.sum.value(), 7, "arith sum mismatch");
+    assert_eq!(dut.sum, 7, "arith sum mismatch");
 }
 
 fn run_perf(cycles: u64) {
     let mut dut = Arith::new();
-    dut.a = Wire::<19>::new(1);
-    dut.b = Wire::<19>::new(2);
+    dut.a = 1;
+    dut.b = 2;
     let start = std::time::Instant::now();
     for i in 0..cycles {
-        dut.a = Wire::<19>::new(i);
-        dut.b = Wire::<19>::new(i.wrapping_mul(3));
+        dut.a = (i as u32) & 0x7ffff;
+        dut.b = (i as u32).wrapping_mul(3) & 0x7ffff;
         dut.eval();
-        std::hint::black_box(dut.sum.value());
+        std::hint::black_box(dut.sum);
     }
     let secs = start.elapsed().as_secs_f64();
     let hz = if secs > 0.0 { (cycles as f64) / secs } else { 0.0 };

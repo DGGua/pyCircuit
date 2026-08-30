@@ -1,10 +1,10 @@
 fn full_cycle(dut: &mut Counter) {
-    dut.clk = Wire::<1>::new(1);
+    dut.clk = true;
     dut.eval();
     dut.tick();
     dut.transfer();
     dut.eval();
-    dut.clk = Wire::<1>::new(0);
+    dut.clk = false;
     dut.eval();
     dut.tick();
     dut.transfer();
@@ -13,19 +13,19 @@ fn full_cycle(dut: &mut Counter) {
 
 fn run_functional() {
     let mut dut = Counter::new();
-    dut.enable = Wire::<1>::new(0);
-    dut.rst = Wire::<1>::new(1);
-    dut.clk = Wire::<1>::new(0);
+    dut.enable = false;
+    dut.rst = true;
+    dut.clk = false;
     dut.eval();
     for _ in 0..2 {
         full_cycle(&mut dut);
     }
-    dut.rst = Wire::<1>::new(0);
+    dut.rst = false;
     full_cycle(&mut dut);
-    dut.enable = Wire::<1>::new(1);
+    dut.enable = true;
     for expect in 1u64..=5 {
         full_cycle(&mut dut);
-        let got = dut.count.value();
+        let got = dut.count as u64;
         println!("count={got}");
         assert_eq!(got, expect, "counter functional mismatch");
     }
@@ -33,14 +33,14 @@ fn run_functional() {
 
 fn run_perf(cycles: u64) {
     let mut dut = Counter::new();
-    dut.enable = Wire::<1>::new(1);
-    dut.rst = Wire::<1>::new(0);
-    dut.clk = Wire::<1>::new(0);
+    dut.enable = true;
+    dut.rst = false;
+    dut.clk = false;
     dut.eval();
     let start = std::time::Instant::now();
     for _ in 0..cycles {
         full_cycle(&mut dut);
-        std::hint::black_box(dut.count.value());
+        std::hint::black_box(dut.count);
     }
     let secs = start.elapsed().as_secs_f64();
     let hz = if secs > 0.0 { (cycles as f64) / secs } else { 0.0 };
