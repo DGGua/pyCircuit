@@ -85,9 +85,10 @@ pyCircuit/
 │       ├── include/pyc/Dialect/PYC/PYCOps.td    # 方言定义
 │       ├── lib/Dialect/PYC/       # op 实现
 │       ├── lib/Transforms/        # 全部 pass
-│       ├── lib/Emit/              # VerilogEmitter / CppEmitter
+│       ├── lib/Emit/              # VerilogEmitter / CppEmitter / RustEmitter（实验性子集）
 │       └── tools/                 # pycc / pyc-opt
 ├── runtime/cpp/                   # C++ 仿真运行时头文件库
+├── runtime/rust/                  # Rust 仿真运行时（v1 子集：Wire 1..=64 + PycReg）
 ├── designs/                       # 示例与设计（examples/BypassUnit/IssueQueue…）
 ├── tests/                         # pytest（vec 算子框架、sidecar 单测等）
 ├── flows/scripts/                 # pyc build、run_examples 等脚本
@@ -329,6 +330,10 @@ endmodule
 ### 规模控制
 
 大模块（davinci 级）单文件会失控，发射器按 `--cpp-split=module` + 行数/字节/AST 节点阈值把 eval/tick/comb 分片为多个 `.cpp`，并输出 `cpp_compile_manifest.json`（源列表、include 路径、`libpyc4_runtime.a`、确定性哈希）供上层并行编译。
+
+### 实验性 Rust 发射器（v1 子集）
+
+文件：`compiler/mlir/lib/Emit/RustEmitter.cpp`；运行时 `runtime/rust/`。`pycc --emit=rust` 消费与 C++ 同一份过 gate 的 IR，生成带 `eval`/`tick`/`transfer` 的模块 `struct`。首版只支持标量宽度 1..=64、`pyc.reg` 与 `pyc.instance`；向量、mem/FIFO、Probe/VCD 会报错。不接入 `pycircuit.cli build --target`。对照脚本：`flows/tools/perf/run_rust_vs_cpp.py`。
 
 ---
 
