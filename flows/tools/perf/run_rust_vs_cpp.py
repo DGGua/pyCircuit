@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Compare generated C++ vs Rust functional-sim performance (v1 subset).
 
-Uses the same .pyc, the same step protocol, and -O2 / opt-level=2. This is a
+Uses the same .pyc, the same step protocol, and -O2 / opt-level=3. This is a
 naive full-eval comparison; production C++ still has extra caches/SCC/PGO.
 """
 
@@ -145,7 +145,7 @@ def main() -> int:
     out = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "pycc": str(pycc),
-        "opt": {"cxx": "-O2", "rustc": "-C opt-level=2"},
+        "opt": {"cxx": "-O2", "rustc": "-C opt-level=3"},
         "note": "Naive full-eval comparison. Production C++ may use caches/SCC/PGO/-Os.",
         "designs": rows,
     }
