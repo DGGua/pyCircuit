@@ -153,7 +153,7 @@ def compile_cpp_harness(harness_cpp: Path, dut_cpp: Path, exe: Path) -> Path:
     cmd = [
         "g++",
         "-std=c++17",
-        "-O2",
+        "-O3",
         f"-I{REPO_ROOT / 'runtime'}",
         f"-include",
         str(dut_cpp),
