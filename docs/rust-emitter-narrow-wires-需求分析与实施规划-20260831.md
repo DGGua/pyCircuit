@@ -86,6 +86,8 @@ python3 flows/tools/perf/run_rust_vs_cpp.py --repeats 3
 - counter / arith 的 Rust Hz 仍不可当作 ISA 对比。
 - Rust 二进制仍约 4.5 MB（链 `std`）；C++ 约 19 KB。
 
+后续（同日）：对照 `rustc` 改为 `-C opt-level=3`，见 `docs/rust-emitter-opt-level3-需求分析与实施规划-20260831.md`。microbench Rust 中位 1.45e7 → 1.48e7，几乎不变。
+
 ## 实施步骤
 
 1. 落盘本文。
