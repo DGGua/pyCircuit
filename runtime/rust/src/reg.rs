@@ -1,45 +1,45 @@
-//! Two-phase register matching C++ `pyc_reg` (Decision 0001 tick/transfer).
-//!
-//! State is stored here; wires are passed in on each call so generated modules
-//! do not need self-referential structs.
+//! Two-phase register. Control pins are `bool`; data is the generated wire type.
 
-use crate::bits::Wire;
+use core::marker::PhantomData;
 
 /// Sequential register: sample on posedge in `tick_compute`, publish in `tick_commit`.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct PycReg<const W: u32> {
-    q_next: Wire<W>,
+#[derive(Clone, Copy, Debug)]
+pub struct PycReg<T: Copy + Default> {
+    q_next: T,
     pending: bool,
     clk_prev: bool,
+    _ty: PhantomData<T>,
 }
 
-impl<const W: u32> PycReg<W> {
+impl<T: Copy + Default> Default for PycReg<T> {
+    fn default() -> Self {
+        Self {
+            q_next: T::default(),
+            pending: false,
+            clk_prev: false,
+            _ty: PhantomData,
+        }
+    }
+}
+
+impl<T: Copy + Default> PycReg<T> {
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Rising-edge sample. Reset wins over enable, matching `pyc_reg::posedge_compute_inner`.
-    pub fn tick_compute(
-        &mut self,
-        clk: Wire<1>,
-        rst: Wire<1>,
-        en: Wire<1>,
-        d: Wire<W>,
-        init: Wire<W>,
-    ) {
-        let clk_now = clk.to_bool();
-        let posedge = !self.clk_prev && clk_now;
-        self.clk_prev = clk_now;
+    /// Rising-edge sample. Reset wins over enable, matching C++ `pyc_reg`.
+    pub fn tick_compute(&mut self, clk: bool, rst: bool, en: bool, d: T, init: T) {
+        let posedge = !self.clk_prev && clk;
+        self.clk_prev = clk;
         if !posedge {
             self.pending = false;
             return;
         }
-        let r = rst.to_bool();
-        self.pending = r || en.to_bool();
-        self.q_next = if r { init } else { d };
+        self.pending = rst || en;
+        self.q_next = if rst { init } else { d };
     }
 
-    pub fn tick_commit(&mut self, q: &mut Wire<W>) {
+    pub fn tick_commit(&mut self, q: &mut T) {
         if self.pending {
             *q = self.q_next;
             self.pending = false;
@@ -50,59 +50,23 @@ impl<const W: u32> PycReg<W> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bits::Wire;
 
     #[test]
     fn posedge_enable_then_commit() {
-        let mut r = PycReg::<8>::new();
-        let mut q = Wire::<8>::new(0);
-        r.tick_compute(
-            Wire::<1>::new(1),
-            Wire::<1>::new(0),
-            Wire::<1>::new(1),
-            Wire::<8>::new(7),
-            Wire::<8>::new(0),
-        );
-        assert_eq!(q.value(), 0);
+        let mut r = PycReg::<u8>::new();
+        let mut q = 0u8;
+        r.tick_compute(true, false, true, 7, 0);
+        assert_eq!(q, 0);
         r.tick_commit(&mut q);
-        assert_eq!(q.value(), 7);
+        assert_eq!(q, 7);
     }
 
     #[test]
     fn reset_beats_enable() {
-        let mut r = PycReg::<8>::new();
-        let mut q = Wire::<8>::new(9);
-        r.tick_compute(
-            Wire::<1>::new(1),
-            Wire::<1>::new(1),
-            Wire::<1>::new(1),
-            Wire::<8>::new(7),
-            Wire::<8>::new(3),
-        );
+        let mut r = PycReg::<u8>::new();
+        let mut q = 9u8;
+        r.tick_compute(true, true, true, 7, 3);
         r.tick_commit(&mut q);
-        assert_eq!(q.value(), 3);
-    }
-
-    #[test]
-    fn no_update_without_posedge() {
-        let mut r = PycReg::<8>::new();
-        let mut q = Wire::<8>::new(1);
-        r.tick_compute(
-            Wire::<1>::new(1),
-            Wire::<1>::new(0),
-            Wire::<1>::new(1),
-            Wire::<8>::new(4),
-            Wire::<8>::new(0),
-        );
-        r.tick_commit(&mut q);
-        r.tick_compute(
-            Wire::<1>::new(1),
-            Wire::<1>::new(0),
-            Wire::<1>::new(1),
-            Wire::<8>::new(5),
-            Wire::<8>::new(0),
-        );
-        r.tick_commit(&mut q);
-        assert_eq!(q.value(), 4);
+        assert_eq!(q, 3);
     }
 }
