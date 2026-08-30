@@ -102,11 +102,129 @@ static LogicalResult checkScalarWidth(Operation *op, Type ty, const char *what) 
   return success();
 }
 
-static std::string rustType(Type ty) {
-  unsigned w = bitWidth(ty);
-  if (w == 0)
-    w = 1;
-  return "Wire<" + std::to_string(w) + ">";
+static std::string rustPrimTy(unsigned w) {
+  if (w <= 1)
+    return "bool";
+  if (w <= 8)
+    return "u8";
+  if (w <= 16)
+    return "u16";
+  if (w <= 32)
+    return "u32";
+  return "u64";
+}
+
+static unsigned rustStorageBits(unsigned w) {
+  if (w <= 1)
+    return 1;
+  if (w <= 8)
+    return 8;
+  if (w <= 16)
+    return 16;
+  if (w <= 32)
+    return 32;
+  return 64;
+}
+
+static bool rustNeedsMask(unsigned w) { return w > 1 && w != rustStorageBits(w); }
+
+static std::string rustType(Type ty) { return rustPrimTy(bitWidth(ty) == 0 ? 1 : bitWidth(ty)); }
+
+static std::string rustZero(unsigned w) { return w <= 1 ? "false" : "0"; }
+
+static std::string rustMaskLit(unsigned w) {
+  uint64_t m = w >= 64 ? ~uint64_t{0} : (w == 0 ? 0 : ((uint64_t{1} << w) - 1));
+  std::string out = "0x";
+  out += llvm::utohexstr(m);
+  if (w <= 8)
+    out += "u8";
+  else if (w <= 16)
+    out += "u16";
+  else if (w <= 32)
+    out += "u32";
+  else
+    out += "u64";
+  return out;
+}
+
+static std::string rustLit(unsigned w, uint64_t v) {
+  if (w <= 1)
+    return (v & 1) ? "true" : "false";
+  if (w < 64)
+    v &= (uint64_t{1} << w) - 1;
+  std::string out = "0x";
+  out += llvm::utohexstr(v);
+  out += rustPrimTy(w) == "u8" ? "u8" : rustPrimTy(w) == "u16" ? "u16" : rustPrimTy(w) == "u32" ? "u32" : "u64";
+  return out;
+}
+
+/// Truncate `expr` (already the dest primitive type) if width < storage.
+static std::string rustAndMask(const std::string &expr, unsigned w) {
+  if (w <= 1 || !rustNeedsMask(w))
+    return expr;
+  return "(" + expr + ") & " + rustMaskLit(w);
+}
+
+static std::string rustAsU64(const std::string &expr, unsigned w) {
+  if (w <= 1)
+    return "u64::from(" + expr + ")";
+  return expr + " as u64";
+}
+
+static std::string rustFromU64(const std::string &expr, unsigned w) {
+  if (w <= 1)
+    return "((" + expr + ") & 1) != 0";
+  std::string cast = "(" + expr + ") as " + rustPrimTy(w);
+  return rustAndMask(cast, w);
+}
+
+static std::string rustAsU32(const std::string &expr, unsigned w) {
+  if (w <= 1)
+    return "u32::from(" + expr + ")";
+  return expr + " as u32";
+}
+
+static std::string rustAsBool(const std::string &expr, unsigned w) {
+  if (w <= 1)
+    return expr;
+  return "(" + expr + " != 0)";
+}
+
+/// C++ `pyc::cpp::shl`: amount >= width yields 0 (not Rust wrapping_shl wrap).
+static std::string rustShl(const std::string &val, unsigned w, const std::string &amtU32) {
+  if (w <= 1)
+    return "if " + amtU32 + " == 0 { " + val + " } else { false }";
+  std::string shifted = rustAndMask(val + ".wrapping_shl(_s)", w);
+  return "{ let _s = " + amtU32 + "; if _s >= " + std::to_string(w) + " { " + rustZero(w) +
+         " } else { " + shifted + " } }";
+}
+
+static std::string rustLshr(const std::string &val, unsigned w, const std::string &amtU32) {
+  if (w <= 1)
+    return "if " + amtU32 + " == 0 { " + val + " } else { false }";
+  std::string shifted = rustAndMask(val + ".wrapping_shr(_s)", w);
+  return "{ let _s = " + amtU32 + "; if _s >= " + std::to_string(w) + " { " + rustZero(w) +
+         " } else { " + shifted + " } }";
+}
+
+static std::string rustShlImm(const std::string &val, unsigned w, unsigned amt) {
+  if (amt == 0)
+    return val;
+  if (amt >= w)
+    return rustZero(w);
+  if (w <= 1)
+    return "false";
+  return rustAndMask(val + ".wrapping_shl(" + std::to_string(amt) + ")", w);
+}
+
+static std::string rustLshrImm(const std::string &val, unsigned w, unsigned amt) {
+  if (amt == 0)
+    return val;
+  if (amt >= w)
+    return rustZero(w);
+  if (w <= 1)
+    return "false";
+  return rustAndMask(val + ".wrapping_shr(" + std::to_string(amt) + ")", w);
 }
 
 static std::string rustStringLiteral(llvm::StringRef s) {
@@ -225,9 +343,7 @@ static LogicalResult emitCombAssign(Operation &op, llvm::raw_ostream &os, NameTa
     uint64_t word = v.getRawData()[0];
     if (w < 64)
       word &= (1ull << w) - 1ull;
-    assignLine(os, nt, c.getResult(), [&](llvm::raw_ostream &e) {
-      e << "Wire::<" << w << ">::new(0x" << llvm::utohexstr(word) << "u64)";
-    });
+    assignLine(os, nt, c.getResult(), [&](llvm::raw_ostream &e) { e << rustLit(w, word); });
     return success();
   }
   if (auto a = dyn_cast<pyc::AliasOp>(op)) {
@@ -245,24 +361,39 @@ static LogicalResult emitCombAssign(Operation &op, llvm::raw_ostream &os, NameTa
   if (auto a = dyn_cast<pyc::AddOp>(op)) {
     if (failed(checkScalarWidth(&op, a.getType(), "pyc.add")))
       return failure();
+    unsigned w = bitWidth(a.getType());
     assignLine(os, nt, a.getResult(), [&](llvm::raw_ostream &e) {
-      e << field(nt, a.getLhs()) << " + " << field(nt, a.getRhs());
+      if (w <= 1) {
+        e << field(nt, a.getLhs()) << " ^ " << field(nt, a.getRhs());
+        return;
+      }
+      e << rustAndMask(field(nt, a.getLhs()) + ".wrapping_add(" + field(nt, a.getRhs()) + ")", w);
     });
     return success();
   }
   if (auto s = dyn_cast<pyc::SubOp>(op)) {
     if (failed(checkScalarWidth(&op, s.getType(), "pyc.sub")))
       return failure();
+    unsigned w = bitWidth(s.getType());
     assignLine(os, nt, s.getResult(), [&](llvm::raw_ostream &e) {
-      e << field(nt, s.getLhs()) << " - " << field(nt, s.getRhs());
+      if (w <= 1) {
+        e << field(nt, s.getLhs()) << " ^ " << field(nt, s.getRhs());
+        return;
+      }
+      e << rustAndMask(field(nt, s.getLhs()) + ".wrapping_sub(" + field(nt, s.getRhs()) + ")", w);
     });
     return success();
   }
   if (auto m = dyn_cast<pyc::MulOp>(op)) {
     if (failed(checkScalarWidth(&op, m.getType(), "pyc.mul")))
       return failure();
+    unsigned w = bitWidth(m.getType());
     assignLine(os, nt, m.getResult(), [&](llvm::raw_ostream &e) {
-      e << field(nt, m.getLhs()) << " * " << field(nt, m.getRhs());
+      if (w <= 1) {
+        e << field(nt, m.getLhs()) << " & " << field(nt, m.getRhs());
+        return;
+      }
+      e << rustAndMask(field(nt, m.getLhs()) + ".wrapping_mul(" + field(nt, m.getRhs()) + ")", w);
     });
     return success();
   }
@@ -271,7 +402,9 @@ static LogicalResult emitCombAssign(Operation &op, llvm::raw_ostream &os, NameTa
     if (failed(checkScalarWidth(&op, d.getType(), "pyc.udiv")))
       return failure();
     assignLine(os, nt, d.getResult(), [&](llvm::raw_ostream &e) {
-      e << "udiv::<" << w << ">(" << field(nt, d.getLhs()) << ", " << field(nt, d.getRhs()) << ")";
+      e << rustFromU64("udiv_bits(" + rustAsU64(field(nt, d.getLhs()), w) + ", " +
+                           rustAsU64(field(nt, d.getRhs()), w) + ", " + std::to_string(w) + ")",
+                       w);
     });
     return success();
   }
@@ -280,7 +413,9 @@ static LogicalResult emitCombAssign(Operation &op, llvm::raw_ostream &os, NameTa
     if (failed(checkScalarWidth(&op, r.getType(), "pyc.urem")))
       return failure();
     assignLine(os, nt, r.getResult(), [&](llvm::raw_ostream &e) {
-      e << "urem::<" << w << ">(" << field(nt, r.getLhs()) << ", " << field(nt, r.getRhs()) << ")";
+      e << rustFromU64("urem_bits(" + rustAsU64(field(nt, r.getLhs()), w) + ", " +
+                           rustAsU64(field(nt, r.getRhs()), w) + ", " + std::to_string(w) + ")",
+                       w);
     });
     return success();
   }
@@ -289,7 +424,9 @@ static LogicalResult emitCombAssign(Operation &op, llvm::raw_ostream &os, NameTa
     if (failed(checkScalarWidth(&op, d.getType(), "pyc.sdiv")))
       return failure();
     assignLine(os, nt, d.getResult(), [&](llvm::raw_ostream &e) {
-      e << "sdiv::<" << w << ">(" << field(nt, d.getLhs()) << ", " << field(nt, d.getRhs()) << ")";
+      e << rustFromU64("sdiv_bits(" + rustAsU64(field(nt, d.getLhs()), w) + ", " +
+                           rustAsU64(field(nt, d.getRhs()), w) + ", " + std::to_string(w) + ")",
+                       w);
     });
     return success();
   }
@@ -298,7 +435,9 @@ static LogicalResult emitCombAssign(Operation &op, llvm::raw_ostream &os, NameTa
     if (failed(checkScalarWidth(&op, r.getType(), "pyc.srem")))
       return failure();
     assignLine(os, nt, r.getResult(), [&](llvm::raw_ostream &e) {
-      e << "srem::<" << w << ">(" << field(nt, r.getLhs()) << ", " << field(nt, r.getRhs()) << ")";
+      e << rustFromU64("srem_bits(" + rustAsU64(field(nt, r.getLhs()), w) + ", " +
+                           rustAsU64(field(nt, r.getRhs()), w) + ", " + std::to_string(w) + ")",
+                       w);
     });
     return success();
   }
@@ -307,10 +446,9 @@ static LogicalResult emitCombAssign(Operation &op, llvm::raw_ostream &os, NameTa
       return failure();
     if (isa<VectorType>(m.getSel().getType()))
       return m.emitError("Rust emitter v1 subset does not support vector mux select");
-    unsigned w = bitWidth(m.getResult().getType());
     assignLine(os, nt, m.getResult(), [&](llvm::raw_ostream &e) {
-      e << "mux::<" << w << ">(" << field(nt, m.getSel()) << ", " << field(nt, m.getA()) << ", "
-        << field(nt, m.getB()) << ")";
+      e << "if " << field(nt, m.getSel()) << " { " << field(nt, m.getA()) << " } else { "
+        << field(nt, m.getB()) << " }";
     });
     return success();
   }
@@ -320,8 +458,8 @@ static LogicalResult emitCombAssign(Operation &op, llvm::raw_ostream &os, NameTa
     if (failed(checkScalarWidth(&op, s.getType(), "arith.select")))
       return failure();
     assignLine(os, nt, s.getResult(), [&](llvm::raw_ostream &e) {
-      e << "if " << field(nt, s.getCondition()) << ".to_bool() { " << field(nt, s.getTrueValue())
-        << " } else { " << field(nt, s.getFalseValue()) << " }";
+      e << "if " << field(nt, s.getCondition()) << " { " << field(nt, s.getTrueValue()) << " } else { "
+        << field(nt, s.getFalseValue()) << " }";
     });
     return success();
   }
@@ -352,25 +490,28 @@ static LogicalResult emitCombAssign(Operation &op, llvm::raw_ostream &os, NameTa
   if (auto n = dyn_cast<pyc::NotOp>(op)) {
     if (failed(checkScalarWidth(&op, n.getType(), "pyc.not")))
       return failure();
-    assignLine(os, nt, n.getResult(),
-               [&](llvm::raw_ostream &e) { e << "!" << field(nt, n.getIn()); });
+    unsigned w = bitWidth(n.getType());
+    assignLine(os, nt, n.getResult(), [&](llvm::raw_ostream &e) {
+      if (w <= 1)
+        e << "!" << field(nt, n.getIn());
+      else
+        e << rustAndMask("!" + field(nt, n.getIn()), w);
+    });
     return success();
   }
   if (auto e = dyn_cast<pyc::EqOp>(op)) {
-    unsigned w = bitWidth(e.getLhs().getType());
     if (failed(checkScalarWidth(&op, e.getLhs().getType(), "pyc.eq")))
       return failure();
     assignLine(os, nt, e.getResult(), [&](llvm::raw_ostream &eout) {
-      eout << "eq::<" << w << ">(" << field(nt, e.getLhs()) << ", " << field(nt, e.getRhs()) << ")";
+      eout << field(nt, e.getLhs()) << " == " << field(nt, e.getRhs());
     });
     return success();
   }
   if (auto u = dyn_cast<pyc::UltOp>(op)) {
-    unsigned w = bitWidth(u.getLhs().getType());
     if (failed(checkScalarWidth(&op, u.getLhs().getType(), "pyc.ult")))
       return failure();
     assignLine(os, nt, u.getResult(), [&](llvm::raw_ostream &eout) {
-      eout << "ult::<" << w << ">(" << field(nt, u.getLhs()) << ", " << field(nt, u.getRhs()) << ")";
+      eout << field(nt, u.getLhs()) << " < " << field(nt, u.getRhs());
     });
     return success();
   }
@@ -379,7 +520,8 @@ static LogicalResult emitCombAssign(Operation &op, llvm::raw_ostream &os, NameTa
     if (failed(checkScalarWidth(&op, s.getLhs().getType(), "pyc.slt")))
       return failure();
     assignLine(os, nt, s.getResult(), [&](llvm::raw_ostream &eout) {
-      eout << "slt::<" << w << ">(" << field(nt, s.getLhs()) << ", " << field(nt, s.getRhs()) << ")";
+      eout << "slt_bits(" << rustAsU64(field(nt, s.getLhs()), w) << ", "
+           << rustAsU64(field(nt, s.getRhs()), w) << ", " << w << ")";
     });
     return success();
   }
@@ -390,7 +532,7 @@ static LogicalResult emitCombAssign(Operation &op, llvm::raw_ostream &os, NameTa
         failed(checkScalarWidth(&op, t.getType(), "pyc.trunc out")))
       return failure();
     assignLine(os, nt, t.getResult(), [&](llvm::raw_ostream &e) {
-      e << "trunc::<" << ow << ", " << iw << ">(" << field(nt, t.getIn()) << ")";
+      e << rustFromU64(rustAsU64(field(nt, t.getIn()), iw), ow);
     });
     return success();
   }
@@ -401,7 +543,7 @@ static LogicalResult emitCombAssign(Operation &op, llvm::raw_ostream &os, NameTa
         failed(checkScalarWidth(&op, z.getType(), "pyc.zext out")))
       return failure();
     assignLine(os, nt, z.getResult(), [&](llvm::raw_ostream &e) {
-      e << "zext::<" << ow << ", " << iw << ">(" << field(nt, z.getIn()) << ")";
+      e << rustFromU64(rustAsU64(field(nt, z.getIn()), iw), ow);
     });
     return success();
   }
@@ -412,7 +554,9 @@ static LogicalResult emitCombAssign(Operation &op, llvm::raw_ostream &os, NameTa
         failed(checkScalarWidth(&op, s.getType(), "pyc.sext out")))
       return failure();
     assignLine(os, nt, s.getResult(), [&](llvm::raw_ostream &e) {
-      e << "sext::<" << ow << ", " << iw << ">(" << field(nt, s.getIn()) << ")";
+      e << rustFromU64("sext_bits(" + rustAsU64(field(nt, s.getIn()), iw) + ", " +
+                           std::to_string(iw) + ", " + std::to_string(ow) + ")",
+                       ow);
     });
     return success();
   }
@@ -422,9 +566,9 @@ static LogicalResult emitCombAssign(Operation &op, llvm::raw_ostream &os, NameTa
     if (failed(checkScalarWidth(&op, ex.getIn().getType(), "pyc.extract in")) ||
         failed(checkScalarWidth(&op, ex.getType(), "pyc.extract out")))
       return failure();
+    unsigned lsb = static_cast<unsigned>(ex.getLsbAttr().getInt());
     assignLine(os, nt, ex.getResult(), [&](llvm::raw_ostream &e) {
-      e << "extract::<" << ow << ", " << iw << ">(" << field(nt, ex.getIn()) << ", "
-        << ex.getLsbAttr().getInt() << "u32)";
+      e << rustFromU64(rustAsU64(field(nt, ex.getIn()), iw) + " >> " + std::to_string(lsb), ow);
     });
     return success();
   }
@@ -432,9 +576,9 @@ static LogicalResult emitCombAssign(Operation &op, llvm::raw_ostream &os, NameTa
     unsigned w = bitWidth(sh.getResult().getType());
     if (failed(checkScalarWidth(&op, sh.getType(), "pyc.shli")))
       return failure();
+    unsigned amt = static_cast<unsigned>(sh.getAmountAttr().getInt());
     assignLine(os, nt, sh.getResult(), [&](llvm::raw_ostream &e) {
-      e << "shl::<" << w << ">(" << field(nt, sh.getIn()) << ", "
-        << sh.getAmountAttr().getInt() << "u32)";
+      e << rustShlImm(field(nt, sh.getIn()), w, amt);
     });
     return success();
   }
@@ -442,9 +586,9 @@ static LogicalResult emitCombAssign(Operation &op, llvm::raw_ostream &os, NameTa
     unsigned w = bitWidth(sh.getResult().getType());
     if (failed(checkScalarWidth(&op, sh.getType(), "pyc.lshri")))
       return failure();
+    unsigned amt = static_cast<unsigned>(sh.getAmountAttr().getInt());
     assignLine(os, nt, sh.getResult(), [&](llvm::raw_ostream &e) {
-      e << "lshr::<" << w << ">(" << field(nt, sh.getIn()) << ", "
-        << sh.getAmountAttr().getInt() << "u32)";
+      e << rustLshrImm(field(nt, sh.getIn()), w, amt);
     });
     return success();
   }
@@ -452,9 +596,11 @@ static LogicalResult emitCombAssign(Operation &op, llvm::raw_ostream &os, NameTa
     unsigned w = bitWidth(sh.getResult().getType());
     if (failed(checkScalarWidth(&op, sh.getType(), "pyc.ashri")))
       return failure();
+    unsigned amt = static_cast<unsigned>(sh.getAmountAttr().getInt());
     assignLine(os, nt, sh.getResult(), [&](llvm::raw_ostream &e) {
-      e << "ashr::<" << w << ">(" << field(nt, sh.getIn()) << ", "
-        << sh.getAmountAttr().getInt() << "u32)";
+      e << rustFromU64("ashr_bits(" + rustAsU64(field(nt, sh.getIn()), w) + ", " +
+                           std::to_string(w) + ", " + std::to_string(amt) + ")",
+                       w);
     });
     return success();
   }
@@ -462,9 +608,9 @@ static LogicalResult emitCombAssign(Operation &op, llvm::raw_ostream &os, NameTa
     unsigned w = bitWidth(sh.getResult().getType());
     if (failed(checkScalarWidth(&op, sh.getType(), "pyc.shl")))
       return failure();
+    unsigned aw = bitWidth(sh.getAmount().getType());
     assignLine(os, nt, sh.getResult(), [&](llvm::raw_ostream &e) {
-      e << "shl::<" << w << ">(" << field(nt, sh.getIn()) << ", "
-        << field(nt, sh.getAmount()) << ".value() as u32)";
+      e << rustShl(field(nt, sh.getIn()), w, rustAsU32(field(nt, sh.getAmount()), aw));
     });
     return success();
   }
@@ -472,9 +618,9 @@ static LogicalResult emitCombAssign(Operation &op, llvm::raw_ostream &os, NameTa
     unsigned w = bitWidth(sh.getResult().getType());
     if (failed(checkScalarWidth(&op, sh.getType(), "pyc.lshr")))
       return failure();
+    unsigned aw = bitWidth(sh.getAmount().getType());
     assignLine(os, nt, sh.getResult(), [&](llvm::raw_ostream &e) {
-      e << "lshr::<" << w << ">(" << field(nt, sh.getIn()) << ", "
-        << field(nt, sh.getAmount()) << ".value() as u32)";
+      e << rustLshr(field(nt, sh.getIn()), w, rustAsU32(field(nt, sh.getAmount()), aw));
     });
     return success();
   }
@@ -482,9 +628,12 @@ static LogicalResult emitCombAssign(Operation &op, llvm::raw_ostream &os, NameTa
     unsigned w = bitWidth(sh.getResult().getType());
     if (failed(checkScalarWidth(&op, sh.getType(), "pyc.ashr")))
       return failure();
+    unsigned aw = bitWidth(sh.getAmount().getType());
     assignLine(os, nt, sh.getResult(), [&](llvm::raw_ostream &e) {
-      e << "ashr::<" << w << ">(" << field(nt, sh.getIn()) << ", "
-        << field(nt, sh.getAmount()) << ".value() as u32)";
+      e << rustFromU64("ashr_bits(" + rustAsU64(field(nt, sh.getIn()), w) + ", " +
+                           std::to_string(w) + ", " + rustAsU32(field(nt, sh.getAmount()), aw) +
+                           ")",
+                       w);
     });
     return success();
   }
@@ -497,24 +646,26 @@ static LogicalResult emitCombAssign(Operation &op, llvm::raw_ostream &os, NameTa
       if (failed(checkScalarWidth(&op, in.getType(), "pyc.concat input")))
         return failure();
     }
+    unsigned ow = bitWidth(c.getType());
     assignLine(os, nt, c.getResult(), [&](llvm::raw_ostream &e) {
       // Nest from the right so MSB-first concat matches C++ concat(a, concat(b, ...)).
+      std::string acc;
       std::function<void(unsigned)> emitFrom = [&](unsigned i) {
         Value in = c.getInputs()[i];
         unsigned aw = bitWidth(in.getType());
+        std::string piece = rustAsU64(field(nt, in), aw);
         if (i + 1 == c.getNumOperands()) {
-          e << field(nt, in);
+          acc = piece;
           return;
         }
         unsigned restW = 0;
         for (unsigned j = i + 1; j < c.getNumOperands(); ++j)
           restW += bitWidth(c.getInputs()[j].getType());
-        unsigned ow = aw + restW;
-        e << "concat2::<" << aw << ", " << restW << ", " << ow << ">(" << field(nt, in) << ", ";
         emitFrom(i + 1);
-        e << ")";
+        acc = "((" + piece + " << " + std::to_string(restW) + ") | " + acc + ")";
       };
       emitFrom(0);
+      e << rustFromU64(acc, ow);
     });
     return success();
   }
@@ -538,8 +689,8 @@ static LogicalResult emitEvalNode(Operation &op, llvm::raw_ostream &os, NameTabl
     std::string msg = "pyc.assert failed";
     if (auto m = a.getMsgAttr())
       msg = m.getValue().str();
-    os << "        if !" << field(nt, a.getCond()) << ".to_bool() { panic!(\"{}\", "
-       << rustStringLiteral(msg) << "); }\n";
+    os << "        if !" << rustAsBool(field(nt, a.getCond()), bitWidth(a.getCond().getType()))
+       << " { panic!(\"{}\", " << rustStringLiteral(msg) << "); }\n";
     return success();
   }
   if (auto comb = dyn_cast<pyc::CombOp>(op)) {
@@ -717,8 +868,7 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os) {
   });
 
   for (auto r : regs) {
-    unsigned w = bitWidth(r.getQ().getType());
-    os << "    " << nt.get(r.getQ()) << "_inst: PycReg<" << w << ">,\n";
+    os << "    " << nt.get(r.getQ()) << "_inst: PycReg<" << rustType(r.getQ().getType()) << ">,\n";
   }
   for (const auto &ii : instInfos)
     os << "    pub " << ii.member << ": Box<" << ii.rustTy << ">,\n";
@@ -728,9 +878,11 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os) {
   os << "    fn default() -> Self {\n";
   os << "        Self {\n";
   for (unsigned i = 0; i < inNames.size(); ++i)
-    os << "            " << inNames[i] << ": Wire::new(0),\n";
+    os << "            " << inNames[i] << ": " << rustZero(bitWidth(f.getArgument(i).getType()))
+       << ",\n";
   for (unsigned i = 0; i < outNames.size(); ++i)
-    os << "            " << outNames[i] << ": Wire::new(0),\n";
+    os << "            " << outNames[i] << ": " << rustZero(bitWidth(f.getResultTypes()[i]))
+       << ",\n";
   declared.clear();
   for (Value arg : f.getArguments())
     declared.insert(arg);
@@ -740,7 +892,7 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os) {
         continue;
       if (bitWidth(r.getType()) == 0 || isa<VectorType>(r.getType()))
         continue;
-      os << "            " << nt.get(r) << ": Wire::new(0),\n";
+      os << "            " << nt.get(r) << ": " << rustZero(bitWidth(r.getType())) << ",\n";
       declared.insert(r);
     }
   });
@@ -782,8 +934,10 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os) {
     os << "        self." << ii.member << ".tick_compute();\n";
   }
   for (auto r : regs) {
-    os << "        self." << nt.get(r.getQ()) << "_inst.tick_compute(" << field(nt, r.getClk())
-       << ", " << field(nt, r.getRst()) << ", " << field(nt, r.getEn()) << ", "
+    os << "        self." << nt.get(r.getQ()) << "_inst.tick_compute("
+       << rustAsBool(field(nt, r.getClk()), bitWidth(r.getClk().getType())) << ", "
+       << rustAsBool(field(nt, r.getRst()), bitWidth(r.getRst().getType())) << ", "
+       << rustAsBool(field(nt, r.getEn()), bitWidth(r.getEn().getType())) << ", "
        << field(nt, r.getNext()) << ", " << field(nt, r.getInit()) << ");\n";
   }
   os << "    }\n\n";
