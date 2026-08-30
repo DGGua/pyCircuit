@@ -173,6 +173,8 @@ python3 flows/tools/perf/run_rust_vs_cpp.py
 - 功能：counter 两边 `count=1..5` 一致；mem 设计 Rust emit 按子集报错。
 - pytest：`tests/rust_emit/test_rust_emitter.py` 本地通过。
 
+后续探索（2026-08-31）：DUT 字段改为 `bool`/`u8`/`u16`/`u32`/`u64`，见 `docs/rust-emitter-narrow-wires-需求分析与实施规划-20260831.md`。microbench Rust 中位从 1.24e7 Hz 到 1.45e7 Hz。
+
 ## 实施步骤
 
 1. 落盘本文档。
