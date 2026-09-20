@@ -250,5 +250,7 @@ designs/XiangShan-doc/
 designs/DavinciOO/
 # pyCircuit imports use package name outerCube — symlink only, never commit
 designs/outerCube/
+
+.claude/settings.local.json
 # gate outputs
 docs/gates

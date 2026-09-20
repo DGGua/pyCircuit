@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pycircuit import (
+    u,
     CycleAwareCircuit,
     CycleAwareDomain,
     cas,
@@ -17,7 +18,7 @@ MODE_SET_SEC = 3
 
 def _to_bcd8(m: CycleAwareCircuit, domain: CycleAwareDomain, v, width: int):
     vw = wire_of(v)
-    ten = m.const(10, width=width)
+    ten = u(width, 10)
     ones_w = vw % ten
     tens_w = vw // ten
     return cas(domain, m.cat(tens_w[0:4], ones_w[0:4]), cycle=v.cycle)
@@ -37,21 +38,21 @@ def build(m: CycleAwareCircuit, domain: CycleAwareDomain, clk_freq: int = 50_000
     btn_plus = cas(domain, m.input("btn_plus", width=1), cycle=0)
     btn_minus = cas(domain, m.input("btn_minus", width=1), cycle=0)
 
-    clk_max = cas(domain, m.const(clk_freq - 1, width=prescaler_w), cycle=0)
-    zero_p = cas(domain, m.const(0, width=prescaler_w), cycle=0)
-    one_p = cas(domain, m.const(1, width=prescaler_w), cycle=0)
-    zero6 = cas(domain, m.const(0, width=6), cycle=0)
-    one6 = cas(domain, m.const(1, width=6), cycle=0)
-    fifty_nine6 = cas(domain, m.const(59, width=6), cycle=0)
-    zero5 = cas(domain, m.const(0, width=5), cycle=0)
-    one5 = cas(domain, m.const(1, width=5), cycle=0)
-    twenty_three5 = cas(domain, m.const(23, width=5), cycle=0)
+    clk_max = u(prescaler_w, clk_freq - 1)
+    zero_p = u(prescaler_w, 0)
+    one_p = u(prescaler_w, 1)
+    zero6 = u(6, 0)
+    one6 = u(6, 1)
+    fifty_nine6 = u(6, 59)
+    zero5 = u(5, 0)
+    one5 = u(5, 1)
+    twenty_three5 = u(5, 23)
 
-    mode_run_2 = cas(domain, m.const(MODE_RUN, width=2), cycle=0)
-    mode_set_hour_2 = cas(domain, m.const(MODE_SET_HOUR, width=2), cycle=0)
-    mode_set_min_2 = cas(domain, m.const(MODE_SET_MIN, width=2), cycle=0)
-    mode_set_sec_2 = cas(domain, m.const(MODE_SET_SEC, width=2), cycle=0)
-    one2 = cas(domain, m.const(1, width=2), cycle=0)
+    mode_run_2 = u(2, MODE_RUN)
+    mode_set_hour_2 = u(2, MODE_SET_HOUR)
+    mode_set_min_2 = u(2, MODE_SET_MIN)
+    mode_set_sec_2 = u(2, MODE_SET_SEC)
+    one2 = u(2, 1)
 
     tick_1hz = prescaler == clk_max
     prescaler_n = mux(tick_1hz, zero_p, prescaler + one_p)
@@ -75,6 +76,7 @@ def build(m: CycleAwareCircuit, domain: CycleAwareDomain, clk_freq: int = 50_000
     hr_n_tick = mux(tick_run, hr_next_run, hour)
 
     mode_next = mux(mode == mode_set_sec_2, mode_run_2, mode + one2)
+    blink_next = mux(tick_1hz, ~blink, blink)
 
     hour_p = mux(btn_plus & is_set_hour, mux(hour == twenty_three5, zero5, hour + one5), hr_n_tick)
     min_p = mux(btn_plus & is_set_min, mux(minute == fifty_nine6, zero6, minute + one6), min_n_tick)
@@ -97,7 +99,7 @@ def build(m: CycleAwareCircuit, domain: CycleAwareDomain, clk_freq: int = 50_000
     minute <<= min_n
     hour <<= hour_n
     mode.assign(mode_next, when=btn_set)
-    blink.assign(~blink, when=tick_1hz)
+    blink <<= blink_next
 
 
 build.__pycircuit_name__ = "digital_clock"

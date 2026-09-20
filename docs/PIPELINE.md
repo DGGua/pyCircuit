@@ -28,6 +28,7 @@ Backend responsibilities:
 - emit:
   - C++ model (`--emit=cpp`)
   - Verilog netlist (`--emit=verilog`)
+  - experimental Rust model (`--emit=rust`; v1 subset: scalar 1..=64, `reg`, `instance`)
   - testbench text (for `.pyc` files containing `pyc.tb.payload`)
 
 Default backend hierarchy policy:
@@ -60,6 +61,7 @@ Emit a single `.pyc`:
 
 ```bash
 python3 -m pycircuit.cli emit <design.py> -o out.pyc
+pycc out.pyc --emit=rust -o out.rs
 ```
 
 Build a project (multi-module + testbench):

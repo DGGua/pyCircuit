@@ -16,9 +16,9 @@ def build(m: CycleAwareCircuit, domain: CycleAwareDomain, rounds: int = 4) -> No
     b = cas(domain, m.input("b", width=8), cycle=0)
     op = cas(domain, m.input("op", width=2), cycle=0)
 
-    op0 = cas(domain, m.const(0, width=2), cycle=0)
-    op1 = cas(domain, m.const(1, width=2), cycle=0)
-    op2 = cas(domain, m.const(2, width=2), cycle=0)
+    op0 = u(2, 0)
+    op1 = u(2, 1)
+    op2 = u(2, 2)
 
     acc = mux(op == op0, a + b,
           mux(op == op1, a - b,

@@ -7,6 +7,7 @@ from pycircuit import (
     CycleAwareDomain,
     compile_cycle_aware,
     mux,
+    u,
 )
 
 PKT_W = 32
@@ -31,17 +32,17 @@ def build(m: CycleAwareCircuit, domain: CycleAwareDomain, *, N_PORTS: int = 4, F
     hbm_port = hbm_dst[0:PORT_BITS]
 
     for j in range(N_PORTS):
-        merged_data = m.const(0, width=PKT_W)
-        merged_valid = m.const(0, width=1)
+        merged_data = u(PKT_W, 0)
+        merged_valid = u(1, 0)
 
         for i in range(N_PORTS):
             rx_dst_i = rx_pkts[i][24:28]
             rx_port_i = rx_dst_i[0:PORT_BITS]
-            fwd_match = (rx_port_i == m.const(j, width=PORT_BITS)) & rx_vals[i]
+            fwd_match = (rx_port_i == u(PORT_BITS, j)) & rx_vals[i]
             merged_data = mux(fwd_match, rx_pkts[i], merged_data)
             merged_valid = fwd_match | merged_valid
 
-        hbm_match_j = hbm_valid & (hbm_port == m.const(j, width=PORT_BITS))
+        hbm_match_j = hbm_valid & (hbm_port == u(PORT_BITS, j))
         merged_data = mux(hbm_match_j, hbm_pkt, merged_data)
         merged_valid = hbm_match_j | merged_valid
 
@@ -50,11 +51,11 @@ def build(m: CycleAwareCircuit, domain: CycleAwareDomain, *, N_PORTS: int = 4, F
     tx_pkts = []
     tx_vals = []
     for i in range(N_PORTS):
-        pop_result = fifos[i].pop(when=m.const(1, width=1))
+        pop_result = fifos[i].pop(when=u(1, 1))
         tx_pkts.append(pop_result.data)
         tx_vals.append(pop_result.valid)
 
-    hbm_ready_sig = m.const(1, width=1)
+    hbm_ready_sig = u(1, 1)
 
     for i in range(N_PORTS):
         m.output(f"tx_pkt_{i}", tx_pkts[i])

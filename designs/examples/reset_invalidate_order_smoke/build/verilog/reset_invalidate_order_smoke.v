@@ -8,20 +8,16 @@ module reset_invalidate_order_smoke (
   output [7:0] y
 );
 
-wire [7:0] _v5_bal_1; // pyc.name="_v5_bal_1"
-wire [7:0] _v5_bal_1__next; // pyc.name="_v5_bal_1__next"
-wire [7:0] pyc_add_11; // op=pyc.add
-wire [7:0] pyc_comb_13; // op=pyc.comb
+wire [7:0] pyc_add_8; // op=pyc.add
+wire [7:0] pyc_comb_10; // op=pyc.comb
+wire [7:0] pyc_comb_11; // op=pyc.comb
 wire pyc_comb_4; // op=pyc.comb
 wire [7:0] pyc_comb_5; // op=pyc.comb
 wire [7:0] pyc_comb_6; // op=pyc.comb
-wire [7:0] pyc_comb_8; // op=pyc.comb
-wire [7:0] pyc_comb_9; // op=pyc.comb
 wire pyc_constant_1; // op=pyc.constant
 wire [7:0] pyc_constant_2; // op=pyc.constant
 wire [7:0] pyc_constant_3; // op=pyc.constant
-wire [7:0] pyc_mux_12; // op=pyc.mux
-wire [7:0] pyc_reg_10; // op=pyc.reg
+wire [7:0] pyc_mux_9; // op=pyc.mux
 wire [7:0] pyc_reg_7; // op=pyc.reg
 wire [7:0] q; // pyc.name="q"
 wire [7:0] q__next; // pyc.name="q__next"
@@ -34,24 +30,13 @@ assign pyc_comb_4 = pyc_constant_1;
 assign pyc_comb_5 = pyc_constant_2;
 assign pyc_comb_6 = pyc_constant_3;
 assign q = pyc_reg_7;
-assign _v5_bal_1__next = q;
-assign pyc_comb_8 = q;
-assign pyc_comb_9 = _v5_bal_1__next;
-assign _v5_bal_1 = pyc_reg_10;
-assign pyc_add_11 = (_v5_bal_1 + pyc_comb_6);
-assign pyc_mux_12 = (en ? pyc_add_11 : pyc_comb_8);
-assign pyc_comb_13 = pyc_mux_12;
-assign q__next = pyc_comb_13;
+assign pyc_add_8 = (q + pyc_comb_6);
+assign pyc_mux_9 = (en ? pyc_add_8 : q);
+assign pyc_comb_10 = q;
+assign pyc_comb_11 = pyc_mux_9;
+assign q__next = pyc_comb_11;
 
 // --- Sequential primitives
-pyc_reg #(.WIDTH(8)) pyc_reg_10_inst (
-  .clk(clk),
-  .rst(rst),
-  .en(pyc_comb_4),
-  .d(pyc_comb_9),
-  .init(pyc_comb_5),
-  .q(pyc_reg_10)
-);
 pyc_reg #(.WIDTH(8)) pyc_reg_7_inst (
   .clk(clk),
   .rst(rst),
@@ -61,7 +46,7 @@ pyc_reg #(.WIDTH(8)) pyc_reg_7_inst (
   .q(pyc_reg_7)
 );
 
-assign y = pyc_comb_8;
+assign y = pyc_comb_10;
 
 endmodule
 

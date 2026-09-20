@@ -566,12 +566,12 @@ ASL 的「数学域」发生在**指令执行时**（描述语义）；PyCircuit
 | 加减 | `bits(N) ± bits(N) → bits(N)`（截断，签名无关） | `+ -`（同宽截断） | ✅ 语义完全相同 |
 | 位逻辑 | `AND OR XOR NOT`（关键字） | `& \| ^ ~`（Python 运算符） | ✅ 语义相同，拼写不同 |
 | 拼接 | `x :: y` | `cat(x, y)` | ✅ |
-| 相等 | `== !=`（仅同型） | `== !=` / `.eq() .ne()` | ✅ |
+| 相等 | `== !=`（仅同型） | `== !=` | ✅ |
 | 大小比较 | bits **不可直接比较**，须 `UInt(x) < UInt(y)` 或 `SInt` | `<`（按 `signed` 标记选 ult/slt）；亦有显式 `.ult() .slt() .ugt() ...` | ⚠️ 见下 |
 | 乘法 | bits 域**无乘法**（只在 integer 域） | `*`（截断到操作数宽度） | ⚠️ PyCircuit 更"硬件"：乘法器是真实电路 |
 | 移位 | 整数域 `<< >>`；bits 用库函数 `LSL/LSR/ASR/ROL/ROR` | `<< >>`（右移按 signed 选算术/逻辑） | ✅ 覆盖（rotate 需手写 cat） |
 | 除法 | `DIV`（精确）/ `DIVRM`（floor）/ `MOD`，仅整数域 | `// %`（按 signed 选 udiv/sdiv） | 定位差异：ASL 用于语义定义，PyCircuit 生成真实除法器 |
-| 条件 | `if t then x else y`（表达式） | `mux(t, x, y)` / `t.select(x, y)` | ✅ |
+| 条件 | `if t then x else y`（表达式） | `mux(t, x, y)` | ✅ |
 | 短路 `&& \|\|` | 布尔域短路求值 | 无意义（组合电路两支路都存在） | 定位差异，无需对齐 |
 
 **关于比较运算的签名处理**——这是唯一值得斟酌的差异：

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pycircuit import (
+    u,
     CycleAwareCircuit,
     CycleAwareDomain,
     cas,
@@ -32,7 +33,7 @@ def build(m: CycleAwareCircuit, domain: CycleAwareDomain) -> None:
     in_ready = ~v0[3] | pop0
     push = in_valid & in_ready
 
-    zero1 = cas(domain, m.const(0, width=1), cycle=0)
+    zero1 = u(1, 0)
     s1_v, s1_d = _shift4(v0, d0, zero1)
     a1_v = [mux(pop0, s1_v[i], v0[i]) for i in range(4)]
     a1_d = [mux(pop0, s1_d[i], d0[i]) for i in range(4)]

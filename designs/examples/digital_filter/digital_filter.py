@@ -7,6 +7,7 @@ Implements:
 from __future__ import annotations
 
 from pycircuit import (
+    u,
     CycleAwareCircuit,
     CycleAwareDomain,
     cas,

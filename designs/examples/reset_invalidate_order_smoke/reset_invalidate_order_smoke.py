@@ -19,8 +19,11 @@ def build(m: CycleAwareCircuit, domain: CycleAwareDomain, width: int = 8) -> Non
     q = domain.signal(width=width, reset_value=0, name="q")
     m.output("y", wire_of(q))
 
+    # Spec: compute next at cycle 0, then commit after domain.next().
+    # Assigning `q + 1` after next() inserts an extra _v5_bal register.
+    q_next = mux(en, q + 1, q)
     domain.next()
-    q.assign(q + 1, when=en)
+    q <<= q_next
 
 
 build.__pycircuit_name__ = "reset_invalidate_order_smoke"

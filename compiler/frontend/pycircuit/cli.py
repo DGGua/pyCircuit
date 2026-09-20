@@ -108,6 +108,23 @@ def _project_root(entry: Path, *, project_root_override: str | None = None) -> P
     return nearest_project_root(entry)
 
 
+def _is_cycle_aware_entrypoint(build: Any) -> bool:
+    """True for V5 ``def build(m, domain, ...)`` cycle-aware designs."""
+    try:
+        params = list(inspect.signature(build).parameters.values())
+    except (TypeError, ValueError):
+        return False
+    if len(params) < 2:
+        return False
+    p1 = params[1]
+    if p1.name == "domain":
+        return True
+    ann = p1.annotation
+    if ann is inspect._empty:
+        return False
+    return "CycleAwareDomain" in str(ann)
+
+
 def _collect_jit_params(build: Any, *, overrides: list[str]) -> dict[str, object]:
     if not callable(build):
         raise SystemExit("build must be a callable @module entrypoint: `def build(m: Circuit, ...)`")
@@ -117,6 +134,7 @@ def _collect_jit_params(build: Any, *, overrides: list[str]) -> dict[str, object
     if not params:
         raise SystemExit("build must use JIT entry semantics: `@module def build(m: Circuit, ...)`")
     value_param_names = set(value_params_of(build).keys())
+    cycle_aware = _is_cycle_aware_entrypoint(build)
 
     # Cycle-aware entrypoints use ``build(m, domain, *, ...)``.  The domain is
     # supplied by ``compile_cycle_aware`` rather than being a JIT parameter.
@@ -127,6 +145,9 @@ def _collect_jit_params(build: Any, *, overrides: list[str]) -> dict[str, object
     missing: list[str] = []
     for p in params[param_start:]:
         if p.name in value_param_names:
+            continue
+        # Injected by compile_cycle_aware; not a CLI/JIT value parameter.
+        if cycle_aware and p.name == "domain":
             continue
         if p.default is inspect._empty:
             missing.append(p.name)
@@ -157,6 +178,28 @@ def _collect_jit_params(build: Any, *, overrides: list[str]) -> dict[str, object
     return jit_params
 
 
+def _compile_to_design(build: Any, *, top_name: str, jit_params: dict[str, object]) -> Design:
+    """Compile ``build`` to a :class:`Design` (JIT ``@module`` or eager V5 cycle-aware)."""
+    if _is_cycle_aware_entrypoint(build):
+        from .v5 import _make_compiled_module, compile_cycle_aware
+
+        circuit = compile_cycle_aware(build, name=top_name, eager=True, hierarchical=True, **jit_params)
+        existing = getattr(circuit, "_v5_design", None)
+        if isinstance(existing, Design):
+            return existing
+        cm = _make_compiled_module(build, circuit, top_name)
+        design = Design(top=top_name)
+        design.add(cm)
+        return design
+    try:
+        design_obj = compile(build, name=top_name, **jit_params)
+    except (DesignError, JitError) as e:
+        raise SystemExit(f"design compile failed: {e}") from e
+    if not isinstance(design_obj, Design):
+        raise SystemExit("internal error: expected Design from compile(...)")
+    return design_obj
+
+
 def _top_name_for_build(src: Path, build: Any) -> str:
     top_name = _default_top_name(src)
     override = getattr(build, "__pycircuit_name__", None)
@@ -177,10 +220,7 @@ def _cmd_emit(args: argparse.Namespace) -> int:
 
     jit_params = _collect_jit_params(build, overrides=list(args.param or []))
     top_name = _top_name_for_build(src if src is not None else Path(src_arg.replace(".", "/") + ".py"), build)
-    try:
-        design = compile(build, name=top_name, **jit_params)
-    except (DesignError, JitError) as e:
-        raise SystemExit(f"design compile failed: {e}") from e
+    design = _compile_to_design(build, top_name=top_name, jit_params=jit_params)
 
     if isinstance(design, Design):
         out.write_text(design.emit_mlir(), encoding="utf-8")
@@ -434,15 +474,7 @@ def _collect_build(mod: object, src: Path, args: argparse.Namespace) -> Module |
 
     jit_params = _collect_jit_params(build, overrides=list(getattr(args, "param", []) or []))
     top_name = _top_name_for_build(src, build)
-    try:
-        params = list(inspect.signature(build).parameters.values())
-        if len(params) >= 2 and params[1].name == "domain":
-            from .v5 import compile_cycle_aware
-
-            return compile_cycle_aware(build, name=top_name, **jit_params)
-        return compile(build, name=top_name, **jit_params)
-    except (DesignError, JitError) as e:
-        raise SystemExit(f"design compile failed: {e}") from e
+    return _compile_to_design(build, top_name=top_name, jit_params=jit_params)
 
 
 class _TopIface:
@@ -2206,26 +2238,7 @@ def _cmd_build(args: argparse.Namespace) -> int:
             cache_hit = False
 
     if not cache_hit:
-        try:
-            params = list(inspect.signature(build).parameters.values())
-            if len(params) >= 2 and params[1].name == "domain":
-                from .v5 import compile_cycle_aware
-
-                cycle_circuit = compile_cycle_aware(
-                    build,
-                    name=top_name,
-                    eager=True,
-                    hierarchical=True,
-                    **jit_params,
-                )
-                design_obj = getattr(cycle_circuit, "_v5_design", None)
-            else:
-                design_obj = compile(build, name=top_name, **jit_params)
-        except (DesignError, JitError) as e:
-            raise SystemExit(f"design compile failed: {e}") from e
-        if not isinstance(design_obj, Design):
-            raise SystemExit("internal error: expected Design from compile(...)")
-        design = design_obj
+        design = _compile_to_design(build, top_name=top_name, jit_params=jit_params)
         iface = _top_iface(design)
         manifest_path, manifest, module_paths, design_pyc_path = _emit_multi_pyc_artifacts(design, out_dir=out_dir)
         print("jit-cache: miss")
@@ -2250,6 +2263,8 @@ def _cmd_build(args: argparse.Namespace) -> int:
         "--inline-policy=off",
         "--hierarchy-policy=strict",
     ]
+    if args.cpp_pch:
+        pycc_hard_hierarchy_flags.append("--cpp-pch")
 
     build_flags = {
         "pycc": str(pycc.resolve()),
@@ -2258,6 +2273,7 @@ def _cmd_build(args: argparse.Namespace) -> int:
         "pycc_build_profile": pycc_build_profile,
         "inline_policy": "off",
         "hierarchy_policy": "strict",
+        "cpp_pch": bool(args.cpp_pch),
         "target": target,
         "tb_schedule_mode": str(args.tb_schedule_mode),
         "frontend_contract": FRONTEND_CONTRACT,
@@ -2452,6 +2468,27 @@ def _cmd_build(args: argparse.Namespace) -> int:
             "cxx_standard": "c++17",
             "profile": str(args.profile),
         }
+        if args.cpp_pch:
+            # Collect device hpp headers flagged for PCH across all module manifests.
+            seen: set[str] = set()
+            pch_headers: list[str] = []
+            for manifest_path in sorted(device_cpp_root.rglob("cpp_compile_manifest.json")):
+                data = json.loads(manifest_path.read_text(encoding="utf-8"))
+                profile = data.get("profile_summary") or {}
+                if not profile.get("cpp_pch"):
+                    continue
+                for header in data.get("precompile_headers") or []:
+                    if header not in seen:
+                        seen.add(header)
+                        pch_headers.append(header)
+            pch_headers.sort()
+            if not pch_headers:
+                pch_script = _tool_script("cpp_pch_headers.py")
+                pch_mod = _load_py_file(pch_script)
+                pch_headers = pch_mod.select_device_hpp_headers(build_manifest["headers"])
+            if pch_headers:
+                build_manifest["precompile_headers"] = pch_headers
+                build_manifest["precompile_headers_mode"] = "device_hpp"
         cpp_manifest = out_dir / "cpp_project_manifest.json"
         _save_json(cpp_manifest, build_manifest)
 
@@ -2555,16 +2592,19 @@ def _cmd_build(args: argparse.Namespace) -> int:
                 "-Wno-UNUSEDSIGNAL",
                 "-Wno-WIDTHEXPAND",
                 "--quiet",
-                # MSYS2/Windows Verilator wrapper does not support --quiet-build.
-                "--timing",
-                "--trace",
-                "--top-module",
-                tb_name,
-                "--Mdir",
-                str(vbuild),
-                str(tb_sv_out),
-                *verilog_sources,
             ]
+            cmd.extend(
+                [
+                    "--timing",
+                    "--trace",
+                    "--top-module",
+                    tb_name,
+                    "--Mdir",
+                    str(vbuild),
+                    str(tb_sv_out),
+                    *verilog_sources,
+                ]
+            )
             subprocess.run(cmd, check=True, env=run_env)
             vbin = vbuild / f"V{tb_name}"
             if os.name == "nt" and not vbin.is_file():
@@ -2705,6 +2745,11 @@ def main(argv: list[str] | None = None) -> int:
         help="Backend targets to generate/build",
     )
     build.add_argument("--logic-depth", type=int, default=32, help="Max combinational logic depth for pycc")
+    build.add_argument(
+        "--cpp-pch",
+        action="store_true",
+        help="Precompile device module hpp headers in generated CMake build",
+    )
     build.add_argument(
         "--trace-config",
         default=None,
