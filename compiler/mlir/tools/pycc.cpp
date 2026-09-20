@@ -3019,10 +3019,7 @@ int main(int argc, char **argv) {
       lss << "// pyCircuit Rust emission crate root (v1 subset)\n";
       lss << "pub use pyc_runtime::*;\n\n";
       for (const auto &modName : rustMods) {
-        std::string rustIdent = modName;
-        for (char &c : rustIdent)
-          if (!( (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_'))
-            c = '_';
+        std::string rustIdent = pyc::sanitizeRustIdent(modName);
         lss << "#[path = \"" << modName << ".rs\"]\n";
         lss << "pub mod " << rustIdent << ";\n";
         lss << "pub use " << rustIdent << "::*;\n";

@@ -867,8 +867,12 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os) {
     }
   });
 
-  for (auto r : regs) {
-    os << "    " << nt.get(r.getQ()) << "_inst: PycReg<" << rustType(r.getQ().getType()) << ">,\n";
+  std::vector<std::string> regFieldNames;
+  regFieldNames.reserve(regs.size());
+  for (auto r : regs)
+    regFieldNames.push_back(nt.unique(nt.get(r.getQ()) + std::string("_inst")));
+  for (auto [i, r] : llvm::enumerate(regs)) {
+    os << "    " << regFieldNames[i] << ": PycReg<" << rustType(r.getQ().getType()) << ">,\n";
   }
   for (const auto &ii : instInfos)
     os << "    pub " << ii.member << ": Box<" << ii.rustTy << ">,\n";
@@ -896,8 +900,8 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os) {
       declared.insert(r);
     }
   });
-  for (auto r : regs)
-    os << "            " << nt.get(r.getQ()) << "_inst: PycReg::new(),\n";
+  for (auto [i, r] : llvm::enumerate(regs))
+    os << "            " << regFieldNames[i] << ": PycReg::new(),\n";
   for (const auto &ii : instInfos)
     os << "            " << ii.member << ": Box::new(" << ii.rustTy << "::default()),\n";
   os << "        }\n";
@@ -933,8 +937,8 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os) {
          << field(nt, ii.op.getOperand(j)) << ";\n";
     os << "        self." << ii.member << ".tick_compute();\n";
   }
-  for (auto r : regs) {
-    os << "        self." << nt.get(r.getQ()) << "_inst.tick_compute("
+  for (auto [i, r] : llvm::enumerate(regs)) {
+    os << "        self." << regFieldNames[i] << ".tick_compute("
        << rustAsBool(field(nt, r.getClk()), bitWidth(r.getClk().getType())) << ", "
        << rustAsBool(field(nt, r.getRst()), bitWidth(r.getRst().getType())) << ", "
        << rustAsBool(field(nt, r.getEn()), bitWidth(r.getEn().getType())) << ", "
@@ -945,8 +949,8 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os) {
   os << "    pub fn tick_commit(&mut self) {\n";
   for (const auto &ii : instInfos)
     os << "        self." << ii.member << ".tick_commit();\n";
-  for (auto r : regs) {
-    os << "        self." << nt.get(r.getQ()) << "_inst.tick_commit(&mut self." << nt.get(r.getQ())
+  for (auto [i, r] : llvm::enumerate(regs)) {
+    os << "        self." << regFieldNames[i] << ".tick_commit(&mut self." << nt.get(r.getQ())
        << ");\n";
   }
   os << "    }\n\n";
@@ -1021,6 +1025,8 @@ static LogicalResult topoFuncs(ModuleOp module, llvm::SmallVector<func::FuncOp> 
 
 } // namespace
 
+std::string sanitizeRustIdent(llvm::StringRef s) { return sanitizeId(s); }
+
 LogicalResult emitRust(ModuleOp module, llvm::raw_ostream &os) {
   os << "// pyCircuit Rust emission (v1 subset)\n";
   os << "#[allow(non_camel_case_types, non_snake_case, unused_imports, dead_code)]\n";
@@ -1039,7 +1045,11 @@ LogicalResult emitRustFunc(ModuleOp module, func::FuncOp f, llvm::raw_ostream &o
   (void)module;
   os << "// pyCircuit Rust emission (v1 subset)\n";
   os << "#[allow(non_camel_case_types, non_snake_case, unused_imports, dead_code)]\n";
-  os << "use pyc_runtime::*;\n\n";
+  os << "use pyc_runtime::*;\n";
+  // Sibling module structs are re-exported at the crate root by lib.rs, so pull
+  // them into scope here for hierarchical `Box<Child>` instance fields.
+  os << "#[allow(unused_imports)]\n";
+  os << "use super::*;\n\n";
   return emitFunc(f, os);
 }
 
