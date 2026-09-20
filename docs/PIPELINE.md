@@ -54,6 +54,18 @@ Coexists with `--profile-pass-timing` / `--profile-json`.
 
 See [mlir_pass_ir_dump.md](mlir_pass_ir_dump.md) for full details.
 
+### C++ member placement (always-on for `--emit=cpp`)
+
+After legality gates, `pycc --emit=cpp` runs `pyc-cpp-placement`. Comb
+temporaries that stay inside one method become function-local `Wire<>`
+instead of SimObject struct members. There is no opt-in flag.
+
+```bash
+pycc foo.pyc --emit=cpp --out-dir out --cpp-split=module
+```
+
+See [cpp_member_placement.md](cpp_member_placement.md).
+
 ## CLI entrypoints
 
 Emit a single `.pyc`:

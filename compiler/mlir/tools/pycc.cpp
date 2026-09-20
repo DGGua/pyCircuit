@@ -2264,6 +2264,9 @@ int main(int argc, char **argv) {
         static_cast<int64_t>(effectiveCanonicalizeBudget) * 4096);
   }
 
+  const unsigned cppCombChunkNodes = cppShardMaxAstNodes > 0 ? cppShardMaxAstNodes
+                                                           : pyc::CppEmitterOptions::kDefaultCombChunkNodes;
+
   // Cleanup + optimization pipeline tuned for netlist-style emission.
   PassManager pm(&ctx);
   std::unique_ptr<PassTimingCollector> passTimingStorage;
@@ -2335,6 +2338,8 @@ int main(int argc, char **argv) {
   pm.addNestedPass<func::FuncOp>(pyc::createCheckFlatTypesPass());
   pm.addNestedPass<func::FuncOp>(pyc::createCheckNoDynamicPass());
   pm.addPass(pyc::createCheckLogicDepthPass(logicDepthLimit));
+  if (emitKind == "cpp")
+    pm.addPass(pyc::createCppPlacementPass(cppCombChunkNodes));
   pm.addNestedPass<func::FuncOp>(pyc::createCollectCompileStatsPass());
   const auto tPassStart = Clock::now();
   if (failed(pm.run(*module))) {
@@ -2386,7 +2391,11 @@ int main(int argc, char **argv) {
     return writeCompileStatsJson(statsPath, compileStats);
   };
 
-  auto buildProfileSummary = [&]() -> llvm::json::Object {
+  pyc::CppPlacementSummary placementTotals;
+  if (emitKind == "cpp")
+    placementTotals = pyc::accumulateModulePlacementSummary(*module);
+
+  auto buildProfileSummary = [&](const pyc::CppPlacementSummary &placementSummary) -> llvm::json::Object {
     llvm::json::Object obj;
     obj["build_profile"] = buildProfileNorm;
     obj["hierarchy_policy"] = hierarchyPolicy.getValue();
@@ -2403,6 +2412,18 @@ int main(int argc, char **argv) {
     obj["cpp_shard_threshold_bytes"] = static_cast<int64_t>(cppShardThresholdBytes);
     obj["cpp_shard_max_ast_nodes"] = static_cast<int64_t>(cppShardMaxAstNodes);
     obj["profile_pass_timing"] = collectPassTiming;
+    {
+      llvm::json::Object placement;
+      placement["struct_members"] = static_cast<int64_t>(placementSummary.structMembers);
+      placement["local_in_method"] = static_cast<int64_t>(placementSummary.localInMethod);
+      placement["probe_pinned_struct"] = static_cast<int64_t>(placementSummary.probePinnedStruct);
+      placement["cross_part_promoted"] = static_cast<int64_t>(placementSummary.crossPartPromoted);
+      placement["scheduled_cross_method"] =
+          static_cast<int64_t>(placementSummary.scheduledCrossMethod);
+      placement["scheduled_cut_weight"] =
+          static_cast<int64_t>(placementSummary.scheduledCutWeight);
+      obj["cpp_placement"] = std::move(placement);
+    }
     return obj;
   };
 
@@ -2566,10 +2587,6 @@ int main(int argc, char **argv) {
       llvm::json::Array cppFiles;
       std::vector<CppManifestSource> cppManifestSources;
       pyc::CppEmitterOptions cppEmitOpts;
-      if (cppShardMaxAstNodes > 0) {
-        cppEmitOpts.evalTopoChunkNodes = cppShardMaxAstNodes;
-        cppEmitOpts.combChunkNodes = cppShardMaxAstNodes;
-      }
       cppEmitOpts.probePlanPath = probePlanPath;
 
       // Collect direct dependencies per module for header includes.
@@ -2857,7 +2874,7 @@ int main(int argc, char **argv) {
         std::vector<std::string> includeDirs = {std::string(outDir)};
         std::vector<std::string> compileDefines;
         std::string topHeaderName = top + ".hpp";
-        llvm::json::Object manifestProfile = buildProfileSummary();
+        llvm::json::Object manifestProfile = buildProfileSummary(placementTotals);
         manifestProfile["pycc_peak_rss_bytes"] = static_cast<int64_t>(getPeakRssBytes());
         manifestProfile["pass_time_ms"] = static_cast<int64_t>(passMs);
         auto toolchainRoot = findToolchainRoot(argv[0]);
@@ -2916,10 +2933,6 @@ int main(int argc, char **argv) {
   }
   if (emitKind == "cpp") {
     pyc::CppEmitterOptions cppEmitOpts;
-    if (cppShardMaxAstNodes > 0) {
-      cppEmitOpts.evalTopoChunkNodes = cppShardMaxAstNodes;
-      cppEmitOpts.combChunkNodes = cppShardMaxAstNodes;
-    }
     cppEmitOpts.probePlanPath = probePlanPath;
     if (failed(pyc::emitCpp(*module, os, cppEmitOpts)))
       return 1;
