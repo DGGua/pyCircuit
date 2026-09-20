@@ -66,6 +66,14 @@ pycc foo.pyc --emit=cpp --out-dir out --cpp-split=module
 
 See [cpp_member_placement.md](cpp_member_placement.md).
 
+### Optional C++ device hpp PCH
+
+`--cpp-pch` records device module headers for CMake
+`target_precompile_headers`. It does not change emit text and requires
+`--cpp-split=module`.
+
+See [cpp_device_pch.md](cpp_device_pch.md).
+
 ## CLI entrypoints
 
 Emit a single `.pyc`:
