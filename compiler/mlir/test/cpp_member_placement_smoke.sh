@@ -18,6 +18,10 @@ if "${PYCC}" --help 2>&1 | grep -q -- '--cpp-localize-members'; then
   echo "fail: --cpp-localize-members must stay removed (placement is always-on)" >&2
   exit 1
 fi
+if ! "${PYCC}" --help 2>&1 | grep -q -- '--cpp-compile-budget'; then
+  echo "fail: pycc missing --cpp-compile-budget (Davinci passes =false on hierarchical cores)" >&2
+  exit 1
+fi
 
 if [[ -x "${PYC_OPT}" ]] && ! "${PYC_OPT}" --help 2>&1 | grep -q 'pyc-cpp-placement'; then
   echo "fail: pyc-opt missing pyc-cpp-placement pass" >&2
@@ -80,8 +84,22 @@ mkdir -p "${OUT}/cpp_repeat"
   --build-profile=dev-fast \
   >/dev/null
 
+mkdir -p "${OUT}/cpp_budget_off"
+"${PYCC}" "${OUT}/counter.pyc" \
+  --emit=cpp \
+  --out-dir "${OUT}/cpp_budget_off" \
+  --cpp-split=module \
+  --cpp-shard-max-ast-nodes=2 \
+  --build-profile=dev-fast \
+  --cpp-compile-budget=false \
+  >/dev/null
+
 if [[ ! -f "${OUT}/cpp/counter.hpp" ]]; then
   echo "fail: missing ${OUT}/cpp/counter.hpp" >&2
+  exit 1
+fi
+if [[ ! -f "${OUT}/cpp_budget_off/counter.hpp" ]]; then
+  echo "fail: --cpp-compile-budget=false did not emit C++" >&2
   exit 1
 fi
 if ! cmp -s "${OUT}/cpp/counter.hpp" "${OUT}/cpp_repeat/counter.hpp"; then

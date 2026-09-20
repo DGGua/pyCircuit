@@ -127,6 +127,11 @@ static llvm::cl::opt<bool> cppPch(
     llvm::cl::desc("Record device module hpp for CMake precompiled headers (requires --cpp-split=module)"),
     llvm::cl::init(false));
 
+static llvm::cl::opt<bool> cppCompileBudget(
+    "cpp-compile-budget",
+    llvm::cl::desc("Enforce predicted C++ compile cost budgets (PYC991-993)"),
+    llvm::cl::init(true));
+
 static llvm::cl::opt<unsigned> cppShardThresholdLines(
     "cpp-shard-threshold-lines",
     llvm::cl::desc("Shard oversized C++ module sources when generated line count exceeds this threshold"),
@@ -2885,7 +2890,8 @@ int main(int argc, char **argv) {
       }
 
       if (splitModule) {
-        if (failed(enforceCppCompileBudgets(*module, cppManifestSources)))
+        if (cppCompileBudget &&
+            failed(enforceCppCompileBudgets(*module, cppManifestSources)))
           return 1;
         llvm::SmallString<256> manifestPathStorage;
         if (!cppManifestPath.empty()) {
