@@ -11,7 +11,7 @@ module attributes {pyc.top = @Top, pyc.frontend.contract = "pycircuit"} {
     return %forward, %zero : i1, i1
   }
 
-  func.func @Top() attributes {arg_names = [], result_names = [], pyc.kind = "module", pyc.inline = "false", pyc.params = "{}", pyc.base = "Top", pyc.struct.metrics = "{\"ast_node_count\":0,\"collection_count\":0,\"collection_instance_count\":0,\"estimated_inline_cost\":0,\"hardware_call_count\":0,\"instance_count\":2,\"loop_count\":0,\"module_call_count\":2,\"module_family_collection_count\":0,\"repeat_pressure\":0,\"repeated_body_clusters\":[],\"source_loc\":0,\"state_alloc_count\":0,\"state_call_count\":0}", pyc.struct.collections = "[]", pyc.value_params = [], pyc.value_param_types = []} {
+  func.func @Top() -> (i1, i1) attributes {arg_names = [], result_names = ["a_out", "b_out"], pyc.kind = "module", pyc.inline = "false", pyc.params = "{}", pyc.base = "Top", pyc.struct.metrics = "{\"ast_node_count\":0,\"collection_count\":0,\"collection_instance_count\":0,\"estimated_inline_cost\":0,\"hardware_call_count\":0,\"instance_count\":2,\"loop_count\":0,\"module_call_count\":2,\"module_family_collection_count\":0,\"repeat_pressure\":0,\"repeated_body_clusters\":[],\"source_loc\":0,\"state_alloc_count\":0,\"state_call_count\":0}", pyc.struct.collections = "[]", pyc.value_params = [], pyc.value_param_types = []} {
     %zero = arith.constant 0 : i1
     %a_feedback = pyc.wire {pyc.name = "a_feedback"} : i1
     %b_feedback = pyc.wire {pyc.name = "b_feedback"} : i1
@@ -21,6 +21,6 @@ module attributes {pyc.top = @Top, pyc.frontend.contract = "pycircuit"} {
         {callee = @B, name = "b"} : (i1, i1) -> (i1, i1)
     pyc.assign %a_feedback, %a0 : i1
     pyc.assign %b_feedback, %b0 : i1
-    return
+    return %a0, %b0 : i1, i1
   }
 }

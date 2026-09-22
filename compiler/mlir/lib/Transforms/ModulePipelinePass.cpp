@@ -5,7 +5,9 @@
 #include "pyc/Transforms/Passes.h"
 
 #include "mlir/IR/BuiltinAttributes.h"
+#include "mlir/IR/IRMapping.h"
 #include "mlir/IR/SymbolTable.h"
+#include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "mlir/Pass/Pass.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
@@ -15,6 +17,7 @@
 
 #include <algorithm>
 #include <functional>
+#include <optional>
 #include <string>
 
 using namespace mlir;
@@ -336,15 +339,15 @@ static ArrayAttr buildEdgeAttrs(MLIRContext *context,
 static DictionaryAttr buildFunctionMetadata(MLIRContext *context,
                                             const FunctionGraph &graph,
                                             int64_t coarseSccCount,
-                                            int64_t falseSccCount) {
+                                            int64_t falseSccCount,
+                                            StringRef mode, bool rewritten) {
   Builder builder(context);
   llvm::SmallVector<NamedAttribute> fields;
   fields.push_back(builder.getNamedAttr(
       "schema", builder.getStringAttr(kModulePipelineSchema)));
+  fields.push_back(builder.getNamedAttr("mode", builder.getStringAttr(mode)));
   fields.push_back(
-      builder.getNamedAttr("mode", builder.getStringAttr("analysis-only")));
-  fields.push_back(
-      builder.getNamedAttr("rewritten", builder.getBoolAttr(false)));
+      builder.getNamedAttr("rewritten", builder.getBoolAttr(rewritten)));
   fields.push_back(builder.getNamedAttr(
       "coarse_scc_count", builder.getI64IntegerAttr(coarseSccCount)));
   fields.push_back(builder.getNamedAttr(
@@ -358,9 +361,250 @@ static DictionaryAttr buildFunctionMetadata(MLIRContext *context,
   return builder.getDictionaryAttr(fields);
 }
 
+struct StagePlan {
+  func::FuncOp origin;
+  func::FuncOp stage;
+  llvm::SmallVector<unsigned> keptArguments;
+};
+
+static int64_t countStateOps(ModuleOp module) {
+  int64_t count = 0;
+  module.walk([&](Operation *op) {
+    if (isStateCut(op))
+      ++count;
+  });
+  return count;
+}
+
+static llvm::DenseMap<Operation *, Operation *>
+snapshotStateOwners(ModuleOp module) {
+  llvm::DenseMap<Operation *, Operation *> owners;
+  module.walk([&](Operation *op) {
+    if (isStateCut(op))
+      owners.try_emplace(op,
+                         op->getParentOfType<func::FuncOp>().getOperation());
+  });
+  return owners;
+}
+
+static LogicalResult verifyStateOwners(
+    ModuleOp module,
+    const llvm::DenseMap<Operation *, Operation *> &expectedOwners) {
+  int64_t seen = 0;
+  LogicalResult result = success();
+  module.walk([&](Operation *op) {
+    if (!isStateCut(op) || failed(result))
+      return;
+    ++seen;
+    auto expected = expectedOwners.find(op);
+    auto owner = op->getParentOfType<func::FuncOp>();
+    if (expected == expectedOwners.end() || !owner ||
+        expected->second != owner.getOperation()) {
+      op->emitError(
+          "PYC4005 module-pipeline rewrite invariant: state ownership changed");
+      result = failure();
+    }
+  });
+  if (failed(result))
+    return failure();
+  if (seen != static_cast<int64_t>(expectedOwners.size())) {
+    module.emitError(
+        "PYC4005 module-pipeline rewrite invariant: state identity changed");
+    return failure();
+  }
+  return success();
+}
+
+static LogicalResult emitUnsupported(Operation *op, Twine detail) {
+  op->emitError("PYC4004 module-pipeline unsupported-edge: ") << detail;
+  return failure();
+}
+
+static LogicalResult validateStageCandidate(func::FuncOp callee) {
+  if (!callee || callee.isDeclaration() || callee.getBody().empty())
+    return emitUnsupported(callee, "stage callee must have a body");
+  if (!llvm::hasSingleElement(callee.getBody()))
+    return emitUnsupported(callee,
+                           "only single-block stage callees are supported");
+  if (callee->hasAttr("pyc.probe_only"))
+    return emitUnsupported(callee, "probe functions cannot be staged");
+
+  LogicalResult result = success();
+  callee.walk([&](Operation *op) {
+    if (failed(result) || op == callee.getOperation() ||
+        isa<func::ReturnOp, pyc::YieldOp>(op))
+      return;
+    if (isStateCut(op)) {
+      result = emitUnsupported(
+          op, "stateful stage extraction is not supported in rewrite v1");
+      return;
+    }
+    if (isa<pyc::InstanceOp, pyc::AssertOp>(op)) {
+      result = emitUnsupported(
+          op, "nested instances/assertions are not supported in rewrite v1");
+      return;
+    }
+    if (!isMemoryEffectFree(op))
+      result = emitUnsupported(
+          op, "operation has an unknown or observable side effect");
+  });
+  return result;
+}
+
+static FailureOr<StagePlan>
+extractSingleStage(ModuleOp module, func::FuncOp callee,
+                   llvm::DenseMap<Operation *, unsigned> &callsiteCounts) {
+  if (callsiteCounts.lookup(callee.getOperation()) != 1u) {
+    (void)emitUnsupported(callee,
+                          "callee must have exactly one pyc.instance callsite");
+    return failure();
+  }
+  if (failed(validateStageCandidate(callee)))
+    return failure();
+
+  StagePlan plan;
+  plan.origin = callee;
+  llvm::SmallVector<Type> stageInputs;
+  for (BlockArgument argument : callee.getArguments()) {
+    if (argument.use_empty())
+      continue;
+    plan.keptArguments.push_back(argument.getArgNumber());
+    stageInputs.push_back(argument.getType());
+  }
+
+  std::string stageName = (callee.getSymName() + "__pyc_stage_0").str();
+  if (SymbolTable::lookupSymbolIn(module, stageName)) {
+    (void)emitUnsupported(
+        callee, "generated stage symbol already exists without v1 metadata");
+    return failure();
+  }
+
+  auto stageType = FunctionType::get(module.getContext(), stageInputs,
+                                     callee.getFunctionType().getResults());
+  func::FuncOp stage =
+      func::FuncOp::create(callee.getLoc(), stageName, stageType);
+  for (NamedAttribute attribute : callee->getAttrs()) {
+    StringRef name = attribute.getName().strref();
+    if (name == SymbolTable::getSymbolAttrName() || name == "function_type" ||
+        name == "arg_attrs" || name == "res_attrs" || name == "arg_names")
+      continue;
+    stage->setAttr(attribute.getName(), attribute.getValue());
+  }
+
+  Builder attrBuilder(module.getContext());
+  llvm::SmallVector<Attribute> argNames;
+  if (auto originalNames = callee->getAttrOfType<ArrayAttr>("arg_names")) {
+    for (unsigned index : plan.keptArguments)
+      if (index < originalNames.size())
+        argNames.push_back(originalNames[index]);
+  }
+  if (argNames.size() == plan.keptArguments.size())
+    stage->setAttr("arg_names", attrBuilder.getArrayAttr(argNames));
+  stage->setAttr(kPipelineGeneratedAttr, attrBuilder.getBoolAttr(true));
+  stage->setAttr(kPipelineOriginAttr,
+                 attrBuilder.getStringAttr(callee.getSymName()));
+  stage->setAttr(kPipelineStageAttr, attrBuilder.getI64IntegerAttr(0));
+  stage->setAttr(kPipelineLogicalPathAttr,
+                 attrBuilder.getStringAttr(callee.getSymName()));
+  stage->setAttr(kPipelineValidatedAttr,
+                 attrBuilder.getStringAttr(kModulePipelineSchema));
+
+  Block *entry = stage.addEntryBlock();
+  IRMapping mapping;
+  for (auto [newIndex, oldIndex] : llvm::enumerate(plan.keptArguments))
+    mapping.map(callee.getArgument(oldIndex), entry->getArgument(newIndex));
+  OpBuilder bodyBuilder = OpBuilder::atBlockEnd(entry);
+  for (Operation &op : callee.getBody().front())
+    bodyBuilder.clone(op, mapping);
+
+  module.push_back(stage);
+  plan.stage = stage;
+  return plan;
+}
+
+static LogicalResult rewriteCallsite(pyc::InstanceOp instance,
+                                     const StagePlan &plan) {
+  llvm::SmallVector<Value> inputs;
+  inputs.reserve(plan.keptArguments.size());
+  for (unsigned index : plan.keptArguments) {
+    if (index >= instance.getNumOperands())
+      return emitUnsupported(instance, "stage argument index is out of range");
+    inputs.push_back(instance.getOperand(index));
+  }
+
+  NamedAttrList attrs(instance->getAttrs());
+  auto stageSymbol =
+      plan.stage->getAttrOfType<StringAttr>(SymbolTable::getSymbolAttrName());
+  attrs.set("callee", FlatSymbolRefAttr::get(instance.getContext(),
+                                             stageSymbol.getValue()));
+  std::string logicalPath = instanceName(instance, 0);
+  attrs.set(kPipelineLogicalPathAttr,
+            StringAttr::get(instance.getContext(), logicalPath));
+
+  OpBuilder builder(instance);
+  OperationState state(instance.getLoc(), pyc::InstanceOp::getOperationName());
+  state.addOperands(inputs);
+  state.addTypes(instance.getResultTypes());
+  state.addAttributes(attrs);
+  Operation *replacement = builder.create(state);
+  instance->replaceAllUsesWith(replacement->getResults());
+  instance.erase();
+  return success();
+}
+
+static LogicalResult verifyRewrittenModule(ModuleOp module,
+                                           int64_t expectedStateCount,
+                                           int64_t expectedStages) {
+  if (countStateOps(module) != expectedStateCount) {
+    module.emitError(
+        "PYC4005 module-pipeline rewrite invariant: state count changed");
+    return failure();
+  }
+
+  int64_t generatedStages = 0;
+  for (func::FuncOp func : module.getOps<func::FuncOp>()) {
+    if (!isPipelineGeneratedFunc(func))
+      continue;
+    ++generatedStages;
+    if (!func->getAttrOfType<StringAttr>(kPipelineOriginAttr) ||
+        !func->getAttrOfType<IntegerAttr>(kPipelineStageAttr) ||
+        !func->getAttrOfType<StringAttr>(kPipelineLogicalPathAttr) ||
+        !isPipelineValidatedFunc(func)) {
+      func.emitError("PYC4005 module-pipeline rewrite invariant: incomplete "
+                     "stage metadata");
+      return failure();
+    }
+  }
+  if (generatedStages != expectedStages) {
+    module.emitError("PYC4005 module-pipeline rewrite invariant: generated "
+                     "stage count mismatch");
+    return failure();
+  }
+
+  CombDepGraphCache cache(module);
+  for (func::FuncOp func : module.getOps<func::FuncOp>()) {
+    if (func.isDeclaration())
+      continue;
+    FailureOr<FunctionGraph> graph = buildFunctionGraph(module, func, cache);
+    if (failed(graph))
+      return failure();
+    for (const auto &component : computeSccs(graph->coarseEdges).components) {
+      if (!isCyclicComponent(component, graph->coarseEdges))
+        continue;
+      func.emitError("PYC4005 module-pipeline rewrite invariant: instance DAG "
+                     "remains cyclic");
+      return failure();
+    }
+  }
+  return success();
+}
+
 struct ModulePipelinePass
     : public PassWrapper<ModulePipelinePass, OperationPass<ModuleOp>> {
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(ModulePipelinePass)
+
+  ModulePipelinePass() = default;
+  explicit ModulePipelinePass(bool rewrite) : rewrite_(rewrite) {}
 
   StringRef getArgument() const override { return "pyc-module-pipeline"; }
   StringRef getDescription() const override {
@@ -376,16 +620,56 @@ struct ModulePipelinePass
       if (!schema || schema.getValue() != kModulePipelineSchema) {
         module.emitError("PYC4005 unknown module-pipeline metadata schema");
         signalPassFailure();
+        return;
       }
-      return;
+      bool wasRewritten = false;
+      if (auto value = existing.getAs<BoolAttr>("rewritten"))
+        wasRewritten = value.getValue();
+      auto existingMode = existing.getAs<StringAttr>("mode");
+      StringRef expectedMode = wasRewritten ? "rewrite" : "analysis";
+      if (!existingMode || existingMode.getValue() != expectedMode) {
+        module.emitError("PYC4005 inconsistent module-pipeline mode metadata");
+        signalPassFailure();
+        return;
+      }
+      if (!rewrite_ || wasRewritten) {
+        if (rewrite_) {
+          auto stateCount = existing.getAs<IntegerAttr>("state_cut_count");
+          auto stageCount =
+              existing.getAs<IntegerAttr>("generated_stage_count");
+          if (!stateCount || !stageCount) {
+            module.emitError(
+                "PYC4005 incomplete module-pipeline rewrite metadata");
+            signalPassFailure();
+            return;
+          }
+          if (failed(verifyRewrittenModule(module, stateCount.getInt(),
+                                           stageCount.getInt())))
+            signalPassFailure();
+        }
+        return;
+      }
+      // Analysis metadata is deliberately replaceable by the physical rewrite.
+      module->removeAttr(kModulePipelineSummaryAttr);
+      for (func::FuncOp func : module.getOps<func::FuncOp>()) {
+        func->removeAttr(kPipelineValidatedAttr);
+        func->removeAttr(kPipelineStageDagAttr);
+      }
     }
 
     CombDepGraphCache combCache(module);
     ModulePipelineSummary aggregate;
+    llvm::DenseSet<Operation *> rewriteCallees;
+    llvm::DenseMap<Operation *, std::pair<int64_t, int64_t>> originalCounts;
+    llvm::DenseMap<Operation *, Type> originalSignatures;
+    const int64_t stateCountBefore = countStateOps(module);
+    const auto stateOwnersBefore = snapshotStateOwners(module);
 
     for (func::FuncOp func : module.getOps<func::FuncOp>()) {
       if (func.isDeclaration())
         continue;
+      originalSignatures.try_emplace(func.getOperation(),
+                                     func.getFunctionType());
       ++aggregate.functionCount;
       FailureOr<FunctionGraph> graphOr =
           buildFunctionGraph(module, func, combCache);
@@ -397,9 +681,13 @@ struct ModulePipelinePass
       aggregate.stateCutCount += graph.stateCutCount;
 
       int64_t coarseSccCount = 0;
-      for (const auto &component : computeSccs(graph.coarseEdges).components)
-        if (isCyclicComponent(component, graph.coarseEdges))
-          ++coarseSccCount;
+      llvm::SmallVector<llvm::SmallVector<unsigned>> coarseCycles;
+      for (const auto &component : computeSccs(graph.coarseEdges).components) {
+        if (!isCyclicComponent(component, graph.coarseEdges))
+          continue;
+        ++coarseSccCount;
+        coarseCycles.push_back(component);
+      }
       aggregate.coarseSccCount += coarseSccCount;
 
       llvm::SmallVector<llvm::SmallVector<unsigned>> trueCycles;
@@ -423,26 +711,124 @@ struct ModulePipelinePass
       }
 
       // With no port-level cycle, every cycle introduced by whole-instance
-      // atomicity is a false SCC. Physical func extraction is intentionally
-      // deferred until state ownership and trace-path rewriting are proven.
+      // atomicity is a false SCC.
       int64_t falseSccCount = coarseSccCount;
       aggregate.falseSccCount += falseSccCount;
-      func->setAttr(
-          kPipelineValidatedAttr,
-          StringAttr::get(module.getContext(), kModulePipelineSchema));
-      func->setAttr(kPipelineStageDagAttr,
-                    buildFunctionMetadata(module.getContext(), graph,
-                                          coarseSccCount, falseSccCount));
+      originalCounts.try_emplace(func.getOperation(), coarseSccCount,
+                                 falseSccCount);
+      if (rewrite_) {
+        for (const auto &component : coarseCycles) {
+          for (unsigned instanceIndex : component) {
+            pyc::InstanceOp instance = graph.instances[instanceIndex];
+            auto callee = dyn_cast_or_null<func::FuncOp>(
+                SymbolTable::lookupSymbolIn(module, instance.getCalleeAttr()));
+            if (callee)
+              rewriteCallees.insert(callee.getOperation());
+          }
+        }
+      } else {
+        func->setAttr(
+            kPipelineValidatedAttr,
+            StringAttr::get(module.getContext(), kModulePipelineSchema));
+        func->setAttr(kPipelineStageDagAttr,
+                      buildFunctionMetadata(module.getContext(), graph,
+                                            coarseSccCount, falseSccCount,
+                                            "analysis", false));
+      }
+    }
+
+    if (rewrite_) {
+      llvm::DenseMap<Operation *, unsigned> callsiteCounts;
+      module.walk([&](pyc::InstanceOp instance) {
+        auto callee = dyn_cast_or_null<func::FuncOp>(
+            SymbolTable::lookupSymbolIn(module, instance.getCalleeAttr()));
+        if (callee)
+          ++callsiteCounts[callee.getOperation()];
+      });
+
+      llvm::SmallVector<StagePlan> plans;
+      llvm::DenseMap<Operation *, unsigned> planIndex;
+      llvm::SmallVector<func::FuncOp> originalFunctions;
+      for (func::FuncOp func : module.getOps<func::FuncOp>())
+        originalFunctions.push_back(func);
+      for (func::FuncOp func : originalFunctions) {
+        if (!rewriteCallees.contains(func.getOperation()))
+          continue;
+        FailureOr<StagePlan> plan =
+            extractSingleStage(module, func, callsiteCounts);
+        if (failed(plan)) {
+          signalPassFailure();
+          return;
+        }
+        planIndex.try_emplace(func.getOperation(), plans.size());
+        plans.push_back(std::move(*plan));
+      }
+
+      llvm::SmallVector<pyc::InstanceOp> callsites;
+      module.walk([&](pyc::InstanceOp instance) {
+        auto callee = dyn_cast_or_null<func::FuncOp>(
+            SymbolTable::lookupSymbolIn(module, instance.getCalleeAttr()));
+        if (callee && planIndex.contains(callee.getOperation()))
+          callsites.push_back(instance);
+      });
+      for (pyc::InstanceOp instance : callsites) {
+        auto callee = dyn_cast<func::FuncOp>(
+            SymbolTable::lookupSymbolIn(module, instance.getCalleeAttr()));
+        if (failed(rewriteCallsite(
+                instance, plans[planIndex.lookup(callee.getOperation())]))) {
+          signalPassFailure();
+          return;
+        }
+      }
+      aggregate.generatedStageCount = plans.size();
+
+      for (const auto &entry : originalSignatures) {
+        auto func = dyn_cast<func::FuncOp>(entry.first);
+        if (!func || func.getFunctionType() != entry.second) {
+          module.emitError("PYC4005 module-pipeline rewrite invariant: "
+                           "original signature changed");
+          signalPassFailure();
+          return;
+        }
+      }
+      if (failed(verifyStateOwners(module, stateOwnersBefore))) {
+        signalPassFailure();
+        return;
+      }
+      if (failed(verifyRewrittenModule(module, stateCountBefore,
+                                       aggregate.generatedStageCount))) {
+        signalPassFailure();
+        return;
+      }
+
+      CombDepGraphCache rewrittenCache(module);
+      for (func::FuncOp func : module.getOps<func::FuncOp>()) {
+        if (func.isDeclaration())
+          continue;
+        auto graph = buildFunctionGraph(module, func, rewrittenCache);
+        if (failed(graph)) {
+          signalPassFailure();
+          return;
+        }
+        auto counts = originalCounts.lookup(func.getOperation());
+        func->setAttr(
+            kPipelineValidatedAttr,
+            StringAttr::get(module.getContext(), kModulePipelineSchema));
+        func->setAttr(kPipelineStageDagAttr,
+                      buildFunctionMetadata(module.getContext(), *graph,
+                                            counts.first, counts.second,
+                                            "rewrite", true));
+      }
     }
 
     Builder builder(module.getContext());
     llvm::SmallVector<NamedAttribute> fields;
     fields.push_back(builder.getNamedAttr(
         "schema", builder.getStringAttr(kModulePipelineSchema)));
+    fields.push_back(builder.getNamedAttr(
+        "mode", builder.getStringAttr(rewrite_ ? "rewrite" : "analysis")));
     fields.push_back(
-        builder.getNamedAttr("mode", builder.getStringAttr("analysis-only")));
-    fields.push_back(
-        builder.getNamedAttr("rewritten", builder.getBoolAttr(false)));
+        builder.getNamedAttr("rewritten", builder.getBoolAttr(rewrite_)));
     fields.push_back(builder.getNamedAttr(
         "function_count", builder.getI64IntegerAttr(aggregate.functionCount)));
     fields.push_back(builder.getNamedAttr(
@@ -455,12 +841,26 @@ struct ModulePipelinePass
         builder.getI64IntegerAttr(aggregate.trueCycleCount)));
     fields.push_back(builder.getNamedAttr(
         "state_cut_count", builder.getI64IntegerAttr(aggregate.stateCutCount)));
+    fields.push_back(builder.getNamedAttr(
+        "generated_stage_count",
+        builder.getI64IntegerAttr(aggregate.generatedStageCount)));
+    fields.push_back(builder.getNamedAttr(
+        "minimum_stage_count",
+        builder.getI64IntegerAttr(aggregate.generatedStageCount)));
     module->setAttr(kModulePipelineSummaryAttr,
                     builder.getDictionaryAttr(fields));
   }
+
+private:
+  bool rewrite_ = false;
 };
 
 } // namespace
+
+bool isPipelineGeneratedFunc(func::FuncOp func) {
+  auto generated = func->getAttrOfType<BoolAttr>(kPipelineGeneratedAttr);
+  return generated && generated.getValue();
+}
 
 bool isPipelineValidatedFunc(func::FuncOp func) {
   auto schema = func->getAttrOfType<StringAttr>(kPipelineValidatedAttr);
@@ -487,13 +887,14 @@ readModulePipelineSummary(ModuleOp module) {
   summary.falseSccCount = readInteger("false_scc_count");
   summary.trueCycleCount = readInteger("true_cycle_count");
   summary.stateCutCount = readInteger("state_cut_count");
+  summary.generatedStageCount = readInteger("generated_stage_count");
   if (auto rewritten = attr.getAs<BoolAttr>("rewritten"))
     summary.rewritten = rewritten.getValue();
   return summary;
 }
 
-std::unique_ptr<::mlir::Pass> createModulePipelinePass() {
-  return std::make_unique<ModulePipelinePass>();
+std::unique_ptr<::mlir::Pass> createModulePipelinePass(bool rewrite) {
+  return std::make_unique<ModulePipelinePass>(rewrite);
 }
 
 static PassRegistration<ModulePipelinePass> pass;
