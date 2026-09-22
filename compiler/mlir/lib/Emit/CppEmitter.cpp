@@ -888,6 +888,14 @@ static LogicalResult emitCombMethod(pyc::CombOp comb,
   return success();
 }
 
+static void emitTimingAdd(llvm::raw_ostream &os, llvm::StringRef indent, llvm::StringRef field,
+                          llvm::StringRef t0) {
+  os << indent << "if (_pyc_sim_timing_enable)\n";
+  os << indent << "  _pyc_sim_stats." << field
+     << " += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>("
+     << "std::chrono::steady_clock::now() - " << t0 << ").count());\n";
+}
+
 static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEmitterOptions &opts) {
   NameTable nt;
 
@@ -1472,8 +1480,26 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
   os << "    std::uint64_t primitive_eval_calls = 0;\n";
   os << "    std::uint64_t primitive_cache_skips = 0;\n";
   os << "    std::uint64_t fallback_iterations = 0;\n";
+  os << "    std::uint64_t eval_calls = 0;\n";
+  os << "    std::uint64_t eval_total_ns = 0;\n";
+  os << "    std::uint64_t topo_eval_calls = 0;\n";
+  os << "    std::uint64_t topo_eval_ns = 0;\n";
+  os << "    std::uint64_t fallback_calls = 0;\n";
+  os << "    std::uint64_t fallback_total_ns = 0;\n";
+  os << "    std::uint64_t initial_comb_pass_calls = 0;\n";
+  os << "    std::uint64_t initial_comb_pass_ns = 0;\n";
+  os << "    std::uint64_t fallback_comb_pass_calls = 0;\n";
+  os << "    std::uint64_t fallback_comb_pass_ns = 0;\n";
+  os << "    std::uint64_t fallback_primitive_ns = 0;\n";
+  os << "    std::uint64_t fallback_max_iterations = 0;\n";
+  os << "    std::uint64_t fallback_iter_hist_0 = 0;\n";
+  os << "    std::uint64_t fallback_iter_hist_1 = 0;\n";
+  os << "    std::uint64_t fallback_iter_hist_2 = 0;\n";
+  os << "    std::uint64_t fallback_iter_hist_3 = 0;\n";
+  os << "    std::uint64_t fallback_iter_hist_4p = 0;\n";
   os << "  };\n";
   os << "  bool _pyc_sim_stats_enable = false;\n";
+  os << "  bool _pyc_sim_timing_enable = false;\n";
   os << "  bool _pyc_sim_fast_enable = false;\n";
   os << "  std::string _pyc_sim_stats_path{};\n";
   os << "  _pyc_sim_stats_t _pyc_sim_stats{};\n\n";
@@ -1489,18 +1515,75 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
   os << "  }\n\n";
   os << "  void _pyc_init_runtime_controls() {\n";
   os << "    _pyc_sim_stats_enable = _pyc_parse_bool_env(\"PYC_SIM_STATS\", false);\n";
+  os << "    _pyc_sim_timing_enable = _pyc_parse_bool_env(\"PYC_SIM_TIMING\", false);\n";
   os << "    _pyc_sim_fast_enable = _pyc_parse_bool_env(\"PYC_SIM_FAST\", false);\n";
   os << "    const char *path = std::getenv(\"PYC_SIM_STATS_PATH\");\n";
   os << "    if (path && *path)\n";
   os << "      _pyc_sim_stats_path = path;\n";
   os << "  }\n\n";
   os << "  void reset_sim_stats() { _pyc_sim_stats = _pyc_sim_stats_t{}; }\n\n";
-  os << "  void dump_sim_stats(std::ostream &os) const {\n";
-  os << "    os << \"instance_eval_calls=\" << _pyc_sim_stats.instance_eval_calls << \"\\n\";\n";
-  os << "    os << \"instance_cache_skips=\" << _pyc_sim_stats.instance_cache_skips << \"\\n\";\n";
-  os << "    os << \"primitive_eval_calls=\" << _pyc_sim_stats.primitive_eval_calls << \"\\n\";\n";
-  os << "    os << \"primitive_cache_skips=\" << _pyc_sim_stats.primitive_cache_skips << \"\\n\";\n";
-  os << "    os << \"fallback_iterations=\" << _pyc_sim_stats.fallback_iterations << \"\\n\";\n";
+  os << "  static void _pyc_json_escape(std::ostream &os, const std::string &s) {\n";
+  os << "    for (unsigned char c : s) {\n";
+  os << "      if (c == '\\\\' || c == '\"') {\n";
+  os << "        os << '\\\\' << static_cast<char>(c);\n";
+  os << "      } else if (c == '\\n') {\n";
+  os << "        os << \"\\\\n\";\n";
+  os << "      } else if (c < 0x20) {\n";
+  os << "        os << ' ';\n";
+  os << "      } else {\n";
+  os << "        os << static_cast<char>(c);\n";
+  os << "      }\n";
+  os << "    }\n";
+  os << "  }\n\n";
+  os << "  void dump_sim_stats_json(std::ostream &os, const std::string &prefix) const {\n";
+  os << "    os << \"{\\\"path\\\":\\\"\";\n";
+  os << "    _pyc_json_escape(os, prefix);\n";
+  os << "    os << \"\\\",\\\"module\\\":\\\"" << structName << "\\\"\";\n";
+  static const char *kStatsFields[] = {
+      "eval_calls",
+      "eval_total_ns",
+      "topo_eval_calls",
+      "topo_eval_ns",
+      "fallback_calls",
+      "fallback_total_ns",
+      "initial_comb_pass_calls",
+      "initial_comb_pass_ns",
+      "fallback_comb_pass_calls",
+      "fallback_comb_pass_ns",
+      "fallback_primitive_ns",
+      "fallback_iterations",
+      "fallback_max_iterations",
+      "fallback_iter_hist_0",
+      "fallback_iter_hist_1",
+      "fallback_iter_hist_2",
+      "fallback_iter_hist_3",
+      "fallback_iter_hist_4p",
+      "instance_eval_calls",
+      "instance_cache_skips",
+      "primitive_eval_calls",
+      "primitive_cache_skips",
+  };
+  for (const char *field : kStatsFields) {
+    os << "    os << \",\\\"" << field << "\\\":\";\n";
+    os << "    os << _pyc_sim_stats." << field << ";\n";
+  }
+  os << "    os << \"}\\n\";\n";
+  os << "  }\n\n";
+  os << "  void dump_sim_stats(std::ostream &os) const { dump_sim_stats_json(os, \"\"); }\n\n";
+  os << "  void dump_sim_stats_tree(std::ostream &os, const std::string &prefix) const {\n";
+  os << "    dump_sim_stats_json(os, prefix);\n";
+  {
+    std::vector<const InstInfo *> children;
+    children.reserve(instInfos.size());
+    for (const auto &ii : instInfos)
+      children.push_back(&ii);
+    std::sort(children.begin(), children.end(),
+              [](const InstInfo *a, const InstInfo *b) { return a->member < b->member; });
+    for (const InstInfo *ii : children) {
+      os << "    if (" << ii->member << ")\n";
+      os << "      " << ii->member << "->dump_sim_stats_tree(os, prefix + \"." << ii->member << "\");\n";
+    }
+  }
   os << "  }\n\n";
   os << "  void dump_sim_stats_to_path(const char *path = nullptr) const {\n";
   os << "    const char *outPath = path;\n";
@@ -2502,9 +2585,18 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
       os << "    for (unsigned _i = 0; _i < " << numPrims << "u; ++_i) {\n";
       os << "      if (_pyc_sim_stats_enable) _pyc_sim_stats.fallback_iterations++;\n";
       os << "      bool _pyc_prim_changed = false;\n";
+      os << "      std::chrono::steady_clock::time_point _pyc_prim_t0{};\n";
+      os << "      if (_pyc_sim_timing_enable)\n";
+      os << "        _pyc_prim_t0 = std::chrono::steady_clock::now();\n";
       for (const std::string &methodName : primGroupMethods)
         os << "      " << methodName << "(_pyc_prim_changed);\n";
+      emitTimingAdd(os, "      ", "fallback_primitive_ns", "_pyc_prim_t0");
+      os << "      std::chrono::steady_clock::time_point _pyc_comb_t0{};\n";
+      os << "      if (_pyc_sim_timing_enable)\n";
+      os << "        _pyc_comb_t0 = std::chrono::steady_clock::now();\n";
+      os << "      if (_pyc_sim_stats_enable) _pyc_sim_stats.fallback_comb_pass_calls++;\n";
       os << "      eval_comb_pass();\n";
+      emitTimingAdd(os, "      ", "fallback_comb_pass_ns", "_pyc_comb_t0");
       os << "      if (!_pyc_prim_changed) break;\n";
       os << "    }\n";
     }
@@ -2588,7 +2680,17 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
   }
 
   os << "  void eval() {\n";
+  os << "    std::chrono::steady_clock::time_point _pyc_eval_t0{};\n";
+  os << "    if (_pyc_sim_timing_enable)\n";
+  os << "      _pyc_eval_t0 = std::chrono::steady_clock::now();\n";
+  os << "    if (_pyc_sim_stats_enable)\n";
+  os << "      _pyc_sim_stats.eval_calls++;\n";
   if (hasFullTopo) {
+    os << "    std::chrono::steady_clock::time_point _pyc_topo_t0{};\n";
+    os << "    if (_pyc_sim_timing_enable)\n";
+    os << "      _pyc_topo_t0 = std::chrono::steady_clock::now();\n";
+    os << "    if (_pyc_sim_stats_enable)\n";
+    os << "      _pyc_sim_stats.topo_eval_calls++;\n";
     if (!topoEvalMethods.empty()) {
       for (const std::string &methodName : topoEvalMethods)
         os << "    " << methodName << "();\n";
@@ -2597,8 +2699,20 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
         if (failed(emitEvalNode(op, "    ")))
           return failure();
     }
+    emitTimingAdd(os, "    ", "topo_eval_ns", "_pyc_topo_t0");
   } else {
+    os << "    std::chrono::steady_clock::time_point _pyc_stage_t0{};\n";
+    os << "    if (_pyc_sim_timing_enable)\n";
+    os << "      _pyc_stage_t0 = std::chrono::steady_clock::now();\n";
+    os << "    if (_pyc_sim_stats_enable)\n";
+    os << "      _pyc_sim_stats.initial_comb_pass_calls++;\n";
     os << "    eval_comb_pass();\n";
+    emitTimingAdd(os, "    ", "initial_comb_pass_ns", "_pyc_stage_t0");
+    os << "    std::uint64_t _pyc_iter_before = _pyc_sim_stats.fallback_iterations;\n";
+    os << "    if (_pyc_sim_timing_enable)\n";
+    os << "      _pyc_stage_t0 = std::chrono::steady_clock::now();\n";
+    os << "    if (_pyc_sim_stats_enable)\n";
+    os << "      _pyc_sim_stats.fallback_calls++;\n";
     unsigned numPrims = static_cast<unsigned>(instInfos.size() + fifos.size() + asyncFifos.size() + byteMems.size());
     if (hasSccWorklistPlan && numPrims > 0) {
       os << "    if (_pyc_sim_fast_enable) {\n";
@@ -2613,6 +2727,17 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
     } else {
       os << "    eval_fixpoint_fallback_path();\n";
     }
+    os << "    if (_pyc_sim_stats_enable) {\n";
+    os << "      std::uint64_t _pyc_iters = _pyc_sim_stats.fallback_iterations - _pyc_iter_before;\n";
+    os << "      if (_pyc_iters > _pyc_sim_stats.fallback_max_iterations)\n";
+    os << "        _pyc_sim_stats.fallback_max_iterations = _pyc_iters;\n";
+    os << "      if (_pyc_iters == 0) _pyc_sim_stats.fallback_iter_hist_0++;\n";
+    os << "      else if (_pyc_iters == 1) _pyc_sim_stats.fallback_iter_hist_1++;\n";
+    os << "      else if (_pyc_iters == 2) _pyc_sim_stats.fallback_iter_hist_2++;\n";
+    os << "      else if (_pyc_iters == 3) _pyc_sim_stats.fallback_iter_hist_3++;\n";
+    os << "      else _pyc_sim_stats.fallback_iter_hist_4p++;\n";
+    os << "    }\n";
+    emitTimingAdd(os, "    ", "fallback_total_ns", "_pyc_stage_t0");
   }
 
   // Connect return values to output ports.
@@ -2622,6 +2747,7 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
   for (auto [i, v] : llvm::enumerate(ret.getOperands()))
     os << "    " << outNames[i] << " = " << nt.get(v) << ";\n";
 
+  emitTimingAdd(os, "    ", "eval_total_ns", "_pyc_eval_t0");
   os << "  }\n\n";
 
   // tick_compute/tick_commit: two-phase sequential update (hierarchy-aware).
@@ -2736,6 +2862,20 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
 	  os << "    comb();\n";
 	  os << "  }\n";
 
+  bool emitStatsDtor = false;
+  if (auto topAttr = mod->getAttrOfType<FlatSymbolRefAttr>("pyc.top"))
+    emitStatsDtor = topAttr.getValue() == f.getSymName();
+  if (emitStatsDtor) {
+    os << "  ~" << structName << "() {\n";
+    os << "    if (_pyc_sim_stats_path.empty())\n";
+    os << "      return;\n";
+    os << "    std::ofstream _pyc_stats_ofs(_pyc_sim_stats_path, std::ios::out | std::ios::trunc);\n";
+    os << "    if (!_pyc_stats_ofs)\n";
+    os << "      return;\n";
+    os << "    dump_sim_stats_tree(_pyc_stats_ofs, \"" << structName << "\");\n";
+    os << "  }\n";
+  }
+
 	  os << "};\n\n";
 	  return success();
 	}
@@ -2744,6 +2884,7 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
 
 LogicalResult emitCpp(ModuleOp module, llvm::raw_ostream &os, const CppEmitterOptions &opts) {
   os << "// pyCircuit C++ emission (prototype)\n";
+  os << "#include <chrono>\n";
   os << "#include <cstdlib>\n";
   os << "#include <cstdint>\n";
   os << "#include <fstream>\n";

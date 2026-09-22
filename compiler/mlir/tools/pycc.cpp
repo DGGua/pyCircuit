@@ -2602,6 +2602,7 @@ int main(int argc, char **argv) {
         (void)moduleName;
         os << "// pyCircuit C++ emission (split)\n";
         os << "#pragma once\n";
+        os << "#include <chrono>\n";
         os << "#include <cstdlib>\n";
         os << "#include <cstdint>\n";
         os << "#include <fstream>\n";
