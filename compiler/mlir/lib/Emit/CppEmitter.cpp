@@ -2,6 +2,7 @@
 
 #include "pyc/Dialect/PYC/PYCOps.h"
 #include "pyc/Dialect/PYC/PYCTypes.h"
+#include "pyc/Transforms/ChangeDrivenSchedule.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -22,6 +23,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <functional>
+#include <limits>
 #include <vector>
 
 using namespace mlir;
@@ -153,6 +155,135 @@ struct NameTable {
     return n;
   }
 };
+
+struct EmissionScheduleNode {
+  Operation *operation = nullptr;
+  unsigned resultIndex = 0;
+  uint64_t id = 0;
+  uint64_t rank = 0;
+  uint64_t slot = 0;
+  llvm::SmallVector<uint64_t> fanout;
+};
+
+struct EmissionSchedule {
+  llvm::SmallVector<EmissionScheduleNode> nodes;
+  llvm::DenseMap<Value, unsigned> valueToNode;
+};
+
+static FailureOr<uint64_t> readScheduleUnsigned(Operation *op,
+                                                StringRef attrName,
+                                                unsigned resultIndex) {
+  auto values = op->getAttrOfType<ArrayAttr>(attrName);
+  if (!values || values.size() != op->getNumResults() ||
+      resultIndex >= values.size())
+    return op->emitError("C++ emitter requires valid per-result schedule attribute '")
+           << attrName << "'";
+  auto value = dyn_cast<IntegerAttr>(values[resultIndex]);
+  if (!value || value.getInt() < 0)
+    return op->emitError("C++ emitter requires unsigned values in schedule attribute '")
+           << attrName << "'";
+  return static_cast<uint64_t>(value.getInt());
+}
+
+/// Reads the verified pyc.change_schedule.v1 contract without rebuilding any
+/// dependency edges. The emitter deliberately treats these attributes as the
+/// sole semantic source for change-driven fanout.
+static FailureOr<EmissionSchedule> readEmissionSchedule(func::FuncOp func) {
+  auto summary =
+      func->getAttrOfType<DictionaryAttr>(kChangeScheduleSummaryAttr);
+  if (!summary)
+    return func.emitError(
+        "C++ emission requires pyc.change_schedule.summary");
+  auto schema = summary.getAs<StringAttr>("schema");
+  auto nodeCountAttr = summary.getAs<IntegerAttr>("node_count");
+  auto edgeCountAttr = summary.getAs<IntegerAttr>("edge_count");
+  auto rankCountAttr = summary.getAs<IntegerAttr>("rank_count");
+  if (!schema || schema.getValue() != kChangeScheduleSchema ||
+      !nodeCountAttr || nodeCountAttr.getInt() < 0 || !edgeCountAttr ||
+      edgeCountAttr.getInt() < 0 || !rankCountAttr ||
+      rankCountAttr.getInt() < 0)
+    return func.emitError(
+        "C++ emission requires valid pyc.change_schedule.v1 summary schema");
+
+  const uint64_t nodeCount = static_cast<uint64_t>(nodeCountAttr.getInt());
+  const uint64_t edgeCount = static_cast<uint64_t>(edgeCountAttr.getInt());
+  const uint64_t rankCount = static_cast<uint64_t>(rankCountAttr.getInt());
+  EmissionSchedule schedule;
+  schedule.nodes.resize(nodeCount);
+  llvm::SmallVector<bool> seen(nodeCount, false);
+  llvm::SmallVector<bool> seenSlots(nodeCount, false);
+  uint64_t actualEdgeCount = 0;
+  uint64_t actualRankCount = 0;
+
+  for (Block &block : func.getBody()) {
+    for (Operation &op : block) {
+      if (!isChangeScheduleNode(&op))
+        continue;
+      for (auto result : llvm::enumerate(op.getResults())) {
+        unsigned resultIndex = static_cast<unsigned>(result.index());
+        auto id = readScheduleUnsigned(&op, kChangeScheduleNodeAttr,
+                                       resultIndex);
+        auto rank = readScheduleUnsigned(&op, kChangeScheduleRankAttr,
+                                         resultIndex);
+        auto slot = readScheduleUnsigned(&op, kChangeScheduleSlotAttr,
+                                         resultIndex);
+        if (failed(id) || failed(rank) || failed(slot))
+          return failure();
+        if (*id >= nodeCount || *slot >= nodeCount || *rank >= rankCount ||
+            seen[*id] || seenSlots[*slot])
+          return op.emitError(
+              "C++ emitter cannot map duplicate or out-of-range schedule node/rank/slot");
+
+        auto allFanouts =
+            op.getAttrOfType<ArrayAttr>(kChangeScheduleFanoutAttr);
+        if (!allFanouts || allFanouts.size() != op.getNumResults())
+          return op.emitError(
+              "C++ emitter requires valid per-result schedule fanout arrays");
+        auto fanout = dyn_cast<ArrayAttr>(allFanouts[resultIndex]);
+        if (!fanout)
+          return op.emitError(
+              "C++ emitter requires each schedule fanout entry to be an array");
+
+        EmissionScheduleNode node;
+        node.operation = &op;
+        node.resultIndex = resultIndex;
+        node.id = *id;
+        node.rank = *rank;
+        node.slot = *slot;
+        uint64_t previous = 0;
+        bool hasPrevious = false;
+        for (Attribute targetAttr : fanout) {
+          auto target = dyn_cast<IntegerAttr>(targetAttr);
+          if (!target || target.getInt() < 0 ||
+              static_cast<uint64_t>(target.getInt()) >= nodeCount)
+            return op.emitError(
+                "C++ emitter cannot map invalid schedule fanout target");
+          uint64_t targetId = static_cast<uint64_t>(target.getInt());
+          if (targetId <= node.id || (hasPrevious && targetId <= previous))
+            return op.emitError(
+                "C++ emitter requires sorted forward schedule fanout");
+          node.fanout.push_back(targetId);
+          previous = targetId;
+          hasPrevious = true;
+        }
+        actualEdgeCount += node.fanout.size();
+        actualRankCount = std::max(actualRankCount, node.rank + 1);
+        seen[node.id] = true;
+        seenSlots[node.slot] = true;
+        schedule.nodes[node.id] = std::move(node);
+        schedule.valueToNode.try_emplace(result.value(),
+                                         static_cast<unsigned>(*id));
+      }
+    }
+  }
+
+  if (llvm::any_of(seen, [](bool present) { return !present; }) ||
+      llvm::any_of(seenSlots, [](bool present) { return !present; }) ||
+      actualEdgeCount != edgeCount || actualRankCount != rankCount)
+    return func.emitError(
+        "C++ emitter schedule nodes do not match summary counts");
+  return schedule;
+}
 
 static std::string treeReduceExpr(llvm::SmallVectorImpl<std::string> &terms,
                                   llvm::StringRef op) {
@@ -391,6 +522,26 @@ static void assignExpr(Value result, Type ty, llvm::raw_ostream &os, NameTable &
 }
 
 static LogicalResult emitCombAssign(Operation &op, llvm::raw_ostream &os, NameTable &nt) {
+  if (auto c = dyn_cast<arith::ConstantOp>(op)) {
+    auto value = dyn_cast<IntegerAttr>(c.getValue());
+    unsigned w = bitWidth(c.getType());
+    if (!value || w == 0)
+      return c.emitError(
+          "C++ emitter only supports integer arith.constant values");
+    const llvm::APInt &bits = value.getValue();
+    unsigned words = (w + 63u) / 64u;
+    os << "    " << nt.get(c.getResult()) << " = pyc::cpp::Wire<" << w
+       << ">({";
+    for (unsigned i = 0; i < words; ++i) {
+      if (i)
+        os << ", ";
+      os << "0x" << llvm::utohexstr(bits.extractBitsAsZExtValue(
+                         std::min(64u, w - i * 64u), i * 64u))
+         << "ull";
+    }
+    os << "});\n";
+    return success();
+  }
   if (auto c = dyn_cast<pyc::ConstantOp>(op)) {
     unsigned w = bitWidth(c.getType());
     if (w == 0)
@@ -814,17 +965,20 @@ static LogicalResult emitCombAssign(Operation &op, llvm::raw_ostream &os, NameTa
   return op.emitError("unsupported combinational op for C++ emission");
 }
 
-static void emitDirtyCombFanout(
-    Value value, llvm::raw_ostream &os,
-    const llvm::DenseMap<Operation *, unsigned> &combIndices,
-    NameTable &nt,
+static void emitMetadataCombFanout(
+    Value value, llvm::raw_ostream &os, const EmissionSchedule &schedule,
+    const llvm::DenseMap<Operation *, unsigned> &combIndices, NameTable &nt,
     llvm::StringRef indent = "      ") {
+  auto sourceIt = schedule.valueToNode.find(value);
+  if (sourceIt == schedule.valueToNode.end())
+    return;
+
   llvm::SmallSet<unsigned, 8> uniqueFanouts;
-  for (OpOperand &use : value.getUses()) {
-    auto consumer = dyn_cast<pyc::CombOp>(use.getOwner());
-    if (!consumer)
+  for (uint64_t targetId : schedule.nodes[sourceIt->second].fanout) {
+    const EmissionScheduleNode &target = schedule.nodes[targetId];
+    if (!isa<pyc::CombOp>(target.operation))
       continue;
-    auto it = combIndices.find(consumer.getOperation());
+    auto it = combIndices.find(target.operation);
     if (it != combIndices.end())
       uniqueFanouts.insert(it->second);
   }
@@ -899,7 +1053,7 @@ static void emitCombInputGuard(
 
 static void emitCombResultPublish(
     pyc::CombOp comb, unsigned combIndex, unsigned resultIndex, Value candidate,
-    llvm::raw_ostream &os, NameTable &nt,
+    llvm::raw_ostream &os, NameTable &nt, const EmissionSchedule &schedule,
     const llvm::DenseMap<Operation *, unsigned> &combIndices,
     CppEmitterOptions::CombUpdateMode updateMode) {
   using CombUpdateMode = CppEmitterOptions::CombUpdateMode;
@@ -927,7 +1081,7 @@ static void emitCombResultPublish(
         "{ ++_pyc_sim_stats.comb_output_semantic_changes; "
         "++_pyc_sim_stats.semantic_changes; }\n";
   if (updateMode == CombUpdateMode::Dirty)
-    emitDirtyCombFanout(result, os, combIndices, nt);
+    emitMetadataCombFanout(result, os, schedule, combIndices, nt);
   os << "    }\n";
 }
 
@@ -936,6 +1090,7 @@ static LogicalResult emitCombMethod(pyc::CombOp comb,
                                     NameTable &nt,
                                     unsigned idx,
                                     const CppEmitterOptions &opts,
+                                    const EmissionSchedule &schedule,
                                     const llvm::DenseMap<Operation *, unsigned>
                                         &combIndices) {
   if (comb.getBody().empty())
@@ -986,7 +1141,7 @@ static LogicalResult emitCombMethod(pyc::CombOp comb,
 
     for (auto [i, v] : llvm::enumerate(y.getOperands()))
       emitCombResultPublish(comb, idx, static_cast<unsigned>(i), v, os, nt,
-                            combIndices, opts.combUpdateMode);
+                            schedule, combIndices, opts.combUpdateMode);
     os << "  }\n\n";
     return success();
   }
@@ -1006,7 +1161,7 @@ static LogicalResult emitCombMethod(pyc::CombOp comb,
 
   for (auto [i, v] : llvm::enumerate(y.getOperands()))
     emitCombResultPublish(comb, idx, static_cast<unsigned>(i), v, os, nt,
-                          combIndices, opts.combUpdateMode);
+                          schedule, combIndices, opts.combUpdateMode);
   os << "  }\n\n";
   return success();
 }
@@ -1024,11 +1179,30 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
 
   if (!llvm::hasSingleElement(f.getBody()))
     return f.emitError("C++ emitter currently supports single-block functions only");
+  auto schedule = readEmissionSchedule(f);
+  if (failed(schedule))
+    return failure();
 
   Block &top = f.getBody().front();
 
   std::string structName = sanitizeId(f.getSymName());
   os << "struct " << structName << " {\n";
+  os << "  static constexpr const char *_pyc_change_schedule_schema = \""
+     << kChangeScheduleSchema << "\";\n";
+  os << "  static constexpr unsigned _pyc_change_schedule_node_count = "
+     << schedule->nodes.size() << "u;\n";
+  os << "  static constexpr std::array<unsigned, " << schedule->nodes.size()
+     << "> _pyc_change_schedule_rank{{";
+  llvm::interleaveComma(schedule->nodes, os, [&](const EmissionScheduleNode &node) {
+    os << node.rank << "u";
+  });
+  os << "}};\n";
+  os << "  static constexpr std::array<unsigned, " << schedule->nodes.size()
+     << "> _pyc_change_schedule_slot{{";
+  llvm::interleaveComma(schedule->nodes, os, [&](const EmissionScheduleNode &node) {
+    os << node.slot << "u";
+  });
+  os << "}};\n\n";
 
   // Ports.
   std::vector<std::string> inNames;
@@ -1120,7 +1294,6 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
       return sanitizeId(nameAttr.getValue());
     return nt.get(m.getRdata0());
   };
-  auto asyncFifoKey = [&](pyc::AsyncFifoOp f) { return nt.get(f.getInReady()); };
   auto cdcKey = [&](pyc::CdcSyncOp s) { return nt.get(s.getOut()); };
 
   std::sort(regs.begin(), regs.end(), [&](pyc::RegOp a, pyc::RegOp b) { return regKey(a) < regKey(b); });
@@ -1128,14 +1301,39 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
   std::sort(byteMems.begin(), byteMems.end(), [&](pyc::ByteMemOp a, pyc::ByteMemOp b) { return memKey(a) < memKey(b); });
   std::sort(syncMems.begin(), syncMems.end(), [&](pyc::SyncMemOp a, pyc::SyncMemOp b) { return syncMemKey(a) < syncMemKey(b); });
   std::sort(syncMemDPs.begin(), syncMemDPs.end(), [&](pyc::SyncMemDPOp a, pyc::SyncMemDPOp b) { return syncMemDPKey(a) < syncMemDPKey(b); });
-  std::sort(asyncFifos.begin(), asyncFifos.end(), [&](pyc::AsyncFifoOp a, pyc::AsyncFifoOp b) { return asyncFifoKey(a) < asyncFifoKey(b); });
   std::sort(cdcSyncs.begin(), cdcSyncs.end(), [&](pyc::CdcSyncOp a, pyc::CdcSyncOp b) { return cdcKey(a) < cdcKey(b); });
-  auto combKey = [&](pyc::CombOp c) { return nt.get(c.getResult(0)); };
-  std::sort(combs.begin(), combs.end(), [&](pyc::CombOp a, pyc::CombOp b) { return combKey(a) < combKey(b); });
+
+  auto scheduleSlot = [&](Operation *op) -> uint64_t {
+    if (!op || op->getNumResults() == 0)
+      return std::numeric_limits<uint64_t>::max();
+    auto it = schedule->valueToNode.find(op->getResult(0));
+    if (it == schedule->valueToNode.end())
+      return std::numeric_limits<uint64_t>::max();
+    return schedule->nodes[it->second].slot;
+  };
+  auto sortBySchedule = [&](auto &operations) {
+    llvm::stable_sort(operations, [&](auto lhs, auto rhs) {
+      return scheduleSlot(lhs.getOperation()) < scheduleSlot(rhs.getOperation());
+    });
+  };
+  sortBySchedule(fifos);
+  sortBySchedule(byteMems);
+  sortBySchedule(asyncFifos);
+  sortBySchedule(combs);
 
   llvm::DenseMap<Operation *, unsigned> combIndex;
   for (auto [i, comb] : llvm::enumerate(combs))
     combIndex.try_emplace(comb.getOperation(), static_cast<unsigned>(i));
+  for (const EmissionScheduleNode &node : schedule->nodes) {
+    if (isa<pyc::CombOp>(node.operation) &&
+        !combIndex.contains(node.operation))
+      return node.operation->emitError(
+          "C++ emitter cannot map schedule node to a comb execution unit");
+    if (!isa<pyc::CombOp, pyc::InstanceOp, pyc::FifoOp, pyc::ByteMemOp,
+             pyc::AsyncFifoOp>(node.operation))
+      return node.operation->emitError(
+          "C++ emitter cannot map schedule node to a supported execution unit");
+  }
 
   // Guarded snapshots every direct input. Dirty replaces direct fused-comb
   // snapshots with producer activity, while boundary values remain polled.
@@ -1179,14 +1377,7 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
     os << "  }\n\n";
   }
 
-  auto instKey = [&](pyc::InstanceOp i) -> std::string {
-    if (auto nameAttr = i->getAttrOfType<StringAttr>("name"))
-      return sanitizeId(nameAttr.getValue());
-    if (i.getNumResults() > 0)
-      return nt.get(i.getResult(0));
-    return "inst";
-  };
-  std::sort(instances.begin(), instances.end(), [&](pyc::InstanceOp a, pyc::InstanceOp b) { return instKey(a) < instKey(b); });
+  sortBySchedule(instances);
 
   struct InstInfo {
     pyc::InstanceOp op;
@@ -1945,7 +2136,7 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
   // Emit fused comb helpers.
   for (auto [i, comb] : llvm::enumerate(combs)) {
     if (failed(emitCombMethod(comb, os, nt, static_cast<unsigned>(i), opts,
-                              combIndex)))
+                              *schedule, combIndex)))
       return failure();
   }
 
@@ -1974,12 +2165,22 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
       nodeIndex.try_emplace(&op, idx);
 
       std::string k;
-      if (auto a = dyn_cast<pyc::AssignOp>(op))
-        k = nt.get(a.getDst());
-      else if (op.getNumResults() > 0)
-        k = nt.get(op.getResult(0));
-      else
-        k = sanitizeId(op.getName().getStringRef()) + "_" + std::to_string(idx);
+      if (op.getNumResults() > 0) {
+        auto scheduleIt = schedule->valueToNode.find(op.getResult(0));
+        if (scheduleIt != schedule->valueToNode.end()) {
+          uint64_t slot = schedule->nodes[scheduleIt->second].slot;
+          k = "schedule_" + llvm::utostr(slot);
+        }
+      }
+      if (k.empty()) {
+        if (auto a = dyn_cast<pyc::AssignOp>(op))
+          k = nt.get(a.getDst());
+        else if (op.getNumResults() > 0)
+          k = nt.get(op.getResult(0));
+        else
+          k = sanitizeId(op.getName().getStringRef()) + "_" +
+              std::to_string(idx);
+      }
       nodeKey.push_back(std::move(k));
     }
 
@@ -2114,7 +2315,8 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
          << " << \"\\n\"; std::abort(); }\n";
       continue;
     }
-    if (isa<pyc::ConstantOp,
+    if (isa<arith::ConstantOp,
+            pyc::ConstantOp,
             pyc::AddOp,
             pyc::SubOp,
             pyc::MulOp,
@@ -2309,7 +2511,7 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
         os << "      " << resultName << " = " << childOutput << ";\n";
         os << "      _pyc_inst_output_changed = true;\n";
         if (opts.combUpdateMode == CppEmitterOptions::CombUpdateMode::Dirty)
-          emitDirtyCombFanout(result, os, combIndex, nt);
+          emitMetadataCombFanout(result, os, *schedule, combIndex, nt);
         os << "    }\n";
       }
       // The fixed-point fallback must converge on semantic output changes,
@@ -2358,7 +2560,8 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
         for (auto [i, output] : llvm::enumerate(outputs)) {
           os << indent << "if (" << prefix << "_" << i << " != "
              << nt.get(output) << ") {\n";
-          emitDirtyCombFanout(output, os, combIndex, nt, nestedIndent);
+          emitMetadataCombFanout(output, os, *schedule, combIndex, nt,
+                                 nestedIndent);
           os << indent << "}\n";
         }
       };
@@ -2612,7 +2815,8 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
       }
       return success();
     }
-    if (isa<pyc::ConstantOp,
+    if (isa<arith::ConstantOp,
+            pyc::ConstantOp,
             pyc::AddOp,
             pyc::SubOp,
             pyc::MulOp,
@@ -3231,7 +3435,8 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
     os << indent << "  if (_pyc_sim_stats_enable) "
           "++_pyc_sim_stats.commit_changes;\n";
     if (opts.combUpdateMode == CppEmitterOptions::CombUpdateMode::Dirty)
-      emitDirtyCombFanout(output, os, combIndex, nt, (indent + "  ").str());
+      emitMetadataCombFanout(output, os, *schedule, combIndex, nt,
+                             (indent + "  ").str());
     os << indent << "}\n";
   };
   for (auto r : regs) {

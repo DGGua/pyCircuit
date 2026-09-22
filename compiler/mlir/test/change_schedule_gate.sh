@@ -97,6 +97,10 @@ if [[ -x "${PYC_OPT}" ]]; then
     --pyc-check-change-driven-schedule \
     "missing change-driven schedule summary"
   expect_failure \
+    "${ROOT}/compiler/mlir/test/Inputs/change_schedule_tampered.mlir" \
+    --pyc-check-change-driven-schedule \
+    "schedule fanout size mismatch"
+  expect_failure \
     "${ROOT}/compiler/mlir/test/Inputs/change_schedule_missing_summary.mlir" \
     --pyc-plan-change-driven-schedule \
     "missing combinational dependency summary"

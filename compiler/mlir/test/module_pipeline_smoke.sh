@@ -5,6 +5,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 PYC_OPT="${PYC_OPT:-${ROOT}/.pycircuit_out/toolchain/build/bin/pyc-opt}"
 PYCC="${PYCC:-${ROOT}/.pycircuit_out/toolchain/build/bin/pycc}"
+CXX="${CXX:-c++}"
 INPUTS="${ROOT}/compiler/mlir/test/Inputs"
 OUT="${ROOT}/.pycircuit_out/gates/module_pipeline_smoke"
 
@@ -118,6 +119,47 @@ grep -q 'pyc.pipeline.origin = "A"' "${OUT}/rewrite.1.mlir"
 grep -q 'pyc.pipeline.stage = 0' "${OUT}/rewrite.1.mlir"
 grep -q 'pyc.pipeline.logical_path = "a"' "${OUT}/rewrite.1.mlir"
 grep -q 'state_cut_count = 0' "${OUT}/rewrite.1.mlir"
+python3 - "${OUT}/rewrite.1.mlir" <<'PY'
+import re
+import sys
+
+text = open(sys.argv[1], encoding="utf-8").read()
+stages = re.findall(
+    r"func\.func @[^(\s]+__pyc_stage_0\b.*?"
+    r"pyc\.change_schedule\.summary = \{([^}]+)\}",
+    text,
+)
+if len(stages) != 2:
+    raise SystemExit(f"fail: expected 2 generated stage summaries, got {len(stages)}")
+for summary in stages:
+    if 'schema = "pyc.change_schedule.v1"' not in summary:
+        raise SystemExit("fail: generated stage lacks canonical schedule schema")
+    if "node_count = 0 : i64" not in summary:
+        raise SystemExit("fail: generated passthrough stage has incomplete schedule")
+top_instances = [
+    line for line in text.splitlines()
+    if "pyc.instance" in line and "__pyc_stage_0" in line
+]
+if len(top_instances) != 2:
+    raise SystemExit("fail: expected two generated stage instances")
+for line in top_instances:
+    for attr in ("node", "rank", "slot", "fanout"):
+        if f"pyc.change_schedule.{attr}" not in line:
+            raise SystemExit(
+                f"fail: generated stage instance lacks result {attr} metadata"
+            )
+PY
+
+stage_cpp="${OUT}/module_pipeline_stage.cpp"
+"${PYCC}" "${INPUTS}/module_pipeline_false_scc.mlir" \
+  --emit=cpp --module-pipeline=rewrite --comb-partition=none \
+  --comb-update=dirty -o "${stage_cpp}" >/dev/null
+grep -q '_pyc_change_schedule_schema = "pyc.change_schedule.v1"' \
+  "${stage_cpp}"
+"${CXX}" -std=c++17 -O0 \
+  -I"${ROOT}/.pycircuit_out/toolchain/install/include" \
+  -c "${stage_cpp}" -o "${OUT}/module_pipeline_stage.o"
+
 "${PYCC}" "${INPUTS}/module_pipeline_false_scc.mlir" \
   --emit=none --module-pipeline=rewrite \
   --comb-partition=static --comb-partition-max-nodes=3 \

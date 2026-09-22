@@ -57,6 +57,26 @@ done
 cmp "${OUT}/always.v" "${OUT}/guarded.v"
 cmp "${OUT}/always.v" "${OUT}/dirty.v"
 
+for mode in "${modes[@]}"; do
+  cpp_file="${OUT}/${mode}/comb_dirty_scheduler.cpp"
+  grep -q '_pyc_change_schedule_schema = "pyc.change_schedule.v1"' \
+    "${cpp_file}"
+  grep -q '_pyc_change_schedule_node_count = 5u' "${cpp_file}"
+  grep -q '_pyc_change_schedule_rank{{0u, 1u, 1u, 2u, 0u}}' \
+    "${cpp_file}"
+  grep -q '_pyc_change_schedule_slot{{0u, 1u, 2u, 3u, 4u}}' \
+    "${cpp_file}"
+done
+if grep -q 'DirtyBitset<' "${OUT}/always/comb_dirty_scheduler.cpp" ||
+    grep -q 'DirtyBitset<' "${OUT}/guarded/comb_dirty_scheduler.cpp"; then
+  echo "fail: always/guarded unexpectedly emitted dirty skip state" >&2
+  exit 1
+fi
+dirty_cpp="${OUT}/dirty/comb_dirty_scheduler.cpp"
+grep -q 'std::array<unsigned, 2> _pyc_direct_fanout_.*{{1u, 2u}}' \
+  "${dirty_cpp}"
+test "$(grep -c '_pyc_direct_fanout_' "${dirty_cpp}")" -eq 6
+
 python3 -m pycircuit.cli emit "${STATE_PY}" -o "${OUT}/comb_dirty_state.pyc"
 state_dir="${OUT}/state"
 mkdir -p "${state_dir}"
