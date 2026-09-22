@@ -167,6 +167,12 @@ static llvm::cl::opt<unsigned> logicDepthLimit(
     llvm::cl::desc("Maximum combinational logic depth allowed between sequential boundaries"),
     llvm::cl::init(32));
 
+static llvm::cl::opt<std::string> modulePipelineMode(
+    "module-pipeline",
+    llvm::cl::desc("Module stage-DAG mode: off|analyze|rewrite "
+                   "(rewrite is not available in v1)"),
+    llvm::cl::init("off"));
+
 static llvm::cl::opt<std::string> simMode("sim-mode", llvm::cl::desc("Simulation mode: default|cpp-only"),
                                           llvm::cl::init("default"));
 
@@ -2105,6 +2111,23 @@ int main(int argc, char **argv) {
     return 1;
   }
 
+  std::string modulePipelineModeNorm =
+      llvm::StringRef(modulePipelineMode).lower();
+  if (modulePipelineModeNorm != "off" &&
+      modulePipelineModeNorm != "analyze" &&
+      modulePipelineModeNorm != "rewrite") {
+    llvm::errs() << "error: unknown --module-pipeline: "
+                 << modulePipelineMode
+                 << " (expected: off|analyze|rewrite)\n";
+    return 1;
+  }
+  if (modulePipelineModeNorm == "rewrite") {
+    llvm::errs()
+        << "error: --module-pipeline=rewrite is not implemented in v1; "
+           "use analyze to emit validated analysis-only stage DAG metadata\n";
+    return 1;
+  }
+
   // Dev-fast defaults to smaller C++ shards unless explicitly overridden.
   if (isDevFastProfile && cppShardThresholdLines.getNumOccurrences() == 0)
     cppShardThresholdLines = 16000;
@@ -2378,9 +2401,19 @@ int main(int argc, char **argv) {
   if (!unrollVector)
     pm.addNestedPass<func::FuncOp>(pyc::createSLPPackWiresPass());
   pm.addNestedPass<func::FuncOp>(pyc::createCombCanonicalizePass());
-  pm.addPass(pyc::createCheckCombCyclesPass());
-  pm.addPass(pyc::createCheckClockDomainsPass());
-  pm.addNestedPass<func::FuncOp>(pyc::createPackI1RegsPass());
+  if (modulePipelineModeNorm == "analyze") {
+    pm.addPass(pyc::createCheckClockDomainsPass());
+    pm.addNestedPass<func::FuncOp>(pyc::createPackI1RegsPass());
+    pm.addPass(pyc::createModulePipelinePass());
+    // Keep the legacy local wire-cycle gate after the instance-aware gate.
+    // The module-pipeline pass owns cross-instance diagnostics; the legacy
+    // checker still covers local graphs with no instance ports.
+    pm.addPass(pyc::createCheckCombCyclesPass());
+  } else {
+    pm.addPass(pyc::createCheckCombCyclesPass());
+    pm.addPass(pyc::createCheckClockDomainsPass());
+    pm.addNestedPass<func::FuncOp>(pyc::createPackI1RegsPass());
+  }
   const bool enableFuseComb =
       (((!cppOnly) || !cppOnlyPreserveOps) && !enableStaticCombPartition);
   if (enableFuseComb)

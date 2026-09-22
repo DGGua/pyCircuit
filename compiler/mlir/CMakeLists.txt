@@ -91,6 +91,7 @@ add_library(pyc_transforms
   lib/Transforms/FuseCombPass.cpp
   lib/Transforms/PartitionCombPass.cpp
   lib/Transforms/LowerSCFToPYCStaticPass.cpp
+  lib/Transforms/ModulePipelinePass.cpp
   lib/Transforms/PrunePortsPass.cpp
   lib/Transforms/SLPPackWiresPass.cpp
   lib/Support/PassIRDumper.cpp
