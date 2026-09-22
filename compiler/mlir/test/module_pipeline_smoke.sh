@@ -103,6 +103,14 @@ rewrite_to_file "${INPUTS}/module_pipeline_false_scc.mlir" \
 rewrite_to_file "${OUT}/rewrite.1.mlir" "${OUT}/rewrite.2.mlir"
 grep -q 'mode = "rewrite"' "${OUT}/rewrite.1.mlir"
 grep -q 'rewritten = true' "${OUT}/rewrite.1.mlir"
+grep -q 'function_count = 5' "${OUT}/rewrite.1.mlir"
+grep -q 'coarse_scc_count = 0' "${OUT}/rewrite.1.mlir"
+grep -q 'false_scc_count = 0' "${OUT}/rewrite.1.mlir"
+if grep -q 'coarse_scc_count = 1' "${OUT}/rewrite.1.mlir" ||
+    grep -q 'false_scc_count = 1' "${OUT}/rewrite.1.mlir"; then
+  echo "fail: rewrite retained pre-rewrite SCC counts" >&2
+  exit 1
+fi
 grep -q 'generated_stage_count = 2' "${OUT}/rewrite.1.mlir"
 grep -q 'minimum_stage_count = 2' "${OUT}/rewrite.1.mlir"
 test "$(grep -c 'func.func @.*__pyc_stage_0' "${OUT}/rewrite.1.mlir")" -eq 2
@@ -159,6 +167,71 @@ grep -q '_pyc_change_schedule_schema = "pyc.change_schedule.v1"' \
 "${CXX}" -std=c++17 -O0 \
   -I"${ROOT}/.pycircuit_out/toolchain/install/include" \
   -c "${stage_cpp}" -o "${OUT}/module_pipeline_stage.o"
+
+python3 - "${OUT}/rewrite.1.mlir" <<'PY'
+import sys
+
+text = open(sys.argv[1], encoding="utf-8").read()
+expected_counts = {
+    'pyc.clock_domain = "core"': 4,
+    'pyc.clock_domain = "feedback"': 2,
+    'test.custom_arg = "A-forward"': 2,
+    'test.custom_arg = "A-feedback"': 1,
+    'test.custom_arg = "B-forward"': 2,
+    'test.custom_arg = "B-feedback"': 1,
+    'test.custom_result = "A-out"': 2,
+    'test.custom_result = "A-unused"': 2,
+    'test.custom_result = "B-out"': 2,
+    'test.custom_result = "B-unused"': 2,
+}
+for marker, expected in expected_counts.items():
+    actual = text.count(marker)
+    if actual != expected:
+        raise SystemExit(
+            f"fail: signature attr {marker!r} count {actual}, expected {expected}"
+        )
+PY
+
+python3 - "${OUT}/rewrite.1.mlir" "${OUT}/stale-function.mlir" \
+  "${OUT}/stale-module.mlir" <<'PY'
+import sys
+
+source = open(sys.argv[1], encoding="utf-8").read()
+lines = source.splitlines()
+
+function_lines = list(lines)
+for index, line in enumerate(function_lines):
+    if "pyc.pipeline.stage_dag" in line:
+        function_lines[index] = line.replace(
+            "coarse_scc_count = 0", "coarse_scc_count = 7", 1
+        )
+        break
+else:
+    raise SystemExit("fail: no function pipeline metadata to corrupt")
+open(sys.argv[2], "w", encoding="utf-8").write("\n".join(function_lines) + "\n")
+
+module_lines = list(lines)
+for index, line in enumerate(module_lines):
+    if "pyc.module_pipeline.summary" in line:
+        module_lines[index] = line.replace(
+            "coarse_scc_count = 0", "coarse_scc_count = 7", 1
+        )
+        break
+else:
+    raise SystemExit("fail: no module pipeline metadata to corrupt")
+open(sys.argv[3], "w", encoding="utf-8").write("\n".join(module_lines) + "\n")
+PY
+
+for stale in stale-function stale-module; do
+  if "${PYCC}" "${OUT}/${stale}.mlir" --emit=none \
+      --module-pipeline=rewrite -o /dev/null \
+      >"${OUT}/${stale}.stdout" 2>"${OUT}/${stale}.stderr"; then
+    echo "fail: idempotent rewrite accepted ${stale} metadata" >&2
+    exit 1
+  fi
+  grep -q 'PYC4005 module-pipeline rewrite invariant: stale' \
+    "${OUT}/${stale}.stderr"
+done
 
 "${PYCC}" "${INPUTS}/module_pipeline_false_scc.mlir" \
   --emit=none --module-pipeline=rewrite \

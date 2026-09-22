@@ -492,6 +492,18 @@ extractSingleStage(ModuleOp module, func::FuncOp callee,
   }
 
   Builder attrBuilder(module.getContext());
+  if (auto originalArgAttrs = callee->getAttrOfType<ArrayAttr>("arg_attrs")) {
+    llvm::SmallVector<Attribute> argAttrs;
+    argAttrs.reserve(plan.keptArguments.size());
+    for (unsigned index : plan.keptArguments)
+      if (index < originalArgAttrs.size())
+        argAttrs.push_back(originalArgAttrs[index]);
+    if (argAttrs.size() == plan.keptArguments.size())
+      stage->setAttr("arg_attrs", attrBuilder.getArrayAttr(argAttrs));
+  }
+  if (auto resultAttrs = callee->getAttrOfType<ArrayAttr>("res_attrs"))
+    stage->setAttr("res_attrs", resultAttrs);
+
   llvm::SmallVector<Attribute> argNames;
   if (auto originalNames = callee->getAttrOfType<ArrayAttr>("arg_names")) {
     for (unsigned index : plan.keptArguments)
@@ -599,6 +611,93 @@ static LogicalResult verifyRewrittenModule(ModuleOp module,
   return success();
 }
 
+static DictionaryAttr
+buildModuleSummaryMetadata(MLIRContext *context,
+                           const ModulePipelineSummary &summary) {
+  Builder builder(context);
+  llvm::SmallVector<NamedAttribute> fields;
+  fields.push_back(builder.getNamedAttr(
+      "schema", builder.getStringAttr(kModulePipelineSchema)));
+  fields.push_back(builder.getNamedAttr(
+      "mode",
+      builder.getStringAttr(summary.rewritten ? "rewrite" : "analysis")));
+  fields.push_back(builder.getNamedAttr(
+      "rewritten", builder.getBoolAttr(summary.rewritten)));
+  fields.push_back(builder.getNamedAttr(
+      "function_count", builder.getI64IntegerAttr(summary.functionCount)));
+  fields.push_back(builder.getNamedAttr(
+      "coarse_scc_count",
+      builder.getI64IntegerAttr(summary.coarseSccCount)));
+  fields.push_back(builder.getNamedAttr(
+      "false_scc_count", builder.getI64IntegerAttr(summary.falseSccCount)));
+  fields.push_back(builder.getNamedAttr(
+      "true_cycle_count",
+      builder.getI64IntegerAttr(summary.trueCycleCount)));
+  fields.push_back(builder.getNamedAttr(
+      "state_cut_count", builder.getI64IntegerAttr(summary.stateCutCount)));
+  fields.push_back(builder.getNamedAttr(
+      "generated_stage_count",
+      builder.getI64IntegerAttr(summary.generatedStageCount)));
+  fields.push_back(builder.getNamedAttr(
+      "minimum_stage_count",
+      builder.getI64IntegerAttr(summary.generatedStageCount)));
+  return builder.getDictionaryAttr(fields);
+}
+
+static FailureOr<ModulePipelineSummary>
+recomputeRewrittenMetadata(ModuleOp module, int64_t generatedStageCount,
+                           bool verifyExisting) {
+  ModulePipelineSummary summary;
+  summary.generatedStageCount = generatedStageCount;
+  summary.rewritten = true;
+  CombDepGraphCache cache(module);
+
+  for (func::FuncOp func : module.getOps<func::FuncOp>()) {
+    if (func.isDeclaration())
+      continue;
+    ++summary.functionCount;
+    FailureOr<FunctionGraph> graph = buildFunctionGraph(module, func, cache);
+    if (failed(graph))
+      return failure();
+    summary.stateCutCount += graph->stateCutCount;
+
+    int64_t coarseSccCount = 0;
+    for (const auto &component : computeSccs(graph->coarseEdges).components)
+      if (isCyclicComponent(component, graph->coarseEdges))
+        ++coarseSccCount;
+    int64_t trueCycleCount = 0;
+    for (const auto &component : computeSccs(graph->portEdges).components)
+      if (isCyclicComponent(component, graph->portEdges))
+        ++trueCycleCount;
+    if (trueCycleCount != 0) {
+      func.emitError("PYC4005 module-pipeline rewrite invariant: "
+                     "post-rewrite graph contains a true cycle");
+      return failure();
+    }
+
+    summary.coarseSccCount += coarseSccCount;
+    summary.falseSccCount += coarseSccCount;
+    DictionaryAttr expected =
+        buildFunctionMetadata(module.getContext(), *graph, coarseSccCount,
+                              coarseSccCount, "rewrite", true);
+    if (verifyExisting) {
+      if (!isPipelineValidatedFunc(func) ||
+          func->getAttrOfType<DictionaryAttr>(kPipelineStageDagAttr) !=
+              expected) {
+        func.emitError("PYC4005 module-pipeline rewrite invariant: stale "
+                       "function graph metadata");
+        return failure();
+      }
+    } else {
+      func->setAttr(
+          kPipelineValidatedAttr,
+          StringAttr::get(module.getContext(), kModulePipelineSchema));
+      func->setAttr(kPipelineStageDagAttr, expected);
+    }
+  }
+  return summary;
+}
+
 struct ModulePipelinePass
     : public PassWrapper<ModulePipelinePass, OperationPass<ModuleOp>> {
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(ModulePipelinePass)
@@ -646,6 +745,18 @@ struct ModulePipelinePass
           if (failed(verifyRewrittenModule(module, stateCount.getInt(),
                                            stageCount.getInt())))
             signalPassFailure();
+          else {
+            FailureOr<ModulePipelineSummary> recomputed =
+                recomputeRewrittenMetadata(module, stageCount.getInt(), true);
+            if (failed(recomputed) ||
+                buildModuleSummaryMetadata(module.getContext(), *recomputed) !=
+                    existing) {
+              if (succeeded(recomputed))
+                module.emitError("PYC4005 module-pipeline rewrite invariant: "
+                                 "stale module graph metadata");
+              signalPassFailure();
+            }
+          }
         }
         return;
       }
@@ -660,7 +771,6 @@ struct ModulePipelinePass
     CombDepGraphCache combCache(module);
     ModulePipelineSummary aggregate;
     llvm::DenseSet<Operation *> rewriteCallees;
-    llvm::DenseMap<Operation *, std::pair<int64_t, int64_t>> originalCounts;
     llvm::DenseMap<Operation *, Type> originalSignatures;
     const int64_t stateCountBefore = countStateOps(module);
     const auto stateOwnersBefore = snapshotStateOwners(module);
@@ -714,8 +824,6 @@ struct ModulePipelinePass
       // atomicity is a false SCC.
       int64_t falseSccCount = coarseSccCount;
       aggregate.falseSccCount += falseSccCount;
-      originalCounts.try_emplace(func.getOperation(), coarseSccCount,
-                                 falseSccCount);
       if (rewrite_) {
         for (const auto &component : coarseCycles) {
           for (unsigned instanceIndex : component) {
@@ -801,54 +909,19 @@ struct ModulePipelinePass
         return;
       }
 
-      CombDepGraphCache rewrittenCache(module);
-      for (func::FuncOp func : module.getOps<func::FuncOp>()) {
-        if (func.isDeclaration())
-          continue;
-        auto graph = buildFunctionGraph(module, func, rewrittenCache);
-        if (failed(graph)) {
-          signalPassFailure();
-          return;
-        }
-        auto counts = originalCounts.lookup(func.getOperation());
-        func->setAttr(
-            kPipelineValidatedAttr,
-            StringAttr::get(module.getContext(), kModulePipelineSchema));
-        func->setAttr(kPipelineStageDagAttr,
-                      buildFunctionMetadata(module.getContext(), *graph,
-                                            counts.first, counts.second,
-                                            "rewrite", true));
+      FailureOr<ModulePipelineSummary> rewritten =
+          recomputeRewrittenMetadata(module, aggregate.generatedStageCount,
+                                     false);
+      if (failed(rewritten)) {
+        signalPassFailure();
+        return;
       }
+      aggregate = *rewritten;
     }
 
-    Builder builder(module.getContext());
-    llvm::SmallVector<NamedAttribute> fields;
-    fields.push_back(builder.getNamedAttr(
-        "schema", builder.getStringAttr(kModulePipelineSchema)));
-    fields.push_back(builder.getNamedAttr(
-        "mode", builder.getStringAttr(rewrite_ ? "rewrite" : "analysis")));
-    fields.push_back(
-        builder.getNamedAttr("rewritten", builder.getBoolAttr(rewrite_)));
-    fields.push_back(builder.getNamedAttr(
-        "function_count", builder.getI64IntegerAttr(aggregate.functionCount)));
-    fields.push_back(builder.getNamedAttr(
-        "coarse_scc_count",
-        builder.getI64IntegerAttr(aggregate.coarseSccCount)));
-    fields.push_back(builder.getNamedAttr(
-        "false_scc_count", builder.getI64IntegerAttr(aggregate.falseSccCount)));
-    fields.push_back(builder.getNamedAttr(
-        "true_cycle_count",
-        builder.getI64IntegerAttr(aggregate.trueCycleCount)));
-    fields.push_back(builder.getNamedAttr(
-        "state_cut_count", builder.getI64IntegerAttr(aggregate.stateCutCount)));
-    fields.push_back(builder.getNamedAttr(
-        "generated_stage_count",
-        builder.getI64IntegerAttr(aggregate.generatedStageCount)));
-    fields.push_back(builder.getNamedAttr(
-        "minimum_stage_count",
-        builder.getI64IntegerAttr(aggregate.generatedStageCount)));
+    aggregate.rewritten = rewrite_;
     module->setAttr(kModulePipelineSummaryAttr,
-                    builder.getDictionaryAttr(fields));
+                    buildModuleSummaryMetadata(module.getContext(), aggregate));
   }
 
 private:

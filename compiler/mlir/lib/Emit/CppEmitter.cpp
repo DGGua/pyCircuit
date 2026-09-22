@@ -1991,7 +1991,6 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
   }
   os << "    os << \"}\\n\";\n";
   os << "  }\n\n";
-  os << "  void dump_sim_stats(std::ostream &os) const { dump_sim_stats_json(os, \"\"); }\n\n";
   os << "  void dump_sim_stats_tree(std::ostream &os, const std::string &prefix) const {\n";
   os << "    dump_sim_stats_json(os, prefix);\n";
   {
@@ -2007,6 +2006,8 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
     }
   }
   os << "  }\n\n";
+  os << "  void dump_sim_stats(std::ostream &os) const { dump_sim_stats_tree(os, \""
+     << structName << "\"); }\n\n";
   os << "  void dump_sim_stats_to_path(const char *path = nullptr) const {\n";
   os << "    const char *outPath = path;\n";
   os << "    if (!outPath || !*outPath)\n";

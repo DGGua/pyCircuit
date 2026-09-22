@@ -11,6 +11,7 @@ fi
 CXX="${CXX:-c++}"
 OUT="${ROOT}/.pycircuit_out/gates/sim_timing_stats_smoke"
 ANALYZER="${ROOT}/flows/tools/perf/analyze_module_fallback_stats.py"
+CHANGE_ANALYZER="${ROOT}/flows/tools/perf/analyze_change_driven_stats.py"
 
 if [[ ! -x "${PYCC}" ]]; then
   echo "skip: pycc not built at ${PYCC}" >&2
@@ -73,6 +74,7 @@ emit_and_compile() {
   cat >"${OUT}/${name}_main.cpp" <<EOF
 #include <cstdint>
 #include <iostream>
+#include <sstream>
 
 #include "${name}.cpp"
 
@@ -88,6 +90,14 @@ int main() {
               << " expect=${expect}\n";
     return 1;
   }
+  std::ostringstream stats;
+  dut.dump_sim_stats(stats);
+  if (stats.str().find("\"path\":\"${struct_name}\"") ==
+      std::string::npos) {
+    std::cerr << "${name} dump has no stable module path\n";
+    return 1;
+  }
+  dut.dump_sim_stats_to_path("${OUT}/${name}.manual.jsonl");
   std::cout << "${name} " << first << " " << second << "\n";
   return 0;
 }
@@ -126,6 +136,27 @@ run_pair() {
 
 run_pair topo
 run_pair fallback
+
+python3 - <<'PY' "${OUT}/topo.manual.jsonl" "${OUT}/fallback.manual.jsonl"
+import json
+import sys
+
+topo = [json.loads(line) for line in open(sys.argv[1], encoding="utf-8") if line.strip()]
+fallback = [json.loads(line) for line in open(sys.argv[2], encoding="utf-8") if line.strip()]
+if [row["path"] for row in topo] != ["topo_top"]:
+    raise SystemExit(f"direct topo dump paths are unstable: {topo}")
+fallback_paths = [row["path"] for row in fallback]
+if not fallback_paths or fallback_paths[0] != "fb_top":
+    raise SystemExit(f"direct fallback dump has no stable root: {fallback_paths}")
+if any(not path or not path.startswith("fb_top") for path in fallback_paths):
+    raise SystemExit(f"direct fallback tree has invalid paths: {fallback_paths}")
+print("direct dump paths ok")
+PY
+
+python3 "${CHANGE_ANALYZER}" \
+  --out-json "${OUT}/manual-change-summary.json" \
+  --out-md "${OUT}/manual-change-summary.md" \
+  "${OUT}/fallback.manual.jsonl"
 
 python3 - <<'PY' "${OUT}/topo.jsonl" "${OUT}/fallback.jsonl"
 import json
