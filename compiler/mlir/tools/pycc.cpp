@@ -175,6 +175,19 @@ static llvm::cl::opt<bool> cppOnlyPreserveOps(
     llvm::cl::desc("Preserve operation-granular C++ scheduling in --sim-mode=cpp-only (disables comb fusion)"),
     llvm::cl::init(false));
 
+static llvm::cl::opt<std::string> combPartitionMode(
+    "comb-partition",
+    llvm::cl::desc("MLIR comb partition policy: none|static"),
+    // Current main still permits legal late-wire scheduling shapes that cannot
+    // yet be relocated into static siblings. Keep the new path opt-in until
+    // wire normalization provides an insertion point for every candidate.
+    llvm::cl::init("none"));
+
+static llvm::cl::opt<unsigned> combPartitionMaxNodes(
+    "comb-partition-max-nodes",
+    llvm::cl::desc("Maximum operation count per static comb partition"),
+    llvm::cl::init(35));
+
 static llvm::cl::opt<bool> unrollVector(
     "unroll-vector",
     llvm::cl::desc("Unroll vector operations to scalars at IR level before optimization passes"),
@@ -2151,6 +2164,28 @@ int main(int argc, char **argv) {
     return 1;
   }
 
+  std::string combPartitionNorm = llvm::StringRef(combPartitionMode).lower();
+  bool enableStaticCombPartition = false;
+  if (combPartitionNorm == "none") {
+    enableStaticCombPartition = false;
+  } else if (combPartitionNorm == "static") {
+    enableStaticCombPartition = true;
+  } else {
+    llvm::errs() << "error: unknown --comb-partition: " << combPartitionMode
+                 << " (expected: none|static)\n";
+    return 1;
+  }
+  if (enableStaticCombPartition && combPartitionMaxNodes == 0) {
+    llvm::errs() << "error: --comb-partition-max-nodes must be positive when "
+                    "--comb-partition=static\n";
+    return 1;
+  }
+  if (enableStaticCombPartition && cppOnly && cppOnlyPreserveOps) {
+    llvm::errs() << "error: --comb-partition=static is incompatible with "
+                    "--cpp-only-preserve-ops\n";
+    return 1;
+  }
+
   if (emitStructuralMode != "auto" && emitStructuralMode != "on" && emitStructuralMode != "off") {
     llvm::errs() << "error: unknown --emit-structural: " << emitStructuralMode << " (expected: auto|on|off)\n";
     return 1;
@@ -2299,6 +2334,9 @@ int main(int argc, char **argv) {
     pm.addInstrumentation(std::move(passIRDumperStorage));
   }
   pm.addPass(pyc::createCheckFrontendContractPass());
+  // Reject malformed incoming plans before any transform can repair metadata.
+  pm.addNestedPass<func::FuncOp>(pyc::createCheckCombPartitionsPass());
+  pm.addNestedPass<func::FuncOp>(pyc::createCheckCombMemoizablePass());
   pm.addPass(pyc::createInlineFunctionsPass());
   if (wantFlatten)
     pm.addPass(pyc::createFlattenInstancesPass());
@@ -2324,7 +2362,8 @@ int main(int argc, char **argv) {
   pm.addPass(pyc::createCheckCombCyclesPass());
   pm.addPass(pyc::createCheckClockDomainsPass());
   pm.addNestedPass<func::FuncOp>(pyc::createPackI1RegsPass());
-  const bool enableFuseComb = (!cppOnly) || !cppOnlyPreserveOps;
+  const bool enableFuseComb =
+      (((!cppOnly) || !cppOnlyPreserveOps) && !enableStaticCombPartition);
   if (enableFuseComb)
     pm.addNestedPass<func::FuncOp>(pyc::createFuseCombPass());
   pm.addPass(createCanonicalizerPass(canonicalizeCfg));
@@ -2332,6 +2371,12 @@ int main(int argc, char **argv) {
   addRemoveDeadValuesPassIfSupported(pm);
   pm.addNestedPass<func::FuncOp>(pyc::createEliminateDeadInstancesPass());
   pm.addPass(createSymbolDCEPass());
+  pm.addNestedPass<func::FuncOp>(pyc::createCheckCombMemoizablePass());
+  if (enableStaticCombPartition)
+    pm.addPass(pyc::createPartitionCombPass(combPartitionMaxNodes));
+  pm.addNestedPass<func::FuncOp>(pyc::createCheckCombMemoizablePass());
+  pm.addNestedPass<func::FuncOp>(pyc::createCheckCombPartitionsPass());
+  pm.addPass(pyc::createCheckCombCyclesPass());
   pm.addNestedPass<func::FuncOp>(pyc::createCheckFlatTypesPass());
   pm.addNestedPass<func::FuncOp>(pyc::createCheckNoDynamicPass());
   pm.addPass(pyc::createCheckLogicDepthPass(logicDepthLimit));
