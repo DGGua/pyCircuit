@@ -92,6 +92,7 @@ add_library(pyc_transforms
   lib/Transforms/PackI1RegsPass.cpp
   lib/Transforms/FuseCombPass.cpp
   lib/Transforms/PartitionCombPass.cpp
+  lib/Transforms/CppPlacementPass.cpp
   lib/Transforms/LowerSCFToPYCStaticPass.cpp
   lib/Transforms/ModulePipelinePass.cpp
   lib/Transforms/PrunePortsPass.cpp
