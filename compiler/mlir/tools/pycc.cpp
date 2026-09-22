@@ -2429,6 +2429,8 @@ int main(int argc, char **argv) {
   pm.addNestedPass<func::FuncOp>(pyc::createCheckCombMemoizablePass());
   pm.addNestedPass<func::FuncOp>(pyc::createCheckCombPartitionsPass());
   pm.addPass(pyc::createCheckCombCyclesPass());
+  pm.addPass(pyc::createPlanChangeDrivenSchedulePass());
+  pm.addPass(pyc::createCheckChangeDrivenSchedulePass());
   pm.addNestedPass<func::FuncOp>(pyc::createCheckFlatTypesPass());
   pm.addNestedPass<func::FuncOp>(pyc::createCheckNoDynamicPass());
   pm.addPass(pyc::createCheckLogicDepthPass(logicDepthLimit));

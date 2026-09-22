@@ -80,6 +80,8 @@ add_library(pyc_transforms
   lib/Transforms/CheckNoDynamicPass.cpp
   lib/Transforms/CheckCombCyclesPass.cpp
   lib/Transforms/CheckClockDomainsPass.cpp
+  lib/Transforms/PlanChangeDrivenSchedulePass.cpp
+  lib/Transforms/CheckChangeDrivenSchedulePass.cpp
   lib/Transforms/CombCanonicalizePass.cpp
   lib/Transforms/CollectCompileStatsPass.cpp
   lib/Transforms/EliminateDeadInstancesPass.cpp
