@@ -182,8 +182,12 @@ static unsigned producerCombDepth(Value value, unsigned limit,
 }
 
 static std::optional<llvm::APInt> constantValue(Value value) {
-  while (auto alias = value.getDefiningOp<pyc::AliasOp>())
+  llvm::SmallPtrSet<Operation *, 8> aliasSeen;
+  while (auto alias = value.getDefiningOp<pyc::AliasOp>()) {
+    if (!aliasSeen.insert(alias.getOperation()).second)
+      return std::nullopt;
     value = alias.getIn();
+  }
   if (auto constant = value.getDefiningOp<pyc::ConstantOp>())
     return constant.getValueAttr().getValue();
   if (auto constant = value.getDefiningOp<arith::ConstantOp>()) {
@@ -259,9 +263,15 @@ static ConeMatch matchPipelineLink(pyc::RegOp consumer, pyc::RegOp keyReg,
       visiting.erase(value);
       return;
     }
+    // Mark the op before descending. The cone is a DAG; recording it only
+    // after the subtree returns re-expands every shared mux.
+    if (!seenOps.insert(def).second) {
+      visiting.erase(value);
+      return;
+    }
     for (Value operand : def->getOperands())
       self(self, operand);
-    if (!failed && seenOps.insert(def).second)
+    if (!failed)
       link.coneOps.push_back(def);
     visiting.erase(value);
   };
@@ -484,9 +494,21 @@ matchCommonDelayRegion(Operation *root, unsigned maxCombDepth,
       visiting.erase(value);
       return;
     }
+    // Same DAG pruning as the pipeline matcher. Cones larger than the depth
+    // budget are rejected below, so stop walking once that bound is crossed.
+    if (!region.coneSet.insert(def).second) {
+      visiting.erase(value);
+      return;
+    }
+    if (region.coneSet.size() > maxCombDepth) {
+      failed = true;
+      ++stats.blockedCost;
+      visiting.erase(value);
+      return;
+    }
     for (Value operand : def->getOperands())
       self(self, operand);
-    if (!failed && region.coneSet.insert(def).second)
+    if (!failed)
       region.coneOps.push_back(def);
     visiting.erase(value);
   };
