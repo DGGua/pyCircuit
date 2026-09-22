@@ -1087,7 +1087,10 @@ static std::optional<std::string> findToolchainRoot(const char *argv0) {
   for (unsigned i = 0; i < 6 && !cur.empty(); ++i) {
     if (auto found = tryRoot(cur))
       return found;
-    cur = llvm::sys::path::parent_path(cur);
+    // parent_path(cur) is a StringRef into cur. Copy it before assigning back
+    // because SmallVector assignment may resize and invalidate that reference.
+    llvm::SmallString<256> next = llvm::sys::path::parent_path(cur);
+    cur = next;
   }
   return std::nullopt;
 }
