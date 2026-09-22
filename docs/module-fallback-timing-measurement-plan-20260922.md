@@ -3,7 +3,7 @@
 日期：2026-09-22  
 PyCircuit 分支：`measure/module-fallback-stats`  
 基线：`upstream/main` @ `27b226cd2dc87a30b4a55b714e04f50eb49d4547`  
-状态：已批准。使用当前脏 DavinciBaseLine（`lys` @ `b848b236`），不修改其源码。PyCircuit 只增加默认可关闭的统计。
+状态：已测量。使用当前脏 DavinciBaseLine（`lys` @ `4e924f6c`），未修改其源码。顶层 fallback 占 `eval()` 的 99.91%。
 
 ## 背景与目标
 
@@ -319,11 +319,87 @@ export PYC_REPLAY_OPT='-O3'
    - `5%–15%`：只考虑简单单模块拆分原型；
    - `>15%`：再评估完整 module-pipeline pass。
 
+## 实测结果
+
+测量日期：2026-09-22。PyCircuit `282fee7829471b70dc5e8fe001b849654a6079a5`。
+DavinciBaseLine `lys` @ `4e924f6c01ce5ceddc772f70494ced4197776deb`，tracked diff
+sha256 `df7f46145e44b3d68595604e3012750fc3c739a0e996d842127e2990ec097a5a`。
+主机 `Linux 5.14.0-612.el9.x86_64`，`clang++ 22.1.3`，`-O3`。
+
+产物在 `/tmp/pyc-module-fallback-timing-20260922/`。主测 trace：
+
+`model/tests/fixtures/traces/models_qwen3_14b_decode_fwd.pto.trace`
+
+`--drain-cycles 512`。五次计时与一次统计关闭运行的确定性字段一致：
+`cycles=9743`，`fetch_complete=true`，`timed_out=false`，`instructions=2190`。
+统计关闭时 runner `elapsed_ms=199254`。五次计时的 runner `elapsed_ms` 为
+188389、190421、194071、195992、200543，中位数 194071，没有显示出计时开销。
+
+### 生成命令与 pycc 差异
+
+Davinci 当前 `build_pycircuit_module.py` 会传入 `--cpp-compile-budget=false`
+和 `--cpp-pch`。这两个参数在本分支的 pycc 上不存在，因此没有改 Davinci
+源码，而是用本编译器已有参数发射 C++。pycc 在写出全部源文件后以
+`[PYC991]` 退出；Davinci 脚本把该诊断视为可接受错误。随后按该脚本的缺省
+manifest 路径补写 `manifest.json`，并调用其现有
+`complete_precompile_headers()` 与 hint adapter。replay 编译参数包含
+`-DPYC_DISABLE_INSTANCE_EVAL_CACHE`，并且启用了 clang PCH。cache 关闭会让
+子实例在 fallback 循环里反复求值，本结果描述的是这条 replay 配置。
+
+### 顶层占比
+
+五次 `fallback_share`：
+
+| 指标 | 值 |
+| --- | --- |
+| median | 99.9144% |
+| min | 99.9142% |
+| max | 99.9150% |
+
+第一次计时的顶层 `v5_superscalar_v5_core`：
+
+| 指标 | 值 |
+| --- | --- |
+| `eval_calls` | 58472 |
+| `topo_share` | 0 |
+| `fallback_share` | 99.9146% |
+| `fallback_comb_share` | 0.6201% |
+| `initial_comb_share` | 0.0815% |
+| primitive/instance group / `eval_total_ns` | 99.282% |
+| 每次 fallback 迭代 | 恰好 4 |
+| histogram | 全部落在 `4+`，`fallback_max_iterations=4` |
+
+顶层没有走单遍拓扑。fallback 时间几乎都在每轮 primitive/instance
+求值，不在重复的 `eval_comb_pass()`。
+
+### 层次热点
+
+子实例时间嵌套在父实例里，不能相加。第一次计时：
+
+| 实例 | 自身 fallback 占比 | 平均迭代 | 相对顶层 `eval` 的调用倍数 |
+| --- | --- | --- | --- |
+| `v5_core_shared` | 98.84% | 8 | 4 |
+| `v5_core_pe0_cluster` / `v5_core_pe1_cluster` | 约 0.01% | 0 | 4 |
+| `v5_core_storage` | 7.54% | 0 | 4 |
+| shared 下的 gm/icache/mte/sfu/scoreboard | 0 | 0 | 32 |
+| shared 下的 gmov/l2/stgb | 0.20%–0.87% | 0 | 32 |
+
+两个 PE cluster 自己不再迭代，但因为顶层每次 `eval()` 固定迭代 4 次，
+它们各被调用 4 次。`v5_core_shared` 自己再固定迭代 8 次，所以它的子模块
+相对一次顶层 `eval()` 被调用 32 次。
+
+### 决策
+
+顶层 fallback 占比远高于 15%。按本方案阈值，值得继续评估模块流水
+pass。收益点是去掉顶层 4 次和 shared 8 次的重复实例求值；重复 comb
+pass 只占顶层 `eval()` 的 0.62%，不是主要成本。这仍是路径计时，不是
+拆分前后的 A/B。cache 关闭会放大子实例重复求值。
+
 ## 待确认事项
 
 ### 已决定 1：使用当前脏 DavinciBaseLine
 
-用户已批准选项 A。测量读取 `/home/lidongzhe/DavinciBaseLine`，不在其中写入源文件。报告记录 HEAD、dirty 状态和 diff hash。该结果代表本地开发树，不代表远端 `origin/lys`。
+用户已批准选项 A。测量读取 `/home/lidongzhe/DavinciBaseLine`，不在其中写入源文件。实际 HEAD 是 `4e924f6c`，不是更早记录的 `b848b236`。tracked diff sha256 见“实测结果”。该结果代表当时的本地 `lys` 工作树，不代表远端 `origin/lys`。
 
 ### 待确认 1：DavinciBaseLine 使用当前工作树还是干净基线
 
