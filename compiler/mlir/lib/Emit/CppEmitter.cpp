@@ -817,6 +817,7 @@ static LogicalResult emitCombAssign(Operation &op, llvm::raw_ostream &os, NameTa
 static void emitDirtyCombFanout(
     Value value, llvm::raw_ostream &os,
     const llvm::DenseMap<Operation *, unsigned> &combIndices,
+    NameTable &nt,
     llvm::StringRef indent = "      ") {
   llvm::SmallSet<unsigned, 8> uniqueFanouts;
   for (OpOperand &use : value.getUses()) {
@@ -830,11 +831,16 @@ static void emitDirtyCombFanout(
   llvm::SmallVector<unsigned> fanouts(uniqueFanouts.begin(),
                                       uniqueFanouts.end());
   llvm::sort(fanouts);
-  for (unsigned fanout : fanouts) {
-    os << indent << "if (_pyc_comb_mark_active(" << fanout
-       << "u) && _pyc_sim_stats_enable) "
-          "_pyc_sim_stats.comb_fanout_enqueues++;\n";
-  }
+  if (fanouts.empty())
+    return;
+  std::string fanoutName = "_pyc_direct_fanout_" + sanitizeId(nt.get(value));
+  os << indent << "static constexpr std::array<unsigned, " << fanouts.size()
+     << "> " << fanoutName << "{{";
+  llvm::interleaveComma(fanouts, os,
+                        [&](unsigned fanout) { os << fanout << "u"; });
+  os << "}};\n";
+  os << indent << "for (unsigned _pyc_consumer : " << fanoutName << ")\n";
+  os << indent << "  _pyc_mark_comb_dirty(_pyc_consumer);\n";
 }
 
 static bool hasDirtyPolledBoundaryInput(pyc::CombOp comb) {
@@ -850,12 +856,15 @@ static void emitCombInputGuard(
 
   if (updateMode == CombUpdateMode::Always) {
     os << "    if (_pyc_sim_stats_enable) "
-          "_pyc_sim_stats.comb_eval_calls++;\n";
+          "{ ++_pyc_sim_stats.comb_eval_calls; "
+          "++_pyc_sim_stats.stage_eval_calls; }\n";
     return;
   }
 
   os << "    if (_pyc_sim_stats_enable) "
         "_pyc_sim_stats.comb_guard_checks++;\n";
+  os << "    if (_pyc_sim_stats_enable) _pyc_sim_stats.source_checks += "
+     << comb.getNumOperands() << "u;\n";
   if (updateMode == CombUpdateMode::Dirty)
     os << "    bool _pyc_comb_should_eval = _pyc_comb_take_active(" << idx
        << "u);\n";
@@ -870,6 +879,8 @@ static void emitCombInputGuard(
     os << "    if (" << cacheName << " != " << nt.get(input) << ") {\n";
     os << "      " << cacheName << " = " << nt.get(input) << ";\n";
     os << "      _pyc_comb_inputs_changed = true;\n";
+    os << "      if (_pyc_sim_stats_enable) "
+          "++_pyc_sim_stats.source_changes;\n";
     os << "    }\n";
   }
   if (updateMode == CombUpdateMode::Dirty)
@@ -882,7 +893,8 @@ static void emitCombInputGuard(
   os << "    }\n";
   os << "    _pyc_comb_" << idx << "_inputs_valid = true;\n";
   os << "    if (_pyc_sim_stats_enable) "
-        "_pyc_sim_stats.comb_eval_calls++;\n";
+        "{ ++_pyc_sim_stats.comb_eval_calls; "
+        "++_pyc_sim_stats.stage_eval_calls; }\n";
 }
 
 static void emitCombResultPublish(
@@ -898,11 +910,13 @@ static void emitCombResultPublish(
   os << "    const auto &" << candidateName << " = " << nt.get(candidate)
      << ";\n";
   os << "    if (_pyc_sim_stats_enable) "
-        "_pyc_sim_stats.comb_output_store_attempts++;\n";
+        "{ ++_pyc_sim_stats.comb_output_store_attempts; "
+        "++_pyc_sim_stats.output_publish_attempts; }\n";
   if (updateMode == CombUpdateMode::Always) {
     os << "    if (_pyc_sim_stats_enable && " << resultName << " != "
        << candidateName
-       << ") _pyc_sim_stats.comb_output_semantic_changes++;\n";
+       << ") { ++_pyc_sim_stats.comb_output_semantic_changes; "
+          "++_pyc_sim_stats.semantic_changes; }\n";
     os << "    " << resultName << " = " << candidateName << ";\n";
     return;
   }
@@ -910,9 +924,10 @@ static void emitCombResultPublish(
   os << "    if (" << resultName << " != " << candidateName << ") {\n";
   os << "      " << resultName << " = " << candidateName << ";\n";
   os << "      if (_pyc_sim_stats_enable) "
-        "_pyc_sim_stats.comb_output_semantic_changes++;\n";
+        "{ ++_pyc_sim_stats.comb_output_semantic_changes; "
+        "++_pyc_sim_stats.semantic_changes; }\n";
   if (updateMode == CombUpdateMode::Dirty)
-    emitDirtyCombFanout(result, os, combIndices);
+    emitDirtyCombFanout(result, os, combIndices, nt);
   os << "    }\n";
 }
 
@@ -1143,37 +1158,24 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
 
   if (!combs.empty() &&
       opts.combUpdateMode == CppEmitterOptions::CombUpdateMode::Dirty) {
-    unsigned activityWords =
-        (static_cast<unsigned>(combs.size()) + 63u) / 64u;
-    os << "  // Local fused-comb activity bitmap; first evaluation is dirty.\n";
-    os << "  std::uint64_t _pyc_comb_active_words[" << activityWords
-       << "] = {";
-    for (unsigned i = 0; i < activityWords; ++i) {
-      if (i)
-        os << ", ";
-      os << "~std::uint64_t{0}";
-    }
-    os << "};\n";
+    os << "  // Runtime-owned local fused-comb dirty set.\n";
+    os << "  pyc::cpp::DirtyBitset<" << combs.size()
+       << "> _pyc_comb_dirty{};\n";
     os << "  inline bool _pyc_comb_take_active(unsigned id) {\n";
-    os << "    const unsigned word = id >> 6u;\n";
-    os << "    const std::uint64_t mask = std::uint64_t{1} << (id & 63u);\n";
-    os << "    const bool active = (_pyc_comb_active_words[word] & mask) != "
-          "0;\n";
-    os << "    _pyc_comb_active_words[word] &= ~mask;\n";
-    os << "    return active;\n";
+    os << "    return _pyc_comb_dirty.take(id);\n";
     os << "  }\n";
     os << "  inline bool _pyc_comb_is_active(unsigned id) const {\n";
-    os << "    const unsigned word = id >> 6u;\n";
-    os << "    const std::uint64_t mask = std::uint64_t{1} << (id & 63u);\n";
-    os << "    return (_pyc_comb_active_words[word] & mask) != 0;\n";
+    os << "    return _pyc_comb_dirty.test(id);\n";
     os << "  }\n";
-    os << "  inline bool _pyc_comb_mark_active(unsigned id) {\n";
-    os << "    const unsigned word = id >> 6u;\n";
-    os << "    const std::uint64_t mask = std::uint64_t{1} << (id & 63u);\n";
-    os << "    const bool fresh = (_pyc_comb_active_words[word] & mask) == "
-          "0;\n";
-    os << "    _pyc_comb_active_words[word] |= mask;\n";
-    os << "    return fresh;\n";
+    os << "  inline void _pyc_mark_comb_dirty(unsigned id) {\n";
+    os << "    const bool fresh = _pyc_comb_dirty.mark(id);\n";
+    os << "    if (_pyc_sim_stats_enable) {\n";
+    os << "      if (fresh) ++_pyc_sim_stats.dirty_enqueues;\n";
+    os << "      else ++_pyc_sim_stats.coalesced;\n";
+    os << "      _pyc_sim_stats.max_ready = std::max<std::uint64_t>("
+          "_pyc_sim_stats.max_ready, _pyc_comb_dirty.count());\n";
+    os << "      if (fresh) ++_pyc_sim_stats.comb_fanout_enqueues;\n";
+    os << "    }\n";
     os << "  }\n\n";
   }
 
@@ -1639,9 +1641,50 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
       stages = st.getValue().getZExtValue();
     os << "  pyc::cpp::pyc_cdc_sync<" << w << ", " << stages << "> " << nt.get(s.getOut()) << "_inst;\n";
   }
+  auto emitTickSnapshotDecls = [&](llvm::StringRef key,
+                                   OperandRange operands) {
+    os << "  bool " << key << "_tick_inputs_valid = false;\n";
+    for (auto [index, operand] : llvm::enumerate(operands))
+      os << "  " << cppType(operand.getType()) << " " << key
+         << "_tick_input_" << index << "{};\n";
+  };
+  if (opts.combUpdateMode == CppEmitterOptions::CombUpdateMode::Dirty) {
+    os << "\n  // State-source snapshots used by dirty tick_compute.\n";
+    for (const auto &ii : instInfos)
+      emitTickSnapshotDecls(ii.member, ii.op->getOperands());
+    for (auto r : regs)
+      emitTickSnapshotDecls(nt.get(r.getQ()) + "_inst", r->getOperands());
+    for (auto fifo : fifos)
+      emitTickSnapshotDecls(nt.get(fifo.getInReady()) + "_inst",
+                            fifo->getOperands());
+    for (auto mem : byteMems)
+      emitTickSnapshotDecls(byteMemInstName.lookup(mem.getOperation()),
+                            mem->getOperands());
+    for (auto mem : syncMems)
+      emitTickSnapshotDecls(syncMemInstName.lookup(mem.getOperation()),
+                            mem->getOperands());
+    for (auto mem : syncMemDPs)
+      emitTickSnapshotDecls(syncMemDPInstName.lookup(mem.getOperation()),
+                            mem->getOperands());
+    for (auto fifo : asyncFifos)
+      emitTickSnapshotDecls(nt.get(fifo.getInReady()) + "_inst",
+                            fifo->getOperands());
+    for (auto sync : cdcSyncs)
+      emitTickSnapshotDecls(nt.get(sync.getOut()) + "_inst",
+                            sync->getOperands());
+  }
   os << "\n";
 
   os << "  struct _pyc_sim_stats_t {\n";
+  os << "    std::uint64_t source_checks = 0;\n";
+  os << "    std::uint64_t source_changes = 0;\n";
+  os << "    std::uint64_t dirty_enqueues = 0;\n";
+  os << "    std::uint64_t coalesced = 0;\n";
+  os << "    std::uint64_t stage_eval_calls = 0;\n";
+  os << "    std::uint64_t output_publish_attempts = 0;\n";
+  os << "    std::uint64_t semantic_changes = 0;\n";
+  os << "    std::uint64_t max_ready = 0;\n";
+  os << "    std::uint64_t commit_changes = 0;\n";
   os << "    std::uint64_t comb_guard_checks = 0;\n";
   os << "    std::uint64_t comb_eval_calls = 0;\n";
   os << "    std::uint64_t comb_cache_skips = 0;\n";
@@ -1713,8 +1756,17 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
   os << "    _pyc_json_escape(os, prefix);\n";
   os << "    os << \"\\\",\\\"module\\\":\\\"" << structName << "\\\"\";\n";
   static const char *kStatsFields[] = {
-      "comb_guard_checks",
+      "source_checks",
+      "source_changes",
+      "dirty_enqueues",
+      "coalesced",
+      "stage_eval_calls",
       "comb_eval_calls",
+      "output_publish_attempts",
+      "semantic_changes",
+      "max_ready",
+      "commit_changes",
+      "comb_guard_checks",
       "comb_cache_skips",
       "comb_output_store_attempts",
       "comb_output_semantic_changes",
@@ -1830,6 +1882,12 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
        << nt.get(s.getIn()) << ", " << nt.get(s.getOut()) << ")";
   }
   os << " {\n";
+  if (!combs.empty() &&
+      opts.combUpdateMode == CppEmitterOptions::CombUpdateMode::Dirty) {
+    os << "    for (unsigned _pyc_id = 0; _pyc_id < " << combs.size()
+       << "u; ++_pyc_id)\n";
+    os << "      _pyc_comb_dirty.mark(_pyc_id);\n";
+  }
   for (auto r : regs) {
     unsigned w = bitWidth(r.getQ().getType());
     if (w == 0)
@@ -2135,7 +2193,7 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
       os << "    " << ii.member << "->" << ii.inPorts[i] << " = " << inValue << ";\n";
     }
     os << "    " << ii.member << "->eval();\n";
-    os << "    if (_pyc_sim_stats_enable) _pyc_sim_stats.instance_eval_calls++;\n";
+    os << "    if (_pyc_sim_stats_enable) { ++_pyc_sim_stats.instance_eval_calls; ++_pyc_sim_stats.stage_eval_calls; }\n";
     os << "    _pyc_inst_changed = true;\n";
     os << "    #else\n";
     std::string changedFlag = ii.member + "_eval_cache_changed";
@@ -2155,7 +2213,7 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
         os << "      " << ii.member << "->" << ii.inPorts[i] << " = " << inValue << ";\n";
       }
       os << "      " << ii.member << "->eval();\n";
-      os << "      if (_pyc_sim_stats_enable) _pyc_sim_stats.instance_eval_calls++;\n";
+      os << "      if (_pyc_sim_stats_enable) { ++_pyc_sim_stats.instance_eval_calls; ++_pyc_sim_stats.stage_eval_calls; }\n";
       os << "      " << ii.member << "_eval_cache_words = _pyc_inputs;\n";
       os << "    } else {\n";
       os << "      if (_pyc_sim_stats_enable) _pyc_sim_stats.instance_cache_skips++;\n";
@@ -2204,7 +2262,7 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
         os << "      " << ii.member << "->" << ii.inPorts[i] << " = " << cacheName << ";\n";
       }
       os << "      " << ii.member << "->eval();\n";
-      os << "      if (_pyc_sim_stats_enable) _pyc_sim_stats.instance_eval_calls++;\n";
+      os << "      if (_pyc_sim_stats_enable) { ++_pyc_sim_stats.instance_eval_calls; ++_pyc_sim_stats.stage_eval_calls; }\n";
       os << "    } else {\n";
       os << "      if (_pyc_sim_stats_enable) _pyc_sim_stats.instance_cache_skips++;\n";
       os << "    }\n";
@@ -2223,7 +2281,7 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
         os << "      " << cacheName << " = " << inValue << ";\n";
       }
       os << "      " << ii.member << "->eval();\n";
-      os << "      if (_pyc_sim_stats_enable) _pyc_sim_stats.instance_eval_calls++;\n";
+      os << "      if (_pyc_sim_stats_enable) { ++_pyc_sim_stats.instance_eval_calls; ++_pyc_sim_stats.stage_eval_calls; }\n";
       os << "    } else {\n";
       os << "      if (_pyc_sim_stats_enable) _pyc_sim_stats.instance_cache_skips++;\n";
       os << "    }\n";
@@ -2251,7 +2309,7 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
         os << "      " << resultName << " = " << childOutput << ";\n";
         os << "      _pyc_inst_output_changed = true;\n";
         if (opts.combUpdateMode == CppEmitterOptions::CombUpdateMode::Dirty)
-          emitDirtyCombFanout(result, os, combIndex);
+          emitDirtyCombFanout(result, os, combIndex, nt);
         os << "    }\n";
       }
       // The fixed-point fallback must converge on semantic output changes,
@@ -2300,7 +2358,7 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
         for (auto [i, output] : llvm::enumerate(outputs)) {
           os << indent << "if (" << prefix << "_" << i << " != "
              << nt.get(output) << ") {\n";
-          emitDirtyCombFanout(output, os, combIndex, nestedIndent);
+          emitDirtyCombFanout(output, os, combIndex, nt, nestedIndent);
           os << indent << "}\n";
         }
       };
@@ -2319,7 +2377,7 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
     emitPrimitiveOutputSnapshots(outputs, indent, outputSnapshot);
     os << indent << "#ifdef PYC_DISABLE_PRIMITIVE_EVAL_CACHE\n";
     os << indent << instName << ".eval();\n";
-    os << indent << "if (_pyc_sim_stats_enable) _pyc_sim_stats.primitive_eval_calls++;\n";
+    os << indent << "if (_pyc_sim_stats_enable) { ++_pyc_sim_stats.primitive_eval_calls; ++_pyc_sim_stats.stage_eval_calls; }\n";
     if (!changedAnyVar.empty())
       os << indent << changedAnyVar << " = true;\n";
     os << indent << "#else\n";
@@ -2384,7 +2442,7 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
     os << indent << "#endif\n";
     os << indent << "if (" << changedFlag << ") {\n";
     os << indent << "  " << instName << ".eval();\n";
-    os << indent << "  if (_pyc_sim_stats_enable) _pyc_sim_stats.primitive_eval_calls++;\n";
+    os << indent << "  if (_pyc_sim_stats_enable) { ++_pyc_sim_stats.primitive_eval_calls; ++_pyc_sim_stats.stage_eval_calls; }\n";
     os << indent << "} else {\n";
     os << indent << "  if (_pyc_sim_stats_enable) _pyc_sim_stats.primitive_cache_skips++;\n";
     os << indent << "}\n";
@@ -2417,7 +2475,7 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
     emitPrimitiveOutputSnapshots(outputs, indent, outputSnapshot);
     os << indent << "#ifdef PYC_DISABLE_PRIMITIVE_EVAL_CACHE\n";
     os << indent << instName << ".eval();\n";
-    os << indent << "if (_pyc_sim_stats_enable) _pyc_sim_stats.primitive_eval_calls++;\n";
+    os << indent << "if (_pyc_sim_stats_enable) { ++_pyc_sim_stats.primitive_eval_calls; ++_pyc_sim_stats.stage_eval_calls; }\n";
     if (!changedAnyVar.empty())
       os << indent << changedAnyVar << " = true;\n";
     os << indent << "#else\n";
@@ -2434,7 +2492,7 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
        << ")) " << changedFlag << " = true;\n";
     os << indent << "if (" << changedFlag << ") {\n";
     os << indent << "  " << instName << ".eval();\n";
-    os << indent << "  if (_pyc_sim_stats_enable) _pyc_sim_stats.primitive_eval_calls++;\n";
+    os << indent << "  if (_pyc_sim_stats_enable) { ++_pyc_sim_stats.primitive_eval_calls; ++_pyc_sim_stats.stage_eval_calls; }\n";
     os << indent << "} else {\n";
     os << indent << "  if (_pyc_sim_stats_enable) _pyc_sim_stats.primitive_cache_skips++;\n";
     os << indent << "}\n";
@@ -2467,7 +2525,7 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
     emitPrimitiveOutputSnapshots(outputs, indent, outputSnapshot);
     os << indent << "#ifdef PYC_DISABLE_PRIMITIVE_EVAL_CACHE\n";
     os << indent << instName << ".eval();\n";
-    os << indent << "if (_pyc_sim_stats_enable) _pyc_sim_stats.primitive_eval_calls++;\n";
+    os << indent << "if (_pyc_sim_stats_enable) { ++_pyc_sim_stats.primitive_eval_calls; ++_pyc_sim_stats.stage_eval_calls; }\n";
     if (!changedAnyVar.empty())
       os << indent << changedAnyVar << " = true;\n";
     os << indent << "#else\n";
@@ -2486,7 +2544,7 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
        << changedFlag << " = true;\n";
     os << indent << "if (" << changedFlag << ") {\n";
     os << indent << "  " << instName << ".eval();\n";
-    os << indent << "  if (_pyc_sim_stats_enable) _pyc_sim_stats.primitive_eval_calls++;\n";
+    os << indent << "  if (_pyc_sim_stats_enable) { ++_pyc_sim_stats.primitive_eval_calls; ++_pyc_sim_stats.stage_eval_calls; }\n";
     os << indent << "} else {\n";
     os << indent << "  if (_pyc_sim_stats_enable) _pyc_sim_stats.primitive_cache_skips++;\n";
     os << indent << "}\n";
@@ -2949,6 +3007,12 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
   os << "      _pyc_eval_t0 = std::chrono::steady_clock::now();\n";
   os << "    if (_pyc_sim_stats_enable)\n";
   os << "      _pyc_sim_stats.eval_calls++;\n";
+  if (!combs.empty() &&
+      opts.combUpdateMode == CppEmitterOptions::CombUpdateMode::Dirty) {
+    os << "    if (_pyc_sim_stats_enable)\n";
+    os << "      _pyc_sim_stats.max_ready = std::max<std::uint64_t>("
+          "_pyc_sim_stats.max_ready, _pyc_comb_dirty.count());\n";
+  }
   if (hasFullTopo) {
     os << "    std::chrono::steady_clock::time_point _pyc_topo_t0{};\n";
     os << "    if (_pyc_sim_timing_enable)\n";
@@ -3027,15 +3091,52 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
   // parts so --cpp-split=module can shard tick across multiple .cpp files.
   constexpr unsigned kTickChunk = 256;
 
+  auto emitStateTickCompute =
+      [&](llvm::StringRef key, OperandRange operands, llvm::StringRef indent,
+          auto &&emitCall) {
+        if (opts.combUpdateMode != CppEmitterOptions::CombUpdateMode::Dirty) {
+          emitCall(indent);
+          os << indent << "if (_pyc_sim_stats_enable) "
+                "++_pyc_sim_stats.stage_eval_calls;\n";
+          return;
+        }
+        std::string dirty = "_pyc_tick_dirty_" + key.str();
+        os << indent << "bool " << dirty << " = !" << key
+           << "_tick_inputs_valid;\n";
+        os << indent << "if (_pyc_sim_stats_enable) _pyc_sim_stats.source_checks += "
+           << operands.size() << "u;\n";
+        for (auto [index, operand] : llvm::enumerate(operands)) {
+          os << indent << "if (" << key << "_tick_input_" << index << " != "
+             << nt.get(operand) << ") {\n";
+          os << indent << "  " << key << "_tick_input_" << index << " = "
+             << nt.get(operand) << ";\n";
+          os << indent << "  " << dirty << " = true;\n";
+          os << indent << "  if (_pyc_sim_stats_enable) "
+                "++_pyc_sim_stats.source_changes;\n";
+          os << indent << "}\n";
+        }
+        os << indent << key << "_tick_inputs_valid = true;\n";
+        os << indent << "if (" << dirty << ") {\n";
+        emitCall((indent + "  ").str());
+        os << indent << "  if (_pyc_sim_stats_enable) "
+              "++_pyc_sim_stats.stage_eval_calls;\n";
+        os << indent << "}\n";
+      };
+
   auto emitTickComputePart = [&](unsigned begin, unsigned end, unsigned partIdx) {
     os << "  inline void tick_compute_part_" << partIdx << "() {\n";
     // Sub-modules (inputs + tick_compute).
     for (unsigned i = begin; i < end && i < instInfos.size(); ++i) {
       const auto &ii = instInfos[i];
       auto inst = ii.op;
-      for (unsigned j = 0; j < inst.getNumOperands(); ++j)
-        os << "    " << ii.member << "->" << ii.inPorts[j] << " = " << nt.get(inst.getOperand(j)) << ";\n";
-      os << "    " << ii.member << "->tick_compute();\n";
+      emitStateTickCompute(
+          ii.member, inst->getOperands(), "    ",
+          [&](llvm::StringRef indent) {
+            for (unsigned j = 0; j < inst.getNumOperands(); ++j)
+              os << indent << ii.member << "->" << ii.inPorts[j] << " = "
+                 << nt.get(inst.getOperand(j)) << ";\n";
+            os << indent << ii.member << "->tick_compute();\n";
+          });
     }
     os << "  }\n\n";
   };
@@ -3065,20 +3166,55 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
       os << "    tick_compute_part_" << i << "();\n";
   }
   os << "    // Local sequential primitives.\n";
-  for (auto r : regs)
-    os << "    " << nt.get(r.getQ()) << "_inst->tick_compute();\n";
-  for (auto fifo : fifos)
-    os << "    " << nt.get(fifo.getInReady()) << "_inst.tick_compute();\n";
-  for (auto mem : byteMems)
-    os << "    " << byteMemInstName.lookup(mem.getOperation()) << ".tick_compute();\n";
-  for (auto mem : syncMems)
-    os << "    " << syncMemInstName.lookup(mem.getOperation()) << "->tick_compute();\n";
-  for (auto mem : syncMemDPs)
-    os << "    " << syncMemDPInstName.lookup(mem.getOperation()) << "->tick_compute();\n";
-  for (auto fifo : asyncFifos)
-    os << "    " << nt.get(fifo.getInReady()) << "_inst.tick_compute();\n";
-  for (auto s : cdcSyncs)
-    os << "    " << nt.get(s.getOut()) << "_inst.tick_compute();\n";
+  for (auto r : regs) {
+    std::string key = nt.get(r.getQ()) + "_inst";
+    emitStateTickCompute(key, r->getOperands(), "    ",
+                         [&](llvm::StringRef indent) {
+                           os << indent << key << "->tick_compute();\n";
+                         });
+  }
+  for (auto fifo : fifos) {
+    std::string key = nt.get(fifo.getInReady()) + "_inst";
+    emitStateTickCompute(key, fifo->getOperands(), "    ",
+                         [&](llvm::StringRef indent) {
+                           os << indent << key << ".tick_compute();\n";
+                         });
+  }
+  for (auto mem : byteMems) {
+    std::string key = byteMemInstName.lookup(mem.getOperation());
+    emitStateTickCompute(key, mem->getOperands(), "    ",
+                         [&](llvm::StringRef indent) {
+                           os << indent << key << ".tick_compute();\n";
+                         });
+  }
+  for (auto mem : syncMems) {
+    std::string key = syncMemInstName.lookup(mem.getOperation());
+    emitStateTickCompute(key, mem->getOperands(), "    ",
+                         [&](llvm::StringRef indent) {
+                           os << indent << key << "->tick_compute();\n";
+                         });
+  }
+  for (auto mem : syncMemDPs) {
+    std::string key = syncMemDPInstName.lookup(mem.getOperation());
+    emitStateTickCompute(key, mem->getOperands(), "    ",
+                         [&](llvm::StringRef indent) {
+                           os << indent << key << "->tick_compute();\n";
+                         });
+  }
+  for (auto fifo : asyncFifos) {
+    std::string key = nt.get(fifo.getInReady()) + "_inst";
+    emitStateTickCompute(key, fifo->getOperands(), "    ",
+                         [&](llvm::StringRef indent) {
+                           os << indent << key << ".tick_compute();\n";
+                         });
+  }
+  for (auto sync : cdcSyncs) {
+    std::string key = nt.get(sync.getOut()) + "_inst";
+    emitStateTickCompute(key, sync->getOperands(), "    ",
+                         [&](llvm::StringRef indent) {
+                           os << indent << key << ".tick_compute();\n";
+                         });
+  }
   os << "  }\n\n";
 
   os << "  void tick_commit() {\n";
@@ -3089,20 +3225,86 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
       os << "    tick_commit_part_" << i << "();\n";
   }
   os << "    // Local sequential primitives.\n";
-  for (auto r : regs)
-    os << "    " << nt.get(r.getQ()) << "_inst->tick_commit();\n";
-  for (auto fifo : fifos)
-    os << "    " << nt.get(fifo.getInReady()) << "_inst.tick_commit();\n";
-  for (auto mem : byteMems)
-    os << "    " << byteMemInstName.lookup(mem.getOperation()) << ".tick_commit();\n";
-  for (auto mem : syncMems)
-    os << "    " << syncMemInstName.lookup(mem.getOperation()) << "->tick_commit();\n";
-  for (auto mem : syncMemDPs)
-    os << "    " << syncMemDPInstName.lookup(mem.getOperation()) << "->tick_commit();\n";
-  for (auto fifo : asyncFifos)
-    os << "    " << nt.get(fifo.getInReady()) << "_inst.tick_commit();\n";
-  for (auto s : cdcSyncs)
-    os << "    " << nt.get(s.getOut()) << "_inst.tick_commit();\n";
+  auto emitCommitWake = [&](llvm::StringRef condition, Value output,
+                            llvm::StringRef indent = "    ") {
+    os << indent << "if (" << condition << ") {\n";
+    os << indent << "  if (_pyc_sim_stats_enable) "
+          "++_pyc_sim_stats.commit_changes;\n";
+    if (opts.combUpdateMode == CppEmitterOptions::CombUpdateMode::Dirty)
+      emitDirtyCombFanout(output, os, combIndex, nt, (indent + "  ").str());
+    os << indent << "}\n";
+  };
+  for (auto r : regs) {
+    std::string key = nt.get(r.getQ()) + "_inst";
+    std::string changed = "_pyc_commit_changed_" + key;
+    os << "    const bool " << changed << " = " << key
+       << "->tick_commit();\n";
+    emitCommitWake(changed, r.getQ());
+  }
+  for (auto fifo : fifos) {
+    std::string key = nt.get(fifo.getInReady()) + "_inst";
+    std::string changed = "_pyc_commit_changed_" + key;
+    os << "    const auto " << changed << " = " << key
+       << ".tick_commit();\n";
+    os << "    if (" << changed << " != 0) " << key << ".eval();\n";
+    emitCommitWake(changed + " & decltype(" + key +
+                       ")::kInReadyChanged",
+                   fifo.getInReady());
+    emitCommitWake(changed + " & decltype(" + key +
+                       ")::kOutValidChanged",
+                   fifo.getOutValid());
+    emitCommitWake(changed + " & decltype(" + key +
+                       ")::kOutDataChanged",
+                   fifo.getOutData());
+  }
+  for (auto mem : byteMems) {
+    std::string key = byteMemInstName.lookup(mem.getOperation());
+    std::string changed = "_pyc_commit_changed_" + key;
+    os << "    const bool " << changed << " = " << key
+       << ".tick_commit();\n";
+    emitCommitWake(changed, mem.getRdata());
+  }
+  for (auto mem : syncMems) {
+    std::string key = syncMemInstName.lookup(mem.getOperation());
+    std::string changed = "_pyc_commit_changed_" + key;
+    os << "    const bool " << changed << " = " << key
+       << "->tick_commit();\n";
+    emitCommitWake(changed, mem.getRdata());
+  }
+  for (auto mem : syncMemDPs) {
+    std::string key = syncMemDPInstName.lookup(mem.getOperation());
+    std::string changed = "_pyc_commit_changed_" + key;
+    os << "    const auto " << changed << " = " << key
+       << "->tick_commit();\n";
+    emitCommitWake(changed + " & std::remove_reference_t<decltype(*" + key +
+                       ")>::kReadData0Changed",
+                   mem.getRdata0());
+    emitCommitWake(changed + " & std::remove_reference_t<decltype(*" + key +
+                       ")>::kReadData1Changed",
+                   mem.getRdata1());
+  }
+  for (auto fifo : asyncFifos) {
+    std::string key = nt.get(fifo.getInReady()) + "_inst";
+    std::string changed = "_pyc_commit_changed_" + key;
+    os << "    const auto " << changed << " = " << key
+       << ".tick_commit();\n";
+    emitCommitWake(changed + " & decltype(" + key +
+                       ")::kInReadyChanged",
+                   fifo.getInReady());
+    emitCommitWake(changed + " & decltype(" + key +
+                       ")::kOutValidChanged",
+                   fifo.getOutValid());
+    emitCommitWake(changed + " & decltype(" + key +
+                       ")::kOutDataChanged",
+                   fifo.getOutData());
+  }
+  for (auto sync : cdcSyncs) {
+    std::string key = nt.get(sync.getOut()) + "_inst";
+    std::string changed = "_pyc_commit_changed_" + key;
+    os << "    const bool " << changed << " = " << key
+       << ".tick_commit();\n";
+    emitCommitWake(changed, sync.getOut());
+  }
   if (!instInfos.empty()) {
     os << "    // Force re-eval on next eval() only for stateful sub-modules.\n";
     for (unsigned i = 0; i < instInfos.size(); ++i) {
@@ -3111,12 +3313,6 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
       }
     }
   }
-  for (auto fifo : fifos)
-    os << "    " << nt.get(fifo.getInReady()) << "_inst_eval_cache_valid = false;\n";
-  for (auto mem : byteMems)
-    os << "    " << byteMemInstName.lookup(mem.getOperation()) << "_eval_cache_valid = false;\n";
-	  for (auto fifo : asyncFifos)
-	    os << "    " << nt.get(fifo.getInReady()) << "_inst_eval_cache_valid = false;\n";
 	  os << "  }\n\n";
 
 	  // Decision 0027: provide explicit comb/tick/commit APIs + high-level step().
@@ -3154,6 +3350,7 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
 
 LogicalResult emitCpp(ModuleOp module, llvm::raw_ostream &os, const CppEmitterOptions &opts) {
   os << "// pyCircuit C++ emission (prototype)\n";
+  os << "#include <array>\n";
   os << "#include <chrono>\n";
   os << "#include <cstdlib>\n";
   os << "#include <cstdint>\n";
@@ -3161,7 +3358,9 @@ LogicalResult emitCpp(ModuleOp module, llvm::raw_ostream &os, const CppEmitterOp
   os << "#include <iostream>\n";
   os << "#include <memory>\n";
   os << "#include <string>\n";
-  os << "#include <cpp/pyc_sim.hpp>\n\n";
+  os << "#include <type_traits>\n";
+  os << "#include <cpp/pyc_sim.hpp>\n";
+  os << "#include <cpp/pyc_change_scheduler.hpp>\n\n";
   os << "namespace pyc::gen {\n\n";
 
   // Emit structs in dependency order so submodule types are defined before use.

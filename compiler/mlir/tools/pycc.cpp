@@ -2704,6 +2704,7 @@ int main(int argc, char **argv) {
         (void)moduleName;
         os << "// pyCircuit C++ emission (split)\n";
         os << "#pragma once\n";
+        os << "#include <array>\n";
         os << "#include <chrono>\n";
         os << "#include <cstdlib>\n";
         os << "#include <cstdint>\n";
@@ -2711,7 +2712,9 @@ int main(int argc, char **argv) {
         os << "#include <iostream>\n";
         os << "#include <memory>\n";
         os << "#include <string>\n";
+        os << "#include <type_traits>\n";
         os << "#include <cpp/pyc_sim.hpp>\n";
+        os << "#include <cpp/pyc_change_scheduler.hpp>\n";
       };
 
       auto writeSourcePreamble = [&](llvm::raw_ostream &os, llvm::StringRef headerName) {
@@ -2933,10 +2936,13 @@ int main(int argc, char **argv) {
           }
           hos << "// pyCircuit C++ emission (prototype)\n";
           hos << "#pragma once\n";
+          hos << "#include <array>\n";
           hos << "#include <cstdlib>\n";
           hos << "#include <iostream>\n";
           hos << "#include <memory>\n";
+          hos << "#include <type_traits>\n";
           hos << "#include <cpp/pyc_sim.hpp>\n";
+          hos << "#include <cpp/pyc_change_scheduler.hpp>\n";
           for (const std::string &dep : deps[f.getSymName()])
             hos << "#include \"" << dep << ".hpp\"\n";
           hos << "\nnamespace pyc::gen {\n\n";

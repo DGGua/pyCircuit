@@ -36,6 +36,27 @@ public:
     return inserted;
   }
 
+  bool test(std::size_t rank) const noexcept {
+    assert(rank < kCapacity && "dirty rank exceeds fixed capacity");
+    if (rank >= kCapacity)
+      return false;
+    const std::size_t word = rank / kWordBits;
+    const std::uint64_t mask = std::uint64_t{1} << (rank % kWordBits);
+    return (words_[word] & mask) != 0;
+  }
+
+  // Removes one known rank. Returns true only if it was dirty.
+  bool take(std::size_t rank) noexcept {
+    assert(rank < kCapacity && "dirty rank exceeds fixed capacity");
+    if (rank >= kCapacity)
+      return false;
+    const std::size_t word = rank / kWordBits;
+    const std::uint64_t mask = std::uint64_t{1} << (rank % kWordBits);
+    const bool present = (words_[word] & mask) != 0;
+    words_[word] &= ~mask;
+    return present;
+  }
+
   // Removes the minimum topological rank. Returns false when the set is empty.
   bool takeNext(std::size_t &rank) noexcept {
     for (std::size_t word = 0; word < kWords; ++word) {
@@ -55,6 +76,17 @@ public:
         return false;
     }
     return true;
+  }
+
+  std::size_t count() const noexcept {
+    std::size_t total = 0;
+    for (std::uint64_t word : words_) {
+      while (word != 0) {
+        word &= word - 1;
+        ++total;
+      }
+    }
+    return total;
   }
 
   void clear() noexcept { words_.fill(0); }

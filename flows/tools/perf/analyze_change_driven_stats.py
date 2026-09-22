@@ -24,6 +24,35 @@ COUNT_FIELDS = (
     "commit_changes",
 )
 REQUIRED_FIELDS = IDENTITY_FIELDS + COUNT_FIELDS
+OPTIONAL_LEGACY_FIELDS = (
+    "comb_guard_checks",
+    "comb_cache_skips",
+    "comb_output_store_attempts",
+    "comb_output_semantic_changes",
+    "comb_fanout_enqueues",
+    "eval_calls",
+    "eval_total_ns",
+    "topo_eval_calls",
+    "topo_eval_ns",
+    "fallback_calls",
+    "fallback_total_ns",
+    "initial_comb_pass_calls",
+    "initial_comb_pass_ns",
+    "fallback_comb_pass_calls",
+    "fallback_comb_pass_ns",
+    "fallback_primitive_ns",
+    "fallback_iterations",
+    "fallback_max_iterations",
+    "fallback_iter_hist_0",
+    "fallback_iter_hist_1",
+    "fallback_iter_hist_2",
+    "fallback_iter_hist_3",
+    "fallback_iter_hist_4p",
+    "instance_eval_calls",
+    "instance_cache_skips",
+    "primitive_eval_calls",
+    "primitive_cache_skips",
+)
 RATIO_FIELDS = (
     "source_change_rate",
     "coalesced_rate",
@@ -50,7 +79,8 @@ def _validate_row(row: Any, where: str) -> dict[str, Any]:
     if not isinstance(row, dict):
         raise StatsError(f"{where}: expected a JSON object")
     missing = [field for field in REQUIRED_FIELDS if field not in row]
-    unknown = sorted(set(row) - set(REQUIRED_FIELDS))
+    allowed = set(REQUIRED_FIELDS) | set(OPTIONAL_LEGACY_FIELDS)
+    unknown = sorted(set(row) - allowed)
     if missing:
         raise StatsError(f"{where}: missing fields: {', '.join(missing)}")
     if unknown:

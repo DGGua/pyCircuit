@@ -12,6 +12,7 @@ STATE_PY="${ROOT}/compiler/mlir/test/Inputs/comb_dirty_state.py"
 STATE_DRIVER="${ROOT}/compiler/mlir/test/Inputs/comb_dirty_state_driver.cpp"
 INSTANCE_PY="${ROOT}/compiler/mlir/test/Inputs/comb_dirty_instance.py"
 INSTANCE_DRIVER="${ROOT}/compiler/mlir/test/Inputs/comb_dirty_instance_driver.cpp"
+PRIMITIVES_PY="${ROOT}/compiler/mlir/test/Inputs/comb_dirty_primitives.py"
 OUT="${ROOT}/.pycircuit_out/gates/comb_dirty_scheduler"
 
 if [[ ! -x "${PYCC}" ]]; then
@@ -79,5 +80,50 @@ mkdir -p "${instance_dir}"
   -I"${instance_dir}" -I"${ROOT}/.pycircuit_out/toolchain/install/include" \
   "${INSTANCE_DRIVER}" -o "${OUT}/run_instance"
 "${OUT}/run_instance"
+
+python3 -m pycircuit.cli emit "${PRIMITIVES_PY}" \
+  -o "${OUT}/comb_dirty_primitives.pyc"
+primitive_dir="${OUT}/primitives"
+mkdir -p "${primitive_dir}"
+"${PYCC}" "${OUT}/comb_dirty_primitives.pyc" --emit=cpp \
+  -o "${primitive_dir}/comb_dirty_primitives.cpp" --comb-update=dirty \
+  "${common[@]}"
+primitive_cpp="${primitive_dir}/comb_dirty_primitives.cpp"
+for required in \
+  'DirtyBitset<' \
+  '_pyc_direct_fanout_' \
+  'kInReadyChanged' \
+  'kOutValidChanged' \
+  'kOutDataChanged' \
+  'kReadData0Changed' \
+  'kReadData1Changed' \
+  'commit_changes' \
+  'source_checks' \
+  'source_changes' \
+  'dirty_enqueues' \
+  'coalesced' \
+  'max_ready'; do
+  if ! grep -q "${required}" "${primitive_cpp}"; then
+    echo "fail: primitive dirty source missing ${required}" >&2
+    exit 1
+  fi
+done
+cat >"${primitive_dir}/driver.cpp" <<'CPP'
+#include "comb_dirty_primitives.cpp"
+
+int main() {
+  pyc::gen::comb_dirty_primitives dut;
+  dut._pyc_sim_stats_enable = true;
+  dut.comb();
+  dut.tick();
+  dut.commit();
+  dut.comb();
+  return dut._pyc_sim_stats.source_checks == 0;
+}
+CPP
+"${CXX}" -std=c++17 -O0 \
+  -I"${primitive_dir}" -I"${ROOT}/.pycircuit_out/toolchain/install/include" \
+  "${primitive_dir}/driver.cpp" -o "${OUT}/run_primitives"
+"${OUT}/run_primitives"
 
 echo "ok: fused-comb dirty scheduler smoke"

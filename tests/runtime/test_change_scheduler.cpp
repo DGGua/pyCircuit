@@ -29,10 +29,15 @@ void testDirtyBitset() {
   assert(dirty.mark(129));
   assert(dirty.mark(0));
   assert(dirty.mark(64));
+  assert(dirty.count() == 4);
+  assert(dirty.test(65));
+  assert(dirty.take(65));
+  assert(!dirty.test(65));
+  assert(!dirty.take(65));
+  assert(dirty.count() == 3);
 
   assert(dirty.takeNext(rank) && rank == 0);
   assert(dirty.takeNext(rank) && rank == 64);
-  assert(dirty.takeNext(rank) && rank == 65);
   assert(dirty.takeNext(rank) && rank == 129);
   assert(dirty.empty());
   assert(!dirty.takeNext(rank));
