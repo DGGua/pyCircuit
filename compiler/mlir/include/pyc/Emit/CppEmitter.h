@@ -15,6 +15,17 @@ struct CppEmitterOptions {
     Module,
   };
 
+  /// Runtime update policy for fused `pyc.comb` regions.
+  ///
+  /// Always is the reference schedule. Guarded snapshots every direct input.
+  /// Dirty also propagates semantic output changes through local direct-comb
+  /// fanout while conservatively polling non-comb boundaries.
+  enum class CombUpdateMode {
+    Always,
+    Guarded,
+    Dirty,
+  };
+
   SplitMode splitMode = SplitMode::None;
   unsigned shardThresholdLines = 120000;
   unsigned shardThresholdBytes = 4 * 1024 * 1024;
@@ -24,6 +35,7 @@ struct CppEmitterOptions {
   // Chunk fused comb helpers to avoid single mega-functions that dominate
   // downstream C++ TU cost even after file sharding.
   unsigned combChunkNodes = 256;
+  CombUpdateMode combUpdateMode = CombUpdateMode::Dirty;
   std::string probePlanPath{};
 };
 

@@ -188,6 +188,11 @@ static llvm::cl::opt<unsigned> combPartitionMaxNodes(
     llvm::cl::desc("Maximum operation count per static comb partition"),
     llvm::cl::init(35));
 
+static llvm::cl::opt<std::string> combUpdateMode(
+    "comb-update",
+    llvm::cl::desc("C++ fused-comb update policy: always|guarded|dirty"),
+    llvm::cl::init("dirty"));
+
 static llvm::cl::opt<bool> unrollVector(
     "unroll-vector",
     llvm::cl::desc("Unroll vector operations to scalars at IR level before optimization passes"),
@@ -2086,6 +2091,20 @@ int main(int argc, char **argv) {
   }
   const bool isDevFastProfile = (buildProfileNorm == "dev-fast");
 
+  std::string combUpdateNorm = llvm::StringRef(combUpdateMode).lower();
+  pyc::CppEmitterOptions::CombUpdateMode cppCombUpdatePolicy;
+  if (combUpdateNorm == "always") {
+    cppCombUpdatePolicy = pyc::CppEmitterOptions::CombUpdateMode::Always;
+  } else if (combUpdateNorm == "guarded") {
+    cppCombUpdatePolicy = pyc::CppEmitterOptions::CombUpdateMode::Guarded;
+  } else if (combUpdateNorm == "dirty") {
+    cppCombUpdatePolicy = pyc::CppEmitterOptions::CombUpdateMode::Dirty;
+  } else {
+    llvm::errs() << "error: unknown --comb-update: " << combUpdateMode
+                 << " (expected: always|guarded|dirty)\n";
+    return 1;
+  }
+
   // Dev-fast defaults to smaller C++ shards unless explicitly overridden.
   if (isDevFastProfile && cppShardThresholdLines.getNumOccurrences() == 0)
     cppShardThresholdLines = 16000;
@@ -2447,6 +2466,7 @@ int main(int argc, char **argv) {
     obj["cpp_shard_threshold_lines"] = static_cast<int64_t>(cppShardThresholdLines);
     obj["cpp_shard_threshold_bytes"] = static_cast<int64_t>(cppShardThresholdBytes);
     obj["cpp_shard_max_ast_nodes"] = static_cast<int64_t>(cppShardMaxAstNodes);
+    obj["comb_update"] = combUpdateNorm;
     obj["profile_pass_timing"] = collectPassTiming;
     return obj;
   };
@@ -2616,6 +2636,7 @@ int main(int argc, char **argv) {
         cppEmitOpts.combChunkNodes = cppShardMaxAstNodes;
       }
       cppEmitOpts.probePlanPath = probePlanPath;
+      cppEmitOpts.combUpdateMode = cppCombUpdatePolicy;
 
       // Collect direct dependencies per module for header includes.
       llvm::StringMap<llvm::SmallVector<std::string>> deps;
@@ -2967,6 +2988,7 @@ int main(int argc, char **argv) {
       cppEmitOpts.combChunkNodes = cppShardMaxAstNodes;
     }
     cppEmitOpts.probePlanPath = probePlanPath;
+    cppEmitOpts.combUpdateMode = cppCombUpdatePolicy;
     if (failed(pyc::emitCpp(*module, os, cppEmitOpts)))
       return 1;
     if (failed(writeSingleOutputStats()))

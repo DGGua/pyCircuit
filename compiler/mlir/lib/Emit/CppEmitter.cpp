@@ -814,11 +814,115 @@ static LogicalResult emitCombAssign(Operation &op, llvm::raw_ostream &os, NameTa
   return op.emitError("unsupported combinational op for C++ emission");
 }
 
+static void emitDirtyCombFanout(
+    Value value, llvm::raw_ostream &os,
+    const llvm::DenseMap<Operation *, unsigned> &combIndices,
+    llvm::StringRef indent = "      ") {
+  llvm::SmallSet<unsigned, 8> uniqueFanouts;
+  for (OpOperand &use : value.getUses()) {
+    auto consumer = dyn_cast<pyc::CombOp>(use.getOwner());
+    if (!consumer)
+      continue;
+    auto it = combIndices.find(consumer.getOperation());
+    if (it != combIndices.end())
+      uniqueFanouts.insert(it->second);
+  }
+  llvm::SmallVector<unsigned> fanouts(uniqueFanouts.begin(),
+                                      uniqueFanouts.end());
+  llvm::sort(fanouts);
+  for (unsigned fanout : fanouts) {
+    os << indent << "if (_pyc_comb_mark_active(" << fanout
+       << "u) && _pyc_sim_stats_enable) "
+          "_pyc_sim_stats.comb_fanout_enqueues++;\n";
+  }
+}
+
+static bool hasDirtyPolledBoundaryInput(pyc::CombOp comb) {
+  return llvm::any_of(comb.getInputs(), [](Value input) {
+    return !input.getDefiningOp<pyc::CombOp>();
+  });
+}
+
+static void emitCombInputGuard(
+    pyc::CombOp comb, llvm::raw_ostream &os, NameTable &nt, unsigned idx,
+    CppEmitterOptions::CombUpdateMode updateMode) {
+  using CombUpdateMode = CppEmitterOptions::CombUpdateMode;
+
+  if (updateMode == CombUpdateMode::Always) {
+    os << "    if (_pyc_sim_stats_enable) "
+          "_pyc_sim_stats.comb_eval_calls++;\n";
+    return;
+  }
+
+  os << "    if (_pyc_sim_stats_enable) "
+        "_pyc_sim_stats.comb_guard_checks++;\n";
+  if (updateMode == CombUpdateMode::Dirty)
+    os << "    bool _pyc_comb_should_eval = _pyc_comb_take_active(" << idx
+       << "u);\n";
+  os << "    bool _pyc_comb_inputs_changed = !_pyc_comb_" << idx
+     << "_inputs_valid;\n";
+  for (auto [inputIndex, input] : llvm::enumerate(comb.getInputs())) {
+    if (updateMode == CombUpdateMode::Dirty &&
+        input.getDefiningOp<pyc::CombOp>())
+      continue;
+    std::string cacheName = "_pyc_comb_" + std::to_string(idx) + "_input_" +
+                            std::to_string(inputIndex);
+    os << "    if (" << cacheName << " != " << nt.get(input) << ") {\n";
+    os << "      " << cacheName << " = " << nt.get(input) << ";\n";
+    os << "      _pyc_comb_inputs_changed = true;\n";
+    os << "    }\n";
+  }
+  if (updateMode == CombUpdateMode::Dirty)
+    os << "    _pyc_comb_inputs_changed = _pyc_comb_inputs_changed || "
+          "_pyc_comb_should_eval;\n";
+  os << "    if (!_pyc_comb_inputs_changed) {\n";
+  os << "      if (_pyc_sim_stats_enable) "
+        "_pyc_sim_stats.comb_cache_skips++;\n";
+  os << "      return;\n";
+  os << "    }\n";
+  os << "    _pyc_comb_" << idx << "_inputs_valid = true;\n";
+  os << "    if (_pyc_sim_stats_enable) "
+        "_pyc_sim_stats.comb_eval_calls++;\n";
+}
+
+static void emitCombResultPublish(
+    pyc::CombOp comb, unsigned combIndex, unsigned resultIndex, Value candidate,
+    llvm::raw_ostream &os, NameTable &nt,
+    const llvm::DenseMap<Operation *, unsigned> &combIndices,
+    CppEmitterOptions::CombUpdateMode updateMode) {
+  using CombUpdateMode = CppEmitterOptions::CombUpdateMode;
+  Value result = comb.getResult(resultIndex);
+  std::string resultName = nt.get(result);
+  std::string candidateName = "_pyc_comb_" + std::to_string(combIndex) +
+                              "_candidate_" + std::to_string(resultIndex);
+  os << "    const auto &" << candidateName << " = " << nt.get(candidate)
+     << ";\n";
+  os << "    if (_pyc_sim_stats_enable) "
+        "_pyc_sim_stats.comb_output_store_attempts++;\n";
+  if (updateMode == CombUpdateMode::Always) {
+    os << "    if (_pyc_sim_stats_enable && " << resultName << " != "
+       << candidateName
+       << ") _pyc_sim_stats.comb_output_semantic_changes++;\n";
+    os << "    " << resultName << " = " << candidateName << ";\n";
+    return;
+  }
+
+  os << "    if (" << resultName << " != " << candidateName << ") {\n";
+  os << "      " << resultName << " = " << candidateName << ";\n";
+  os << "      if (_pyc_sim_stats_enable) "
+        "_pyc_sim_stats.comb_output_semantic_changes++;\n";
+  if (updateMode == CombUpdateMode::Dirty)
+    emitDirtyCombFanout(result, os, combIndices);
+  os << "    }\n";
+}
+
 static LogicalResult emitCombMethod(pyc::CombOp comb,
                                     llvm::raw_ostream &os,
                                     NameTable &nt,
                                     unsigned idx,
-                                    const CppEmitterOptions &opts) {
+                                    const CppEmitterOptions &opts,
+                                    const llvm::DenseMap<Operation *, unsigned>
+                                        &combIndices) {
   if (comb.getBody().empty())
     return comb.emitError("pyc.comb must have a non-empty region");
 
@@ -855,6 +959,7 @@ static LogicalResult emitCombMethod(pyc::CombOp comb,
     }
 
     os << "  inline void eval_comb_" << idx << "() {\n";
+    emitCombInputGuard(comb, os, nt, idx, opts.combUpdateMode);
     for (const std::string &partName : partMethods)
       os << "    " << partName << "();\n";
 
@@ -865,12 +970,14 @@ static LogicalResult emitCombMethod(pyc::CombOp comb,
       return comb.emitError("pyc.yield operand count must match pyc.comb results");
 
     for (auto [i, v] : llvm::enumerate(y.getOperands()))
-      os << "    " << nt.get(comb.getResult(i)) << " = " << nt.get(v) << ";\n";
+      emitCombResultPublish(comb, idx, static_cast<unsigned>(i), v, os, nt,
+                            combIndices, opts.combUpdateMode);
     os << "  }\n\n";
     return success();
   }
 
   os << "  inline void eval_comb_" << idx << "() {\n";
+  emitCombInputGuard(comb, os, nt, idx, opts.combUpdateMode);
   for (Operation *op : combOps) {
     if (failed(emitCombAssign(*op, os, nt)))
       return failure();
@@ -883,7 +990,8 @@ static LogicalResult emitCombMethod(pyc::CombOp comb,
     return comb.emitError("pyc.yield operand count must match pyc.comb results");
 
   for (auto [i, v] : llvm::enumerate(y.getOperands()))
-    os << "    " << nt.get(comb.getResult(i)) << " = " << nt.get(v) << ";\n";
+    emitCombResultPublish(comb, idx, static_cast<unsigned>(i), v, os, nt,
+                          combIndices, opts.combUpdateMode);
   os << "  }\n\n";
   return success();
 }
@@ -1009,6 +1117,65 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
   std::sort(cdcSyncs.begin(), cdcSyncs.end(), [&](pyc::CdcSyncOp a, pyc::CdcSyncOp b) { return cdcKey(a) < cdcKey(b); });
   auto combKey = [&](pyc::CombOp c) { return nt.get(c.getResult(0)); };
   std::sort(combs.begin(), combs.end(), [&](pyc::CombOp a, pyc::CombOp b) { return combKey(a) < combKey(b); });
+
+  llvm::DenseMap<Operation *, unsigned> combIndex;
+  for (auto [i, comb] : llvm::enumerate(combs))
+    combIndex.try_emplace(comb.getOperation(), static_cast<unsigned>(i));
+
+  // Guarded snapshots every direct input. Dirty replaces direct fused-comb
+  // snapshots with producer activity, while boundary values remain polled.
+  if (!combs.empty() &&
+      opts.combUpdateMode != CppEmitterOptions::CombUpdateMode::Always) {
+    os << "  // Per-comb input snapshots for change-driven evaluation.\n";
+    for (auto [index, comb] : llvm::enumerate(combs)) {
+      os << "  bool _pyc_comb_" << index << "_inputs_valid = false;\n";
+      for (auto [inputIndex, input] : llvm::enumerate(comb.getInputs())) {
+        if (opts.combUpdateMode ==
+                CppEmitterOptions::CombUpdateMode::Dirty &&
+            input.getDefiningOp<pyc::CombOp>())
+          continue;
+        os << "  " << cppType(input.getType()) << " _pyc_comb_" << index
+           << "_input_" << inputIndex << "{};\n";
+      }
+    }
+    os << "\n";
+  }
+
+  if (!combs.empty() &&
+      opts.combUpdateMode == CppEmitterOptions::CombUpdateMode::Dirty) {
+    unsigned activityWords =
+        (static_cast<unsigned>(combs.size()) + 63u) / 64u;
+    os << "  // Local fused-comb activity bitmap; first evaluation is dirty.\n";
+    os << "  std::uint64_t _pyc_comb_active_words[" << activityWords
+       << "] = {";
+    for (unsigned i = 0; i < activityWords; ++i) {
+      if (i)
+        os << ", ";
+      os << "~std::uint64_t{0}";
+    }
+    os << "};\n";
+    os << "  inline bool _pyc_comb_take_active(unsigned id) {\n";
+    os << "    const unsigned word = id >> 6u;\n";
+    os << "    const std::uint64_t mask = std::uint64_t{1} << (id & 63u);\n";
+    os << "    const bool active = (_pyc_comb_active_words[word] & mask) != "
+          "0;\n";
+    os << "    _pyc_comb_active_words[word] &= ~mask;\n";
+    os << "    return active;\n";
+    os << "  }\n";
+    os << "  inline bool _pyc_comb_is_active(unsigned id) const {\n";
+    os << "    const unsigned word = id >> 6u;\n";
+    os << "    const std::uint64_t mask = std::uint64_t{1} << (id & 63u);\n";
+    os << "    return (_pyc_comb_active_words[word] & mask) != 0;\n";
+    os << "  }\n";
+    os << "  inline bool _pyc_comb_mark_active(unsigned id) {\n";
+    os << "    const unsigned word = id >> 6u;\n";
+    os << "    const std::uint64_t mask = std::uint64_t{1} << (id & 63u);\n";
+    os << "    const bool fresh = (_pyc_comb_active_words[word] & mask) == "
+          "0;\n";
+    os << "    _pyc_comb_active_words[word] |= mask;\n";
+    os << "    return fresh;\n";
+    os << "  }\n\n";
+  }
 
   auto instKey = [&](pyc::InstanceOp i) -> std::string {
     if (auto nameAttr = i->getAttrOfType<StringAttr>("name"))
@@ -1475,6 +1642,12 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
   os << "\n";
 
   os << "  struct _pyc_sim_stats_t {\n";
+  os << "    std::uint64_t comb_guard_checks = 0;\n";
+  os << "    std::uint64_t comb_eval_calls = 0;\n";
+  os << "    std::uint64_t comb_cache_skips = 0;\n";
+  os << "    std::uint64_t comb_output_store_attempts = 0;\n";
+  os << "    std::uint64_t comb_output_semantic_changes = 0;\n";
+  os << "    std::uint64_t comb_fanout_enqueues = 0;\n";
   os << "    std::uint64_t instance_eval_calls = 0;\n";
   os << "    std::uint64_t instance_cache_skips = 0;\n";
   os << "    std::uint64_t primitive_eval_calls = 0;\n";
@@ -1540,6 +1713,12 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
   os << "    _pyc_json_escape(os, prefix);\n";
   os << "    os << \"\\\",\\\"module\\\":\\\"" << structName << "\\\"\";\n";
   static const char *kStatsFields[] = {
+      "comb_guard_checks",
+      "comb_eval_calls",
+      "comb_cache_skips",
+      "comb_output_store_attempts",
+      "comb_output_semantic_changes",
+      "comb_fanout_enqueues",
       "eval_calls",
       "eval_total_ns",
       "topo_eval_calls",
@@ -1707,13 +1886,10 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
 
   // Emit fused comb helpers.
   for (auto [i, comb] : llvm::enumerate(combs)) {
-    if (failed(emitCombMethod(comb, os, nt, static_cast<unsigned>(i), opts)))
+    if (failed(emitCombMethod(comb, os, nt, static_cast<unsigned>(i), opts,
+                              combIndex)))
       return failure();
   }
-
-  llvm::DenseMap<Operation *, unsigned> combIndex;
-  for (auto [i, comb] : llvm::enumerate(combs))
-    combIndex.try_emplace(comb.getOperation(), static_cast<unsigned>(i));
 
   auto topoOrder = [&](bool includePrims, llvm::SmallVector<Operation *> &ordered) -> bool {
     ordered.clear();
@@ -1857,7 +2033,19 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
       continue;
     }
     if (auto comb = dyn_cast<pyc::CombOp>(*op)) {
-      os << "    eval_comb_" << combIndex.lookup(comb.getOperation()) << "();\n";
+      unsigned index = combIndex.lookup(comb.getOperation());
+      if (opts.combUpdateMode ==
+              CppEmitterOptions::CombUpdateMode::Dirty &&
+          !hasDirtyPolledBoundaryInput(comb)) {
+        os << "    if (_pyc_comb_is_active(" << index << "u)) {\n";
+        os << "      eval_comb_" << index << "();\n";
+        os << "    } else if (_pyc_sim_stats_enable) {\n";
+        os << "      _pyc_sim_stats.comb_cache_skips++;\n";
+        os << "    }\n";
+      } else {
+        os << "    ";
+        os << "eval_comb_" << index << "();\n";
+      }
       continue;
     }
     if (auto a = dyn_cast<pyc::AssertOp>(*op)) {
@@ -2044,8 +2232,32 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
       os << "    " << ii.member << "_eval_cache_valid = true;\n";
       os << "    #endif\n";
     }
-    for (unsigned i = 0; i < inst.getNumResults(); ++i)
-      os << "    " << nt.get(inst.getResult(i)) << " = " << ii.member << "->" << ii.outPorts[i] << ";\n";
+    if (opts.combUpdateMode == CppEmitterOptions::CombUpdateMode::Always) {
+      for (unsigned i = 0; i < inst.getNumResults(); ++i)
+        os << "    " << nt.get(inst.getResult(i)) << " = " << ii.member
+           << "->" << ii.outPorts[i] << ";\n";
+    } else {
+      // The current IR does not carry a callee output-to-input dependency
+      // summary. Keep the existing conservative child input cache/eval, then
+      // publish each output independently and wake only its local direct-comb
+      // users. Cross-instance pruning can become precise once that metadata is
+      // hardened in the dialect.
+      os << "    bool _pyc_inst_output_changed = false;\n";
+      for (unsigned i = 0; i < inst.getNumResults(); ++i) {
+        Value result = inst.getResult(i);
+        std::string resultName = nt.get(result);
+        std::string childOutput = ii.member + "->" + ii.outPorts[i];
+        os << "    if (" << resultName << " != " << childOutput << ") {\n";
+        os << "      " << resultName << " = " << childOutput << ";\n";
+        os << "      _pyc_inst_output_changed = true;\n";
+        if (opts.combUpdateMode == CppEmitterOptions::CombUpdateMode::Dirty)
+          emitDirtyCombFanout(result, os, combIndex);
+        os << "    }\n";
+      }
+      // The fixed-point fallback must converge on semantic output changes,
+      // rather than merely on child input-cache misses.
+      os << "    _pyc_inst_changed = _pyc_inst_output_changed;\n";
+    }
     os << "    return _pyc_inst_changed;\n";
     os << "  }\n\n";
   };
@@ -2066,6 +2278,33 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
     }
   };
 
+  auto emitPrimitiveOutputSnapshots =
+      [&](ArrayRef<Value> outputs, llvm::StringRef indent,
+          llvm::StringRef prefix) {
+        // Primitive APIs update bound output wires by reference. Snapshot
+        // those values around the existing cache/eval path so dirty fanout is
+        // based on semantic output changes, while fallback convergence remains
+        // conservatively driven by the primitive input cache.
+        if (opts.combUpdateMode != CppEmitterOptions::CombUpdateMode::Dirty)
+          return;
+        for (auto [i, output] : llvm::enumerate(outputs))
+          os << indent << "const auto " << prefix << "_" << i << " = "
+             << nt.get(output) << ";\n";
+      };
+  auto emitPrimitiveOutputWake =
+      [&](ArrayRef<Value> outputs, llvm::StringRef indent,
+          llvm::StringRef prefix) {
+        if (opts.combUpdateMode != CppEmitterOptions::CombUpdateMode::Dirty)
+          return;
+        std::string nestedIndent = indent.str() + "  ";
+        for (auto [i, output] : llvm::enumerate(outputs)) {
+          os << indent << "if (" << prefix << "_" << i << " != "
+             << nt.get(output) << ") {\n";
+          emitDirtyCombFanout(output, os, combIndex, nestedIndent);
+          os << indent << "}\n";
+        }
+      };
+
   auto emitFifoEvalWithCache =
       [&](pyc::FifoOp fifo, llvm::StringRef indent, llvm::StringRef changedAnyVar = llvm::StringRef()) {
     std::string instName = nt.get(fifo.getInReady()) + "_inst";
@@ -2074,6 +2313,10 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
     std::string inData = nt.get(fifo.getInData());
     std::string outReady = nt.get(fifo.getOutReady());
     unsigned dataW = bitWidth(fifo.getInData().getType());
+    llvm::SmallVector<Value> outputs{fifo.getInReady(), fifo.getOutValid(),
+                                     fifo.getOutData()};
+    std::string outputSnapshot = "_pyc_" + instName + "_output_before";
+    emitPrimitiveOutputSnapshots(outputs, indent, outputSnapshot);
     os << indent << "#ifdef PYC_DISABLE_PRIMITIVE_EVAL_CACHE\n";
     os << indent << instName << ".eval();\n";
     os << indent << "if (_pyc_sim_stats_enable) _pyc_sim_stats.primitive_eval_calls++;\n";
@@ -2156,6 +2399,7 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
     os << indent << "#endif\n";
     os << indent << instName << "_eval_cache_valid = true;\n";
     os << indent << "#endif\n";
+    emitPrimitiveOutputWake(outputs, indent, outputSnapshot);
   };
 
   auto emitAsyncFifoEvalWithCache =
@@ -2167,6 +2411,10 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
     std::string inValid = nt.get(fifo.getInValid());
     std::string inData = nt.get(fifo.getInData());
     std::string outReady = nt.get(fifo.getOutReady());
+    llvm::SmallVector<Value> outputs{fifo.getInReady(), fifo.getOutValid(),
+                                     fifo.getOutData()};
+    std::string outputSnapshot = "_pyc_" + instName + "_output_before";
+    emitPrimitiveOutputSnapshots(outputs, indent, outputSnapshot);
     os << indent << "#ifdef PYC_DISABLE_PRIMITIVE_EVAL_CACHE\n";
     os << indent << instName << ".eval();\n";
     os << indent << "if (_pyc_sim_stats_enable) _pyc_sim_stats.primitive_eval_calls++;\n";
@@ -2201,6 +2449,7 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
     os << indent << "}\n";
     os << indent << instName << "_eval_cache_valid = true;\n";
     os << indent << "#endif\n";
+    emitPrimitiveOutputWake(outputs, indent, outputSnapshot);
   };
 
   auto emitByteMemEvalWithCache =
@@ -2213,6 +2462,9 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
     std::string waddr = nt.get(mem.getWaddr());
     std::string wdata = nt.get(mem.getWdata());
     std::string wstrb = nt.get(mem.getWstrb());
+    llvm::SmallVector<Value> outputs{mem.getRdata()};
+    std::string outputSnapshot = "_pyc_" + instName + "_output_before";
+    emitPrimitiveOutputSnapshots(outputs, indent, outputSnapshot);
     os << indent << "#ifdef PYC_DISABLE_PRIMITIVE_EVAL_CACHE\n";
     os << indent << instName << ".eval();\n";
     os << indent << "if (_pyc_sim_stats_enable) _pyc_sim_stats.primitive_eval_calls++;\n";
@@ -2250,6 +2502,7 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
     os << indent << "}\n";
     os << indent << instName << "_eval_cache_valid = true;\n";
     os << indent << "#endif\n";
+    emitPrimitiveOutputWake(outputs, indent, outputSnapshot);
   };
 
   auto emitEvalNode =
@@ -2287,7 +2540,18 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
       return success();
     }
     if (auto comb = dyn_cast<pyc::CombOp>(*op)) {
-      os << indent << "eval_comb_" << combIndex.lookup(comb.getOperation()) << "();\n";
+      unsigned index = combIndex.lookup(comb.getOperation());
+      if (opts.combUpdateMode ==
+              CppEmitterOptions::CombUpdateMode::Dirty &&
+          !hasDirtyPolledBoundaryInput(comb)) {
+        os << indent << "if (_pyc_comb_is_active(" << index << "u)) {\n";
+        os << indent << "  eval_comb_" << index << "();\n";
+        os << indent << "} else if (_pyc_sim_stats_enable) {\n";
+        os << indent << "  _pyc_sim_stats.comb_cache_skips++;\n";
+        os << indent << "}\n";
+      } else {
+        os << indent << "eval_comb_" << index << "();\n";
+      }
       return success();
     }
     if (isa<pyc::ConstantOp,
@@ -2744,8 +3008,14 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
   auto ret = dyn_cast_or_null<func::ReturnOp>(f.getBody().front().getTerminator());
   if (!ret)
     return f.emitError("missing return");
-  for (auto [i, v] : llvm::enumerate(ret.getOperands()))
-    os << "    " << outNames[i] << " = " << nt.get(v) << ";\n";
+  for (auto [i, v] : llvm::enumerate(ret.getOperands())) {
+    if (opts.combUpdateMode == CppEmitterOptions::CombUpdateMode::Always) {
+      os << "    " << outNames[i] << " = " << nt.get(v) << ";\n";
+    } else {
+      os << "    if (" << outNames[i] << " != " << nt.get(v) << ") "
+         << outNames[i] << " = " << nt.get(v) << ";\n";
+    }
+  }
 
   emitTimingAdd(os, "    ", "eval_total_ns", "_pyc_eval_t0");
   os << "  }\n\n";
