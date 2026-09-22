@@ -1,0 +1,2 @@
+{"path":"top","module":"Top","source_checks":80,"source_changes":8,"dirty_enqueues":8,"coalesced":0,"stage_eval_calls":8,"comb_eval_calls":8,"output_publish_attempts":20,"semantic_changes":4,"max_ready":3,"commit_changes":2}
+{"path":"top.u0","module":"Leaf","source_checks":32,"source_changes":4,"dirty_enqueues":4,"coalesced":0,"stage_eval_calls":4,"comb_eval_calls":4,"output_publish_attempts":6,"semantic_changes":2,"max_ready":1,"commit_changes":1}
