@@ -2035,6 +2035,13 @@ def _canonical_hash(payload: dict[str, Any]) -> str:
     return hashlib.sha256(blob).hexdigest()
 
 
+def _backend_build_flag_hashes(build_flags: dict[str, Any], *, cpp_pch: bool) -> tuple[str, str]:
+    """Return shared-backend and C++-specific cache keys."""
+    shared_hash = _canonical_hash(build_flags)
+    cpp_hash = _canonical_hash({**build_flags, "cpp_pch": bool(cpp_pch)})
+    return shared_hash, cpp_hash
+
+
 def _load_json(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
 
@@ -2263,8 +2270,6 @@ def _cmd_build(args: argparse.Namespace) -> int:
         "--inline-policy=off",
         "--hierarchy-policy=strict",
     ]
-    if args.cpp_pch:
-        pycc_hard_hierarchy_flags.append("--cpp-pch")
 
     build_flags = {
         "pycc": str(pycc.resolve()),
@@ -2273,13 +2278,16 @@ def _cmd_build(args: argparse.Namespace) -> int:
         "pycc_build_profile": pycc_build_profile,
         "inline_policy": "off",
         "hierarchy_policy": "strict",
-        "cpp_pch": bool(args.cpp_pch),
         "target": target,
         "tb_schedule_mode": str(args.tb_schedule_mode),
         "frontend_contract": FRONTEND_CONTRACT,
     }
-    build_flags_hash = _canonical_hash(build_flags)
+    cpp_build_flags = {**build_flags, "cpp_pch": bool(args.cpp_pch)}
+    build_flags_hash, cpp_build_flags_hash = _backend_build_flag_hashes(
+        build_flags, cpp_pch=bool(args.cpp_pch)
+    )
     same_flags = str(cache.get("build_flags_hash", "")) == build_flags_hash
+    cpp_same_flags = str(cache.get("cpp_build_flags_hash", "")) == cpp_build_flags_hash
 
     design_key = "__design_pyc"
     old_hashes = dict(cache.get("module_hashes", {}))
@@ -2365,26 +2373,35 @@ def _cmd_build(args: argparse.Namespace) -> int:
         h = _module_hash(mp)
         module_hashes[sym] = h
         unchanged = same_flags and old_hashes.get(sym) == h
+        cpp_unchanged = cpp_same_flags and old_hashes.get(sym) == h
 
         cpp_out_dir = device_cpp_root / sym
-        cpp_ready = cpp_out_dir.is_dir() and any(cpp_out_dir.glob("*.cpp")) and any(cpp_out_dir.glob("*.hpp"))
-        if do_cpp and not (unchanged and cpp_ready):
+        cpp_ready = (
+            cpp_out_dir.is_dir()
+            and any(cpp_out_dir.glob("*.cpp"))
+            and any(cpp_out_dir.glob("*.hpp"))
+            and (cpp_out_dir / "cpp_compile_manifest.json").is_file()
+        )
+        if do_cpp and not (cpp_unchanged and cpp_ready):
             cpp_out_dir.mkdir(parents=True, exist_ok=True)
+            cpp_args = [
+                str(pycc),
+                str(mp),
+                "--emit=cpp",
+                *pycc_hard_hierarchy_flags,
+                "--out-dir",
+                str(cpp_out_dir),
+                "--cpp-split=module",
+                "--probe-plan",
+                str(probe_plan_path),
+                f"--logic-depth={logic_depth}",
+            ]
+            if args.cpp_pch:
+                cpp_args.append("--cpp-pch")
             pycc_jobs.append(
                 (
                     f"cpp:{sym}",
-                    [
-                        str(pycc),
-                        str(mp),
-                        "--emit=cpp",
-                        *pycc_hard_hierarchy_flags,
-                        "--out-dir",
-                        str(cpp_out_dir),
-                        "--cpp-split=module",
-                        "--probe-plan",
-                        str(probe_plan_path),
-                        f"--logic-depth={logic_depth}",
-                    ],
+                    cpp_args,
                 )
             )
 
@@ -2624,6 +2641,8 @@ def _cmd_build(args: argparse.Namespace) -> int:
             "pycc": str(pycc),
             "build_flags": build_flags,
             "build_flags_hash": build_flags_hash,
+            "cpp_build_flags": cpp_build_flags,
+            "cpp_build_flags_hash": cpp_build_flags_hash,
             "jit_cache_key": jit_key,
             "jit_cache_inputs": jit_inputs,
             "last_pycc_jobs": int(len(pycc_jobs)),

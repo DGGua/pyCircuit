@@ -488,6 +488,11 @@ static bool pinToStruct(Value v) {
   if (!def)
     return true;
 
+  // Named values are registered as probes by the C++ emitter. Their addresses
+  // must therefore remain valid for the lifetime of the generated SimObject.
+  if (def->hasAttr("pyc.name"))
+    return true;
+
   // Top-level comb results and state-holding ops always live on the struct.
   if (isa<pyc::CombOp>(def))
     return true;
@@ -597,7 +602,7 @@ static CppPlacementSummary runCppMemberPlacement(func::FuncOp f, unsigned combCh
     if (pinToStruct(v)) {
       annotatePlacement(v, CppStorageKind::Struct, {});
       summary.structMembers++;
-      if (!def)
+      if (!def || def->hasAttr("pyc.name"))
         summary.probePinnedStruct++;
       continue;
     }
@@ -680,7 +685,7 @@ CppPlacementSummary accumulateModulePlacementSummary(ModuleOp module) {
 struct CppPlacementPass : public PassWrapper<CppPlacementPass, OperationPass<ModuleOp>> {
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(CppPlacementPass)
 
-  CppPlacementPass(unsigned chunkNodes)
+  CppPlacementPass(unsigned chunkNodes = CppEmitterOptions::kDefaultCombChunkNodes)
       : combChunkNodes(chunkNodes) {}
 
   StringRef getArgument() const override { return "pyc-cpp-placement"; }
@@ -710,5 +715,7 @@ struct CppPlacementPass : public PassWrapper<CppPlacementPass, OperationPass<Mod
 std::unique_ptr<Pass> createCppPlacementPass(unsigned combChunkNodes) {
   return std::make_unique<CppPlacementPass>(combChunkNodes);
 }
+
+static PassRegistration<CppPlacementPass> pass;
 
 } // namespace pyc

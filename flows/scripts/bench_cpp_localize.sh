@@ -29,6 +29,10 @@ if [[ -z "${BASELINE_ROOT}" || ! -d "${BASELINE_ROOT}" ]]; then
   echo "error: --baseline-root must be an existing worktree of upstream/main" >&2
   exit 2
 fi
+if ! [[ "${REPEAT}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "error: --repeat must be a positive integer" >&2
+  exit 2
+fi
 
 find_pycc() {
   local root="$1"
@@ -83,25 +87,33 @@ PY
   echo "${dest}"
 }
 
-compile_tu() {
+compile_all_tus() {
   local dest="$1"
   local include="${2:-}"
-  local src
-  src="$(find "${dest}/cpp" -name '*.cpp' -print | sort | head -n 1)"
-  if [[ -z "${src}" ]]; then
-    echo "0"
-    return
+  local sources=()
+  while IFS= read -r src; do
+    sources+=("${src}")
+  done < <(find "${dest}/cpp" -name '*.cpp' -type f -print | sort)
+  if [[ "${#sources[@]}" -eq 0 ]]; then
+    echo "error: no generated C++ translation units under ${dest}/cpp" >&2
+    return 1
   fi
-  local obj="${dest}/compile_probe.o"
-  local start end
+  local start end idx=0
   start="$(date +%s%N)"
-  g++ -std=c++17 -O0 -c "${src}" \
-    -I"${dest}/cpp" \
-    ${include:+-I"${include}"} \
-    -o "${obj}" >/dev/null 2>"${dest}/gxx.stderr" || {
-    echo "compile-failed"
-    return
-  }
+  : >"${dest}/gxx.stdout"
+  : >"${dest}/gxx.stderr"
+  for src in "${sources[@]}"; do
+    local obj="${dest}/compile_probe_${idx}.o"
+    if ! g++ -std=c++17 -O0 -c "${src}" \
+      -I"${dest}/cpp" \
+      ${include:+-I"${include}"} \
+      -o "${obj}" >>"${dest}/gxx.stdout" 2>>"${dest}/gxx.stderr"; then
+      echo "error: failed to compile generated TU ${src}" >&2
+      cat "${dest}/gxx.stderr" >&2
+      return 1
+    fi
+    idx=$((idx + 1))
+  done
   end="$(date +%s%N)"
   python3 - <<PY
 start=int("${start}")
@@ -131,7 +143,7 @@ DESIGN_PY[issue_queue_2picker]="${ROOT}/designs/examples/issue_queue_2picker/iss
   echo "designs=${DESIGNS}"
 } > "${OUT_DIR}/commands.txt"
 
-echo "label,design,hpp_lines,gxx_ms_median,notes" > "${OUT_DIR}/summary.csv"
+echo "label,design,hpp_lines,gxx_all_tus_ms_median,tu_count,notes" > "${OUT_DIR}/summary.csv"
 
 IFS=',' read -r -a names <<< "${DESIGNS}"
 for name in "${names[@]}"; do
@@ -148,21 +160,25 @@ for name in "${names[@]}"; do
   base_times=()
   new_times=()
   for ((i=1; i<=REPEAT; i++)); do
-    base_times+=("$(compile_tu "${base_dest}" "${BASE_INC}")")
-    new_times+=("$(compile_tu "${new_dest}" "${NEW_INC}")")
+    base_times+=("$(compile_all_tus "${base_dest}" "${BASE_INC}")")
+    new_times+=("$(compile_all_tus "${new_dest}" "${NEW_INC}")")
   done
   median() {
     python3 - <<PY
 vals = """$*""".split()
-nums = sorted(float(v) for v in vals if v not in ("", "compile-failed"))
-print("compile-failed" if not nums else nums[len(nums)//2])
+nums = sorted(float(v) for v in vals)
+if not nums:
+    raise SystemExit("no successful compile measurements")
+print(nums[len(nums)//2])
 PY
   }
   base_med="$(median "${base_times[*]}")"
   new_med="$(median "${new_times[*]}")"
-  echo "baseline,${name},${base_hpp},${base_med}," >> "${OUT_DIR}/summary.csv"
-  echo "localize,${name},${new_hpp},${new_med}," >> "${OUT_DIR}/summary.csv"
-  echo "[${name}] baseline hpp=${base_hpp} g++=${base_med}ms | localize hpp=${new_hpp} g++=${new_med}ms"
+  base_tus="$(find "${base_dest}/cpp" -name '*.cpp' -type f -print | wc -l)"
+  new_tus="$(find "${new_dest}/cpp" -name '*.cpp' -type f -print | wc -l)"
+  echo "baseline,${name},${base_hpp},${base_med},${base_tus}," >> "${OUT_DIR}/summary.csv"
+  echo "localize,${name},${new_hpp},${new_med},${new_tus}," >> "${OUT_DIR}/summary.csv"
+  echo "[${name}] baseline hpp=${base_hpp} all-TU g++=${base_med}ms | localize hpp=${new_hpp} all-TU g++=${new_med}ms"
 done
 
 echo "wrote ${OUT_DIR}/summary.csv"

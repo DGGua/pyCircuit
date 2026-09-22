@@ -8,8 +8,12 @@ run_id="${PYC_GATE_RUN_ID:-$(date +%Y%m%d-%H%M%S)}"
 docs_dir="${PYC_ROOT_DIR}/docs/gates/logs/${run_id}"
 mkdir -p "${docs_dir}"
 
+build_command="bash flows/scripts/pyc build"
+if [[ "${PYC_GATE_SKIP_BUILD:-0}" == "1" ]]; then
+  build_command="# build skipped; use prebuilt PYCC"
+fi
 cat >"${docs_dir}/commands.txt" <<EOF
-bash flows/scripts/pyc build
+${build_command}
 bash compiler/mlir/test/cpp_member_placement_smoke.sh
 EOF
 
@@ -32,9 +36,9 @@ json.dump(
             "pyc_build": {"status": status_build},
             "cpp_member_placement_smoke": {"status": status_smoke},
         },
-        "decisions": [],
+        "decisions": ["0141", "0147"],
         "feature": "cpp-member-placement",
-        "note": "codegen / compile-cost; no new pyc4.0 decision ID",
+        "note": "deterministic C++ placement and reduced incremental compile scope",
     },
     open(out, "w", encoding="utf-8"),
     indent=2,
@@ -56,15 +60,24 @@ on_exit() {
 }
 trap on_exit EXIT
 
-if bash "${PYC_ROOT_DIR}/flows/scripts/pyc" build \
-  >"${docs_dir}/pyc_build.stdout" 2>"${docs_dir}/pyc_build.stderr"; then
-  status_build="pass"
+if [[ "${PYC_GATE_SKIP_BUILD:-0}" == "1" ]]; then
+  status_build="skipped"
+  : >"${docs_dir}/pyc_build.stdout"
+  echo "build skipped; using prebuilt PYCC=${PYCC:-<auto>}" >"${docs_dir}/pyc_build.stderr"
 else
-  status_build="fail"
-  exit 1
+  if bash "${PYC_ROOT_DIR}/flows/scripts/pyc" build \
+    >"${docs_dir}/pyc_build.stdout" 2>"${docs_dir}/pyc_build.stderr"; then
+    status_build="pass"
+  else
+    status_build="fail"
+    exit 1
+  fi
 fi
 
-if PYCC="$(pyc_find_pycc)" bash "${PYC_ROOT_DIR}/compiler/mlir/test/cpp_member_placement_smoke.sh" \
+pyc_find_pycc
+PYC_OPT="${PYC_OPT:-$(dirname -- "${PYCC}")/pyc-opt}"
+if PYCC="${PYCC}" PYC_OPT="${PYC_OPT}" \
+  bash "${PYC_ROOT_DIR}/compiler/mlir/test/cpp_member_placement_smoke.sh" \
   >"${docs_dir}/cpp_member_placement_smoke.stdout" \
   2>"${docs_dir}/cpp_member_placement_smoke.stderr"; then
   status_smoke="pass"

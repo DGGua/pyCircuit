@@ -7,11 +7,18 @@ PYCC="${PYCC:-${ROOT}/.pycircuit_out/toolchain/build/bin/pycc}"
 PYC_OPT="${PYC_OPT:-${ROOT}/.pycircuit_out/toolchain/build/bin/pyc-opt}"
 EXAMPLE="${ROOT}/designs/examples/counter/counter.py"
 INVALID_COMB="${ROOT}/compiler/mlir/test/invalid_comb_effect.mlir"
+NAMED_PROBE="${ROOT}/compiler/mlir/test/cpp_named_comb_probe.mlir"
 OUT="${ROOT}/.pycircuit_out/gates/cpp_member_placement_smoke"
 
 if [[ ! -x "${PYCC}" ]]; then
-  echo "skip: pycc not built at ${PYCC}" >&2
-  exit 0
+  echo "fail: pycc not built at ${PYCC}" >&2
+  exit 1
+fi
+TOOLCHAIN_ROOT="$(cd -- "$(dirname -- "${PYCC}")/.." && pwd)"
+RUNTIME_INCLUDE="${TOOLCHAIN_ROOT}/include"
+if [[ ! -f "${RUNTIME_INCLUDE}/cpp/pyc_sim.hpp" ]]; then
+  echo "fail: installed runtime headers missing under ${RUNTIME_INCLUDE}" >&2
+  exit 1
 fi
 
 if "${PYCC}" --help 2>&1 | grep -q -- '--cpp-localize-members'; then
@@ -23,14 +30,18 @@ if ! "${PYCC}" --help 2>&1 | grep -q -- '--cpp-compile-budget'; then
   exit 1
 fi
 
-if [[ -x "${PYC_OPT}" ]] && ! "${PYC_OPT}" --help 2>&1 | grep -q 'pyc-cpp-placement'; then
-  echo "fail: pyc-opt missing pyc-cpp-placement pass" >&2
-  exit 1
+if [[ -x "${PYC_OPT}" ]]; then
+  if ! "${PYC_OPT}" --help 2>&1 | grep -q 'pyc-cpp-placement'; then
+    echo "fail: pyc-opt missing pyc-cpp-placement pass" >&2
+    exit 1
+  fi
+else
+  echo "note: pyc-opt unavailable; registration CLI check not run" >&2
 fi
 
 if [[ ! -f "${EXAMPLE}" ]]; then
-  echo "skip: example not found: ${EXAMPLE}" >&2
-  exit 0
+  echo "fail: example not found: ${EXAMPLE}" >&2
+  exit 1
 fi
 
 rm -rf "${OUT}"
@@ -102,10 +113,65 @@ if [[ ! -f "${OUT}/cpp_budget_off/counter.hpp" ]]; then
   echo "fail: --cpp-compile-budget=false did not emit C++" >&2
   exit 1
 fi
-if ! cmp -s "${OUT}/cpp/counter.hpp" "${OUT}/cpp_repeat/counter.hpp"; then
-  echo "fail: locality scheduling is not deterministic" >&2
+if ! diff -ru --exclude='*.json' "${OUT}/cpp" "${OUT}/cpp_repeat" >/dev/null; then
+  echo "fail: full C++ placement output is not deterministic" >&2
   exit 1
 fi
+
+generated_sources=()
+while IFS= read -r source; do
+  generated_sources+=("${source}")
+done < <(find "${OUT}/cpp" -name '*.cpp' -type f -print | sort)
+if [[ "${#generated_sources[@]}" -eq 0 ]]; then
+  echo "fail: placement smoke produced no C++ sources" >&2
+  exit 1
+fi
+for source in "${generated_sources[@]}"; do
+  g++ -std=c++17 -fsyntax-only "${source}" \
+    -I"${OUT}/cpp" -I"${RUNTIME_INCLUDE}"
+done
+
+"${PYCC}" "${NAMED_PROBE}" \
+  --emit=cpp \
+  --out-dir "${OUT}/named_probe" \
+  --cpp-split=module \
+  --build-profile=dev-fast \
+  >/dev/null
+
+named_manifest="${OUT}/named_probe/cpp_compile_manifest.json"
+named_hpp="${OUT}/named_probe/named_comb_probe.hpp"
+named_cpp="${OUT}/named_probe/named_comb_probe.cpp"
+python3 - <<'PY' "${named_manifest}" "${named_hpp}" "${named_cpp}"
+import json
+import sys
+from pathlib import Path
+
+manifest = Path(sys.argv[1])
+hpp_path = Path(sys.argv[2])
+cpp_path = Path(sys.argv[3])
+data = json.loads(manifest.read_text(encoding="utf-8"))
+hpp = hpp_path.read_text(encoding="utf-8")
+cpp = cpp_path.read_text(encoding="utf-8")
+placement = (data.get("profile_summary") or {}).get("cpp_placement") or {}
+if int(placement.get("probe_pinned_struct", 0)) <= 0:
+    raise SystemExit("fail: named comb probe was not pinned to struct storage")
+if "debug_named" not in hpp or 'reg_path("debug_named")' not in cpp:
+    raise SystemExit("fail: named comb probe missing from C++ ProbeRegistry")
+print("ok: named comb probe is struct-pinned and registered")
+PY
+
+named_sources=()
+while IFS= read -r source; do
+  named_sources+=("${source}")
+done < <(find "${OUT}/named_probe" -name '*.cpp' -type f -print | sort)
+if [[ "${#named_sources[@]}" -eq 0 ]]; then
+  echo "fail: named probe smoke produced no C++ sources" >&2
+  exit 1
+fi
+for source in "${named_sources[@]}"; do
+  g++ -std=c++17 -fsyntax-only "${source}" \
+    -I"${OUT}/named_probe" -I"${RUNTIME_INCLUDE}"
+done
 
 manifest="${OUT}/cpp/cpp_compile_manifest.json"
 if [[ ! -f "${manifest}" ]]; then

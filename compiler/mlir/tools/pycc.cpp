@@ -2087,6 +2087,18 @@ int main(int argc, char **argv) {
     llvm::errs() << "error: direct output mode requires a non-empty output path\n";
     return 1;
   }
+  if (cppPch && emitKind != "cpp") {
+    llvm::errs() << "error: --cpp-pch requires --emit=cpp\n";
+    return 1;
+  }
+  if (cppPch && outDir.empty()) {
+    llvm::errs() << "error: --cpp-pch requires --out-dir\n";
+    return 1;
+  }
+  if (cppPch && cppSplitMode != "module") {
+    llvm::errs() << "error: --cpp-pch requires --cpp-split=module\n";
+    return 1;
+  }
 
   std::string buildProfileNorm = llvm::StringRef(buildProfile).lower();
   if (buildProfileNorm != "release" && buildProfileNorm != "dev-fast") {
@@ -2638,11 +2650,6 @@ int main(int argc, char **argv) {
         llvm::errs() << "error: unknown --cpp-split mode: " << cppSplitMode << " (expected: module|none)\n";
         return 1;
       }
-      if (cppPch && !splitModule) {
-        llvm::errs() << "error: --cpp-pch requires --cpp-split=module\n";
-        return 1;
-      }
-
       auto writeHeaderPreamble = [&](llvm::raw_ostream &os, llvm::StringRef moduleName) {
         (void)moduleName;
         os << "// pyCircuit C++ emission (split)\n";

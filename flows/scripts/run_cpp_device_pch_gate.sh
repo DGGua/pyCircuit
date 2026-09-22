@@ -8,8 +8,12 @@ run_id="${PYC_GATE_RUN_ID:-$(date +%Y%m%d-%H%M%S)}"
 docs_dir="${PYC_ROOT_DIR}/docs/gates/logs/${run_id}"
 mkdir -p "${docs_dir}"
 
+build_command="bash flows/scripts/pyc build"
+if [[ "${PYC_GATE_SKIP_BUILD:-0}" == "1" ]]; then
+  build_command="# build skipped; use prebuilt PYCC"
+fi
 cat >"${docs_dir}/commands.txt" <<EOF
-bash flows/scripts/pyc build
+${build_command}
 bash compiler/mlir/test/cpp_device_pch_smoke.sh
 EOF
 
@@ -30,9 +34,9 @@ json.dump(
             "pyc_build": {"status": status_build},
             "cpp_device_pch_smoke": {"status": status_smoke},
         },
-        "decisions": [],
+        "decisions": ["0141"],
         "feature": "cpp-pch",
-        "note": "CMake-only; no new pyc4.0 decision ID",
+        "note": "C++ compile-layer acceleration for incremental builds",
     },
     open(out, "w", encoding="utf-8"),
     indent=2,
@@ -53,15 +57,22 @@ on_exit() {
 }
 trap on_exit EXIT
 
-if bash "${PYC_ROOT_DIR}/flows/scripts/pyc" build \
-  >"${docs_dir}/pyc_build.stdout" 2>"${docs_dir}/pyc_build.stderr"; then
-  status_build="pass"
+if [[ "${PYC_GATE_SKIP_BUILD:-0}" == "1" ]]; then
+  status_build="skipped"
+  : >"${docs_dir}/pyc_build.stdout"
+  echo "build skipped; using prebuilt PYCC=${PYCC:-<auto>}" >"${docs_dir}/pyc_build.stderr"
 else
-  status_build="fail"
-  exit 1
+  if bash "${PYC_ROOT_DIR}/flows/scripts/pyc" build \
+    >"${docs_dir}/pyc_build.stdout" 2>"${docs_dir}/pyc_build.stderr"; then
+    status_build="pass"
+  else
+    status_build="fail"
+    exit 1
+  fi
 fi
 
-if PYCC="$(pyc_find_pycc)" bash "${PYC_ROOT_DIR}/compiler/mlir/test/cpp_device_pch_smoke.sh" \
+pyc_find_pycc
+if PYCC="${PYCC}" bash "${PYC_ROOT_DIR}/compiler/mlir/test/cpp_device_pch_smoke.sh" \
   >"${docs_dir}/cpp_device_pch_smoke.stdout" \
   2>"${docs_dir}/cpp_device_pch_smoke.stderr"; then
   status_smoke="pass"
