@@ -16,6 +16,18 @@ fi
 rm -rf "${OUT}"
 mkdir -p "${OUT}/first" "${OUT}/second"
 
+"${PYCC}" \
+  "${ROOT}/compiler/mlir/test/Inputs/comb_cycle_reg_feedback.mlir" \
+  --emit=none -o /dev/null
+
+true_cycle_log="${OUT}/comb_cycle_true.log"
+if "${PYCC}" "${ROOT}/compiler/mlir/test/Inputs/comb_cycle_true.mlir" \
+    --emit=none -o /dev/null >"${true_cycle_log}" 2>&1; then
+  echo "fail: true local combinational cycle was accepted" >&2
+  exit 1
+fi
+grep -q "combinational cycle detected" "${true_cycle_log}"
+
 run_plan() {
   local dump_dir=$1
   "${PYCC}" "${INPUT}" --emit=none -o /dev/null \
@@ -72,6 +84,20 @@ print("ok: canonical schedule metadata is stable and verified")
 PY
 
 if [[ -x "${PYC_OPT}" ]]; then
+  "${PYC_OPT}" \
+    "${ROOT}/compiler/mlir/test/Inputs/comb_cycle_reg_feedback.mlir" \
+    --pyc-check-comb-cycles -o /dev/null
+
+  true_cycle_opt_log="${OUT}/comb_cycle_true_opt.log"
+  if "${PYC_OPT}" \
+      "${ROOT}/compiler/mlir/test/Inputs/comb_cycle_true.mlir" \
+      --pyc-check-comb-cycles -o /dev/null \
+      >"${true_cycle_opt_log}" 2>&1; then
+    echo "fail: true local combinational cycle was accepted" >&2
+    exit 1
+  fi
+  grep -q "combinational cycle detected" "${true_cycle_opt_log}"
+
   "${PYC_OPT}" "${INPUT}" \
     --pyc-plan-change-driven-schedule \
     --pyc-check-change-driven-schedule -o /dev/null
