@@ -129,6 +129,22 @@ static unsigned bitWidth(Type ty) {
   return 0;
 }
 
+// Number of uint64_t words written by appendPackedWireWords for this type.
+// Unlike bitWidth(), this must include every lane of nested vector values.
+static std::size_t packedWireWordCount(Type ty) {
+  if (isa<pyc::ClockType, pyc::ResetType>(ty))
+    return 1;
+  if (auto intTy = dyn_cast<IntegerType>(ty))
+    return std::max<std::size_t>(1, (intTy.getWidth() + 63u) / 64u);
+  if (auto vectorTy = dyn_cast<VectorType>(ty)) {
+    std::size_t lanes = 1;
+    for (int64_t extent : vectorTy.getShape())
+      lanes *= static_cast<std::size_t>(extent);
+    return lanes * packedWireWordCount(vectorTy.getElementType());
+  }
+  return 0;
+}
+
 // Emit ProbeRegistry registration for a (possibly vector) wire-kind value.
 // Scalars register directly via addWire; vectors lower to nested pyc::cpp::Vec
 // and use ProbeRegistry::addVec, which recurses to per-lane Wire<W>* leaves
@@ -1578,13 +1594,11 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
   }
 
   auto instancePackedCacheWordCount = [&](const InstInfo &ii) -> unsigned {
-    unsigned words = 0;
+    std::size_t words = 0;
     auto inst = ii.op;
-    for (unsigned i = 0; i < inst.getNumOperands(); ++i) {
-      unsigned inW = bitWidth(inst.getOperand(i).getType());
-      words += std::max(1u, (inW + 63u) / 64u);
-    }
-    return words;
+    for (Value input : inst.getInputs())
+      words += packedWireWordCount(input.getType());
+    return static_cast<unsigned>(words);
   };
 
   // Medium fanout glue modules still explode into large TUs if they keep the
