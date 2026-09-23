@@ -205,7 +205,8 @@ static llvm::cl::opt<bool> combineDelayChains(
 static llvm::cl::opt<std::string> stateDelayOpt(
     "state-delay-opt",
     llvm::cl::desc(
-        "State/delay optimization policy: off|generated|structural (default: structural)"),
+        "State/delay optimization policy: off|generated|structural "
+        "(default: structural for C++; off for --emit=verilog unless set explicitly)"),
     llvm::cl::init("structural"));
 
 static llvm::cl::opt<std::string> stateRetimeOpt(
@@ -2594,8 +2595,13 @@ int main(int argc, char **argv) {
   }
 
   std::string stateDelayOptNorm = llvm::StringRef(stateDelayOpt).lower();
+  // Verilog keeps the pre-merge netlist. State merge, delay_line, retiming,
+  // and lane packing stay on for C++ unless the flag is set explicitly.
   if (stateDelayOpt.getNumOccurrences() == 0 &&
-      combineDelayChains.getNumOccurrences() != 0 && combineDelayChains)
+      combineDelayChains.getNumOccurrences() == 0 && emitKind == "verilog")
+    stateDelayOptNorm = "off";
+  else if (stateDelayOpt.getNumOccurrences() == 0 &&
+           combineDelayChains.getNumOccurrences() != 0 && combineDelayChains)
     stateDelayOptNorm = "generated";
   const bool enableStateDelayOptimization =
       combineDelayChains && stateDelayOptNorm != "off";

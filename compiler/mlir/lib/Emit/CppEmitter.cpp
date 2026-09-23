@@ -34,6 +34,79 @@ using namespace mlir;
 namespace pyc {
 namespace {
 
+// A function argument feeds only sequential clock ports when every use is a
+// clock operand, an alias/wire, or an instance port that is itself clock-only.
+// Those values do not change combinational outputs, so the instance eval cache
+// must not treat a clock toggle as a new input.
+static bool isSequentialClockUse(OpOperand &use) {
+  Operation *owner = use.getOwner();
+  Value value = use.get();
+  if (auto reg = dyn_cast<pyc::RegOp>(owner))
+    return reg.getClk() == value;
+  if (auto delay = dyn_cast<pyc::DelayLineOp>(owner))
+    return delay.getClk() == value;
+  if (auto mem = dyn_cast<pyc::SyncMemOp>(owner))
+    return mem.getClk() == value;
+  if (auto mem = dyn_cast<pyc::SyncMemDPOp>(owner))
+    return mem.getClk() == value;
+  if (auto mem = dyn_cast<pyc::ByteMemOp>(owner))
+    return mem.getClk() == value;
+  if (auto fifo = dyn_cast<pyc::FifoOp>(owner))
+    return fifo.getClk() == value;
+  if (auto fifo = dyn_cast<pyc::AsyncFifoOp>(owner))
+    return fifo.getInClk() == value || fifo.getOutClk() == value;
+  if (auto cdc = dyn_cast<pyc::CdcSyncOp>(owner))
+    return cdc.getClk() == value;
+  return false;
+}
+
+static bool argumentIsClockOnly(
+    func::FuncOp func, unsigned argIdx, ModuleOp module,
+    llvm::DenseMap<std::pair<Operation *, unsigned>, bool> &memo) {
+  auto key = std::make_pair(func.getOperation(), argIdx);
+  if (auto it = memo.find(key); it != memo.end())
+    return it->second;
+  // Assume comb-sensitive while recursing so a cycle cannot skip a real cone.
+  memo[key] = false;
+  if (!func || func.isDeclaration() || func.getBody().empty() ||
+      argIdx >= func.getNumArguments())
+    return false;
+
+  bool clockOnly = true;
+  llvm::SmallVector<Value> work{func.getArgument(argIdx)};
+  llvm::DenseSet<Value> seen;
+  while (!work.empty() && clockOnly) {
+    Value value = work.pop_back_val();
+    if (!seen.insert(value).second)
+      continue;
+    for (OpOperand &use : value.getUses()) {
+      Operation *user = use.getOwner();
+      if (auto alias = dyn_cast<pyc::AliasOp>(user)) {
+        work.push_back(alias.getResult());
+        continue;
+      }
+      if (isSequentialClockUse(use))
+        continue;
+      if (auto inst = dyn_cast<pyc::InstanceOp>(user)) {
+        auto calleeAttr = inst->getAttrOfType<FlatSymbolRefAttr>("callee");
+        func::FuncOp callee;
+        if (calleeAttr)
+          callee = module.lookupSymbol<func::FuncOp>(calleeAttr.getValue());
+        if (!callee ||
+            !argumentIsClockOnly(callee, use.getOperandNumber(), module, memo)) {
+          clockOnly = false;
+          break;
+        }
+        continue;
+      }
+      clockOnly = false;
+      break;
+    }
+  }
+  memo[key] = clockOnly;
+  return clockOnly;
+}
+
 // ---------------------------------------------------------------------------
 // placement attribute readers (used internally by the emitter)
 // ---------------------------------------------------------------------------
@@ -127,6 +200,20 @@ static unsigned bitWidth(Type ty) {
   if (auto vt = dyn_cast<VectorType>(ty))
     return bitWidth(vt.getElementType());  // scalar element bit width
   return 0;
+}
+
+// Words appended by appendPackedWireWords, including one slot per vector lane.
+static unsigned packedWireWords(Type ty) {
+  if (auto vt = dyn_cast<VectorType>(ty)) {
+    unsigned lanes = 1;
+    for (std::int64_t dim : vt.getShape())
+      lanes *= static_cast<unsigned>(dim);
+    return lanes * packedWireWords(vt.getElementType());
+  }
+  unsigned width = bitWidth(ty);
+  if (width == 0)
+    width = 1;
+  return std::max(1u, (width + 63u) / 64u);
 }
 
 // Emit ProbeRegistry registration for a (possibly vector) wire-kind value.
@@ -1238,6 +1325,7 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
     std::string seg;
     std::vector<std::string> inPorts;
     std::vector<std::string> outPorts;
+    std::vector<char> clockOnlyIn;
   };
   std::vector<InstInfo> instInfos;
   instInfos.reserve(instances.size());
@@ -1247,6 +1335,7 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
     return f.emitError("C++ emitter: missing parent module for instance resolution");
   std::vector<bool> instHasSequentialCallee{};
 
+  llvm::DenseMap<std::pair<Operation *, unsigned>, bool> clockOnlyMemo;
   if (!instances.empty()) {
     for (auto inst : instances) {
       auto calleeAttr = inst->getAttrOfType<FlatSymbolRefAttr>("callee");
@@ -1278,9 +1367,16 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
         seg = sanitizeId(shortAttr.getValue());
       std::string member = nt.unique(base);
 
+      std::vector<char> clockOnlyIn(inst.getNumOperands(), 0);
+      for (unsigned i = 0; i < inst.getNumOperands(); ++i)
+        clockOnlyIn[i] =
+            argumentIsClockOnly(callee, i, mod, clockOnlyMemo) ? 1 : 0;
+
       unsigned idx = static_cast<unsigned>(instInfos.size());
       instIndex.try_emplace(inst.getOperation(), idx);
-      instInfos.push_back(InstInfo{inst, callee, std::move(member), std::move(seg), std::move(inPorts), std::move(outPorts)});
+      instInfos.push_back(InstInfo{inst, callee, std::move(member), std::move(seg),
+                                   std::move(inPorts), std::move(outPorts),
+                                   std::move(clockOnlyIn)});
     }
 
     llvm::DenseMap<Operation *, SeqStateKind> seqMemo{};
@@ -1294,8 +1390,9 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
     unsigned words = 0;
     auto inst = ii.op;
     for (unsigned i = 0; i < inst.getNumOperands(); ++i) {
-      unsigned inW = bitWidth(inst.getOperand(i).getType());
-      words += std::max(1u, (inW + 63u) / 64u);
+      if (i < ii.clockOnlyIn.size() && ii.clockOnlyIn[i])
+        continue;
+      words += packedWireWords(inst.getOperand(i).getType());
     }
     return words;
   };
@@ -1308,7 +1405,9 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
   auto usePackedInstanceEvalCache = [&](const InstInfo &ii) -> bool {
     auto inst = ii.op;
     unsigned packedWords = instancePackedCacheWordCount(ii);
-    return (inst.getNumOperands() >= kPackedInstanceCacheOperandThreshold) || (packedWords >= kPackedInstanceCacheWordThreshold);
+    return packedWords > 0 &&
+           ((inst.getNumOperands() >= kPackedInstanceCacheOperandThreshold) ||
+            (packedWords >= kPackedInstanceCacheWordThreshold));
   };
 
   llvm::DenseMap<Operation *, std::string> byteMemInstName;
@@ -1335,6 +1434,8 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
            << "_eval_cache_words{};\n";
       } else {
         for (unsigned i = 0; i < inst.getNumOperands(); ++i) {
+          if (i < ii.clockOnlyIn.size() && ii.clockOnlyIn[i])
+            continue;
           std::string cacheName = ii.member + "_eval_cache_in_" + std::to_string(i);
           unsigned inW = bitWidth(inst.getOperand(i).getType());
           os << "  " << cppType(inst.getOperand(i).getType()) << " " << cacheName << "{};\n";
@@ -1557,6 +1658,24 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
       os << "  pyc::cpp::pyc_vec_reg<" << cppType(r.getQ().getType()) << "> *" << nt.get(r.getQ()) << "_inst = nullptr;\n";
     else
       os << "  pyc::cpp::pyc_reg<" << w << "> *" << nt.get(r.getQ()) << "_inst = nullptr;\n";
+  }
+  std::string fastClkName;
+  bool fastClkUnique = true;
+  auto noteFastClk = [&](Value clk) {
+    std::string name = nt.get(clk);
+    if (fastClkName.empty())
+      fastClkName = std::move(name);
+    else if (fastClkName != name)
+      fastClkUnique = false;
+  };
+  for (auto r : regs)
+    noteFastClk(r.getClk());
+  for (auto delay : delayLines)
+    noteFastClk(delay.getClk());
+  const bool fastEdge = fastClkUnique && !fastClkName.empty();
+  if (fastEdge) {
+    os << "  bool _pyc_clk_prev = false;\n";
+    os << "  bool _pyc_seq_armed = false;\n";
   }
   for (auto delay : delayLines) {
     unsigned w = bitWidth(delay.getQ().getType());
@@ -2165,10 +2284,23 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
     os << "    #else\n";
     std::string changedFlag = ii.member + "_eval_cache_changed";
     os << "    bool " << changedFlag << " = !" << ii.member << "_eval_cache_valid;\n";
+    auto clockOnlyIn = [&](unsigned i) {
+      return i < ii.clockOnlyIn.size() && ii.clockOnlyIn[i];
+    };
+    auto emitClockOnlyAssigns = [&](llvm::StringRef indent) {
+      for (unsigned i = 0; i < inst.getNumOperands(); ++i) {
+        if (!clockOnlyIn(i))
+          continue;
+        os << indent << ii.member << "->" << ii.inPorts[i] << " = "
+           << nt.get(inst.getOperand(i)) << ";\n";
+      }
+    };
     if (usePackedCache) {
       os << "    std::array<std::uint64_t, " << instancePackedCacheWordCount(ii) << "> _pyc_inputs{};\n";
       os << "    std::size_t _pyc_inputs_off = 0;\n";
       for (unsigned i = 0; i < inst.getNumOperands(); ++i) {
+        if (clockOnlyIn(i))
+          continue;
         std::string inValue = nt.get(inst.getOperand(i));
         os << "    pyc::cpp::appendPackedWireWords(_pyc_inputs, _pyc_inputs_off, " << inValue << ");\n";
       }
@@ -2183,6 +2315,7 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
       os << "      if (_pyc_sim_stats_enable) _pyc_sim_stats.instance_eval_calls++;\n";
       os << "      " << ii.member << "_eval_cache_words = _pyc_inputs;\n";
       os << "    } else {\n";
+      emitClockOnlyAssigns("      ");
       os << "      if (_pyc_sim_stats_enable) _pyc_sim_stats.instance_cache_skips++;\n";
       os << "    }\n";
       os << "    _pyc_inst_changed = " << changedFlag << ";\n";
@@ -2191,6 +2324,8 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
     } else {
       os << "    #ifndef PYC_DISABLE_VERSIONED_INPUT_CACHE\n";
       for (unsigned i = 0; i < inst.getNumOperands(); ++i) {
+        if (clockOnlyIn(i))
+          continue;
         std::string cacheName = ii.member + "_eval_cache_in_" + std::to_string(i);
         std::string inValue = nt.get(inst.getOperand(i));
         std::string verName = ii.member + "_eval_cache_in_ver_" + std::to_string(i);
@@ -2224,17 +2359,23 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
         os << "    " << seenName << " = " << verName << ";\n";
       }
       os << "    if (" << changedFlag << ") {\n";
+      emitClockOnlyAssigns("      ");
       for (unsigned i = 0; i < inst.getNumOperands(); ++i) {
+        if (clockOnlyIn(i))
+          continue;
         std::string cacheName = ii.member + "_eval_cache_in_" + std::to_string(i);
         os << "      " << ii.member << "->" << ii.inPorts[i] << " = " << cacheName << ";\n";
       }
       os << "      " << ii.member << "->eval();\n";
       os << "      if (_pyc_sim_stats_enable) _pyc_sim_stats.instance_eval_calls++;\n";
       os << "    } else {\n";
+      emitClockOnlyAssigns("      ");
       os << "      if (_pyc_sim_stats_enable) _pyc_sim_stats.instance_cache_skips++;\n";
       os << "    }\n";
       os << "    #else\n";
       for (unsigned i = 0; i < inst.getNumOperands(); ++i) {
+        if (clockOnlyIn(i))
+          continue;
         std::string cacheName = ii.member + "_eval_cache_in_" + std::to_string(i);
         std::string inValue = nt.get(inst.getOperand(i));
         os << "    if (!" << changedFlag << " && (" << cacheName << " != " << inValue << ")) " << changedFlag
@@ -2242,14 +2383,18 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
       }
       os << "    if (" << changedFlag << ") {\n";
       for (unsigned i = 0; i < inst.getNumOperands(); ++i) {
+        if (clockOnlyIn(i))
+          continue;
         std::string cacheName = ii.member + "_eval_cache_in_" + std::to_string(i);
         std::string inValue = nt.get(inst.getOperand(i));
         os << "      " << ii.member << "->" << ii.inPorts[i] << " = " << inValue << ";\n";
         os << "      " << cacheName << " = " << inValue << ";\n";
       }
+      emitClockOnlyAssigns("      ");
       os << "      " << ii.member << "->eval();\n";
       os << "      if (_pyc_sim_stats_enable) _pyc_sim_stats.instance_eval_calls++;\n";
       os << "    } else {\n";
+      emitClockOnlyAssigns("      ");
       os << "      if (_pyc_sim_stats_enable) _pyc_sim_stats.instance_cache_skips++;\n";
       os << "    }\n";
       os << "    #endif\n";
@@ -2967,18 +3112,54 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
       os << "    tick_compute_part_" << i << "();\n";
   }
   os << "    // Local sequential primitives.\n";
-  for (auto r : regs)
-    os << "    " << nt.get(r.getQ()) << "_inst->tick_compute();\n";
-  for (auto delay : delayLines)
-    os << "    " << nt.get(delay.getQ()) << "_inst->tick_compute();\n";
-  for (auto tap : delayTaps) {
-    auto delay = tap.getLine().getDefiningOp<pyc::DelayLineOp>();
-    auto depth = tap->getAttrOfType<IntegerAttr>("depth");
-    if (!delay || !depth)
-      return tap.emitError("invalid delay tap source or depth");
-    os << "    " << nt.get(tap.getTap()) << "_qNext = "
-       << nt.get(delay.getQ()) << "_inst->tap_next(" << depth.getInt()
-       << "u);\n";
+  auto emitEdgeCall = [&](const char *method) {
+    for (auto r : regs)
+      os << "      " << nt.get(r.getQ()) << "_inst->" << method << "();\n";
+    for (auto delay : delayLines)
+      os << "      " << nt.get(delay.getQ()) << "_inst->" << method << "();\n";
+  };
+  auto emitTapUpdates = [&]() -> LogicalResult {
+    for (auto tap : delayTaps) {
+      auto delay = tap.getLine().getDefiningOp<pyc::DelayLineOp>();
+      auto depth = tap->getAttrOfType<IntegerAttr>("depth");
+      if (!delay || !depth)
+        return tap.emitError("invalid delay tap source or depth");
+      os << "      " << nt.get(tap.getTap()) << "_qNext = "
+         << nt.get(delay.getQ()) << "_inst->tap_next(" << depth.getInt()
+         << "u);\n";
+    }
+    return success();
+  };
+  if (fastEdge) {
+    // One edge check for every register on this clock. A falling edge after
+    // commit only keeps clkPrev; it does not sample next-state again.
+    os << "    {\n";
+    os << "      bool _pyc_now = " << fastClkName << ".toBool();\n";
+    os << "      bool _pyc_rise = !_pyc_clk_prev && _pyc_now;\n";
+    os << "      bool _pyc_fall = _pyc_clk_prev && !_pyc_now;\n";
+    os << "      _pyc_clk_prev = _pyc_now;\n";
+    os << "      if (_pyc_rise) {\n";
+    emitEdgeCall("posedge_tick_compute");
+    if (failed(emitTapUpdates()))
+      return failure();
+    os << "        _pyc_seq_armed = true;\n";
+    os << "      } else if (_pyc_fall) {\n";
+    os << "        if (_pyc_seq_armed) {\n";
+    emitEdgeCall("negedge_update");
+    os << "          _pyc_seq_armed = false;\n";
+    os << "        }\n";
+    if (failed(emitTapUpdates()))
+      return failure();
+    os << "      } else {\n";
+    emitEdgeCall("tick_compute");
+    if (failed(emitTapUpdates()))
+      return failure();
+    os << "      }\n";
+    os << "    }\n";
+  } else {
+    emitEdgeCall("tick_compute");
+    if (failed(emitTapUpdates()))
+      return failure();
   }
   for (auto fifo : fifos)
     os << "    " << nt.get(fifo.getInReady()) << "_inst.tick_compute();\n";
@@ -2995,6 +3176,8 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
   os << "  }\n\n";
 
   os << "  void tick_commit() {\n";
+  if (fastEdge)
+    os << "    _pyc_seq_armed = false;\n";
   if (!instInfos.empty()) {
     os << "    // Sub-modules.\n";
     unsigned commitParts = (static_cast<unsigned>(instInfos.size()) + kTickChunk - 1) / kTickChunk;
