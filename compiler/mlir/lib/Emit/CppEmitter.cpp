@@ -1132,9 +1132,14 @@ static void emitMetadataCombFanout(
   os << indent << "  _pyc_mark_comb_dirty(_pyc_consumer);\n";
 }
 
+static bool isDirtyDrivenInput(Value input) {
+  Operation *producer = input.getDefiningOp();
+  return producer && isChangeScheduleNode(producer);
+}
+
 static bool hasDirtyPolledBoundaryInput(pyc::CombOp comb) {
   return llvm::any_of(comb.getInputs(), [](Value input) {
-    return !input.getDefiningOp<pyc::CombOp>();
+    return !isDirtyDrivenInput(input);
   });
 }
 
@@ -1161,7 +1166,7 @@ static void emitCombInputGuard(
      << "_inputs_valid;\n";
   for (auto [inputIndex, input] : llvm::enumerate(comb.getInputs())) {
     if (updateMode == CombUpdateMode::Dirty &&
-        input.getDefiningOp<pyc::CombOp>())
+        isDirtyDrivenInput(input))
       continue;
     std::string cacheName = "_pyc_comb_" + std::to_string(idx) + "_input_" +
                             std::to_string(inputIndex);
@@ -1484,10 +1489,11 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
         !combIndex.contains(node.operation))
       return node.operation->emitError(
           "C++ emitter cannot map schedule node to a comb execution unit");
-    if (!isa<pyc::CombOp, pyc::InstanceOp, pyc::FifoOp, pyc::ByteMemOp,
-             pyc::AsyncFifoOp>(node.operation))
+    if (!isa<pyc::CombOp, pyc::InstanceOp, pyc::RegOp, pyc::FifoOp,
+             pyc::ByteMemOp, pyc::SyncMemOp, pyc::SyncMemDPOp,
+             pyc::AsyncFifoOp, pyc::CdcSyncOp>(node.operation))
       return node.operation->emitError(
-          "C++ emitter cannot map schedule node to a supported execution unit");
+          "C++ emitter cannot map schedule node to a supported execution or state-source unit");
   }
 
   // Guarded snapshots every direct input. Dirty replaces direct fused-comb
@@ -1500,7 +1506,7 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
       for (auto [inputIndex, input] : llvm::enumerate(comb.getInputs())) {
         if (opts.combUpdateMode ==
                 CppEmitterOptions::CombUpdateMode::Dirty &&
-            input.getDefiningOp<pyc::CombOp>())
+            isDirtyDrivenInput(input))
           continue;
         os << "  " << cppType(input.getType()) << " _pyc_comb_" << index
            << "_input_" << inputIndex << "{};\n";
