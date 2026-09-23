@@ -87,7 +87,7 @@ rewrite_to_file() {
   local output="$2"
   local dump="${output}.dump"
   "${PYCC}" "${input}" --emit=none --module-pipeline=rewrite \
-    --comb-partition=none --comb-update=dirty \
+    --comb-partition=none \
     --dump-pass-ir="${dump}" --dump-pass-ir-phase=after \
     --dump-pass-ir-filter=check-logic-depth -o /dev/null >/dev/null
   local files=("${dump}"/*_after_*check-logic-depth*.mlir)
@@ -161,7 +161,7 @@ PY
 stage_cpp="${OUT}/module_pipeline_stage.cpp"
 "${PYCC}" "${INPUTS}/module_pipeline_false_scc.mlir" \
   --emit=cpp --module-pipeline=rewrite --comb-partition=none \
-  --comb-update=dirty -o "${stage_cpp}" >/dev/null
+  -o "${stage_cpp}" >/dev/null
 grep -q '_pyc_change_schedule_schema = "pyc.change_schedule.v1"' \
   "${stage_cpp}"
 "${CXX}" -std=c++17 -O0 \
@@ -236,7 +236,7 @@ done
 "${PYCC}" "${INPUTS}/module_pipeline_false_scc.mlir" \
   --emit=none --module-pipeline=rewrite \
   --comb-partition=static --comb-partition-max-nodes=3 \
-  --comb-update=guarded -o /dev/null >/dev/null
+  -o /dev/null >/dev/null
 
 if "${PYCC}" "${INPUTS}/module_pipeline_unsupported_multicall.mlir" \
     --emit=none --module-pipeline=rewrite -o /dev/null \

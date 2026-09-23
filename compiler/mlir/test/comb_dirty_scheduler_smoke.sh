@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Fused-comb dirty scheduling: reference equivalence, inactivity, semantic
-# publish filtering, direct fanout/reconvergence, first eval, and post-commit.
+# Fused-comb dirty scheduling: inactivity, semantic publish filtering, direct
+# fanout/reconvergence, first eval, post-commit, and removed-mode hard break.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
@@ -20,14 +20,14 @@ if [[ ! -x "${PYCC}" ]]; then
   exit 0
 fi
 
-if ! "${PYCC}" --help 2>&1 | grep -q -- "--comb-update"; then
-  echo "fail: pycc missing --comb-update" >&2
+if "${PYCC}" --help 2>&1 | grep -q -- "--comb-update"; then
+  echo "fail: pycc still exposes removed --comb-update" >&2
   exit 1
 fi
 export PYTHONPATH="${ROOT}/compiler/frontend:${PYTHONPATH:-}"
-if ! python3 -m pycircuit.cli build --help 2>&1 |
+if python3 -m pycircuit.cli build --help 2>&1 |
     grep -q -- "--comb-update"; then
-  echo "fail: pycircuit build missing --comb-update" >&2
+  echo "fail: pycircuit build still exposes removed --comb-update" >&2
   exit 1
 fi
 
@@ -36,43 +36,58 @@ mkdir -p "${OUT}"
 
 common=(--logic-depth=256 --build-profile=dev-fast
         --inline-policy=off --hierarchy-policy=strict)
-modes=(always guarded dirty)
-mode_ids=(0 1 2)
-for idx in "${!modes[@]}"; do
-  mode="${modes[$idx]}"
-  cpp_file="${OUT}/${mode}/comb_dirty_scheduler.cpp"
-  mkdir -p "${OUT}/${mode}"
-  "${PYCC}" "${INPUT}" --emit=cpp -o "${cpp_file}" \
-    --comb-update="${mode}" "${common[@]}"
-  "${CXX}" -std=c++17 -O0 -DPYC_EXPECT_COMB_MODE="${mode_ids[$idx]}" \
-    -I"${OUT}/${mode}" -I"${ROOT}/.pycircuit_out/toolchain/install/include" \
-    "${DRIVER}" \
-    -o "${OUT}/run_${mode}"
-  "${OUT}/run_${mode}"
-
-  "${PYCC}" "${INPUT}" --emit=verilog --include-primitives=false \
-    --comb-update="${mode}" "${common[@]}" -o "${OUT}/${mode}.v"
-done
-
-cmp "${OUT}/always.v" "${OUT}/guarded.v"
-cmp "${OUT}/always.v" "${OUT}/dirty.v"
-
-for mode in "${modes[@]}"; do
-  cpp_file="${OUT}/${mode}/comb_dirty_scheduler.cpp"
-  grep -q '_pyc_change_schedule_schema = "pyc.change_schedule.v1"' \
-    "${cpp_file}"
-  grep -q '_pyc_change_schedule_node_count = 5u' "${cpp_file}"
-  grep -q '_pyc_change_schedule_rank{{0u, 1u, 1u, 2u, 0u}}' \
-    "${cpp_file}"
-  grep -q '_pyc_change_schedule_slot{{0u, 1u, 2u, 3u, 4u}}' \
-    "${cpp_file}"
-done
-if grep -q 'DirtyBitset<' "${OUT}/always/comb_dirty_scheduler.cpp" ||
-    grep -q 'DirtyBitset<' "${OUT}/guarded/comb_dirty_scheduler.cpp"; then
-  echo "fail: always/guarded unexpectedly emitted dirty skip state" >&2
+if "${PYCC}" "${INPUT}" --emit=none --comb-update=dirty -o /dev/null \
+    >"${OUT}/removed-pycc-option.stdout" \
+    2>"${OUT}/removed-pycc-option.stderr"; then
+  echo "fail: pycc accepted removed --comb-update" >&2
   exit 1
 fi
-dirty_cpp="${OUT}/dirty/comb_dirty_scheduler.cpp"
+grep -q "Unknown command line argument '--comb-update=dirty'" \
+  "${OUT}/removed-pycc-option.stderr"
+if python3 -m pycircuit.cli build "${INSTANCE_PY}" \
+    --comb-update=dirty --out-dir "${OUT}/removed-frontend-option" \
+    >"${OUT}/removed-frontend-option.stdout" \
+    2>"${OUT}/removed-frontend-option.stderr"; then
+  echo "fail: pycircuit build accepted removed --comb-update" >&2
+  exit 1
+fi
+grep -q 'unrecognized arguments: --comb-update=dirty' \
+  "${OUT}/removed-frontend-option.stderr"
+
+frontend_build="${OUT}/frontend-build"
+python3 -m pycircuit.cli build \
+  "${ROOT}/designs/examples/arith/tb_arith.py" \
+  --out-dir "${frontend_build}" --target cpp --jobs 1 --profile=dev
+python3 - "${frontend_build}/.build_cache.json" <<'PY'
+import json
+import sys
+
+cache = json.load(open(sys.argv[1], encoding="utf-8"))
+for key in ("build_flags", "cpp_build_flags"):
+    if "comb_update" in cache.get(key, {}):
+        raise SystemExit(f"fail: stale comb_update remains in {key}")
+PY
+
+main_dir="${OUT}/main"
+mkdir -p "${main_dir}"
+dirty_cpp="${main_dir}/comb_dirty_scheduler.cpp"
+"${PYCC}" "${INPUT}" --emit=cpp -o "${dirty_cpp}" "${common[@]}"
+"${CXX}" -std=c++17 -O0 \
+  -I"${main_dir}" -I"${ROOT}/.pycircuit_out/toolchain/install/include" \
+  "${DRIVER}" -o "${OUT}/run_dirty"
+"${OUT}/run_dirty"
+
+"${PYCC}" "${INPUT}" --emit=verilog --include-primitives=false \
+  "${common[@]}" -o "${OUT}/comb_dirty_scheduler.v"
+
+grep -q '_pyc_change_schedule_schema = "pyc.change_schedule.v1"' \
+  "${dirty_cpp}"
+grep -q '_pyc_change_schedule_node_count = 5u' "${dirty_cpp}"
+grep -q '_pyc_change_schedule_rank{{0u, 1u, 1u, 2u, 0u}}' \
+  "${dirty_cpp}"
+grep -q '_pyc_change_schedule_slot{{0u, 1u, 2u, 3u, 4u}}' \
+  "${dirty_cpp}"
+grep -q 'DirtyBitset<' "${dirty_cpp}"
 grep -q 'std::array<unsigned, 2> _pyc_direct_fanout_.*{{1u, 2u}}' \
   "${dirty_cpp}"
 test "$(grep -c '_pyc_direct_fanout_' "${dirty_cpp}")" -eq 6
@@ -81,8 +96,7 @@ python3 -m pycircuit.cli emit "${STATE_PY}" -o "${OUT}/comb_dirty_state.pyc"
 state_dir="${OUT}/state"
 mkdir -p "${state_dir}"
 "${PYCC}" "${OUT}/comb_dirty_state.pyc" --emit=cpp \
-  -o "${state_dir}/comb_dirty_state.cpp" --comb-update=dirty \
-  "${common[@]}"
+  -o "${state_dir}/comb_dirty_state.cpp" "${common[@]}"
 state_cpp="${state_dir}/comb_dirty_state.cpp"
 if grep -q '_pyc_comb_1_input_0' "${state_cpp}"; then
   echo "fail: dirty comb still polls register Q instead of commit fanout" >&2
@@ -103,8 +117,7 @@ python3 -m pycircuit.cli emit "${INSTANCE_PY}" \
 instance_dir="${OUT}/instance"
 mkdir -p "${instance_dir}"
 "${PYCC}" "${OUT}/comb_dirty_instance.pyc" --emit=cpp \
-  -o "${instance_dir}/comb_dirty_instance.cpp" --comb-update=dirty \
-  "${common[@]}"
+  -o "${instance_dir}/comb_dirty_instance.cpp" "${common[@]}"
 instance_cpp="${instance_dir}/comb_dirty_instance.cpp"
 grep -q '_pyc_direct_fanout_' "${instance_cpp}"
 grep -q '_pyc_mark_comb_dirty' "${instance_cpp}"
@@ -118,8 +131,7 @@ python3 -m pycircuit.cli emit "${PRIMITIVES_PY}" \
 primitive_dir="${OUT}/primitives"
 mkdir -p "${primitive_dir}"
 "${PYCC}" "${OUT}/comb_dirty_primitives.pyc" --emit=cpp \
-  -o "${primitive_dir}/comb_dirty_primitives.cpp" --comb-update=dirty \
-  "${common[@]}"
+  -o "${primitive_dir}/comb_dirty_primitives.cpp" "${common[@]}"
 primitive_cpp="${primitive_dir}/comb_dirty_primitives.cpp"
 for required in \
   'DirtyBitset<' \

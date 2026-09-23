@@ -2255,7 +2255,6 @@ def _cmd_build(args: argparse.Namespace) -> int:
     if int(args.logic_depth) <= 0:
         raise SystemExit("--logic-depth must be > 0")
     logic_depth = int(args.logic_depth)
-    comb_update = str(args.comb_update)
 
     device_cpp_root = out_dir / "device" / "cpp"
     device_v_root = out_dir / "device" / "verilog"
@@ -2270,7 +2269,6 @@ def _cmd_build(args: argparse.Namespace) -> int:
         f"--build-profile={pycc_build_profile}",
         "--inline-policy=off",
         "--hierarchy-policy=strict",
-        f"--comb-update={comb_update}",
     ]
 
     build_flags = {
@@ -2280,7 +2278,6 @@ def _cmd_build(args: argparse.Namespace) -> int:
         "pycc_build_profile": pycc_build_profile,
         "inline_policy": "off",
         "hierarchy_policy": "strict",
-        "comb_update": comb_update,
         "target": target,
         "tb_schedule_mode": str(args.tb_schedule_mode),
         "frontend_contract": FRONTEND_CONTRACT,
@@ -2767,12 +2764,6 @@ def main(argv: list[str] | None = None) -> int:
         help="Backend targets to generate/build",
     )
     build.add_argument("--logic-depth", type=int, default=32, help="Max combinational logic depth for pycc")
-    build.add_argument(
-        "--comb-update",
-        choices=["always", "guarded", "dirty"],
-        default="dirty",
-        help="C++ fused-comb update policy (always is the reference schedule)",
-    )
     build.add_argument(
         "--cpp-pch",
         action="store_true",

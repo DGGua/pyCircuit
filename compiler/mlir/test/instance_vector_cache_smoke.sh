@@ -9,7 +9,7 @@ INPUT="${ROOT}/compiler/mlir/test/Inputs/instance_vector_cache.mlir"
 rm -rf "${OUT}"
 mkdir -p "${OUT}"
 
-"${PYCC}" "${INPUT}" --emit=cpp --comb-update=dirty --logic-depth=256 \
+"${PYCC}" "${INPUT}" --emit=cpp --logic-depth=256 \
   -o "${OUT}/instance_vector_cache.cpp"
 
 python3 - "${OUT}/instance_vector_cache.cpp" <<'PY'

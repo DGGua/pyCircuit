@@ -3,10 +3,6 @@
 #include <cstdint>
 #include <iostream>
 
-#ifndef PYC_EXPECT_COMB_MODE
-#error "compile with PYC_EXPECT_COMB_MODE=0(always),1(guarded),2(dirty)"
-#endif
-
 namespace {
 
 using Dut = pyc::gen::comb_dirty_scheduler;
@@ -56,6 +52,6 @@ int main() {
   if (!lowEq(dut.producer, 0x34) || !lowEq(dut.result, 0x01))
     return fail("single-branch update did not reach reconvergence");
 
-  std::cout << "ok mode=" << PYC_EXPECT_COMB_MODE << "\n";
+  std::cout << "ok dirty-only scheduler\n";
   return 0;
 }
