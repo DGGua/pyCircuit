@@ -208,8 +208,3 @@ Additional scheduler/cache bisect flags:
 - `-DPYC_DISABLE_PRIMITIVE_EVAL_CACHE`
 - `-DPYC_DISABLE_SCC_WORKLIST_EVAL`
 - `-DPYC_DISABLE_VERSIONED_INPUT_CACHE`
-
-Runtime perf stats controls:
-
-- `PYC_SIM_STATS=1`
-- `PYC_SIM_STATS_PATH=<path>`
