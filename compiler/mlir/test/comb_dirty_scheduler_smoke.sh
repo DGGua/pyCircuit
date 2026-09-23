@@ -90,6 +90,8 @@ if grep -q '_pyc_comb_1_input_0' "${state_cpp}"; then
 fi
 grep -q '_pyc_direct_fanout_pyc_reg_4{{1u}}' "${state_cpp}"
 grep -q '_pyc_commit_changed_pyc_reg_4_inst' "${state_cpp}"
+grep -q 'if (_pyc_commit_changed_pyc_reg_4_inst)' "${state_cpp}"
+grep -q '_pyc_mark_comb_dirty(_pyc_consumer)' "${state_cpp}"
 "${CXX}" -std=c++17 -O0 \
   -I"${state_dir}" -I"${ROOT}/.pycircuit_out/toolchain/install/include" \
   "${STATE_DRIVER}" \
@@ -103,6 +105,9 @@ mkdir -p "${instance_dir}"
 "${PYCC}" "${OUT}/comb_dirty_instance.pyc" --emit=cpp \
   -o "${instance_dir}/comb_dirty_instance.cpp" --comb-update=dirty \
   "${common[@]}"
+instance_cpp="${instance_dir}/comb_dirty_instance.cpp"
+grep -q '_pyc_direct_fanout_' "${instance_cpp}"
+grep -q '_pyc_mark_comb_dirty' "${instance_cpp}"
 "${CXX}" -std=c++17 -O0 \
   -I"${instance_dir}" -I"${ROOT}/.pycircuit_out/toolchain/install/include" \
   "${INSTANCE_DRIVER}" -o "${OUT}/run_instance"
@@ -124,12 +129,8 @@ for required in \
   'kOutDataChanged' \
   'kReadData0Changed' \
   'kReadData1Changed' \
-  'commit_changes' \
-  'source_checks' \
-  'source_changes' \
-  'dirty_enqueues' \
-  'coalesced' \
-  'max_ready'; do
+  '_pyc_commit_changed_' \
+  '_pyc_mark_comb_dirty'; do
   if ! grep -q "${required}" "${primitive_cpp}"; then
     echo "fail: primitive dirty source missing ${required}" >&2
     exit 1
@@ -140,17 +141,29 @@ cat >"${primitive_dir}/driver.cpp" <<'CPP'
 
 int main() {
   pyc::gen::comb_dirty_primitives dut;
-  dut._pyc_sim_stats_enable = true;
+  dut.clk = pyc::cpp::Wire<1>(0);
+  dut.rst = pyc::cpp::Wire<1>(0);
+  dut.data = pyc::cpp::Wire<8>(7);
+  dut.comb();
+  if (dut.reg_data.word(0) != 1)
+    return 1;
+  dut.clk = pyc::cpp::Wire<1>(1);
   dut.comb();
   dut.tick();
   dut.commit();
   dut.comb();
-  return dut._pyc_sim_stats.source_checks == 0;
+  return dut.reg_data.word(0) == 8 ? 0 : 2;
 }
 CPP
 "${CXX}" -std=c++17 -O0 \
   -I"${primitive_dir}" -I"${ROOT}/.pycircuit_out/toolchain/install/include" \
   "${primitive_dir}/driver.cpp" -o "${OUT}/run_primitives"
 "${OUT}/run_primitives"
+
+if grep -R -E '_pyc_sim_stats|PYC_SIM_STATS|PYC_SIM_TIMING|dump_sim_stats' \
+    "${OUT}" --include='*.cpp'; then
+  echo "fail: generated C++ still contains simulator stats" >&2
+  exit 1
+fi
 
 echo "ok: fused-comb dirty scheduler smoke"

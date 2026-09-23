@@ -1,64 +1,14 @@
 #!/usr/bin/env python3
-"""Self-tests for change-driven statistics and A/B performance tools."""
+"""Self-tests for the change-driven wall-clock A/B performance tool."""
 
 from __future__ import annotations
 
-import json
 import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
 
-import analyze_change_driven_stats as analyzer
 import run_change_driven_ab as ab_runner
-
-HERE = Path(__file__).resolve().parent
-FIXTURES = HERE / "testdata"
-
-
-class AnalyzerTest(unittest.TestCase):
-    def test_single_file_summary(self) -> None:
-        summary = analyzer.summarize_file(FIXTURES / "change_driven_stats_run1.jsonl")
-        self.assertEqual(summary["top_path"], "top")
-        self.assertEqual(len(summary["records"]), 2)
-        self.assertAlmostEqual(summary["top"]["source_change_rate"], 0.2)
-        self.assertAlmostEqual(summary["top"]["coalesced_rate"], 0.2)
-        self.assertAlmostEqual(summary["top"]["comb_calls_per_stage_eval"], 1.5)
-        self.assertAlmostEqual(summary["top"]["semantic_change_rate"], 0.4)
-
-    def test_repeated_run_median_min_max(self) -> None:
-        summaries = [
-            analyzer.summarize_file(FIXTURES / f"change_driven_stats_run{run}.jsonl")
-            for run in (1, 2, 3)
-        ]
-        combined = analyzer.aggregate(summaries)
-        source_checks = combined["metrics"]["source_checks"]
-        self.assertEqual(source_checks, {"median": 100, "min": 80, "max": 120})
-        self.assertIn(
-            "| `source_checks` | 100 | 80 | 120 |",
-            analyzer.render_markdown(summaries, combined),
-        )
-
-    def test_strict_schema_rejects_unknown_and_invalid_fields(self) -> None:
-        base = json.loads(
-            (FIXTURES / "change_driven_stats_run1.jsonl")
-            .read_text(encoding="utf-8")
-            .splitlines()[0]
-        )
-        cases = []
-        unknown = dict(base, unexpected=1)
-        cases.append(unknown)
-        invalid = dict(base, source_changes=base["source_checks"] + 1)
-        cases.append(invalid)
-        boolean = dict(base, max_ready=True)
-        cases.append(boolean)
-        with tempfile.TemporaryDirectory() as temp:
-            path = Path(temp) / "invalid.jsonl"
-            for row in cases:
-                path.write_text(json.dumps(row) + "\n", encoding="utf-8")
-                with self.assertRaises(analyzer.StatsError):
-                    analyzer.load_rows(path)
-
 
 class AbRunnerTest(unittest.TestCase):
     def test_default_one_warmup_seven_interleaved_runs(self) -> None:

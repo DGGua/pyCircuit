@@ -348,7 +348,7 @@ endmodule
 | `pyc_tb_sidecar.hpp` / `pyc_tb_sidecar_runtime.hpp` | Sidecar 容器加载与 runner 调度结构（§9） |
 | `pyc_sim.hpp` / `pyc_sync_mem.hpp` / `pyc_clock.hpp` / `pyc_ops.hpp` | 原语模型与公共设施 |
 
-运行时环境变量：`PYC_SIM_STATS`（打印实例/缓存命中统计）、`PYC_SIM_STATS_PATH`、`PYC_SIM_FAST`。
+运行时环境变量：`PYC_SIM_FAST` 用于选择 SCC 快速求值路径。
 
 ---
 
@@ -483,7 +483,7 @@ PYTHONPATH=compiler/frontend pytest tests/test_sidecar_sections.py
   ```
 
 - `--profile-json` + `--profile-pass-timing`：每 pass 时间/内存 profile；
-- 运行期：`PYC_SIM_STATS=1` 输出实例求值与缓存命中统计；ProbeRegistry + `--probe-manifest` 支持 DFX 信号观测点清单。
+- 运行期：ProbeRegistry + `--probe-manifest` 支持 DFX 信号观测点清单。
 
 ---
 

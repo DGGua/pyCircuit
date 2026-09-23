@@ -1198,17 +1198,9 @@ static void emitCombInputGuard(
     CppEmitterOptions::CombUpdateMode updateMode) {
   using CombUpdateMode = CppEmitterOptions::CombUpdateMode;
 
-  if (updateMode == CombUpdateMode::Always) {
-    os << "    if (_pyc_sim_stats_enable) "
-          "{ ++_pyc_sim_stats.comb_eval_calls; "
-          "++_pyc_sim_stats.stage_eval_calls; }\n";
+  if (updateMode == CombUpdateMode::Always)
     return;
-  }
 
-  os << "    if (_pyc_sim_stats_enable) "
-        "_pyc_sim_stats.comb_guard_checks++;\n";
-  os << "    if (_pyc_sim_stats_enable) _pyc_sim_stats.source_checks += "
-     << comb.getNumOperands() << "u;\n";
   if (updateMode == CombUpdateMode::Dirty)
     os << "    bool _pyc_comb_should_eval = _pyc_comb_take_active(" << idx
        << "u);\n";
@@ -1223,22 +1215,15 @@ static void emitCombInputGuard(
     os << "    if (" << cacheName << " != " << nt.get(input) << ") {\n";
     os << "      " << cacheName << " = " << nt.get(input) << ";\n";
     os << "      _pyc_comb_inputs_changed = true;\n";
-    os << "      if (_pyc_sim_stats_enable) "
-          "++_pyc_sim_stats.source_changes;\n";
     os << "    }\n";
   }
   if (updateMode == CombUpdateMode::Dirty)
     os << "    _pyc_comb_inputs_changed = _pyc_comb_inputs_changed || "
           "_pyc_comb_should_eval;\n";
   os << "    if (!_pyc_comb_inputs_changed) {\n";
-  os << "      if (_pyc_sim_stats_enable) "
-        "_pyc_sim_stats.comb_cache_skips++;\n";
   os << "      return;\n";
   os << "    }\n";
   os << "    _pyc_comb_" << idx << "_inputs_valid = true;\n";
-  os << "    if (_pyc_sim_stats_enable) "
-        "{ ++_pyc_sim_stats.comb_eval_calls; "
-        "++_pyc_sim_stats.stage_eval_calls; }\n";
 }
 
 static void emitCombResultPublish(
@@ -1253,23 +1238,13 @@ static void emitCombResultPublish(
                               "_candidate_" + std::to_string(resultIndex);
   os << "    const auto &" << candidateName << " = " << nt.get(candidate)
      << ";\n";
-  os << "    if (_pyc_sim_stats_enable) "
-        "{ ++_pyc_sim_stats.comb_output_store_attempts; "
-        "++_pyc_sim_stats.output_publish_attempts; }\n";
   if (updateMode == CombUpdateMode::Always) {
-    os << "    if (_pyc_sim_stats_enable && " << resultName << " != "
-       << candidateName
-       << ") { ++_pyc_sim_stats.comb_output_semantic_changes; "
-          "++_pyc_sim_stats.semantic_changes; }\n";
     os << "    " << resultName << " = " << candidateName << ";\n";
     return;
   }
 
   os << "    if (" << resultName << " != " << candidateName << ") {\n";
   os << "      " << resultName << " = " << candidateName << ";\n";
-  os << "      if (_pyc_sim_stats_enable) "
-        "{ ++_pyc_sim_stats.comb_output_semantic_changes; "
-        "++_pyc_sim_stats.semantic_changes; }\n";
   if (updateMode == CombUpdateMode::Dirty)
     emitMetadataCombFanout(result, os, schedule, combIndices, nt);
   os << "    }\n";
@@ -1373,14 +1348,6 @@ static LogicalResult emitCombMethod(pyc::CombOp comb,
   }
   os << "  }\n\n";
   return success();
-}
-
-static void emitTimingAdd(llvm::raw_ostream &os, llvm::StringRef indent, llvm::StringRef field,
-                          llvm::StringRef t0) {
-  os << indent << "if (_pyc_sim_timing_enable)\n";
-  os << indent << "  _pyc_sim_stats." << field
-     << " += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>("
-     << "std::chrono::steady_clock::now() - " << t0 << ").count());\n";
 }
 
 static LogicalResult rejectMultipleWireDrivers(func::FuncOp f) {
@@ -1618,14 +1585,7 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
     os << "    return _pyc_comb_dirty.test(id);\n";
     os << "  }\n";
     os << "  inline void _pyc_mark_comb_dirty(unsigned id) {\n";
-    os << "    const bool fresh = _pyc_comb_dirty.mark(id);\n";
-    os << "    if (_pyc_sim_stats_enable) {\n";
-    os << "      if (fresh) ++_pyc_sim_stats.dirty_enqueues;\n";
-    os << "      else ++_pyc_sim_stats.coalesced;\n";
-    os << "      _pyc_sim_stats.max_ready = std::max<std::uint64_t>("
-          "_pyc_sim_stats.max_ready, _pyc_comb_dirty.count());\n";
-    os << "      if (fresh) ++_pyc_sim_stats.comb_fanout_enqueues;\n";
-    os << "    }\n";
+    os << "    _pyc_comb_dirty.mark(id);\n";
     os << "  }\n\n";
   }
 
@@ -2177,50 +2137,8 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
   }
   os << "\n";
 
-  os << "  struct _pyc_sim_stats_t {\n";
-  os << "    std::uint64_t source_checks = 0;\n";
-  os << "    std::uint64_t source_changes = 0;\n";
-  os << "    std::uint64_t dirty_enqueues = 0;\n";
-  os << "    std::uint64_t coalesced = 0;\n";
-  os << "    std::uint64_t stage_eval_calls = 0;\n";
-  os << "    std::uint64_t output_publish_attempts = 0;\n";
-  os << "    std::uint64_t semantic_changes = 0;\n";
-  os << "    std::uint64_t max_ready = 0;\n";
-  os << "    std::uint64_t commit_changes = 0;\n";
-  os << "    std::uint64_t comb_guard_checks = 0;\n";
-  os << "    std::uint64_t comb_eval_calls = 0;\n";
-  os << "    std::uint64_t comb_cache_skips = 0;\n";
-  os << "    std::uint64_t comb_output_store_attempts = 0;\n";
-  os << "    std::uint64_t comb_output_semantic_changes = 0;\n";
-  os << "    std::uint64_t comb_fanout_enqueues = 0;\n";
-  os << "    std::uint64_t instance_eval_calls = 0;\n";
-  os << "    std::uint64_t instance_cache_skips = 0;\n";
-  os << "    std::uint64_t primitive_eval_calls = 0;\n";
-  os << "    std::uint64_t primitive_cache_skips = 0;\n";
-  os << "    std::uint64_t fallback_iterations = 0;\n";
-  os << "    std::uint64_t eval_calls = 0;\n";
-  os << "    std::uint64_t eval_total_ns = 0;\n";
-  os << "    std::uint64_t topo_eval_calls = 0;\n";
-  os << "    std::uint64_t topo_eval_ns = 0;\n";
-  os << "    std::uint64_t fallback_calls = 0;\n";
-  os << "    std::uint64_t fallback_total_ns = 0;\n";
-  os << "    std::uint64_t initial_comb_pass_calls = 0;\n";
-  os << "    std::uint64_t initial_comb_pass_ns = 0;\n";
-  os << "    std::uint64_t fallback_comb_pass_calls = 0;\n";
-  os << "    std::uint64_t fallback_comb_pass_ns = 0;\n";
-  os << "    std::uint64_t fallback_primitive_ns = 0;\n";
-  os << "    std::uint64_t fallback_max_iterations = 0;\n";
-  os << "    std::uint64_t fallback_iter_hist_0 = 0;\n";
-  os << "    std::uint64_t fallback_iter_hist_1 = 0;\n";
-  os << "    std::uint64_t fallback_iter_hist_2 = 0;\n";
-  os << "    std::uint64_t fallback_iter_hist_3 = 0;\n";
-  os << "    std::uint64_t fallback_iter_hist_4p = 0;\n";
-  os << "  };\n";
-  os << "  bool _pyc_sim_stats_enable = false;\n";
-  os << "  bool _pyc_sim_timing_enable = false;\n";
   os << "  bool _pyc_sim_fast_enable = false;\n";
-  os << "  std::string _pyc_sim_stats_path{};\n";
-  os << "  _pyc_sim_stats_t _pyc_sim_stats{};\n\n";
+  os << "\n";
   os << "  static bool _pyc_parse_bool_env(const char *name, bool dflt = false) {\n";
   os << "    const char *v = std::getenv(name);\n";
   os << "    if (!v || !*v)\n";
@@ -2232,103 +2150,7 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
   os << "    return dflt;\n";
   os << "  }\n\n";
   os << "  void _pyc_init_runtime_controls() {\n";
-  os << "    _pyc_sim_stats_enable = _pyc_parse_bool_env(\"PYC_SIM_STATS\", false);\n";
-  os << "    _pyc_sim_timing_enable = _pyc_parse_bool_env(\"PYC_SIM_TIMING\", false);\n";
   os << "    _pyc_sim_fast_enable = _pyc_parse_bool_env(\"PYC_SIM_FAST\", false);\n";
-  os << "    const char *path = std::getenv(\"PYC_SIM_STATS_PATH\");\n";
-  os << "    if (path && *path)\n";
-  os << "      _pyc_sim_stats_path = path;\n";
-  os << "  }\n\n";
-  os << "  void reset_sim_stats() { _pyc_sim_stats = _pyc_sim_stats_t{}; }\n\n";
-  os << "  static void _pyc_json_escape(std::ostream &os, const std::string &s) {\n";
-  os << "    for (unsigned char c : s) {\n";
-  os << "      if (c == '\\\\' || c == '\"') {\n";
-  os << "        os << '\\\\' << static_cast<char>(c);\n";
-  os << "      } else if (c == '\\n') {\n";
-  os << "        os << \"\\\\n\";\n";
-  os << "      } else if (c < 0x20) {\n";
-  os << "        os << ' ';\n";
-  os << "      } else {\n";
-  os << "        os << static_cast<char>(c);\n";
-  os << "      }\n";
-  os << "    }\n";
-  os << "  }\n\n";
-  os << "  void dump_sim_stats_json(std::ostream &os, const std::string &prefix) const {\n";
-  os << "    os << \"{\\\"path\\\":\\\"\";\n";
-  os << "    _pyc_json_escape(os, prefix);\n";
-  os << "    os << \"\\\",\\\"module\\\":\\\"" << structName << "\\\"\";\n";
-  static const char *kStatsFields[] = {
-      "source_checks",
-      "source_changes",
-      "dirty_enqueues",
-      "coalesced",
-      "stage_eval_calls",
-      "comb_eval_calls",
-      "output_publish_attempts",
-      "semantic_changes",
-      "max_ready",
-      "commit_changes",
-      "comb_guard_checks",
-      "comb_cache_skips",
-      "comb_output_store_attempts",
-      "comb_output_semantic_changes",
-      "comb_fanout_enqueues",
-      "eval_calls",
-      "eval_total_ns",
-      "topo_eval_calls",
-      "topo_eval_ns",
-      "fallback_calls",
-      "fallback_total_ns",
-      "initial_comb_pass_calls",
-      "initial_comb_pass_ns",
-      "fallback_comb_pass_calls",
-      "fallback_comb_pass_ns",
-      "fallback_primitive_ns",
-      "fallback_iterations",
-      "fallback_max_iterations",
-      "fallback_iter_hist_0",
-      "fallback_iter_hist_1",
-      "fallback_iter_hist_2",
-      "fallback_iter_hist_3",
-      "fallback_iter_hist_4p",
-      "instance_eval_calls",
-      "instance_cache_skips",
-      "primitive_eval_calls",
-      "primitive_cache_skips",
-  };
-  for (const char *field : kStatsFields) {
-    os << "    os << \",\\\"" << field << "\\\":\";\n";
-    os << "    os << _pyc_sim_stats." << field << ";\n";
-  }
-  os << "    os << \"}\\n\";\n";
-  os << "  }\n\n";
-  os << "  void dump_sim_stats_tree(std::ostream &os, const std::string &prefix) const {\n";
-  os << "    dump_sim_stats_json(os, prefix);\n";
-  {
-    std::vector<const InstInfo *> children;
-    children.reserve(instInfos.size());
-    for (const auto &ii : instInfos)
-      children.push_back(&ii);
-    std::sort(children.begin(), children.end(),
-              [](const InstInfo *a, const InstInfo *b) { return a->member < b->member; });
-    for (const InstInfo *ii : children) {
-      os << "    if (" << ii->member << ")\n";
-      os << "      " << ii->member << "->dump_sim_stats_tree(os, prefix + \"." << ii->member << "\");\n";
-    }
-  }
-  os << "  }\n\n";
-  os << "  void dump_sim_stats(std::ostream &os) const { dump_sim_stats_tree(os, \""
-     << structName << "\"); }\n\n";
-  os << "  void dump_sim_stats_to_path(const char *path = nullptr) const {\n";
-  os << "    const char *outPath = path;\n";
-  os << "    if (!outPath || !*outPath)\n";
-  os << "      outPath = _pyc_sim_stats_path.c_str();\n";
-  os << "    if (!outPath || !*outPath)\n";
-  os << "      return;\n";
-  os << "    std::ofstream ofs(outPath, std::ios::out | std::ios::trunc);\n";
-  os << "    if (!ofs)\n";
-  os << "      return;\n";
-  os << "    dump_sim_stats(ofs);\n";
   os << "  }\n\n";
 
   os << "  void _pyc_validate_primitive_bindings() const {\n";
@@ -2626,8 +2448,6 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
           !hasDirtyPolledBoundaryInput(comb)) {
         os << "    if (_pyc_comb_is_active(" << index << "u)) {\n";
         os << "      eval_comb_" << index << "();\n";
-        os << "    } else if (_pyc_sim_stats_enable) {\n";
-        os << "      _pyc_sim_stats.comb_cache_skips++;\n";
         os << "    }\n";
       } else {
         os << "    ";
@@ -2725,7 +2545,6 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
       os << "    " << ii.member << "->" << ii.inPorts[i] << " = " << inValue << ";\n";
     }
     os << "    " << ii.member << "->eval();\n";
-    os << "    if (_pyc_sim_stats_enable) { ++_pyc_sim_stats.instance_eval_calls; ++_pyc_sim_stats.stage_eval_calls; }\n";
     os << "    _pyc_inst_changed = true;\n";
     os << "    #else\n";
     std::string changedFlag = ii.member + "_eval_cache_changed";
@@ -2745,10 +2564,7 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
         os << "      " << ii.member << "->" << ii.inPorts[i] << " = " << inValue << ";\n";
       }
       os << "      " << ii.member << "->eval();\n";
-      os << "      if (_pyc_sim_stats_enable) { ++_pyc_sim_stats.instance_eval_calls; ++_pyc_sim_stats.stage_eval_calls; }\n";
       os << "      " << ii.member << "_eval_cache_words = _pyc_inputs;\n";
-      os << "    } else {\n";
-      os << "      if (_pyc_sim_stats_enable) _pyc_sim_stats.instance_cache_skips++;\n";
       os << "    }\n";
       os << "    _pyc_inst_changed = " << changedFlag << ";\n";
       os << "    " << ii.member << "_eval_cache_valid = true;\n";
@@ -2794,9 +2610,6 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
         os << "      " << ii.member << "->" << ii.inPorts[i] << " = " << cacheName << ";\n";
       }
       os << "      " << ii.member << "->eval();\n";
-      os << "      if (_pyc_sim_stats_enable) { ++_pyc_sim_stats.instance_eval_calls; ++_pyc_sim_stats.stage_eval_calls; }\n";
-      os << "    } else {\n";
-      os << "      if (_pyc_sim_stats_enable) _pyc_sim_stats.instance_cache_skips++;\n";
       os << "    }\n";
       os << "    #else\n";
       for (unsigned i = 0; i < inst.getNumOperands(); ++i) {
@@ -2813,9 +2626,6 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
         os << "      " << cacheName << " = " << inValue << ";\n";
       }
       os << "      " << ii.member << "->eval();\n";
-      os << "      if (_pyc_sim_stats_enable) { ++_pyc_sim_stats.instance_eval_calls; ++_pyc_sim_stats.stage_eval_calls; }\n";
-      os << "    } else {\n";
-      os << "      if (_pyc_sim_stats_enable) _pyc_sim_stats.instance_cache_skips++;\n";
       os << "    }\n";
       os << "    #endif\n";
       os << "    _pyc_inst_changed = " << changedFlag << ";\n";
@@ -2910,7 +2720,6 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
     emitPrimitiveOutputSnapshots(outputs, indent, outputSnapshot);
     os << indent << "#ifdef PYC_DISABLE_PRIMITIVE_EVAL_CACHE\n";
     os << indent << instName << ".eval();\n";
-    os << indent << "if (_pyc_sim_stats_enable) { ++_pyc_sim_stats.primitive_eval_calls; ++_pyc_sim_stats.stage_eval_calls; }\n";
     if (!changedAnyVar.empty())
       os << indent << changedAnyVar << " = true;\n";
     os << indent << "#else\n";
@@ -2975,9 +2784,6 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
     os << indent << "#endif\n";
     os << indent << "if (" << changedFlag << ") {\n";
     os << indent << "  " << instName << ".eval();\n";
-    os << indent << "  if (_pyc_sim_stats_enable) { ++_pyc_sim_stats.primitive_eval_calls; ++_pyc_sim_stats.stage_eval_calls; }\n";
-    os << indent << "} else {\n";
-    os << indent << "  if (_pyc_sim_stats_enable) _pyc_sim_stats.primitive_cache_skips++;\n";
     os << indent << "}\n";
     if (!changedAnyVar.empty())
       os << indent << "if (" << changedFlag << ") " << changedAnyVar << " = true;\n";
@@ -3008,7 +2814,6 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
     emitPrimitiveOutputSnapshots(outputs, indent, outputSnapshot);
     os << indent << "#ifdef PYC_DISABLE_PRIMITIVE_EVAL_CACHE\n";
     os << indent << instName << ".eval();\n";
-    os << indent << "if (_pyc_sim_stats_enable) { ++_pyc_sim_stats.primitive_eval_calls; ++_pyc_sim_stats.stage_eval_calls; }\n";
     if (!changedAnyVar.empty())
       os << indent << changedAnyVar << " = true;\n";
     os << indent << "#else\n";
@@ -3025,9 +2830,6 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
        << ")) " << changedFlag << " = true;\n";
     os << indent << "if (" << changedFlag << ") {\n";
     os << indent << "  " << instName << ".eval();\n";
-    os << indent << "  if (_pyc_sim_stats_enable) { ++_pyc_sim_stats.primitive_eval_calls; ++_pyc_sim_stats.stage_eval_calls; }\n";
-    os << indent << "} else {\n";
-    os << indent << "  if (_pyc_sim_stats_enable) _pyc_sim_stats.primitive_cache_skips++;\n";
     os << indent << "}\n";
     if (!changedAnyVar.empty())
       os << indent << "if (" << changedFlag << ") " << changedAnyVar << " = true;\n";
@@ -3058,7 +2860,6 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
     emitPrimitiveOutputSnapshots(outputs, indent, outputSnapshot);
     os << indent << "#ifdef PYC_DISABLE_PRIMITIVE_EVAL_CACHE\n";
     os << indent << instName << ".eval();\n";
-    os << indent << "if (_pyc_sim_stats_enable) { ++_pyc_sim_stats.primitive_eval_calls; ++_pyc_sim_stats.stage_eval_calls; }\n";
     if (!changedAnyVar.empty())
       os << indent << changedAnyVar << " = true;\n";
     os << indent << "#else\n";
@@ -3077,9 +2878,6 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
        << changedFlag << " = true;\n";
     os << indent << "if (" << changedFlag << ") {\n";
     os << indent << "  " << instName << ".eval();\n";
-    os << indent << "  if (_pyc_sim_stats_enable) { ++_pyc_sim_stats.primitive_eval_calls; ++_pyc_sim_stats.stage_eval_calls; }\n";
-    os << indent << "} else {\n";
-    os << indent << "  if (_pyc_sim_stats_enable) _pyc_sim_stats.primitive_cache_skips++;\n";
     os << indent << "}\n";
     if (!changedAnyVar.empty())
       os << indent << "if (" << changedFlag << ") " << changedAnyVar << " = true;\n";
@@ -3137,8 +2935,6 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
           !hasDirtyPolledBoundaryInput(comb)) {
         os << indent << "if (_pyc_comb_is_active(" << index << "u)) {\n";
         os << indent << "  eval_comb_" << index << "();\n";
-        os << indent << "} else if (_pyc_sim_stats_enable) {\n";
-        os << indent << "  _pyc_sim_stats.comb_cache_skips++;\n";
         os << indent << "}\n";
       } else {
         os << indent << "eval_comb_" << index << "();\n";
@@ -3441,20 +3237,10 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
     os << "  inline void eval_fixpoint_fallback_path() {\n";
     if (numPrims > 0) {
       os << "    for (unsigned _i = 0; _i < " << numPrims << "u; ++_i) {\n";
-      os << "      if (_pyc_sim_stats_enable) _pyc_sim_stats.fallback_iterations++;\n";
       os << "      bool _pyc_prim_changed = false;\n";
-      os << "      std::chrono::steady_clock::time_point _pyc_prim_t0{};\n";
-      os << "      if (_pyc_sim_timing_enable)\n";
-      os << "        _pyc_prim_t0 = std::chrono::steady_clock::now();\n";
       for (const std::string &methodName : primGroupMethods)
         os << "      " << methodName << "(_pyc_prim_changed);\n";
-      emitTimingAdd(os, "      ", "fallback_primitive_ns", "_pyc_prim_t0");
-      os << "      std::chrono::steady_clock::time_point _pyc_comb_t0{};\n";
-      os << "      if (_pyc_sim_timing_enable)\n";
-      os << "        _pyc_comb_t0 = std::chrono::steady_clock::now();\n";
-      os << "      if (_pyc_sim_stats_enable) _pyc_sim_stats.fallback_comb_pass_calls++;\n";
       os << "      eval_comb_pass();\n";
-      emitTimingAdd(os, "      ", "fallback_comb_pass_ns", "_pyc_comb_t0");
       os << "      if (!_pyc_prim_changed) break;\n";
       os << "    }\n";
     }
@@ -3495,7 +3281,6 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
           unsigned iterCap = std::max(2u, numPrims + static_cast<unsigned>(comp.nodes.size()) + 2u);
           os << "    bool _pyc_converged = false;\n";
           os << "    for (unsigned _pyc_iter = 0; _pyc_iter < " << iterCap << "u; ++_pyc_iter) {\n";
-          os << "      if (_pyc_sim_stats_enable) _pyc_sim_stats.fallback_iterations++;\n";
           os << "      bool _pyc_prim_changed = false;\n";
           for (const std::string &partName : partMethods)
             os << "      " << partName << "(_pyc_prim_changed);\n";
@@ -3538,23 +3323,7 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
   }
 
   os << "  void eval() {\n";
-  os << "    std::chrono::steady_clock::time_point _pyc_eval_t0{};\n";
-  os << "    if (_pyc_sim_timing_enable)\n";
-  os << "      _pyc_eval_t0 = std::chrono::steady_clock::now();\n";
-  os << "    if (_pyc_sim_stats_enable)\n";
-  os << "      _pyc_sim_stats.eval_calls++;\n";
-  if (!combs.empty() &&
-      opts.combUpdateMode == CppEmitterOptions::CombUpdateMode::Dirty) {
-    os << "    if (_pyc_sim_stats_enable)\n";
-    os << "      _pyc_sim_stats.max_ready = std::max<std::uint64_t>("
-          "_pyc_sim_stats.max_ready, _pyc_comb_dirty.count());\n";
-  }
   if (hasFullTopo) {
-    os << "    std::chrono::steady_clock::time_point _pyc_topo_t0{};\n";
-    os << "    if (_pyc_sim_timing_enable)\n";
-    os << "      _pyc_topo_t0 = std::chrono::steady_clock::now();\n";
-    os << "    if (_pyc_sim_stats_enable)\n";
-    os << "      _pyc_sim_stats.topo_eval_calls++;\n";
     if (!topoEvalMethods.empty()) {
       for (const std::string &methodName : topoEvalMethods)
         os << "    " << methodName << "();\n";
@@ -3563,20 +3332,8 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
         if (failed(emitEvalNode(op, "    ")))
           return failure();
     }
-    emitTimingAdd(os, "    ", "topo_eval_ns", "_pyc_topo_t0");
   } else {
-    os << "    std::chrono::steady_clock::time_point _pyc_stage_t0{};\n";
-    os << "    if (_pyc_sim_timing_enable)\n";
-    os << "      _pyc_stage_t0 = std::chrono::steady_clock::now();\n";
-    os << "    if (_pyc_sim_stats_enable)\n";
-    os << "      _pyc_sim_stats.initial_comb_pass_calls++;\n";
     os << "    eval_comb_pass();\n";
-    emitTimingAdd(os, "    ", "initial_comb_pass_ns", "_pyc_stage_t0");
-    os << "    std::uint64_t _pyc_iter_before = _pyc_sim_stats.fallback_iterations;\n";
-    os << "    if (_pyc_sim_timing_enable)\n";
-    os << "      _pyc_stage_t0 = std::chrono::steady_clock::now();\n";
-    os << "    if (_pyc_sim_stats_enable)\n";
-    os << "      _pyc_sim_stats.fallback_calls++;\n";
     unsigned numPrims = static_cast<unsigned>(instInfos.size() + fifos.size() + asyncFifos.size() + byteMems.size());
     if (hasSccWorklistPlan && numPrims > 0) {
       os << "    if (_pyc_sim_fast_enable) {\n";
@@ -3591,17 +3348,6 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
     } else {
       os << "    eval_fixpoint_fallback_path();\n";
     }
-    os << "    if (_pyc_sim_stats_enable) {\n";
-    os << "      std::uint64_t _pyc_iters = _pyc_sim_stats.fallback_iterations - _pyc_iter_before;\n";
-    os << "      if (_pyc_iters > _pyc_sim_stats.fallback_max_iterations)\n";
-    os << "        _pyc_sim_stats.fallback_max_iterations = _pyc_iters;\n";
-    os << "      if (_pyc_iters == 0) _pyc_sim_stats.fallback_iter_hist_0++;\n";
-    os << "      else if (_pyc_iters == 1) _pyc_sim_stats.fallback_iter_hist_1++;\n";
-    os << "      else if (_pyc_iters == 2) _pyc_sim_stats.fallback_iter_hist_2++;\n";
-    os << "      else if (_pyc_iters == 3) _pyc_sim_stats.fallback_iter_hist_3++;\n";
-    os << "      else _pyc_sim_stats.fallback_iter_hist_4p++;\n";
-    os << "    }\n";
-    emitTimingAdd(os, "    ", "fallback_total_ns", "_pyc_stage_t0");
   }
 
   // Connect return values to output ports.
@@ -3617,7 +3363,6 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
     }
   }
 
-  emitTimingAdd(os, "    ", "eval_total_ns", "_pyc_eval_t0");
   os << "  }\n\n";
 
   // tick_compute/tick_commit: two-phase sequential update (hierarchy-aware).
@@ -3632,30 +3377,22 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
           auto &&emitCall) {
         if (opts.combUpdateMode != CppEmitterOptions::CombUpdateMode::Dirty) {
           emitCall(indent);
-          os << indent << "if (_pyc_sim_stats_enable) "
-                "++_pyc_sim_stats.stage_eval_calls;\n";
           return;
         }
         std::string dirty = "_pyc_tick_dirty_" + key.str();
         os << indent << "bool " << dirty << " = !" << key
            << "_tick_inputs_valid;\n";
-        os << indent << "if (_pyc_sim_stats_enable) _pyc_sim_stats.source_checks += "
-           << operands.size() << "u;\n";
         for (auto [index, operand] : llvm::enumerate(operands)) {
           os << indent << "if (" << key << "_tick_input_" << index << " != "
              << nt.get(operand) << ") {\n";
           os << indent << "  " << key << "_tick_input_" << index << " = "
              << nt.get(operand) << ";\n";
           os << indent << "  " << dirty << " = true;\n";
-          os << indent << "  if (_pyc_sim_stats_enable) "
-                "++_pyc_sim_stats.source_changes;\n";
           os << indent << "}\n";
         }
         os << indent << key << "_tick_inputs_valid = true;\n";
         os << indent << "if (" << dirty << ") {\n";
         emitCall((indent + "  ").str());
-        os << indent << "  if (_pyc_sim_stats_enable) "
-              "++_pyc_sim_stats.stage_eval_calls;\n";
         os << indent << "}\n";
       };
 
@@ -3779,8 +3516,6 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
   auto emitCommitWake = [&](llvm::StringRef condition, Value output,
                             llvm::StringRef indent = "    ") {
     os << indent << "if (" << condition << ") {\n";
-    os << indent << "  if (_pyc_sim_stats_enable) "
-          "++_pyc_sim_stats.commit_changes;\n";
     if (opts.combUpdateMode == CppEmitterOptions::CombUpdateMode::Dirty)
       emitMetadataCombFanout(output, os, *schedule, combIndex, nt,
                              (indent + "  ").str());
@@ -3885,20 +3620,6 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
 	  os << "    commit();\n";
 	  os << "    comb();\n";
 	  os << "  }\n";
-
-  bool emitStatsDtor = false;
-  if (auto topAttr = mod->getAttrOfType<FlatSymbolRefAttr>("pyc.top"))
-    emitStatsDtor = topAttr.getValue() == f.getSymName();
-  if (emitStatsDtor) {
-    os << "  ~" << structName << "() {\n";
-    os << "    if (_pyc_sim_stats_path.empty())\n";
-    os << "      return;\n";
-    os << "    std::ofstream _pyc_stats_ofs(_pyc_sim_stats_path, std::ios::out | std::ios::trunc);\n";
-    os << "    if (!_pyc_stats_ofs)\n";
-    os << "      return;\n";
-    os << "    dump_sim_stats_tree(_pyc_stats_ofs, \"" << structName << "\");\n";
-    os << "  }\n";
-  }
 
 	  os << "};\n\n";
 	  return success();
@@ -4012,10 +3733,8 @@ LogicalResult emitCpp(ModuleOp module, llvm::raw_ostream &os, const CppEmitterOp
 
   os << "// pyCircuit C++ emission (prototype)\n";
   os << "#include <array>\n";
-  os << "#include <chrono>\n";
   os << "#include <cstdlib>\n";
   os << "#include <cstdint>\n";
-  os << "#include <fstream>\n";
   os << "#include <iostream>\n";
   os << "#include <memory>\n";
   os << "#include <string>\n";
