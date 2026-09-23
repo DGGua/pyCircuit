@@ -49,7 +49,7 @@ b@4 ─────────────────────────�
 - 默认性能模式允许丢弃内部 debug/probe/trace/name 的物理状态身份；
 - 端口行为、周期数、reset/enable/init 和功能数据流仍必须等价。
 
-当前默认配置为：
+C++ 生成的默认配置为：
 
 ```text
 --state-delay-opt=structural
@@ -57,6 +57,10 @@ b@4 ─────────────────────────�
 --state-pack-width=192
 --state-opt-preserve-observability=false
 ```
+
+`--emit=verilog` 在未显式传入 `--state-delay-opt` 时使用 `off`，不改写寄存器、
+`delay_line`、retiming 和 lane packing。需要优化后的 Verilog 时显式传入
+`--state-delay-opt=structural`。
 
 在 `xs_core` workload 上，相对完全关闭状态/delay 优化，默认配置将：
 
