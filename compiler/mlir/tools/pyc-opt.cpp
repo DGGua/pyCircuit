@@ -43,6 +43,10 @@ static void forceLinkPycPasses() {
   // Touch each pass factory to force-link the implementations.
   (void)pyc::createCombCanonicalizePass();
   (void)pyc::createFuseCombPass();
+  (void)pyc::createCheckCombMemoizablePass();
+  (void)pyc::createPartitionCombPass(35);
+  (void)pyc::createPartitionFusedCombPass(35);
+  (void)pyc::createCheckCombPartitionsPass();
   (void)pyc::createEliminateWiresPass();
   (void)pyc::createPackI1RegsPass();
   (void)pyc::createLowerSCFToPYCStaticPass();
@@ -55,6 +59,7 @@ static void forceLinkPycPasses() {
   (void)pyc::createEliminateDeadStatePass();
   (void)pyc::createEliminateDeadInstancesPass();
   (void)pyc::createCheckNoDynamicPass();
+  (void)pyc::createCheckWireDriversPass();
   (void)pyc::createCheckCombCyclesPass();
   (void)pyc::createCheckClockDomainsPass();
   (void)pyc::createCheckLogicDepthPass(0);
@@ -82,6 +87,12 @@ int main(int argc, char **argv) {
   config.setPassPipelineSetupFn([](PassManager &pm) -> LogicalResult {
     if (dumpPassIrDir.empty())
       return success();
+    if (dumpPassIrDir.getValue() == "auto") {
+      // pycc resolves `auto` to <--out-dir>/pass_ir; pyc-opt has no --out-dir.
+      llvm::errs() << "error: --dump-pass-ir=auto is not supported by pyc-opt; "
+                      "pass an explicit directory\n";
+      return failure();
+    }
     pyc::PassIRDumperOptions opts;
     opts.dir = dumpPassIrDir.getValue();
     opts.phase = dumpPassIrPhase.getValue();

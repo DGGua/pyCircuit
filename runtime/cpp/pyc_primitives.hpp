@@ -98,11 +98,13 @@ public:
     pending = false;
   }
 
-  inline void tick_commit() {
-    if (__builtin_expect(pending, 0)) {
-      q = qNext;
-      pending = false;
-    }
+  inline bool tick_commit() {
+    if (__builtin_expect(!pending, 1))
+      return false;
+    bool changed = q != qNext;
+    q = qNext;
+    pending = false;
+    return changed;
   }
 
 private:
@@ -157,11 +159,13 @@ public:
     pending = false;
   }
 
-  inline void tick_commit() {
-    if (__builtin_expect(pending, 0)) {
-      q = qNext;
-      pending = false;
-    }
+  inline bool tick_commit() {
+    if (__builtin_expect(!pending, 1))
+      return false;
+    bool changed = q != qNext;
+    q = qNext;
+    pending = false;
+    return changed;
   }
 
 private:

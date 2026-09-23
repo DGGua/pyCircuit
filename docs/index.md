@@ -40,6 +40,7 @@ def build(m: Circuit) -> None:
 - `docs/QUICKSTART.md`
 - `docs/FRONTEND_API.md`
 - `docs/TESTBENCH.md`
+- `docs/BENCHMARK.md` (generated C++ simulator vs Verilator benchmark)
 - `docs/IR_SPEC.md`
 - **V5 cycle-aware**: `docs/PyCircuit_V5_Spec.md`
 - **Implementation workflow (10-step)**: `docs/pycircuit_implementation_method.md`

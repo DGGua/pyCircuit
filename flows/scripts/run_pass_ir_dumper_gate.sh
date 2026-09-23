@@ -18,26 +18,22 @@ EOF
 pyc_log "gate run-id=${run_id}"
 pyc_log "docs evidence: ${docs_dir}"
 
-bash "${PYC_ROOT_DIR}/flows/scripts/pyc" build \
-  >"${docs_dir}/pyc_build.stdout" 2>"${docs_dir}/pyc_build.stderr"
+# Track per-step status and always emit summary.json (including on failure).
+status_build="pending"
+status_smoke="pending"
 
-PYCC="$(pyc_find_pycc)" bash "${PYC_ROOT_DIR}/compiler/mlir/test/pass_ir_dumper_smoke.sh" \
-  >"${docs_dir}/pass_ir_dumper_smoke.stdout" \
-  2>"${docs_dir}/pass_ir_dumper_smoke.stderr"
-
-# This is a diagnostics/tooling feature (no semantic change), so it does not
-# map to any pyc4.0 decision ID; "decisions" is intentionally empty.
-python3 - <<'PY' "${docs_dir}/summary.json" "${run_id}"
+write_summary() {
+  python3 - <<'PY' "${docs_dir}/summary.json" "${run_id}" "${status_build}" "${status_smoke}"
 import json
 import sys
 
-out, run_id = sys.argv[1], sys.argv[2]
+out, run_id, status_build, status_smoke = sys.argv[1:5]
 json.dump(
     {
         "run_id": run_id,
         "gates": {
-            "pyc_build": {"status": "pass"},
-            "pass_ir_dumper_smoke": {"status": "pass"},
+            "pyc_build": {"status": status_build},
+            "pass_ir_dumper_smoke": {"status": status_smoke},
         },
         "decisions": [],
         "feature": "mlir-pass-ir-dump",
@@ -46,6 +42,42 @@ json.dump(
     open(out, "w", encoding="utf-8"),
     indent=2,
 )
+print(f"wrote {out}")
 PY
+}
 
-pyc_log "ok: wrote ${docs_dir}/summary.json"
+on_exit() {
+  local rc=$?
+  # Map anything still pending (interrupted before start) to fail if we exit non-zero.
+  if [[ "${status_build}" == "pending" && "${rc}" -ne 0 ]]; then
+    status_build="fail"
+  fi
+  if [[ "${status_smoke}" == "pending" && "${rc}" -ne 0 ]]; then
+    status_smoke="fail"
+  fi
+  write_summary || true
+  if [[ "${rc}" -eq 0 ]]; then
+    pyc_log "ok: wrote ${docs_dir}/summary.json"
+  else
+    pyc_log "fail: wrote ${docs_dir}/summary.json (exit=${rc})"
+  fi
+  exit "${rc}"
+}
+trap on_exit EXIT
+
+if bash "${PYC_ROOT_DIR}/flows/scripts/pyc" build \
+  >"${docs_dir}/pyc_build.stdout" 2>"${docs_dir}/pyc_build.stderr"; then
+  status_build="pass"
+else
+  status_build="fail"
+  exit 1
+fi
+
+if PYCC="$(pyc_find_pycc)" bash "${PYC_ROOT_DIR}/compiler/mlir/test/pass_ir_dumper_smoke.sh" \
+  >"${docs_dir}/pass_ir_dumper_smoke.stdout" \
+  2>"${docs_dir}/pass_ir_dumper_smoke.stderr"; then
+  status_smoke="pass"
+else
+  status_smoke="fail"
+  exit 1
+fi

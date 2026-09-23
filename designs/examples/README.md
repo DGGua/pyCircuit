@@ -63,6 +63,7 @@ python3 /Users/zhoubot/pyCircuit/flows/tools/check_decision_status.py \
 - `xz_value_model_smoke`: validates v3 trace value payload (`value`, `known`, `z`) emission.
 - `reset_invalidate_order_smoke`: validates reset/invalidate ordering in trace events.
 - `net_resolution_depth_smoke`: validates hierarchical combinational depth propagation in a simple chain.
+- `two_stage_hier_pipeline`: demonstrates `@module` instance hierarchy with `C=A+B` and a one-cycle registered `D` input to `E=C+D_q`.
 
 ## Artifact policy
 
