@@ -38,7 +38,7 @@ pycc --module-pipeline=off|analyze|rewrite
        → 可选 stage func / instance rewrite
        → pyc.module_pipeline.v1 metadata
   → CheckCombCyclesPass
-  → fuse/partition comb
+  → fuse comb
   → PlanChangeDrivenSchedulePass
   → CheckChangeDrivenSchedulePass
 ```

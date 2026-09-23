@@ -233,9 +233,9 @@ dirty-only hard break 进一步删除了固定比较
 ```text
 前端与通用 lowering / cleanup
   → instance-aware / local comb-cycle gates
-  → fuse-comb（或 static comb partition）
+  → fuse-comb
   → canonicalize / CSE / dead cleanup
-  → comb memoizable / partition checks
+  → comb memoizable check
   → 再次检查 comb cycles
   → pyc-plan-change-driven-schedule
   → pyc-check-change-driven-schedule
@@ -349,7 +349,7 @@ frontend contract 与静态 lowering
   ↓
 CombDepGraph：统一值依赖、跨实例摘要、cycle legality
   ↓
-fuse/partition comb
+fuse comb
   ↓
 PlanChangeDrivenSchedule
   ├─ node / rank / slot
@@ -499,9 +499,9 @@ schedule 被接受；仍需单独修正测试或固定诊断优先级。
 CombDepGraph、C++ placement/PCH 等前置工作）为：
 
 ```text
-86 files changed
-10,561 insertions
-615 deletions
+78 files changed
+8,102 insertions
+614 deletions
 ```
 
 该数字不是纯 scheduler LOC，不能用于估计 scheduler 本身复杂度。

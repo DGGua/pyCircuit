@@ -11,10 +11,6 @@ std::unique_ptr<::mlir::Pass> createInlineFunctionsPass();
 std::unique_ptr<::mlir::Pass> createFuseCombPass();
 /// Reject pyc.comb bodies that are not deterministic and exactly comparable.
 std::unique_ptr<::mlir::Pass> createCheckCombMemoizablePass();
-/// Materialize stable GSIM-style sibling pyc.comb partitions. Zero disables it.
-std::unique_ptr<::mlir::Pass> createPartitionCombPass(unsigned maxNodes = 35);
-/// Verify partition metadata, direct boundaries, and forward dependencies.
-std::unique_ptr<::mlir::Pass> createCheckCombPartitionsPass();
 std::unique_ptr<::mlir::Pass> createEliminateWiresPass();
 std::unique_ptr<::mlir::Pass> createPackI1RegsPass();
 std::unique_ptr<::mlir::Pass> createLowerSCFToPYCStaticPass();

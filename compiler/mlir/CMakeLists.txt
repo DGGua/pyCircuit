@@ -72,7 +72,6 @@ add_library(pyc_transforms
   lib/Transforms/CombDepGraph.cpp
   lib/Transforms/CombMemoization.cpp
   lib/Transforms/CheckCombMemoizablePass.cpp
-  lib/Transforms/CheckCombPartitionsPass.cpp
   lib/Transforms/CheckFrontendContractPass.cpp
   lib/Transforms/CheckHierarchyDisciplinePass.cpp
   lib/Transforms/CheckFlatTypesPass.cpp
@@ -91,7 +90,6 @@ add_library(pyc_transforms
   lib/Transforms/InlineFunctionsPass.cpp
   lib/Transforms/PackI1RegsPass.cpp
   lib/Transforms/FuseCombPass.cpp
-  lib/Transforms/PartitionCombPass.cpp
   lib/Transforms/CppPlacementPass.cpp
   lib/Transforms/LowerSCFToPYCStaticPass.cpp
   lib/Transforms/PrunePortsPass.cpp
