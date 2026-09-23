@@ -13,11 +13,16 @@
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringRef.h"
+#include "llvm/ADT/StringSet.h"
+#include "llvm/Support/JSON.h"
+#include "llvm/Support/MemoryBuffer.h"
 
 #include <algorithm>
 #include <cstdint>
 #include <limits>
+#include <optional>
 #include <queue>
+#include <string>
 #include <vector>
 
 using namespace mlir;
@@ -490,13 +495,15 @@ static bool pinToStruct(Value v) {
 
   // Named values are registered as probes by the C++ emitter. Their addresses
   // must therefore remain valid for the lifetime of the generated SimObject.
+  // Trace-selected fields are a subset of these names.
   if (def->hasAttr("pyc.name"))
     return true;
 
   // Top-level comb results and state-holding ops always live on the struct.
   if (isa<pyc::CombOp>(def))
     return true;
-  if (isa<pyc::RegOp, pyc::InstanceOp, pyc::FifoOp, pyc::ByteMemOp, pyc::SyncMemOp, pyc::SyncMemDPOp,
+  if (isa<pyc::RegOp, pyc::DelayLineOp, pyc::DelayTapOp, pyc::InstanceOp,
+          pyc::FifoOp, pyc::ByteMemOp, pyc::SyncMemOp, pyc::SyncMemDPOp,
           pyc::AsyncFifoOp, pyc::CdcSyncOp>(def))
     return true;
 
@@ -685,8 +692,9 @@ CppPlacementSummary accumulateModulePlacementSummary(ModuleOp module) {
 struct CppPlacementPass : public PassWrapper<CppPlacementPass, OperationPass<ModuleOp>> {
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(CppPlacementPass)
 
-  CppPlacementPass(unsigned chunkNodes = CppEmitterOptions::kDefaultCombChunkNodes)
-      : combChunkNodes(chunkNodes) {}
+  CppPlacementPass(unsigned chunkNodes = CppEmitterOptions::kDefaultCombChunkNodes,
+                   std::string planPath = {})
+      : combChunkNodes(chunkNodes), traceCodegenPlanPath(std::move(planPath)) {}
 
   StringRef getArgument() const override { return "pyc-cpp-placement"; }
   StringRef getDescription() const override {
@@ -701,19 +709,91 @@ struct CppPlacementPass : public PassWrapper<CppPlacementPass, OperationPass<Mod
     }
     setModuleCombChunkNodes(module, combChunkNodes);
 
+    std::optional<llvm::json::Value> tracePlan;
+    const llvm::json::Object *traceModules = nullptr;
+    if (!traceCodegenPlanPath.empty()) {
+      auto fileOrErr = llvm::MemoryBuffer::getFile(traceCodegenPlanPath);
+      if (!fileOrErr) {
+        module.emitError("cannot read C++ trace codegen plan: ")
+            << traceCodegenPlanPath;
+        return signalPassFailure();
+      }
+      auto parsed = llvm::json::parse(fileOrErr.get()->getBuffer());
+      if (!parsed || !parsed->getAsObject()) {
+        module.emitError("invalid C++ trace codegen plan JSON: ")
+            << traceCodegenPlanPath;
+        return signalPassFailure();
+      }
+      tracePlan.emplace(std::move(*parsed));
+      const auto *root = tracePlan->getAsObject();
+      auto version = root->getInteger("version");
+      traceModules = root->getObject("modules");
+      if (!version || *version != 1 || !traceModules) {
+        module.emitError(
+            "C++ trace codegen plan requires version=1 and object `modules`");
+        return signalPassFailure();
+      }
+      for (const auto &moduleEntry : *traceModules) {
+        const auto *fields = moduleEntry.second.getAsArray();
+        if (!fields) {
+          module.emitError("C++ trace codegen module entry must be an array: ")
+              << moduleEntry.first.str();
+          return signalPassFailure();
+        }
+        for (const llvm::json::Value &field : *fields) {
+          auto name = field.getAsString();
+          if (!name || name->empty()) {
+            module.emitError(
+                "C++ trace codegen module fields must be non-empty strings");
+            return signalPassFailure();
+          }
+        }
+      }
+    }
+
     for (auto f : module.getOps<func::FuncOp>()) {
       if (f.isDeclaration())
         continue;
+      llvm::StringSet<> traceSelectedFields;
+      if (traceModules) {
+        if (const auto *fields = traceModules->getArray(f.getSymName())) {
+          for (const llvm::json::Value &field : *fields) {
+            auto name = field.getAsString();
+            if (!name || name->empty()) {
+              f.emitError(
+                  "C++ trace codegen module fields must be non-empty strings");
+              return signalPassFailure();
+            }
+            traceSelectedFields.insert(*name);
+          }
+        }
+      }
+      llvm::StringSet<> foundTraceFields;
+      f.walk([&](Operation *op) {
+        if (auto name = op->getAttrOfType<StringAttr>("pyc.name");
+            name && traceSelectedFields.contains(name.getValue()))
+          foundTraceFields.insert(name.getValue());
+      });
+      for (const auto &field : traceSelectedFields) {
+        if (!foundTraceFields.contains(field.getKey())) {
+          f.emitError("C++ trace codegen field not found in module: ")
+              << field.getKey();
+          return signalPassFailure();
+        }
+      }
       CppPlacementSummary summary = runCppMemberPlacement(f, combChunkNodes);
       setFuncPlacementSummary(f, summary);
     }
   }
 
   unsigned combChunkNodes;
+  std::string traceCodegenPlanPath;
 };
 
-std::unique_ptr<Pass> createCppPlacementPass(unsigned combChunkNodes) {
-  return std::make_unique<CppPlacementPass>(combChunkNodes);
+std::unique_ptr<Pass> createCppPlacementPass(unsigned combChunkNodes,
+                                             std::string traceCodegenPlanPath) {
+  return std::make_unique<CppPlacementPass>(combChunkNodes,
+                                            std::move(traceCodegenPlanPath));
 }
 
 static PassRegistration<CppPlacementPass> pass;

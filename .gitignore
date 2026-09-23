@@ -254,3 +254,8 @@ designs/outerCube/
 .claude/settings.local.json
 # gate outputs
 docs/gates
+
+# Brach Dev
+verification
+docs/superpowers
+reports

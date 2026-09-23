@@ -10,6 +10,7 @@
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Types.h"
+#include "mlir/IR/Visitors.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/SmallSet.h"
@@ -26,6 +27,7 @@
 #include <cstdint>
 #include <functional>
 #include <limits>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -430,41 +432,75 @@ static std::vector<ProbeAliasEntry> loadProbeAliasesForTop(llvm::StringRef planP
   return out;
 }
 
-static Value findRegQFromValue(Value v) {
+struct StateProbeSource {
+  Value q;
+  unsigned lsb = 0;
+  Value tap;
+};
+
+static std::optional<StateProbeSource> findRegQFromValue(Value v) {
   llvm::SmallVector<Value, 8> seen;
+  unsigned lsb = 0;
   while (true) {
     for (Value prev : seen) {
       if (prev == v)
-        return Value();
+        return std::nullopt;
     }
     seen.push_back(v);
     while (auto a = v.getDefiningOp<pyc::AliasOp>())
       v = a.getIn();
     if (auto rop = v.getDefiningOp<pyc::RegOp>())
-      return rop.getQ();
+      return StateProbeSource{rop.getQ(), lsb};
+    if (auto delay = v.getDefiningOp<pyc::DelayLineOp>())
+      return StateProbeSource{delay.getQ(), lsb};
+    if (auto tap = v.getDefiningOp<pyc::DelayTapOp>()) {
+      auto delay = tap.getLine().getDefiningOp<pyc::DelayLineOp>();
+      if (!delay)
+        return std::nullopt;
+      return StateProbeSource{delay.getQ(), lsb, tap.getTap()};
+    }
+    if (auto extract = v.getDefiningOp<pyc::ExtractOp>()) {
+      auto packedLsb =
+          extract->getAttrOfType<IntegerAttr>("pyc.state_pack_lsb");
+      if (!packedLsb || packedLsb.getInt() < 0)
+        return std::nullopt;
+      lsb += static_cast<unsigned>(packedLsb.getInt());
+      v = extract.getIn();
+      continue;
+    }
     auto comb = v.getDefiningOp<pyc::CombOp>();
     if (!comb)
-      return Value();
+      return std::nullopt;
 
     auto res = dyn_cast<OpResult>(v);
     if (!res)
-      return Value();
+      return std::nullopt;
     auto yield = dyn_cast_or_null<pyc::YieldOp>(comb.getBody().front().getTerminator());
     if (!yield)
-      return Value();
+      return std::nullopt;
     if (res.getResultNumber() >= yield.getNumOperands())
-      return Value();
+      return std::nullopt;
 
     Value y = yield.getOperand(res.getResultNumber());
     while (auto a = y.getDefiningOp<pyc::AliasOp>())
       y = a.getIn();
+    if (auto extract = y.getDefiningOp<pyc::ExtractOp>()) {
+      auto packedLsb =
+          extract->getAttrOfType<IntegerAttr>("pyc.state_pack_lsb");
+      if (!packedLsb || packedLsb.getInt() < 0)
+        return std::nullopt;
+      lsb += static_cast<unsigned>(packedLsb.getInt());
+      y = extract.getIn();
+      while (auto alias = y.getDefiningOp<pyc::AliasOp>())
+        y = alias.getIn();
+    }
     auto barg = dyn_cast<BlockArgument>(y);
     if (!barg)
-      return Value();
+      return std::nullopt;
     if (barg.getOwner() != &comb.getBody().front())
-      return Value();
+      return std::nullopt;
     if (barg.getArgNumber() >= comb.getNumOperands())
-      return Value();
+      return std::nullopt;
     v = comb.getOperand(barg.getArgNumber());
   }
 }
@@ -519,6 +555,7 @@ static bool functionHasSequentialState(func::FuncOp f,
 
   for (Operation &op : *bodyBlock) {
     if (isa<pyc::RegOp,
+            pyc::DelayLineOp,
             pyc::FifoOp,
             pyc::ByteMemOp,
             pyc::SyncMemOp,
@@ -833,6 +870,19 @@ static LogicalResult emitCombAssign(Operation &op, llvm::raw_ostream &os, NameTa
                [&](llvm::raw_ostream &e) {
                  e << "pyc::cpp::extract<" << ow << ", " << iw << ">(" << nt.get(ex.getIn()) << ", "
                    << ex.getLsbAttr().getInt() << "u)";
+               },
+               ps);
+    return success();
+  }
+  if (auto tap = dyn_cast<pyc::DelayTapOp>(op)) {
+    auto delay = tap.getLine().getDefiningOp<pyc::DelayLineOp>();
+    auto depth = tap->getAttrOfType<IntegerAttr>("depth");
+    if (!delay || !depth)
+      return tap.emitError("invalid delay tap source or depth");
+    assignExpr(tap.getTap(), tap.getTap().getType(), os, nt,
+               [&](llvm::raw_ostream &e) {
+                 e << nt.get(delay.getQ()) << "_inst->tap("
+                   << depth.getInt() << "u)";
                },
                ps);
     return success();
@@ -1291,9 +1341,12 @@ static LogicalResult emitCombMethod(pyc::CombOp comb,
     if (y.getNumOperands() != comb.getNumResults())
       return comb.emitError("pyc.yield operand count must match pyc.comb results");
 
-    for (auto [i, v] : llvm::enumerate(y.getOperands()))
+    placement.beginMethod("eval_comb_" + std::to_string(idx));
+    for (auto [i, v] : llvm::enumerate(y.getOperands())) {
+      (void)placement.emitLocalDeclIfNeeded(v, v.getType(), nt.get(v), os);
       emitCombResultPublish(comb, idx, static_cast<unsigned>(i), v, os, nt,
                             schedule, combIndices, opts.combUpdateMode);
+    }
     os << "  }\n\n";
     return success();
   }
@@ -1313,9 +1366,11 @@ static LogicalResult emitCombMethod(pyc::CombOp comb,
   if (y.getNumOperands() != comb.getNumResults())
     return comb.emitError("pyc.yield operand count must match pyc.comb results");
 
-  for (auto [i, v] : llvm::enumerate(y.getOperands()))
+  for (auto [i, v] : llvm::enumerate(y.getOperands())) {
+    (void)placement.emitLocalDeclIfNeeded(v, v.getType(), nt.get(v), os);
     emitCombResultPublish(comb, idx, static_cast<unsigned>(i), v, os, nt,
                           schedule, combIndices, opts.combUpdateMode);
+  }
   os << "  }\n\n";
   return success();
 }
@@ -1328,8 +1383,28 @@ static void emitTimingAdd(llvm::raw_ostream &os, llvm::StringRef indent, llvm::S
      << "std::chrono::steady_clock::now() - " << t0 << ").count());\n";
 }
 
+static LogicalResult rejectMultipleWireDrivers(func::FuncOp f) {
+  llvm::DenseMap<Value, pyc::AssignOp> firstAssign;
+  LogicalResult result = success();
+  f.walk([&](pyc::AssignOp assign) {
+    auto [it, inserted] = firstAssign.try_emplace(assign.getDst(), assign);
+    if (inserted)
+      return WalkResult::advance();
+    // Decision 0137: wire/assign is a single driver. Successive Reg.set
+    // updates must already have been folded in the frontend.
+    result = assign.emitOpError(
+        "has multiple drivers for the same wire; fold successive updates "
+        "into one assign (Reg.set / assign(when=)) or use an explicit net");
+    return WalkResult::interrupt();
+  });
+  return result;
+}
+
 static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEmitterOptions &opts) {
   NameTable nt;
+
+  if (failed(rejectMultipleWireDrivers(f)))
+    return failure();
 
   if (!f.isDeclaration() && !getFuncPlacementSummary(f))
       return f.emitError(
@@ -1407,6 +1482,8 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
 
   // Sequential primitive instances.
   llvm::SmallVector<pyc::RegOp> regs;
+  llvm::SmallVector<pyc::DelayLineOp> delayLines;
+  llvm::SmallVector<pyc::DelayTapOp> delayTaps;
   llvm::SmallVector<pyc::FifoOp> fifos;
   llvm::SmallVector<pyc::ByteMemOp> byteMems;
   llvm::SmallVector<pyc::SyncMemOp> syncMems;
@@ -1419,6 +1496,10 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
   for (Operation &op : top) {
     if (auto r = dyn_cast<pyc::RegOp>(op))
       regs.push_back(r);
+    else if (auto delay = dyn_cast<pyc::DelayLineOp>(op))
+      delayLines.push_back(delay);
+    else if (auto tap = dyn_cast<pyc::DelayTapOp>(op))
+      delayTaps.push_back(tap);
     else if (auto fifo = dyn_cast<pyc::FifoOp>(op))
       fifos.push_back(fifo);
     else if (auto mem = dyn_cast<pyc::ByteMemOp>(op))
@@ -1436,8 +1517,13 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
     else if (auto comb = dyn_cast<pyc::CombOp>(op))
       combs.push_back(comb);
   }
+  for (pyc::DelayTapOp tap : delayTaps)
+    os << "  " << cppType(tap.getTap().getType()) << " " << nt.get(tap.getTap())
+       << "_qNext{};\n";
 
   auto regKey = [&](pyc::RegOp r) { return nt.get(r.getQ()); };
+  auto delayKey = [&](pyc::DelayLineOp delay) { return nt.get(delay.getQ()); };
+  auto delayTapKey = [&](pyc::DelayTapOp tap) { return nt.get(tap.getTap()); };
   auto fifoKey = [&](pyc::FifoOp f) { return nt.get(f.getInReady()); };
   auto memKey = [&](pyc::ByteMemOp m) -> std::string {
     if (auto nameAttr = m->getAttrOfType<StringAttr>("name"))
@@ -1457,12 +1543,17 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
   auto cdcKey = [&](pyc::CdcSyncOp s) { return nt.get(s.getOut()); };
 
   std::sort(regs.begin(), regs.end(), [&](pyc::RegOp a, pyc::RegOp b) { return regKey(a) < regKey(b); });
+  std::sort(delayLines.begin(), delayLines.end(), [&](pyc::DelayLineOp a, pyc::DelayLineOp b) {
+    return delayKey(a) < delayKey(b);
+  });
+  std::sort(delayTaps.begin(), delayTaps.end(), [&](pyc::DelayTapOp a, pyc::DelayTapOp b) {
+    return delayTapKey(a) < delayTapKey(b);
+  });
   std::sort(fifos.begin(), fifos.end(), [&](pyc::FifoOp a, pyc::FifoOp b) { return fifoKey(a) < fifoKey(b); });
   std::sort(byteMems.begin(), byteMems.end(), [&](pyc::ByteMemOp a, pyc::ByteMemOp b) { return memKey(a) < memKey(b); });
   std::sort(syncMems.begin(), syncMems.end(), [&](pyc::SyncMemOp a, pyc::SyncMemOp b) { return syncMemKey(a) < syncMemKey(b); });
   std::sort(syncMemDPs.begin(), syncMemDPs.end(), [&](pyc::SyncMemDPOp a, pyc::SyncMemDPOp b) { return syncMemDPKey(a) < syncMemDPKey(b); });
   std::sort(cdcSyncs.begin(), cdcSyncs.end(), [&](pyc::CdcSyncOp a, pyc::CdcSyncOp b) { return cdcKey(a) < cdcKey(b); });
-
   auto scheduleSlot = [&](Operation *op) -> uint64_t {
     if (!op || op->getNumResults() == 0)
       return std::numeric_limits<uint64_t>::max();
@@ -1489,8 +1580,8 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
         !combIndex.contains(node.operation))
       return node.operation->emitError(
           "C++ emitter cannot map schedule node to a comb execution unit");
-    if (!isa<pyc::CombOp, pyc::InstanceOp, pyc::RegOp, pyc::FifoOp,
-             pyc::ByteMemOp, pyc::SyncMemOp, pyc::SyncMemDPOp,
+    if (!isa<pyc::CombOp, pyc::InstanceOp, pyc::RegOp, pyc::DelayLineOp,
+             pyc::FifoOp, pyc::ByteMemOp, pyc::SyncMemOp, pyc::SyncMemDPOp,
              pyc::AsyncFifoOp, pyc::CdcSyncOp>(node.operation))
       return node.operation->emitError(
           "C++ emitter cannot map schedule node to a supported execution or state-source unit");
@@ -1655,59 +1746,22 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
     os << "\n";
   }
 
-	  // DFX trace registration (Decision 0145).
-	  os << "  template <typename TbT, typename EnabledInstT, typename EnabledSigT>\n";
-	  os << "  void pyc_trace_vcd(TbT &tb, const std::string &prefix, EnabledInstT &&enabledInst, EnabledSigT &&enabledSig) {\n";
-	  os << "    std::string inst = pyc::cpp::shortenInstancePath(prefix);\n";
-	  os << "    auto trace_port = [&](auto &sig, const char *leaf) {\n";
-  os << "      std::string p = inst;\n";
-  // Decision 0023: canonical_path uses <instance_path>:<field_path>.
-  os << "      p += \":\";\n";
-  os << "      p += leaf;\n";
-		  os << "      if (enabledSig(p)) tb.vcdTrace(sig, p);\n";
-	  os << "    };\n";
-	  for (unsigned i = 0; i < inNames.size(); ++i)
-	    os << "    trace_port(" << inNames[i] << ", " << cppStringLiteral(inCanon[i]) << ");\n";
-	  for (unsigned i = 0; i < outNames.size(); ++i)
-	    os << "    trace_port(" << outNames[i] << ", " << cppStringLiteral(outCanon[i]) << ");\n";
-	  if (!instInfos.empty()) {
-	    os << "    auto trace_child = [&](auto &child, const char *seg) {\n";
-	    os << "      std::string full = prefix;\n";
-	    os << "      full += \".\";\n";
-    os << "      full += seg;\n";
-    os << "      std::string inst_path = pyc::cpp::shortenInstancePath(full);\n";
-    os << "      if (enabledInst(inst_path) && child) child->pyc_trace_vcd(tb, full, enabledInst, enabledSig);\n";
-    os << "    };\n";
-    for (const auto &ii : instInfos)
-      os << "    trace_child(" << ii.member << ", \"" << ii.seg << "\");\n";
-  }
-	  os << "  }\n\n";
-
-	  // ProbeRegistry registration (Decisions 0004, 0018-0021).
-	  os << "  void pyc_register_probes(pyc::cpp::ProbeRegistry &reg, const std::string &prefix) {\n";
-	  os << "    std::string inst = pyc::cpp::shortenInstancePath(prefix);\n";
-	  os << "    auto reg_path = [&](const char *leaf) {\n";
-	  os << "      std::string p = inst;\n";
-	  // Decision 0023: canonical_path uses <instance_path>:<field_path>.
-	  os << "      p += \":\";\n";
-	  os << "      p += leaf;\n";
-	  os << "      return p;\n";
-	  os << "    };\n";
-
     struct NamedProbeInfo {
       std::string fieldPath;
       std::string cppValue;
       std::string cppRegInst;
+      std::string cppRegNext;
       unsigned width = 0;
+      unsigned stateLsb = 0;
+      unsigned stateStorageWidth = 0;
       bool isReg = false;
       Type type;
     };
 
     // Decision 0003 / 0051-0052: infer probe kind for ports and named internal
-    // objects. A value is considered stateful iff it directly returns the q
-    // output of a local pyc.reg (through optional pyc.alias wrappers).
+    // objects. Packed state extracts retain the logical lane's q/pending view.
     std::vector<bool> outIsReg(f.getNumResults(), false);
-    std::vector<Value> outRegQ(f.getNumResults(), Value());
+    std::vector<std::optional<StateProbeSource>> outRegQ(f.getNumResults());
     std::vector<NamedProbeInfo> namedProbes;
     if (!f.isDeclaration()) {
       auto ret = dyn_cast_or_null<func::ReturnOp>(f.getBody().front().getTerminator());
@@ -1720,6 +1774,10 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
 
       llvm::StringSet<> seenNamedFields;
       f.walk([&](Operation *op) {
+        // Cycle-balance names are compiler temporaries, not stable user probes.
+        if (auto generated = op->getAttrOfType<StringAttr>("pyc.generated");
+            generated && generated.getValue() == "cycle_balance")
+          return;
         auto nameAttr = op->getAttrOfType<StringAttr>("pyc.name");
         if (!nameAttr || op->getNumResults() != 1)
           return;
@@ -1732,12 +1790,21 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
         std::string fieldPath = nameAttr.getValue().str();
         if (!seenNamedFields.insert(fieldPath).second)
           return;
-        Value regQ = findRegQFromValue(value);
+        auto regQ = findRegQFromValue(value);
+        std::string regInst =
+            regQ ? (nt.get(regQ->q) + "_inst") : std::string();
+        std::string regNext;
+        if (regQ)
+          regNext = regQ->tap ? (nt.get(regQ->tap) + "_qNext")
+                              : (regInst + "->qNext");
         namedProbes.push_back(NamedProbeInfo{
             fieldPath,
             nt.get(value),
-            static_cast<bool>(regQ) ? (nt.get(regQ) + "_inst") : std::string(),
+            regInst,
+            regNext,
             width,
+            regQ ? regQ->lsb : 0,
+            regQ ? bitWidth(regQ->q.getType()) : 0,
             static_cast<bool>(regQ),
             value.getType(),
         });
@@ -1746,7 +1813,47 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
         return a.fieldPath < b.fieldPath;
       });
     }
+    // DFX trace registration (Decision 0145).
+	  os << "  template <typename TbT, typename EnabledInstT, typename EnabledSigT>\n";
+	  os << "  void pyc_trace_vcd(TbT &tb, const std::string &prefix, EnabledInstT &&enabledInst, EnabledSigT &&enabledSig) {\n";
+	  os << "    std::string inst = pyc::cpp::shortenInstancePath(prefix);\n";
+	  os << "    auto trace_port = [&](auto &sig, const char *leaf) {\n";
+    os << "      std::string p = inst;\n";
+    // Decision 0023: canonical_path uses <instance_path>:<field_path>.
+    os << "      p += \":\";\n";
+    os << "      p += leaf;\n";
+    os << "      if (enabledSig(p)) tb.vcdTrace(sig, p);\n";
+	  os << "    };\n";
+	  for (unsigned i = 0; i < inNames.size(); ++i)
+	    os << "    trace_port(" << inNames[i] << ", " << cppStringLiteral(inCanon[i]) << ");\n";
+	  for (unsigned i = 0; i < outNames.size(); ++i)
+	    os << "    trace_port(" << outNames[i] << ", " << cppStringLiteral(outCanon[i]) << ");\n";
+	  for (const auto &named : namedProbes)
+	    os << "    trace_port(" << named.cppValue << ", "
+	       << cppStringLiteral(named.fieldPath) << ");\n";
+	  if (!instInfos.empty()) {
+	    os << "    auto trace_child = [&](auto &child, const char *seg) {\n";
+	    os << "      std::string full = prefix;\n";
+	    os << "      full += \".\";\n";
+      os << "      full += seg;\n";
+      os << "      std::string inst_path = pyc::cpp::shortenInstancePath(full);\n";
+      os << "      if (enabledInst(inst_path) && child) child->pyc_trace_vcd(tb, full, enabledInst, enabledSig);\n";
+      os << "    };\n";
+      for (const auto &ii : instInfos)
+        os << "    trace_child(" << ii.member << ", \"" << ii.seg << "\");\n";
+    }
+	  os << "  }\n\n";
 
+	  // ProbeRegistry registration (Decisions 0004, 0018-0021).
+	  os << "  void pyc_register_probes(pyc::cpp::ProbeRegistry &reg, const std::string &prefix) {\n";
+	  os << "    std::string inst = pyc::cpp::shortenInstancePath(prefix);\n";
+	  os << "    auto reg_path = [&](const char *leaf) {\n";
+	  os << "      std::string p = inst;\n";
+	  // Decision 0023: canonical_path uses <instance_path>:<field_path>.
+	  os << "      p += \":\";\n";
+	  os << "      p += leaf;\n";
+	  os << "      return p;\n";
+	  os << "    };\n";
 		  for (auto [i, arg] : llvm::enumerate(f.getArguments())) {
 		    unsigned w = bitWidth(arg.getType());
 		    if (w == 0)
@@ -1757,17 +1864,42 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
 		    unsigned w = bitWidth(f.getResultTypes()[i]);
 		    if (w == 0)
 		      return f.emitError("invalid output port width for ProbeRegistry: ") << getPortCanonicalFieldPath(f, i, /*isResult=*/true);
-		    if (outIsReg[i] && !isa<VectorType>(f.getResultTypes()[i])) {
-		      os << "    reg.addReg<" << w << ">(reg_path(" << cppStringLiteral(outCanon[i]) << "), &" << outNames[i]
-		         << ", &" << nt.get(outRegQ[i]) << "_inst->pending, &" << nt.get(outRegQ[i]) << "_inst->qNext);\n";
+			    if (outIsReg[i] && !isa<VectorType>(f.getResultTypes()[i])) {
+		      const auto &source = *outRegQ[i];
+		      const unsigned storageWidth = bitWidth(source.q.getType());
+		      if (source.lsb != 0 || storageWidth != w) {
+			        os << "    reg.addRegSlice<" << w << ", " << storageWidth
+			           << ">(reg_path(" << cppStringLiteral(outCanon[i]) << "), &"
+			           << outNames[i] << ", &" << nt.get(source.q)
+			           << "_inst->pending, &"
+                       << (source.tap ? nt.get(source.tap) + "_qNext"
+                                      : nt.get(source.q) + "_inst->qNext")
+                       << ", " << source.lsb << "u);\n";
+			      } else {
+			        os << "    reg.addReg<" << w << ">(reg_path(" << cppStringLiteral(outCanon[i]) << "), &" << outNames[i]
+			           << ", &" << nt.get(source.q) << "_inst->pending, &"
+                       << (source.tap ? nt.get(source.tap) + "_qNext"
+                                      : nt.get(source.q) + "_inst->qNext")
+                       << ");\n";
+		      }
 		    } else {
 		      emitWireProbes(os, f.getResultTypes()[i], w, outCanon[i], outNames[i]);
 		    }
 		  }
       for (const auto &named : namedProbes) {
         if (named.isReg && !isa<VectorType>(named.type)) {
-          os << "    reg.addReg<" << named.width << ">(reg_path(" << cppStringLiteral(named.fieldPath) << "), &"
-             << named.cppValue << ", &" << named.cppRegInst << "->pending, &" << named.cppRegInst << "->qNext);\n";
+          if (named.stateLsb != 0 ||
+              named.stateStorageWidth != named.width) {
+            os << "    reg.addRegSlice<" << named.width << ", "
+               << named.stateStorageWidth << ">(reg_path("
+               << cppStringLiteral(named.fieldPath) << "), &"
+               << named.cppValue << ", &" << named.cppRegInst
+               << "->pending, &" << named.cppRegNext << ", "
+               << named.stateLsb << "u);\n";
+          } else {
+            os << "    reg.addReg<" << named.width << ">(reg_path(" << cppStringLiteral(named.fieldPath) << "), &"
+               << named.cppValue << ", &" << named.cppRegInst << "->pending, &" << named.cppRegNext << ");\n";
+          }
         } else {
           emitWireProbes(os, named.type, named.width, named.fieldPath, named.cppValue);
         }
@@ -1823,6 +1955,21 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
       os << "  pyc::cpp::pyc_vec_reg<" << cppType(r.getQ().getType()) << "> *" << nt.get(r.getQ()) << "_inst = nullptr;\n";
     else
       os << "  pyc::cpp::pyc_reg<" << w << "> *" << nt.get(r.getQ()) << "_inst = nullptr;\n";
+  }
+  for (auto delay : delayLines) {
+    unsigned w = bitWidth(delay.getQ().getType());
+    if (w == 0)
+      return delay.emitError("invalid delay_line width");
+    auto depthAttr = delay->getAttrOfType<IntegerAttr>("depth");
+    if (!depthAttr)
+      return delay.emitError("missing integer attribute `depth`");
+    auto depth = depthAttr.getValue().getZExtValue();
+    if (isa<VectorType>(delay.getQ().getType()))
+      os << "  pyc::cpp::pyc_vec_delay_line<" << cppType(delay.getQ().getType()) << ", " << depth << "> *"
+         << nt.get(delay.getQ()) << "_inst = nullptr;\n";
+    else
+      os << "  pyc::cpp::pyc_delay_line<" << w << ", " << depth << "> *" << nt.get(delay.getQ())
+         << "_inst = nullptr;\n";
   }
   for (auto fifo : fifos) {
     unsigned w = bitWidth(fifo.getOutData().getType());
@@ -2006,6 +2153,9 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
       emitTickSnapshotDecls(ii.member, ii.op->getOperands());
     for (auto r : regs)
       emitTickSnapshotDecls(nt.get(r.getQ()) + "_inst", r->getOperands());
+    for (auto delay : delayLines)
+      emitTickSnapshotDecls(nt.get(delay.getQ()) + "_inst",
+                            delay->getOperands());
     for (auto fifo : fifos)
       emitTickSnapshotDecls(nt.get(fifo.getInReady()) + "_inst",
                             fifo->getOperands());
@@ -2185,6 +2335,9 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
   for (auto r : regs)
     os << "    if (!" << nt.get(r.getQ()) << "_inst) { std::cerr << \"pyc null reg binding: " << nt.get(r.getQ())
        << "_inst\" << \"\\n\"; std::abort(); }\n";
+  for (auto delay : delayLines)
+    os << "    if (!" << nt.get(delay.getQ()) << "_inst) { std::cerr << \"pyc null delay_line binding: "
+       << nt.get(delay.getQ()) << "_inst\" << \"\\n\"; std::abort(); }\n";
   for (auto mem : syncMems) {
     std::string instName = syncMemInstName.lookup(mem.getOperation());
     os << "    if (!" << instName << ") { std::cerr << \"pyc null sync_mem binding: " << instName
@@ -2253,6 +2406,18 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
     os << nt.get(r.getClk()) << ", " << nt.get(r.getRst()) << ", " << nt.get(r.getEn()) << ", "
        << nt.get(r.getNext()) << ", " << nt.get(r.getInit()) << ", " << nt.get(r.getQ()) << ");\n";
   }
+  for (auto delay : delayLines) {
+    unsigned w = bitWidth(delay.getQ().getType());
+    auto depth = delay->getAttrOfType<IntegerAttr>("depth").getValue().getZExtValue();
+    if (isa<VectorType>(delay.getQ().getType()))
+      os << "    " << nt.get(delay.getQ()) << "_inst = new pyc::cpp::pyc_vec_delay_line<"
+         << cppType(delay.getQ().getType()) << ", " << depth << ">(";
+    else
+      os << "    " << nt.get(delay.getQ()) << "_inst = new pyc::cpp::pyc_delay_line<" << w << ", " << depth
+         << ">(";
+    os << nt.get(delay.getClk()) << ", " << nt.get(delay.getRst()) << ", " << nt.get(delay.getEn()) << ", "
+       << nt.get(delay.getNext()) << ", " << nt.get(delay.getInit()) << ", " << nt.get(delay.getQ()) << ");\n";
+  }
   for (auto mem : syncMems) {
     auto addrTy = dyn_cast<IntegerType>(mem.getRaddr().getType());
     auto dataTy = dyn_cast<IntegerType>(mem.getRdata().getType());
@@ -2310,7 +2475,8 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
     llvm::DenseMap<Operation *, unsigned> nodeIndex;
 
     auto shouldInclude = [&](Operation &op) -> bool {
-      if (isa<func::ReturnOp>(op) || isa<pyc::WireOp>(op) || isa<pyc::RegOp>(op) || isa<pyc::SyncMemOp>(op) ||
+      if (isa<func::ReturnOp>(op) || isa<pyc::WireOp>(op) || isa<pyc::RegOp>(op) ||
+          isa<pyc::DelayLineOp>(op) || isa<pyc::SyncMemOp>(op) ||
           isa<pyc::SyncMemDPOp>(op) || isa<pyc::CdcSyncOp>(op))
         return false;
       if (!includePrims &&
@@ -2501,6 +2667,7 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
             pyc::ZextOp,
             pyc::SextOp,
             pyc::ExtractOp,
+            pyc::DelayTapOp,
             pyc::ShliOp,
             pyc::LshriOp,
             pyc::AshriOp,
@@ -2526,7 +2693,8 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
             pyc::SyncMemDPOp,
             pyc::CdcSyncOp,
             pyc::InstanceOp,
-            pyc::RegOp>(*op)) {
+            pyc::RegOp,
+            pyc::DelayLineOp>(*op)) {
       // Primitives are evaluated in eval(), and regs only tick.
       continue;
     }
@@ -3001,6 +3169,7 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
             pyc::ZextOp,
             pyc::SextOp,
             pyc::ExtractOp,
+            pyc::DelayTapOp,
             pyc::ShliOp,
             pyc::LshriOp,
             pyc::AshriOp,
@@ -3041,7 +3210,8 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
 
     llvm::DenseMap<Operation *, unsigned> nodeIndex;
     for (Operation &op : top) {
-      if (isa<func::ReturnOp>(op) || isa<pyc::WireOp>(op) || isa<pyc::RegOp>(op) || isa<pyc::SyncMemOp>(op) ||
+      if (isa<func::ReturnOp>(op) || isa<pyc::WireOp>(op) || isa<pyc::RegOp>(op) ||
+          isa<pyc::DelayLineOp>(op) || isa<pyc::SyncMemOp>(op) ||
           isa<pyc::SyncMemDPOp>(op) || isa<pyc::CdcSyncOp>(op))
         continue;
 
@@ -3539,6 +3709,22 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
                            os << indent << key << "->tick_compute();\n";
                          });
   }
+  for (auto delay : delayLines) {
+    std::string key = nt.get(delay.getQ()) + "_inst";
+    emitStateTickCompute(key, delay->getOperands(), "    ",
+                         [&](llvm::StringRef indent) {
+                           os << indent << key << "->tick_compute();\n";
+                         });
+  }
+  for (auto tap : delayTaps) {
+    auto delay = tap.getLine().getDefiningOp<pyc::DelayLineOp>();
+    auto depth = tap->getAttrOfType<IntegerAttr>("depth");
+    if (!delay || !depth)
+      return tap.emitError("invalid delay tap source or depth");
+    os << "    " << nt.get(tap.getTap()) << "_qNext = "
+       << nt.get(delay.getQ()) << "_inst->tap_next(" << depth.getInt()
+       << "u);\n";
+  }
   for (auto fifo : fifos) {
     std::string key = nt.get(fifo.getInReady()) + "_inst";
     emitStateTickCompute(key, fifo->getOperands(), "    ",
@@ -3580,8 +3766,7 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
                          [&](llvm::StringRef indent) {
                            os << indent << key << ".tick_compute();\n";
                          });
-  }
-  os << "  }\n\n";
+  }  os << "  }\n\n";
 
   os << "  void tick_commit() {\n";
   if (!instInfos.empty()) {
@@ -3607,6 +3792,13 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
     os << "    const bool " << changed << " = " << key
        << "->tick_commit();\n";
     emitCommitWake(changed, r.getQ());
+  }
+  for (auto delay : delayLines) {
+    std::string key = nt.get(delay.getQ()) + "_inst";
+    std::string changed = "_pyc_commit_changed_" + key;
+    os << "    const bool " << changed << " = " << key
+       << "->tick_commit();\n";
+    emitCommitWake(changed, delay.getQ());
   }
   for (auto fifo : fifos) {
     std::string key = nt.get(fifo.getInReady()) + "_inst";
@@ -3671,8 +3863,7 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
     os << "    const bool " << changed << " = " << key
        << ".tick_commit();\n";
     emitCommitWake(changed, sync.getOut());
-  }
-  if (!instInfos.empty()) {
+  }  if (!instInfos.empty()) {
     os << "    // Force re-eval on next eval() only for stateful sub-modules.\n";
     for (unsigned i = 0; i < instInfos.size(); ++i) {
       if (i < instHasSequentialCallee.size() && instHasSequentialCallee[i]) {

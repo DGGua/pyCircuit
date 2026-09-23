@@ -1002,6 +1002,40 @@ LogicalResult RegOp::verify() {
   return success();
 }
 
+LogicalResult DelayLineOp::verify() {
+  auto nextTy = getNext().getType();
+  if (getInit().getType() != nextTy)
+    return emitOpError("init type must match next type");
+  if (getQ().getType() != nextTy)
+    return emitOpError("result type must match next type");
+  auto depthAttr = (*this)->getAttrOfType<IntegerAttr>("depth");
+  if (!depthAttr)
+    return emitOpError("requires integer attribute `depth`");
+  if (depthAttr.getValue().getSExtValue() <= 1)
+    return emitOpError("depth must be > 1");
+  return success();
+}
+
+LogicalResult DelayTapOp::verify() {
+  auto line = getLine();
+  auto delay = line.getDefiningOp<DelayLineOp>();
+  if (!delay)
+    return emitOpError("line must be defined by pyc.delay_line");
+  auto depthAttr = delay->getAttrOfType<IntegerAttr>("depth");
+  if (!depthAttr)
+    return emitOpError("line delay_line is missing integer attribute `depth`");
+  auto tapAttr = (*this)->getAttrOfType<IntegerAttr>("depth");
+  if (!tapAttr)
+    return emitOpError("requires integer attribute `depth`");
+  int64_t tapDepth = tapAttr.getInt();
+  int64_t lineDepth = depthAttr.getInt();
+  if (tapDepth <= 0)
+    return emitOpError("tap depth must be > 0");
+  if (tapDepth > lineDepth)
+    return emitOpError("tap depth must not exceed delay_line depth");
+  return success();
+}
+
 LogicalResult FifoOp::verify() {
   auto inTy = getInData().getType();
   auto outTy = getOutData().getType();

@@ -292,6 +292,8 @@ public:
     bool *write_valid = nullptr;
     const void *write_data_ptr = nullptr;
     std::uint32_t write_width_bits = 0;
+    std::uint32_t write_storage_width_bits = 0;
+    std::uint32_t write_lsb_bits = 0;
     const std::size_t *write_addr = nullptr;
     const void *write_mask_ptr = nullptr;
     std::uint32_t write_mask_width_bits = 0;
@@ -345,7 +347,23 @@ public:
                    static_cast<void *>(q),
                    write_valid,
                    static_cast<const void *>(write_data),
-                   /*write_width_bits=*/W);
+                   /*write_width_bits=*/W,
+                   /*write_storage_width_bits=*/W,
+                   /*write_lsb_bits=*/0);
+  }
+
+  template <unsigned W, unsigned StorageW>
+  std::uint64_t addRegSlice(std::string path, Wire<W> *q, bool *write_valid,
+                            Wire<StorageW> *write_data, unsigned lsb) {
+    return addImpl(std::move(path),
+                   ProbeKind::Reg,
+                   /*width_bits=*/W,
+                   static_cast<void *>(q),
+                   write_valid,
+                   static_cast<const void *>(write_data),
+                   /*write_width_bits=*/W,
+                   /*write_storage_width_bits=*/StorageW,
+                   /*write_lsb_bits=*/lsb);
   }
 
   template <typename MemT>
@@ -367,6 +385,8 @@ public:
                    write_valid,
                    static_cast<const void *>(write_data),
                    /*write_width_bits=*/DataW,
+                   /*write_storage_width_bits=*/DataW,
+                   /*write_lsb_bits=*/0,
                    write_addr,
                    static_cast<const void *>(write_mask),
                    /*write_mask_width_bits=*/MaskW);
@@ -380,6 +400,8 @@ public:
                    src.write_valid,
                    src.write_data_ptr,
                    src.write_width_bits,
+                   src.write_storage_width_bits,
+                   src.write_lsb_bits,
                    src.write_addr,
                    src.write_mask_ptr,
                    src.write_mask_width_bits,
@@ -464,6 +486,8 @@ private:
                         bool *write_valid = nullptr,
                         const void *write_data_ptr = nullptr,
                         std::uint32_t write_width_bits = 0,
+                        std::uint32_t write_storage_width_bits = 0,
+                        std::uint32_t write_lsb_bits = 0,
                         const std::size_t *write_addr = nullptr,
                         const void *write_mask_ptr = nullptr,
                         std::uint32_t write_mask_width_bits = 0,
@@ -499,6 +523,8 @@ private:
     e.write_valid = write_valid;
     e.write_data_ptr = write_data_ptr;
     e.write_width_bits = write_width_bits;
+    e.write_storage_width_bits = write_storage_width_bits;
+    e.write_lsb_bits = write_lsb_bits;
     e.write_addr = write_addr;
     e.write_mask_ptr = write_mask_ptr;
     e.write_mask_width_bits = write_mask_width_bits;

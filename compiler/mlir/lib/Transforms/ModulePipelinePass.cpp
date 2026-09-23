@@ -26,8 +26,9 @@ namespace pyc {
 namespace {
 
 static bool isStateCut(Operation *op) {
-  return isa<pyc::RegOp, pyc::FifoOp, pyc::ByteMemOp, pyc::SyncMemOp,
-             pyc::SyncMemDPOp, pyc::AsyncFifoOp, pyc::CdcSyncOp>(op);
+  return isa<pyc::RegOp, pyc::DelayLineOp, pyc::FifoOp, pyc::ByteMemOp,
+             pyc::SyncMemOp, pyc::SyncMemDPOp, pyc::AsyncFifoOp,
+             pyc::CdcSyncOp>(op);
 }
 
 struct SccResult {
