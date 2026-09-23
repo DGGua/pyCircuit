@@ -7,7 +7,7 @@ PyCircuit 分支：`measure/module-fallback-stats`
 
 ## 背景与目标
 
-模块流水重构及“最少 stage”搜索实现复杂，目前缺少证据说明
+模块级调度重构及“最少 stage”搜索实现复杂，目前缺少证据说明
 `eval_fixpoint_fallback_path()`、SCC 收敛和重复 `eval_comb_pass()` 在真实
 DavinciBaseLine trace 中占多少时间。
 
@@ -317,7 +317,7 @@ export PYC_REPLAY_OPT='-O3'
 7. 根据 fallback share 决定：
    - `<5%`：停止模块拆分优化；
    - `5%–15%`：只考虑简单单模块拆分原型；
-   - `>15%`：再评估完整 module-pipeline pass。
+   - `>15%`：再评估独立的模块级调度优化。
 
 ## 实测结果
 
@@ -390,8 +390,8 @@ manifest 路径补写 `manifest.json`，并调用其现有
 
 ### 决策
 
-顶层 fallback 占比远高于 15%。按本方案阈值，值得继续评估模块流水
-pass。收益点是去掉顶层 4 次和 shared 8 次的重复实例求值；重复 comb
+顶层 fallback 占比远高于 15%。按本方案阈值，值得继续评估模块级调度优化。
+收益点是去掉顶层 4 次和 shared 8 次的重复实例求值；重复 comb
 pass 只占顶层 `eval()` 的 0.62%，不是主要成本。这仍是路径计时，不是
 拆分前后的 A/B。cache 关闭会放大子实例重复求值。
 

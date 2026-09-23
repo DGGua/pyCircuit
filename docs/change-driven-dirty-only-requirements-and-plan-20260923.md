@@ -77,7 +77,6 @@ python -m pycircuit.cli build --comb-update=<mode>
 - `compiler/mlir/test/comb_dirty_scheduler_smoke.sh`
 - `compiler/mlir/test/Inputs/comb_dirty_scheduler_driver.cpp`
 - `compiler/mlir/test/instance_vector_cache_smoke.sh`
-- `compiler/mlir/test/module_pipeline_smoke.sh`
 - `flows/tools/perf/run_change_driven_ab.py`
 - `flows/tools/perf/test_change_driven_perf_tools.py`
 - `docs/change-driven-scheduler-implementation-20260923.md`
@@ -114,8 +113,8 @@ python -m pycircuit.cli build --comb-update=<mode>
 - 生成的有 comb C++ 包含 `DirtyBitset`、`_pyc_mark_comb_dirty` 和 direct fanout。
 - 生成 C++ 不含运行时模式分支。
 - pycc 构建通过。
-- runtime scheduler、dirty scheduler、module pipeline、instance vector cache 和
-  schedule gate 按更新后的预期运行。
+- runtime scheduler、dirty scheduler、instance vector cache 和 schedule gate
+  按更新后的预期运行。
 - `docs/change-driven-scheduler-implementation-20260923.md` 只描述 dirty-only
   现状，不再建议模式切换。
 
@@ -123,8 +122,8 @@ python -m pycircuit.cli build --comb-update=<mode>
 
 ### 模块边界、输入与输出
 
-本次不改变 MLIR schedule schema、CombDepGraph、module-pipeline 或 runtime
-`DirtyBitset` 接口。变化边界位于 C++ emission policy：
+本次不改变 MLIR schedule schema、CombDepGraph 或 runtime `DirtyBitset` 接口。
+变化边界位于 C++ emission policy：
 
 ```text
 输入：已通过 pyc-check-change-driven-schedule 的 MLIR
@@ -196,9 +195,6 @@ Python build / pycc
   - 保留功能断言。
 - `compiler/mlir/test/instance_vector_cache_smoke.sh`
   - 删除显式 `--comb-update=dirty`。
-- `compiler/mlir/test/module_pipeline_smoke.sh`
-  - 删除所有 `--comb-update`；
-  - 原 guarded 组合改为唯一 dirty 路径。
 
 #### 性能工具
 
@@ -225,8 +221,6 @@ Python build / pycc
 - 第一次构造仍将所有本地 comb 标 dirty，保证首轮完整求值。
 - instance/primitive cache 宏仍保留；它们控制 cache 实现，不是 comb update mode。
 - `PYC_SIM_FAST`/SCC fallback 选择不属于 `--comb-update`，本次不删除。
-- module-pipeline `off|analyze|rewrite` 是编译期层次处理选择，不属于 comb update，
-  本次不修改。
 
 ## 与既有文档和约束的一致性检查
 
@@ -262,7 +256,6 @@ Python build / pycc
 
    ```bash
    compiler/mlir/test/comb_dirty_scheduler_smoke.sh
-   compiler/mlir/test/module_pipeline_smoke.sh
    compiler/mlir/test/instance_vector_cache_smoke.sh
    compiler/mlir/test/change_schedule_gate.sh
    ```
@@ -295,8 +288,8 @@ CLI 修改导致新失败时修复，不借本任务改变 verifier 诊断优先
 无待确认架构项。请求批准以下 hard-break 方案：彻底删除 `--comb-update` 和
 `CombUpdateMode`，不保留 deprecated/ignored alias；C++ emitter 永远生成当前
 dirty 路径；删除 always/guarded 测试矩阵和失效的三 variant A/B 工具；保留
-instance/primitive cache 开关、`PYC_SIM_FAST` 和 module-pipeline mode，因为它们
-不是 comb update 策略选择。
+instance/primitive cache 开关和 `PYC_SIM_FAST`，因为它们不是 comb update
+策略选择。
 
 ## 实施与验证结果
 
@@ -309,7 +302,7 @@ instance/primitive cache 开关、`PYC_SIM_FAST` 和 module-pipeline mode，因�
 - 删除 build manifest/profile 中的 `comb_update` 字段。
 - 将 comb guard、semantic publish、instance output、primitive output、state
   tick/commit 和 top return 全部固化为原 dirty 路径。
-- 更新 scheduler、module-pipeline 和 vector-cache smoke，移除正常路径中的旧参数。
+- 更新 scheduler 和 vector-cache smoke，移除正常路径中的旧参数。
 - scheduler smoke 新增 pycc/frontend 旧参数必须失败的 hard-break 检查。
 - 删除 `run_change_driven_ab.py` 及其三模式单测。
 - 更新 `CHANGELOG.md` 和 change-driven 实现说明。
@@ -321,7 +314,6 @@ instance/primitive cache 开关、`PYC_SIM_FAST` 和 module-pipeline mode，因�
 cmake --build .pycircuit_out/toolchain/build --target pycc -j2
 tests/runtime/run_change_scheduler.sh
 compiler/mlir/test/comb_dirty_scheduler_smoke.sh
-compiler/mlir/test/module_pipeline_smoke.sh
 compiler/mlir/test/instance_vector_cache_smoke.sh
 cmake --build .pycircuit_out/toolchain/build \
   --target pyc4_primitive_change_reporting_test -j2

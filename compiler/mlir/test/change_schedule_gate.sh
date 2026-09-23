@@ -28,6 +28,34 @@ if "${PYCC}" "${ROOT}/compiler/mlir/test/Inputs/comb_cycle_true.mlir" \
 fi
 grep -q "combinational cycle detected" "${true_cycle_log}"
 
+"${PYCC}" \
+  "${ROOT}/compiler/mlir/test/Inputs/comb_cycle_cross_instance_false_scc.mlir" \
+  --emit=none -o /dev/null
+
+cross_cycle_log="${OUT}/comb_cycle_cross_instance_true.log"
+if "${PYCC}" \
+    "${ROOT}/compiler/mlir/test/Inputs/comb_cycle_cross_instance_true.mlir" \
+    --emit=none -o /dev/null >"${cross_cycle_log}" 2>&1; then
+  echo "fail: true cross-instance combinational cycle was accepted" >&2
+  exit 1
+fi
+grep -q "combinational cycle detected" "${cross_cycle_log}"
+grep -q "a_input" "${cross_cycle_log}"
+grep -q "b_input" "${cross_cycle_log}"
+
+if "${PYCC}" --help 2>&1 | grep -q -- "--module-pipeline"; then
+  echo "fail: pycc still exposes removed --module-pipeline" >&2
+  exit 1
+fi
+if "${PYCC}" "${INPUT}" --emit=none --module-pipeline=analyze -o /dev/null \
+    >"${OUT}/removed-module-pipeline.stdout" \
+    2>"${OUT}/removed-module-pipeline.stderr"; then
+  echo "fail: pycc accepted removed --module-pipeline" >&2
+  exit 1
+fi
+grep -q "Unknown command line argument '--module-pipeline=analyze'" \
+  "${OUT}/removed-module-pipeline.stderr"
+
 run_plan() {
   local dump_dir=$1
   "${PYCC}" "${INPUT}" --emit=none -o /dev/null \

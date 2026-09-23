@@ -23,8 +23,6 @@ std::unique_ptr<::mlir::Pass> createCheckHierarchyDisciplinePass();
 std::unique_ptr<::mlir::Pass> createCheckNoDynamicPass();
 std::unique_ptr<::mlir::Pass> createCheckCombCyclesPass();
 std::unique_ptr<::mlir::Pass> createCheckClockDomainsPass();
-/// Analyze the module stage DAG, optionally materializing supported false SCCs.
-std::unique_ptr<::mlir::Pass> createModulePipelinePass(bool rewrite = false);
 std::unique_ptr<::mlir::Pass> createPlanChangeDrivenSchedulePass();
 std::unique_ptr<::mlir::Pass> createCheckChangeDrivenSchedulePass();
 std::unique_ptr<::mlir::Pass> createCheckFlatTypesPass();

@@ -196,27 +196,7 @@ dirty 模式为 instance 和本地状态 primitive 的 tick inputs 保存 snapsh
 - commit 仍保持两阶段更新，不改变 state ownership；
 - commit 后只对实际变化的输出传播 dirty。
 
-### 3.8 module-pipeline 辅助能力
-
-分支还实现了可选的：
-
-```text
---module-pipeline=off|analyze|rewrite
-```
-
-其用途是：
-
-- 用 instance-aware graph 区分真实跨实例组合环和“整 instance 原子化”造成的伪 SCC；
-- analysis 模式只输出可审计 summary；
-- rewrite 模式在受支持场景生成最少 stage，并重写 callsite；
-- 重写后重新生成并校验 change schedule metadata；
-- 重复运行保持幂等；
-- metadata 过期、真实组合环或 unsupported multi-callsite 时失败。
-
-默认模式仍是 `off`。当前 rewrite 是受约束实现，不应描述成对任意大型层次设计都已
-完成通用最优拆分。
-
-### 3.9 明确删除的功能
+### 3.8 明确删除的功能
 
 开发过程中曾加入 simulator statistics、timing JSON 和 A/B 分析工具。最终提交
 `7d84e293` 删除了这些运行时统计字段、环境变量、dump API、相关 gate 和统计分析
@@ -226,7 +206,7 @@ dirty-only hard break 进一步删除了固定比较
 `current/dag-always/dag-dirty` 的 `run_change_driven_ab.py` 及其单测。未来性能
 对比应使用独立 baseline/candidate 二进制，不能为测量重新引入 emitter mode。
 
-### 3.10 当前实现边界
+### 3.9 当前实现边界
 
 当前实现更准确的描述是：
 
@@ -253,7 +233,6 @@ dirty-only hard break 进一步删除了固定比较
 ```text
 前端与通用 lowering / cleanup
   → instance-aware / local comb-cycle gates
-  → 可选 module-pipeline analyze/rewrite
   → fuse-comb（或 static comb partition）
   → canonicalize / CSE / dead cleanup
   → comb memoizable / partition checks
@@ -353,8 +332,7 @@ dirty 传播只替代可证明由 schedule producer 驱动的输入。顶层参�
 - dirty guards、instance/primitive cache 和 semantic publish 同样减少 fallback
   内部的无效工作。
 
-因此本分支的实际定位是“本地 fused-comb 的 change-driven 跳过与传播机制 +
-受约束模块流水”，
+因此本分支的实际定位是“本地 fused-comb 的 change-driven 跳过与传播机制”，
 不是“所有设计都已强制转换为无 fallback 的单遍 DAG”。
 
 同理，它还不是 Decision 0109 所描述的“全图 dirty queue 处理到空”为唯一执行
@@ -370,8 +348,6 @@ Python DSL / .pyc
 frontend contract 与静态 lowering
   ↓
 CombDepGraph：统一值依赖、跨实例摘要、cycle legality
-  ↓
-可选 module-pipeline：分析或重写伪 SCC
   ↓
 fuse/partition comb
   ↓
@@ -474,7 +450,6 @@ primitive 的输出比较控制 dirty fanout，但尚未像 instance 一样把 f
 | `compiler/mlir/include/pyc/Emit/CppEmitter.h` | C++ emitter 公共配置；更新策略固定为 dirty |
 | `runtime/cpp/pyc_change_scheduler.hpp` | fixed-capacity dirty set 与 version/publish 工具 |
 | `runtime/cpp/pyc_*` primitives | eval cache 和 commit change reporting |
-| `compiler/mlir/lib/Transforms/ModulePipelinePass.cpp` | 可选跨实例 SCC 分析/重写 |
 | `compiler/mlir/tools/pycc.cpp` | CLI 参数和 pass 接线 |
 | `compiler/frontend/pycircuit/cli.py` | build CLI；不再暴露 comb update 模式 |
 
@@ -496,7 +471,6 @@ runtime 源文件及两个 public include 副本保持一致：
 | `cmake --build .pycircuit_out/toolchain/build --target pycc -j2` | PASS | 独立分支 pycc 编译链接 |
 | `tests/runtime/run_change_scheduler.sh` | PASS | 三份 public header、DirtyBitset、semantic publish、version wrap/rebase |
 | `compiler/mlir/test/comb_dirty_scheduler_smoke.sh` | PASS | dirty-only CLI hard break、direct fanout、reconvergence、state/instance/primitive、无 stats 残留 |
-| `compiler/mlir/test/module_pipeline_smoke.sh` | PASS | analysis/rewrite、真实环拒绝、最少 stage、幂等、metadata、安全失败 |
 | `compiler/mlir/test/instance_vector_cache_smoke.sh` | PASS | nested vector instance cache 精确为 48 packed words |
 
 ### 7.2 部分失败
@@ -522,12 +496,12 @@ schedule 被接受；仍需单独修正测试或固定诊断优先级。
 ### 7.3 代码规模
 
 相对 `upstream/main` @ `27b226cd`，当前 tracked 工作树（包含 change-driven 所依赖的
-CombDepGraph、module pipeline、C++ placement/PCH 等前置工作）为：
+CombDepGraph、C++ placement/PCH 等前置工作）为：
 
 ```text
-89 files changed
-10,926 insertions
-618 deletions
+86 files changed
+10,561 insertions
+615 deletions
 ```
 
 该数字不是纯 scheduler LOC，不能用于估计 scheduler 本身复杂度。
@@ -545,7 +519,6 @@ CombDepGraph、module pipeline、C++ placement/PCH 等前置工作）为：
 
 - Davinci qwen3-14b 端到端提升了某个百分比；
 - 所有层次设计都已消除 fallback；
-- module-pipeline rewrite 已覆盖任意多 callsite 或所有 primitive 拆分；
 - dirty-only 实现在所有 workload 上都一定快于旧 always reference。
 
 原因是最终实现没有完成同一设计和工具链下的旧 baseline binary 与 dirty-only
@@ -569,16 +542,14 @@ candidate binary 正式 A/B。性能收益必须使用两个独立构建产物�
    - 输出、状态、assert、TICK-OBS/XFER-OBS 一致性。
 3. 将 callee output-to-input 精确摘要硬化到 dialect/metadata，减少 instance
    输入变化时的保守 child eval。
-4. 扩展 module-pipeline rewrite 对多 callsite 和更多复杂状态 ownership 的覆盖。
-5. 在模块 DAG 证明充分后评估彻底删除正常路径的 fixed-point fallback；在此之前
+4. 在模块 DAG 证明充分后评估彻底删除正常路径的 fixed-point fallback；在此之前
    fallback 仍是当前实现的一部分。
-6. 更新 `docs/MLIR_PASS_PIPELINE.md`，其当前表格尚未完整列出 module-pipeline、
-   plan/check-change-driven-schedule 等新 pass。
-7. 从外部输入 fanout 计算首次 dirty set，完成 Decision 0108，而不是首次把所有
+5. 更新 `docs/MLIR_PASS_PIPELINE.md`，补充 plan/check-change-driven-schedule。
+6. 从外部输入 fanout 计算首次 dirty set，完成 Decision 0108，而不是首次把所有
    本地 comb 标 dirty。
-8. 将调度扩展为覆盖 instance/primitive/state 的全图 worklist，并处理到队列为空，
+7. 将调度扩展为覆盖 instance/primitive/state 的全图 worklist，并处理到队列为空，
    逐步完成 Decision 0109。
-9. 实现 X/Z 三掩码值存储和完整 equality/version/signature，完成 Decision 0129。
+8. 实现 X/Z 三掩码值存储和完整 equality/version/signature，完成 Decision 0129。
 
 ## 9. 环境与复现命令
 
@@ -613,7 +584,6 @@ cmake --build .pycircuit_out/toolchain/build --target pycc -j2
 
 tests/runtime/run_change_scheduler.sh
 compiler/mlir/test/comb_dirty_scheduler_smoke.sh
-compiler/mlir/test/module_pipeline_smoke.sh
 compiler/mlir/test/instance_vector_cache_smoke.sh
 ```
 
