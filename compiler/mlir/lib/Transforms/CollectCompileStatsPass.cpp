@@ -63,6 +63,8 @@ public:
 
     int64_t regCount = 0;
     int64_t regBits = 0;
+    int64_t delayLineCount = 0;
+    int64_t delayLineDepthTotal = 0;
     int64_t memCount = 0;
     int64_t memBits = 0;
 
@@ -70,6 +72,16 @@ public:
       if (auto r = dyn_cast<pyc::RegOp>(op)) {
         regCount += 1;
         regBits = satAddMul(regBits, hardwareBitCount(r.getQ().getType()), 1);
+        return;
+      }
+      if (auto delay = dyn_cast<pyc::DelayLineOp>(op)) {
+        // An IR delay line is compact syntax, not one hardware register.
+        // Preserve resource accounting by charging every logical stage.
+        int64_t depth = depthAttr(op);
+        delayLineCount += 1;
+        delayLineDepthTotal = satAddMul(delayLineDepthTotal, depth, 1);
+        regCount = satAddMul(regCount, depth, 1);
+        regBits = satAddMul(regBits, hardwareBitCount(delay.getQ().getType()), depth);
         return;
       }
 
@@ -97,6 +109,8 @@ public:
     auto i64Ty = IntegerType::get(ctx, 64);
     f->setAttr("pyc.stats.reg_count", IntegerAttr::get(i64Ty, regCount));
     f->setAttr("pyc.stats.reg_bits", IntegerAttr::get(i64Ty, regBits));
+    f->setAttr("pyc.stats.delay_line_count", IntegerAttr::get(i64Ty, delayLineCount));
+    f->setAttr("pyc.stats.delay_line_depth_total", IntegerAttr::get(i64Ty, delayLineDepthTotal));
     f->setAttr("pyc.stats.mem_count", IntegerAttr::get(i64Ty, memCount));
     f->setAttr("pyc.stats.mem_bits", IntegerAttr::get(i64Ty, memBits));
   }
