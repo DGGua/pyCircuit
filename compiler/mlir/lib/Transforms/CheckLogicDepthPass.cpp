@@ -115,118 +115,155 @@ public:
       llvm::DenseSet<Value> visiting;
       bool failedThisFunc = false;
 
-      auto depthOf = [&](auto &&self, Value v) -> int64_t {
-        if (!v)
-          return 0;
-        auto it = memo.find(v);
-        if (it != memo.end())
-          return it->second;
-        if (!visiting.insert(v).second)
-          return limit + 1;
-
-        int64_t d = 0;
-
+      auto dependencies = [&](Value v, llvm::SmallVectorImpl<Value> &out) {
         if (auto barg = dyn_cast<BlockArgument>(v)) {
-          Operation *parentOp = barg.getOwner() ? barg.getOwner()->getParentOp() : nullptr;
-          if (isa_and_nonnull<func::FuncOp>(parentOp)) {
-            d = 0;
-          } else if (auto comb = dyn_cast_or_null<pyc::CombOp>(parentOp)) {
-            unsigned idx = static_cast<unsigned>(barg.getArgNumber());
-            auto inputs = comb.getInputs();
-            if (idx < inputs.size())
-              d = self(self, inputs[idx]);
-            else
-              d = 0;
-          } else {
-            d = 0;
+          Operation *parent = barg.getOwner() ? barg.getOwner()->getParentOp() : nullptr;
+          if (auto comb = dyn_cast_or_null<pyc::CombOp>(parent)) {
+            unsigned idx = barg.getArgNumber();
+            if (idx < comb.getInputs().size())
+              out.push_back(comb.getInputs()[idx]);
           }
-
-          visiting.erase(v);
-          memo.try_emplace(v, d);
-          return d;
+          return;
         }
-
         Operation *def = v.getDefiningOp();
-        if (!def || isSequentialOp(def)) {
-          d = 0;
-        } else if (isa<arith::ConstantOp, pyc::ConstantOp>(def)) {
-          d = 0;
-        } else if (isa<pyc::WireOp>(def)) {
-          int64_t inMax = 0;
-          if (auto itD = wireDrivers.find(v); itD != wireDrivers.end()) {
-            for (Value src : itD->second)
-              inMax = std::max(inMax, self(self, src));
-          }
-          d = inMax;
-        } else if (auto a = dyn_cast<pyc::AliasOp>(def)) {
-          d = self(self, a.getIn());
+        if (!def || isSequentialOp(def) || isa<arith::ConstantOp, pyc::ConstantOp>(def))
+          return;
+        if (isa<pyc::WireOp>(def)) {
+          if (auto it = wireDrivers.find(v); it != wireDrivers.end())
+            out.append(it->second.begin(), it->second.end());
+        } else if (auto alias = dyn_cast<pyc::AliasOp>(def)) {
+          out.push_back(alias.getIn());
         } else if (auto comb = dyn_cast<pyc::CombOp>(def)) {
-          auto r = dyn_cast<OpResult>(v);
-          unsigned resIdx = r ? r.getResultNumber() : 0u;
-          auto yield = comb.getBody().empty() ? pyc::YieldOp() : dyn_cast_or_null<pyc::YieldOp>(comb.getBody().front().getTerminator());
-          if (!yield || resIdx >= yield.getValues().size()) {
-            d = 0;
-          } else {
-            d = self(self, yield.getValues()[resIdx]);
-          }
+          auto result = dyn_cast<OpResult>(v);
+          unsigned index = result ? result.getResultNumber() : 0u;
+          auto yield = comb.getBody().empty()
+                           ? pyc::YieldOp()
+                           : dyn_cast_or_null<pyc::YieldOp>(comb.getBody().front().getTerminator());
+          if (yield && index < yield.getValues().size())
+            out.push_back(yield.getValues()[index]);
         } else if (auto inst = dyn_cast<pyc::InstanceOp>(def)) {
-          auto r = dyn_cast<OpResult>(v);
-          unsigned resIdx = r ? r.getResultNumber() : 0u;
-
+          auto result = dyn_cast<OpResult>(v);
+          unsigned index = result ? result.getResultNumber() : 0u;
           auto calleeAttr = inst->getAttrOfType<FlatSymbolRefAttr>("callee");
-          if (!calleeAttr) {
-            inst.emitError("pyc.instance missing required `callee` attr");
-            failedThisFunc = true;
-            d = limit + 1;
-          } else {
-            auto sym = SymbolTable::lookupSymbolIn(module, calleeAttr.getValue());
-            auto callee = dyn_cast_or_null<func::FuncOp>(sym);
-            if (!callee) {
-              inst.emitError("pyc.instance callee is not a func.func symbol: ") << calleeAttr.getValue();
-              failedThisFunc = true;
-              d = limit + 1;
-            } else {
-              const FuncCombSummary *sum = combCache.getFuncSummary(callee);
-              if (!sum) {
-                // Multi-.pyc build mode emits declaration-only dependency stubs.
-                // Without a callee body (or an explicit summary) we cannot
-                // propagate depth precisely, so treat the instance result as a
-                // local cut point here. Full-design gates should validate
-                // cross-instance depth when the full IR is available.
-                if (callee.isDeclaration()) {
-                  d = 0;
-                } else {
-                  failedThisFunc = true;
-                  d = limit + 1;
-                }
-              } else if (resIdx >= sum->results.size()) {
-                d = 0;
-              } else {
-                const CombResultSummary &rs = sum->results[resIdx];
-                int64_t best = (rs.baseDepth >= 0) ? rs.baseDepth : 0;
-
+          auto callee = calleeAttr
+                            ? dyn_cast_or_null<func::FuncOp>(SymbolTable::lookupSymbolIn(module, calleeAttr.getValue()))
+                            : func::FuncOp();
+          if (callee) {
+            if (const FuncCombSummary *sum = combCache.getFuncSummary(callee)) {
+              if (index < sum->results.size()) {
+                const auto &argDepth = sum->results[index].argDepth;
                 auto inputs = inst.getInputs();
-                unsigned n = std::min<unsigned>(static_cast<unsigned>(inputs.size()), static_cast<unsigned>(rs.argDepth.size()));
-                for (unsigned i = 0; i < n; ++i) {
-                  int64_t delta = rs.argDepth[i];
-                  if (delta < 0)
-                    continue;
-                  best = std::max(best, self(self, inputs[i]) + delta);
-                }
-                d = best;
+                unsigned n = std::min<unsigned>(inputs.size(), argDepth.size());
+                for (unsigned i = 0; i < n; ++i)
+                  if (argDepth[i] >= 0)
+                    out.push_back(inputs[i]);
               }
             }
           }
         } else {
-          int64_t inMax = 0;
-          for (Value in : def->getOperands())
-            inMax = std::max(inMax, self(self, in));
-          d = inMax + opCost(def);
+          out.append(def->operand_begin(), def->operand_end());
         }
+      };
 
-        visiting.erase(v);
-        memo.try_emplace(v, d);
-        return d;
+      struct DepthFrame {
+        Value value;
+        llvm::SmallVector<Value> inputs;
+        size_t next = 0;
+      };
+      auto depthOf = [&](Value root) -> int64_t {
+        if (!root)
+          return 0;
+        if (auto it = memo.find(root); it != memo.end())
+          return it->second;
+        llvm::SmallVector<DepthFrame> stack;
+        visiting.insert(root);
+        stack.push_back({root, {}, 0});
+        dependencies(root, stack.back().inputs);
+        while (!stack.empty()) {
+          DepthFrame &frame = stack.back();
+          if (frame.next < frame.inputs.size()) {
+            Value child = frame.inputs[frame.next++];
+            if (!child || memo.count(child) || visiting.count(child))
+              continue;
+            visiting.insert(child);
+            stack.push_back({child, {}, 0});
+            dependencies(child, stack.back().inputs);
+            continue;
+          }
+
+          auto getDepth = [&](Value child) -> int64_t {
+            if (!child)
+              return 0;
+            if (auto it = memo.find(child); it != memo.end())
+              return it->second;
+            return limit + 1; // A combinational cycle reaches an active ancestor.
+          };
+          Value v = frame.value;
+          int64_t d = 0;
+          if (auto barg = dyn_cast<BlockArgument>(v)) {
+            Operation *parent = barg.getOwner() ? barg.getOwner()->getParentOp() : nullptr;
+            if (auto comb = dyn_cast_or_null<pyc::CombOp>(parent)) {
+              unsigned idx = barg.getArgNumber();
+              if (idx < comb.getInputs().size())
+                d = getDepth(comb.getInputs()[idx]);
+            }
+          } else if (Operation *def = v.getDefiningOp()) {
+            if (isSequentialOp(def) || isa<arith::ConstantOp, pyc::ConstantOp>(def)) {
+              d = 0;
+            } else if (isa<pyc::WireOp>(def)) {
+              if (auto it = wireDrivers.find(v); it != wireDrivers.end())
+                for (Value src : it->second)
+                  d = std::max(d, getDepth(src));
+            } else if (auto alias = dyn_cast<pyc::AliasOp>(def)) {
+              d = getDepth(alias.getIn());
+            } else if (auto comb = dyn_cast<pyc::CombOp>(def)) {
+              auto result = dyn_cast<OpResult>(v);
+              unsigned index = result ? result.getResultNumber() : 0u;
+              auto yield = comb.getBody().empty()
+                               ? pyc::YieldOp()
+                               : dyn_cast_or_null<pyc::YieldOp>(comb.getBody().front().getTerminator());
+              if (yield && index < yield.getValues().size())
+                d = getDepth(yield.getValues()[index]);
+            } else if (auto inst = dyn_cast<pyc::InstanceOp>(def)) {
+              auto result = dyn_cast<OpResult>(v);
+              unsigned index = result ? result.getResultNumber() : 0u;
+              auto calleeAttr = inst->getAttrOfType<FlatSymbolRefAttr>("callee");
+              if (!calleeAttr) {
+                inst.emitError("pyc.instance missing required `callee` attr");
+                failedThisFunc = true;
+                d = limit + 1;
+              } else {
+                auto callee = dyn_cast_or_null<func::FuncOp>(SymbolTable::lookupSymbolIn(module, calleeAttr.getValue()));
+                if (!callee) {
+                  inst.emitError("pyc.instance callee is not a func.func symbol: ") << calleeAttr.getValue();
+                  failedThisFunc = true;
+                  d = limit + 1;
+                } else if (const FuncCombSummary *sum = combCache.getFuncSummary(callee)) {
+                  if (index < sum->results.size()) {
+                    const CombResultSummary &rs = sum->results[index];
+                    d = std::max<int64_t>(0, rs.baseDepth);
+                    auto inputs = inst.getInputs();
+                    unsigned n = std::min<unsigned>(inputs.size(), rs.argDepth.size());
+                    for (unsigned i = 0; i < n; ++i)
+                      if (rs.argDepth[i] >= 0)
+                        d = std::max(d, getDepth(inputs[i]) + rs.argDepth[i]);
+                  }
+                } else if (!callee.isDeclaration()) {
+                  failedThisFunc = true;
+                  d = limit + 1;
+                }
+              }
+            } else {
+              for (Value in : def->getOperands())
+                d = std::max(d, getDepth(in));
+              d += opCost(def);
+            }
+          }
+          memo.try_emplace(v, d);
+          visiting.erase(v);
+          stack.pop_back();
+        }
+        return memo.lookup(root);
       };
 
       int64_t maxDepth = 0;
@@ -234,7 +271,7 @@ public:
       int64_t tns = 0;
 
       auto observeEndpoint = [&](Operation *op, Value v) {
-        int64_t d = depthOf(depthOf, v);
+        int64_t d = depthOf(v);
         maxDepth = std::max(maxDepth, d);
         int64_t slack = limit - d;
         wns = std::min(wns, slack);

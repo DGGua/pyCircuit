@@ -10,6 +10,7 @@
 #include "mlir/IR/OpImplementation.h"
 #include "mlir/IR/SymbolTable.h"
 #include "mlir/IR/Types.h"
+#include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "mlir/Support/LogicalResult.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/STLExtras.h"
@@ -1230,6 +1231,13 @@ LogicalResult CombOp::verify() {
   auto yield = dyn_cast<YieldOp>(b.getTerminator());
   if (!yield)
     return emitOpError("body must terminate with pyc.yield");
+
+  for (Operation &step : b) {
+    if (&step == b.getTerminator())
+      break;
+    if (!isMemoryEffectFree(&step))
+      return step.emitError("pyc.comb body must contain only pure operations");
+  }
 
   if (yield.getNumOperands() != getNumResults())
     return emitOpError("pyc.yield operand count must match comb results");

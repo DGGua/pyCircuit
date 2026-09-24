@@ -1,7 +1,5 @@
 #include "pyc/Emit/CppEmitter.h"
 
-#include "pyc/Dialect/PYC/PYCOps.h"
-#include "pyc/Dialect/PYC/PYCTypes.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -9,7 +7,6 @@
 #include "mlir/IR/Types.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"
-#include "llvm/ADT/SmallSet.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringSet.h"
@@ -22,6 +19,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <functional>
+#include <set>
 #include <vector>
 
 using namespace mlir;
@@ -74,53 +72,31 @@ static std::string cppStringLiteral(llvm::StringRef s) {
   return out;
 }
 
-static std::string cppType(Type ty) {
-  if (isa<pyc::ClockType>(ty) || isa<pyc::ResetType>(ty))
-    return "pyc::cpp::Wire<1>";
-  if (auto intTy = dyn_cast<IntegerType>(ty))
-    return "pyc::cpp::Wire<" + std::to_string(intTy.getWidth()) + ">";
-  if (auto vt = dyn_cast<VectorType>(ty)) {
-    // Build nested pyc::cpp::Vec from the shape (outermost to innermost).
-    // vector<4x8xi32> → pyc::cpp::Vec<pyc::cpp::Vec<Wire<32>, 8>, 4>
-    auto shape = vt.getShape();
-    std::string inner = cppType(vt.getElementType());
-    for (int i = shape.size() - 1; i >= 0; --i)
-      inner = "pyc::cpp::Vec<" + inner + ", " + std::to_string(shape[i]) + ">";
-    return inner;
-  }
-  std::string msg;
-  llvm::raw_string_ostream os(msg);
-  os << "CppEmitter: unsupported type in cppType(): " << ty;
-  llvm::report_fatal_error(llvm::StringRef(os.str()));
+static std::string cppType(const SimType &type) {
+  std::string name = "pyc::cpp::Wire<" + std::to_string(type.width) + ">";
+  for (auto it = type.shape.rbegin(); it != type.shape.rend(); ++it)
+    name = "pyc::cpp::Vec<" + name + ", " + std::to_string(*it) + ">";
+  return name;
 }
 
-static unsigned bitWidth(Type ty) {
-  if (isa<pyc::ClockType>(ty) || isa<pyc::ResetType>(ty))
-    return 1;
-  if (auto intTy = dyn_cast<IntegerType>(ty))
-    return intTy.getWidth();
-  if (auto vt = dyn_cast<VectorType>(ty))
-    return bitWidth(vt.getElementType());  // scalar element bit width
-  return 0;
-}
-
-// Emit ProbeRegistry registration for a (possibly vector) wire-kind value.
-// Scalars register directly via addWire; vectors lower to nested pyc::cpp::Vec
-// and use ProbeRegistry::addVec, which recurses to per-lane Wire<W>* leaves
-// under indexed paths (e.g. "a[0][1]").
-static void emitWireProbes(llvm::raw_ostream &os, Type ty, unsigned w,
-                           const std::string &fieldPath, const std::string &cppExpr) {
-  if (isa<VectorType>(ty)) {
+// Vectors register recursively through ProbeRegistry::addVec.
+static void emitWireProbes(llvm::raw_ostream &os, const SimType &type,
+                           const std::string &fieldPath,
+                           const std::string &cppExpr) {
+  if (!type.shape.empty()) {
     os << "    reg.addVec(reg_path(" << cppStringLiteral(fieldPath) << "), &" << cppExpr << ");\n";
     return;
   }
-  os << "    reg.addWire<" << w << ">(reg_path(" << cppStringLiteral(fieldPath) << "), &" << cppExpr << ");\n";
+  os << "    reg.addWire<" << type.width << ">(reg_path(" << cppStringLiteral(fieldPath) << "), &" << cppExpr << ");\n";
 }
 
 struct NameTable {
-  llvm::DenseMap<Value, std::string> names;
+  const SimGraph &graph;
+  llvm::DenseMap<unsigned, std::string> names;
   llvm::StringMap<unsigned> used;
   int next = 0;
+
+  explicit NameTable(const SimGraph &graph) : graph(graph) {}
 
   std::string unique(std::string base) {
     unsigned &n = used[base];
@@ -130,28 +106,30 @@ struct NameTable {
     return base + "_" + std::to_string(n);
   }
 
-  std::string get(Value v) {
-    if (auto it = names.find(v); it != names.end())
+  std::string get(unsigned id) {
+    if (auto it = names.find(id); it != names.end())
       return it->second;
-    if (Operation *def = v.getDefiningOp()) {
-      if (auto nAttr = def->getAttrOfType<StringAttr>("pyc.name")) {
-        std::string cand = unique(sanitizeId(nAttr.getValue()));
-        names.try_emplace(v, cand);
-        return cand;
-      }
+    const SimValue &value = graph.values[id];
+    if (value.sourceNameIsExplicit) {
+      std::string cand = unique(sanitizeId(value.sourceNameBase));
+      names.try_emplace(id, cand);
+      return cand;
+    }
+    if (!value.sourceNameBase.empty()) {
       // Fall back to op-based names for readability (instead of v1/v2/...).
-      std::string base = sanitizeId(def->getName().getStringRef());
+      std::string base = sanitizeId(value.sourceNameBase);
       if (base.empty())
         base = "v";
       base += "_" + std::to_string(++next);
       std::string cand = unique(base);
-      names.try_emplace(v, cand);
+      names.try_emplace(id, cand);
       return cand;
     }
     std::string n = unique("arg_" + std::to_string(++next));
-    names.try_emplace(v, n);
+    names.try_emplace(id, n);
     return n;
   }
+
 };
 
 static std::string treeReduceExpr(llvm::SmallVectorImpl<std::string> &terms,
@@ -177,46 +155,6 @@ static std::string chainReduceExpr(llvm::SmallVectorImpl<std::string> &terms,
   for (size_t i = 1; i < terms.size(); ++i)
     out = "(" + out + " " + op.str() + " " + terms[i] + ")";
   return out;
-}
-
-static bool isTreeReduceMode(Operation *op) {
-  if (auto mode = op->getAttrOfType<StringAttr>("mode"))
-    return mode.getValue() == "tree";
-  return false;
-}
-
-static std::string getPortName(func::FuncOp f, unsigned idx, bool isResult) {
-  if (!isResult) {
-    if (auto names = f->getAttrOfType<ArrayAttr>("arg_names")) {
-      if (idx < names.size())
-        if (auto s = dyn_cast<StringAttr>(names[idx]))
-          return sanitizeId(s.getValue());
-    }
-    return "arg" + std::to_string(idx);
-  }
-  if (auto names = f->getAttrOfType<ArrayAttr>("result_names")) {
-    if (idx < names.size())
-      if (auto s = dyn_cast<StringAttr>(names[idx]))
-        return sanitizeId(s.getValue());
-  }
-  return "out" + std::to_string(idx);
-}
-
-static std::string getPortCanonicalFieldPath(func::FuncOp f, unsigned idx, bool isResult) {
-  if (!isResult) {
-    if (auto names = f->getAttrOfType<ArrayAttr>("arg_names")) {
-      if (idx < names.size())
-        if (auto s = dyn_cast<StringAttr>(names[idx]))
-          return s.getValue().str();
-    }
-    return "arg" + std::to_string(idx);
-  }
-  if (auto names = f->getAttrOfType<ArrayAttr>("result_names")) {
-    if (idx < names.size())
-      if (auto s = dyn_cast<StringAttr>(names[idx]))
-        return s.getValue().str();
-  }
-  return "out" + std::to_string(idx);
 }
 
 struct ProbeAliasEntry {
@@ -260,597 +198,281 @@ static std::vector<ProbeAliasEntry> loadProbeAliasesForTop(llvm::StringRef planP
   return out;
 }
 
-static Value findRegQFromValue(Value v) {
-  llvm::SmallVector<Value, 8> seen;
-  while (true) {
-    for (Value prev : seen) {
-      if (prev == v)
-        return Value();
-    }
-    seen.push_back(v);
-    while (auto a = v.getDefiningOp<pyc::AliasOp>())
-      v = a.getIn();
-    if (auto rop = v.getDefiningOp<pyc::RegOp>())
-      return rop.getQ();
-    auto comb = v.getDefiningOp<pyc::CombOp>();
-    if (!comb)
-      return Value();
-
-    auto res = dyn_cast<OpResult>(v);
-    if (!res)
-      return Value();
-    auto yield = dyn_cast_or_null<pyc::YieldOp>(comb.getBody().front().getTerminator());
-    if (!yield)
-      return Value();
-    if (res.getResultNumber() >= yield.getNumOperands())
-      return Value();
-
-    Value y = yield.getOperand(res.getResultNumber());
-    while (auto a = y.getDefiningOp<pyc::AliasOp>())
-      y = a.getIn();
-    auto barg = dyn_cast<BlockArgument>(y);
-    if (!barg)
-      return Value();
-    if (barg.getOwner() != &comb.getBody().front())
-      return Value();
-    if (barg.getArgNumber() >= comb.getNumOperands())
-      return Value();
-    v = comb.getOperand(barg.getArgNumber());
-  }
-}
-
-static void computeUniquePortNames(func::FuncOp f, std::vector<std::string> &inNames, std::vector<std::string> &outNames) {
-  NameTable nt;
-  inNames.clear();
-  outNames.clear();
-  auto fTy = f.getFunctionType();
-  unsigned numInputs = fTy.getNumInputs();
-  unsigned numResults = fTy.getNumResults();
-  inNames.reserve(numInputs);
-  outNames.reserve(numResults);
-  for (unsigned i = 0; i < numInputs; ++i) {
-    inNames.push_back(nt.unique(getPortName(f, static_cast<unsigned>(i), /*isResult=*/false)));
-  }
-  for (unsigned i = 0; i < numResults; ++i) {
-    outNames.push_back(nt.unique(getPortName(f, i, /*isResult=*/true)));
-  }
-}
-
-enum class SeqStateKind : std::uint8_t {
-  Unknown = 0,
-  Visiting = 1,
-  NoSequential = 2,
-  HasSequential = 3,
-};
-
-static bool functionHasSequentialState(func::FuncOp f,
-                                       ModuleOp mod,
-                                       llvm::DenseMap<Operation *, SeqStateKind> &memo) {
-  if (!f)
-    return true;
-
-  if (auto it = memo.find(f.getOperation()); it != memo.end()) {
-    if (it->second == SeqStateKind::Visiting) {
-      // Cyclic/self-recursive hierarchy is treated as sequential to stay safe.
-      return true;
-    }
-    return it->second == SeqStateKind::HasSequential;
-  }
-
-  memo[f.getOperation()] = SeqStateKind::Visiting;
-  bool hasSeq = false;
-
-  Region *callable = f.getCallableRegion();
-  auto bodyBlock = (!callable || callable->empty()) ? nullptr : &callable->front();
-  if (!bodyBlock) {
-    memo[f.getOperation()] = SeqStateKind::HasSequential;
-    return true;
-  }
-
-  for (Operation &op : *bodyBlock) {
-    if (isa<pyc::RegOp,
-            pyc::FifoOp,
-            pyc::ByteMemOp,
-            pyc::SyncMemOp,
-            pyc::SyncMemDPOp,
-            pyc::AsyncFifoOp,
-            pyc::CdcSyncOp>(op)) {
-      hasSeq = true;
-      break;
-    }
-
-    if (auto inst = dyn_cast<pyc::InstanceOp>(op)) {
-      auto calleeAttr = inst->getAttrOfType<FlatSymbolRefAttr>("callee");
-      if (!calleeAttr) {
-        hasSeq = true;
-        break;
-      }
-      auto callee = mod.lookupSymbol<func::FuncOp>(calleeAttr.getValue());
-      if (!callee) {
-        hasSeq = true;
-        break;
-      }
-      if (functionHasSequentialState(callee, mod, memo)) {
-        hasSeq = true;
-        break;
-      }
-    }
-  }
-
-  memo[f.getOperation()] = hasSeq ? SeqStateKind::HasSequential : SeqStateKind::NoSequential;
-  return hasSeq;
-}
-
-// Simplified assignExpr without placement support — writes a direct assignment.
-static void assignExpr(Value result, Type ty, llvm::raw_ostream &os, NameTable &nt,
-                       llvm::function_ref<void(llvm::raw_ostream &)> buildExpr) {
-  std::string expr;
-  llvm::raw_string_ostream ess(expr);
-  buildExpr(ess);
-  os << "    " << nt.get(result) << " = " << ess.str() << ";\n";
-}
-
-static LogicalResult emitCombAssign(Operation &op, llvm::raw_ostream &os, NameTable &nt) {
-  if (auto c = dyn_cast<pyc::ConstantOp>(op)) {
-    unsigned w = bitWidth(c.getType());
-    if (w == 0)
-      return c.emitError("invalid constant width");
-    auto v = c.getValueAttr().getValue();
-    unsigned words = (w + 63u) / 64u;
-    os << "    " << nt.get(c.getResult()) << " = pyc::cpp::Wire<" << w << ">({";
-    for (unsigned i = 0; i < words; i++) {
-      if (i)
-        os << ", ";
-      std::uint64_t word = v.getRawData()[i];
-      os << "0x" << llvm::utohexstr(word) << "ull";
-    }
-    os << "});\n";
+// Emit a copied expression description. The original MLIR operation is not
+// consulted for its opcode, operands, widths, constants or attributes here.
+static LogicalResult emitGraphExpr(const SimGraph &graph, const SimExpr &expr,
+                                   llvm::raw_ostream &os, NameTable &nt,
+                                   llvm::DenseMap<unsigned, std::string> *inlineRhs = nullptr) {
+  if (expr.omitOriginalEvaluation)
     return success();
-  }
-  if (auto a = dyn_cast<pyc::AliasOp>(op)) {
-    os << "    " << nt.get(a.getResult()) << " = " << nt.get(a.getIn()) << ";\n";
-    return success();
-  }
-  if (auto ra = dyn_cast<pyc::ResetActiveOp>(op)) {
-    os << "    " << nt.get(ra.getActive()) << " = " << nt.get(ra.getRst()) << ";\n";
-    return success();
-  }
-  if (auto a = dyn_cast<pyc::AddOp>(op)) {
-    os << "    " << nt.get(a.getResult()) << " = (" << nt.get(a.getLhs()) << " + " << nt.get(a.getRhs()) << ");\n";
-    return success();
-  }
-  if (auto s = dyn_cast<pyc::SubOp>(op)) {
-    os << "    " << nt.get(s.getResult()) << " = (" << nt.get(s.getLhs()) << " - " << nt.get(s.getRhs()) << ");\n";
-    return success();
-  }
-  if (auto m = dyn_cast<pyc::MulOp>(op)) {
-    os << "    " << nt.get(m.getResult()) << " = (" << nt.get(m.getLhs()) << " * " << nt.get(m.getRhs()) << ");\n";
-    return success();
-  }
-  if (auto d = dyn_cast<pyc::UdivOp>(op)) {
-    unsigned w = bitWidth(d.getResult().getType());
-    if (w == 0)
-      return d.emitError("invalid udiv width");
-    os << "    " << nt.get(d.getResult()) << " = pyc::cpp::udiv<" << w << ">(" << nt.get(d.getLhs()) << ", "
-       << nt.get(d.getRhs()) << ");\n";
-    return success();
-  }
-  if (auto r = dyn_cast<pyc::UremOp>(op)) {
-    unsigned w = bitWidth(r.getResult().getType());
-    if (w == 0)
-      return r.emitError("invalid urem width");
-    os << "    " << nt.get(r.getResult()) << " = pyc::cpp::urem<" << w << ">(" << nt.get(r.getLhs()) << ", "
-       << nt.get(r.getRhs()) << ");\n";
-    return success();
-  }
-  if (auto d = dyn_cast<pyc::SdivOp>(op)) {
-    unsigned w = bitWidth(d.getResult().getType());
-    if (w == 0)
-      return d.emitError("invalid sdiv width");
-    os << "    " << nt.get(d.getResult()) << " = pyc::cpp::sdiv<" << w << ">(" << nt.get(d.getLhs()) << ", "
-       << nt.get(d.getRhs()) << ");\n";
-    return success();
-  }
-  if (auto r = dyn_cast<pyc::SremOp>(op)) {
-    unsigned w = bitWidth(r.getResult().getType());
-    if (w == 0)
-      return r.emitError("invalid srem width");
-    os << "    " << nt.get(r.getResult()) << " = pyc::cpp::srem<" << w << ">(" << nt.get(r.getLhs()) << ", "
-       << nt.get(r.getRhs()) << ");\n";
-    return success();
-  }
-  if (auto m = dyn_cast<pyc::MuxOp>(op)) {
-    unsigned w = bitWidth(m.getResult().getType());
-    if (w == 0)
-      return m.emitError("invalid mux width");
-    bool selIsVec = isa<VectorType>(m.getSel().getType());
-    assignExpr(m.getResult(), m.getType(), os, nt,
-               [&](llvm::raw_ostream &e) {
-                 if (selIsVec)
-                   e << "pyc::cpp::mux_vec<" << w << ">(" << nt.get(m.getSel()) << ", " << nt.get(m.getA()) << ", "
-                     << nt.get(m.getB()) << ")";
-                 else
-                   e << "pyc::cpp::mux<" << w << ">(" << nt.get(m.getSel()) << ", " << nt.get(m.getA()) << ", "
-                     << nt.get(m.getB()) << ")";
-               });
-    return success();
-  }
-  if (auto s = dyn_cast<arith::SelectOp>(op)) {
-    if (!s.getCondition().getType().isInteger(1))
-      return s.emitError("C++ emitter only supports arith.select with i1 condition");
-    os << "    " << nt.get(s.getResult()) << " = (" << nt.get(s.getCondition()) << ".toBool() ? " << nt.get(s.getTrueValue())
-       << " : " << nt.get(s.getFalseValue()) << ");\n";
-    return success();
-  }
-  if (auto a = dyn_cast<pyc::AndOp>(op)) {
-    os << "    " << nt.get(a.getResult()) << " = (" << nt.get(a.getLhs()) << " & " << nt.get(a.getRhs()) << ");\n";
-    return success();
-  }
-  if (auto o = dyn_cast<pyc::OrOp>(op)) {
-    os << "    " << nt.get(o.getResult()) << " = (" << nt.get(o.getLhs()) << " | " << nt.get(o.getRhs()) << ");\n";
-    return success();
-  }
-  if (auto x = dyn_cast<pyc::XorOp>(op)) {
-    os << "    " << nt.get(x.getResult()) << " = (" << nt.get(x.getLhs()) << " ^ " << nt.get(x.getRhs()) << ");\n";
-    return success();
-  }
-  if (auto n = dyn_cast<pyc::NotOp>(op)) {
-    os << "    " << nt.get(n.getResult()) << " = (~" << nt.get(n.getIn()) << ");\n";
-    return success();
-  }
-  if (auto e = dyn_cast<pyc::EqOp>(op)) {
-    unsigned w = bitWidth(e.getLhs().getType());
-    if (w == 0)
-      return e.emitError("invalid eq width");
-    assignExpr(e.getResult(), e.getType(), os, nt,
-               [&](llvm::raw_ostream &eout) {
-                 eout << "pyc::cpp::eq<" << w << ">(" << nt.get(e.getLhs()) << ", " << nt.get(e.getRhs()) << ")";
-               });
-    return success();
-  }
-  if (auto u = dyn_cast<pyc::UltOp>(op)) {
-    unsigned w = bitWidth(u.getLhs().getType());
-    if (w == 0)
-      return u.emitError("invalid ult width");
-    assignExpr(u.getResult(), u.getType(), os, nt,
-               [&](llvm::raw_ostream &eout) {
-                 eout << "pyc::cpp::ult<" << w << ">(" << nt.get(u.getLhs()) << ", " << nt.get(u.getRhs()) << ")";
-               });
-    return success();
-  }
-  if (auto s = dyn_cast<pyc::SltOp>(op)) {
-    unsigned w = bitWidth(s.getLhs().getType());
-    if (w == 0)
-      return s.emitError("invalid slt width");
-    assignExpr(s.getResult(), s.getType(), os, nt,
-               [&](llvm::raw_ostream &eout) {
-                 eout << "pyc::cpp::slt<" << w << ">(" << nt.get(s.getLhs()) << ", " << nt.get(s.getRhs()) << ")";
-               });
-    return success();
-  }
-  if (auto t = dyn_cast<pyc::TruncOp>(op)) {
-    unsigned iw = bitWidth(t.getIn().getType());
-    unsigned ow = bitWidth(t.getResult().getType());
-    if (iw == 0 || ow == 0)
-      return t.emitError("invalid trunc width");
-    bool inIsVec = isa<VectorType>(t.getIn().getType());
-    assignExpr(t.getResult(), t.getType(), os, nt,
-               [&](llvm::raw_ostream &e) {
-                 e << "pyc::cpp::" << (inIsVec ? "trunc_vec<" : "trunc<")
-                   << ow << ", " << iw << ">(" << nt.get(t.getIn()) << ")";
-               });
-    return success();
-  }
-  if (auto z = dyn_cast<pyc::ZextOp>(op)) {
-    unsigned iw = bitWidth(z.getIn().getType());
-    unsigned ow = bitWidth(z.getResult().getType());
-    if (iw == 0 || ow == 0)
-      return z.emitError("invalid zext width");
-    bool inIsVec = isa<VectorType>(z.getIn().getType());
-    assignExpr(z.getResult(), z.getType(), os, nt,
-               [&](llvm::raw_ostream &e) {
-                 e << "pyc::cpp::" << (inIsVec ? "zext_vec<" : "zext<")
-                   << ow << ", " << iw << ">(" << nt.get(z.getIn()) << ")";
-               });
-    return success();
-  }
-  if (auto s = dyn_cast<pyc::SextOp>(op)) {
-    unsigned iw = bitWidth(s.getIn().getType());
-    unsigned ow = bitWidth(s.getResult().getType());
-    if (iw == 0 || ow == 0)
-      return s.emitError("invalid sext width");
-    bool inIsVec = isa<VectorType>(s.getIn().getType());
-    assignExpr(s.getResult(), s.getType(), os, nt,
-               [&](llvm::raw_ostream &e) {
-                 e << "pyc::cpp::" << (inIsVec ? "sext_vec<" : "sext<")
-                   << ow << ", " << iw << ">(" << nt.get(s.getIn()) << ")";
-               });
-    return success();
-  }
-  if (auto ex = dyn_cast<pyc::ExtractOp>(op)) {
-    unsigned iw = bitWidth(ex.getIn().getType());
-    unsigned ow = bitWidth(ex.getResult().getType());
-    if (iw == 0 || ow == 0)
-      return ex.emitError("invalid extract width");
-    bool inIsVec = isa<VectorType>(ex.getIn().getType());
-    assignExpr(ex.getResult(), ex.getType(), os, nt,
-               [&](llvm::raw_ostream &e) {
-                 e << "pyc::cpp::" << (inIsVec ? "extract_vec<" : "extract<")
-                   << ow << ", " << iw << ">(" << nt.get(ex.getIn()) << ", "
-                   << ex.getLsbAttr().getInt() << "u)";
-               });
-    return success();
-  }
-  if (auto sh = dyn_cast<pyc::ShliOp>(op)) {
-    unsigned w = bitWidth(sh.getResult().getType());
-    if (w == 0)
-      return sh.emitError("invalid shli width");
-    os << "    " << nt.get(sh.getResult()) << " = pyc::cpp::shl<" << w << ">(" << nt.get(sh.getIn()) << ", "
-       << sh.getAmountAttr().getInt() << "u);\n";
-    return success();
-  }
-  if (auto sh = dyn_cast<pyc::LshriOp>(op)) {
-    unsigned w = bitWidth(sh.getResult().getType());
-    if (w == 0)
-      return sh.emitError("invalid lshri width");
-    os << "    " << nt.get(sh.getResult()) << " = pyc::cpp::lshr<" << w << ">(" << nt.get(sh.getIn()) << ", "
-       << sh.getAmountAttr().getInt() << "u);\n";
-    return success();
-  }
-  if (auto sh = dyn_cast<pyc::AshriOp>(op)) {
-    unsigned w = bitWidth(sh.getResult().getType());
-    if (w == 0)
-      return sh.emitError("invalid ashri width");
-    os << "    " << nt.get(sh.getResult()) << " = pyc::cpp::ashr<" << w << ">(" << nt.get(sh.getIn()) << ", "
-       << sh.getAmountAttr().getInt() << "u);\n";
-    return success();
-  }
-  if (auto sh = dyn_cast<pyc::ShlOp>(op)) {
-    unsigned w = bitWidth(sh.getResult().getType());
-    if (w == 0)
-      return sh.emitError("invalid shl width");
-    os << "    " << nt.get(sh.getResult()) << " = pyc::cpp::shl<" << w << ">(" << nt.get(sh.getIn())
-       << ", static_cast<unsigned>(" << nt.get(sh.getAmount()) << ".value()));\n";
-    return success();
-  }
-  if (auto sh = dyn_cast<pyc::LshrOp>(op)) {
-    unsigned w = bitWidth(sh.getResult().getType());
-    if (w == 0)
-      return sh.emitError("invalid lshr width");
-    os << "    " << nt.get(sh.getResult()) << " = pyc::cpp::lshr<" << w << ">(" << nt.get(sh.getIn())
-       << ", static_cast<unsigned>(" << nt.get(sh.getAmount()) << ".value()));\n";
-    return success();
-  }
-  if (auto sh = dyn_cast<pyc::AshrOp>(op)) {
-    unsigned w = bitWidth(sh.getResult().getType());
-    if (w == 0)
-      return sh.emitError("invalid ashr width");
-    os << "    " << nt.get(sh.getResult()) << " = pyc::cpp::ashr<" << w << ">(" << nt.get(sh.getIn())
-       << ", static_cast<unsigned>(" << nt.get(sh.getAmount()) << ".value()));\n";
-    return success();
-  }
-  if (auto c = dyn_cast<pyc::ConcatOp>(op)) {
-    unsigned w = bitWidth(c.getResult().getType());
-    if (w == 0)
-      return c.emitError("invalid concat width");
-    os << "    " << nt.get(c.getResult()) << " = pyc::cpp::concat(";
-    for (auto [i, v] : llvm::enumerate(c.getInputs())) {
-      if (i)
-        os << ", ";
-      os << nt.get(v);
-    }
-    os << ");\n";
-    return success();
-  }
-  if (auto vg = dyn_cast<pyc::VGetOp>(op)) {
-    auto vecTy = dyn_cast<VectorType>(vg.getVec().getType());
-    if (!vecTy)
-      return vg.emitError("C++ emitter expects vector operand for pyc.v_get");
-    std::int64_t idx = vg.getIndexAttr().getInt();
-    if (idx < 0 || idx >= vecTy.getDimSize(0))
-      return vg.emitError("pyc.v_get index out of range for C++ emission");
-    assignExpr(vg.getResult(), vg.getType(), os, nt,
-               [&](llvm::raw_ostream &e) { e << nt.get(vg.getVec()) << "[" << idx << "]"; });
-    return success();
-  }
-  if (auto vc = dyn_cast<pyc::VCreateOp>(op)) {
-    assignExpr(vc.getResult(), vc.getType(), os, nt,
-               [&](llvm::raw_ostream &e) {
-                 e << cppType(vc.getType()) << "{{";
-                 for (auto [i, v] : llvm::enumerate(vc.getElements())) {
-                   if (i)
-                     e << ", ";
-                   e << nt.get(v);
-                 }
-                 e << "}}";
-               }
-               );
-    return success();
-  }
-  if (auto vb = dyn_cast<pyc::VBroadcastOp>(op)) {
-    std::int64_t size = vb.getSizeAttr().getInt();
-    if (size < 0)
-      return vb.emitError("negative size is invalid for pyc.v_broadcast");
-    assignExpr(vb.getResult(), vb.getType(), os, nt,
-               [&](llvm::raw_ostream &e) {
-                 e << cppType(vb.getType()) << "{{";
-                 for (std::int64_t i = 0; i < size; ++i) {
-                   if (i)
-                     e << ", ";
-                   e << nt.get(vb.getScalar());
-                 }
-                 e << "}}";
-               }
-               );
-    return success();
-  }
-  if (auto vbd = dyn_cast<pyc::VBroadcastDimOp>(op)) {
-    auto srcVT = dyn_cast<VectorType>(vbd.getVec().getType());
-    auto dstVT = dyn_cast<VectorType>(vbd.getResult().getType());
-    if (!srcVT || !dstVT)
-      return vbd.emitError("C++ emitter expects vector types for v_broadcast_dim");
-    std::int64_t dim = vbd.getDimAttr().getInt();
-    assignExpr(vbd.getResult(), vbd.getType(), os, nt,
-               [&](llvm::raw_ostream &e) {
-                 e << cppType(dstVT) << "{{";
-                 // Walk all result lanes, mapping to source.
-                 std::function<void(unsigned, std::vector<int64_t> &)> walk;
-                 bool emittedAny = false;
-                 walk = [&](unsigned depth, std::vector<int64_t> &idx) {
-                   if (depth == static_cast<unsigned>(dstVT.getRank())) {
-                     if (emittedAny)
-                       e << ", ";
-                     emittedAny = true;
-                     // Build source index by dropping the broadcast dim.
-                     std::string srcIdx;
-                     for (unsigned d = 0; d < dstVT.getRank(); ++d)
-                       if (static_cast<int64_t>(d) != dim)
-                         srcIdx += "[" + std::to_string(idx[d]) + "]";
-                     e << nt.get(vbd.getVec()) << srcIdx;
-                     return;
-                   }
-                   for (int64_t i = 0; i < dstVT.getDimSize(depth); ++i) {
-                     idx.push_back(i);
-                     walk(depth + 1, idx);
-                     idx.pop_back();
-                   }
-                 };
-                 std::vector<int64_t> idx;
-                 walk(0, idx);
-                 e << "}}";
-               });
-    return success();
-  }
-  auto emitVectorReduce = [&](auto vr, const char *opName, const char *opToken) -> LogicalResult {
-    auto vt = dyn_cast<VectorType>(vr.getVec().getType());
-    if (!vt)
-      return vr.emitError("C++ emitter expects vector operand for pyc.") << opName;
-    if (vt.getRank() < 1 || vt.getRank() > 2)
-      return vr.emitError("C++ emitter currently supports rank-1/rank-2 pyc.") << opName;
-    for (std::int64_t lanes : vt.getShape()) {
-      if (lanes <= 0)
-        return vr.emitError("pyc.") << opName << " requires non-empty vector dimensions";
-    }
-    bool useTree = isTreeReduceMode(vr.getOperation());
-
-    if (!vr.getDim()) {
-      assignExpr(vr.getResult(), vr.getType(), os, nt,
-                 [&](llvm::raw_ostream &e) {
-                   llvm::SmallVector<std::string> terms;
-                   if (vt.getRank() == 1) {
-                     for (std::int64_t i = 0; i < vt.getShape()[0]; ++i)
-                       terms.push_back(nt.get(vr.getVec()) + "[" +
-                                       std::to_string(static_cast<long long>(i)) + "]");
-                   } else {
-                     for (std::int64_t i = 0; i < vt.getShape()[0]; ++i)
-                       for (std::int64_t j = 0; j < vt.getShape()[1]; ++j)
-                         terms.push_back(nt.get(vr.getVec()) + "[" +
-                                         std::to_string(static_cast<long long>(i)) + "][" +
-                                         std::to_string(static_cast<long long>(j)) + "]");
-                   }
-                   e << (useTree ? treeReduceExpr(terms, opToken) : chainReduceExpr(terms, opToken));
-                 });
-      return success();
-    }
-
-    std::int64_t dim = *vr.getDim();
-    if (dim < 0 || dim >= vt.getRank())
-      return vr.emitError("pyc.") << opName << " dim out of range";
-
-    std::int64_t lanes = vt.getShape()[0];
-    if (vt.getRank() == 1) {
-      assignExpr(vr.getResult(), vr.getType(), os, nt,
-                 [&](llvm::raw_ostream &e) {
-                   llvm::SmallVector<std::string> terms;
-                   for (std::int64_t i = 0; i < lanes; ++i) {
-                     terms.push_back(nt.get(vr.getVec()) + "[" +
-                                     std::to_string(static_cast<long long>(i)) + "]");
-                   }
-                   e << (useTree ? treeReduceExpr(terms, opToken) : chainReduceExpr(terms, opToken));
-                 }
-                 );
-      return success();
-    }
-
-    std::int64_t rows = vt.getShape()[0];
-    std::int64_t cols = vt.getShape()[1];
-    if (rows <= 0 || cols <= 0)
-      return vr.emitError("pyc.") << opName << " requires non-empty vector";
-    assignExpr(vr.getResult(), vr.getType(), os, nt,
-               [&](llvm::raw_ostream &e) {
-                 e << cppType(vr.getResult().getType()) << "{{";
-                 std::int64_t outLanes = (dim == 0) ? cols : rows;
-                 std::int64_t reduceLanes = (dim == 0) ? rows : cols;
-                 for (std::int64_t i = 0; i < outLanes; ++i) {
-                   if (i)
-                     e << ", ";
-                   llvm::SmallVector<std::string> terms;
-                   for (std::int64_t j = 0; j < reduceLanes; ++j) {
-                     if (dim == 0)
-                       terms.push_back(nt.get(vr.getVec()) + "[" +
-                                       std::to_string(static_cast<long long>(j)) + "][" +
-                                       std::to_string(static_cast<long long>(i)) + "]");
-                     else
-                       terms.push_back(nt.get(vr.getVec()) + "[" +
-                                       std::to_string(static_cast<long long>(i)) + "][" +
-                                       std::to_string(static_cast<long long>(j)) + "]");
-                   }
-                   e << (useTree ? treeReduceExpr(terms, opToken) : chainReduceExpr(terms, opToken));
-                 }
-                 e << "}}";
-               }
-               );
-    return success();
+  auto type = [&](unsigned id) -> const SimType & { return graph.values[id].type; };
+  auto name = [&](unsigned id) -> std::string {
+    return graph.values[id].sourceBacked ? nt.get(id)
+                                   : "_pyc_expr_" + std::to_string(id);
   };
-  if (auto vr = dyn_cast<pyc::VOrReduceOp>(op)) {
-    return emitVectorReduce(vr, "v_or_reduce", "|");
+  auto input = [&](unsigned index) {
+    unsigned id = expr.operands[index];
+    if (inlineRhs)
+      if (auto it = inlineRhs->find(id); it != inlineRhs->end())
+        return "(" + it->second + ")";
+    return name(id);
+  };
+  const SimType &resultType = type(expr.result);
+  unsigned width = resultType.width;
+  auto inputWidth = [&](unsigned index) { return type(expr.operands[index]).width; };
+  auto binary = [&](llvm::StringRef token) {
+    return "(" + input(0) + " " + token.str() + " " + input(1) + ")";
+  };
+  auto call = [&](llvm::StringRef function, unsigned callWidth,
+                  unsigned count) {
+    std::string code = "pyc::cpp::" + function.str() + "<" +
+                       std::to_string(callWidth) + ">(";
+    for (unsigned i = 0; i < count; ++i) {
+      if (i) code += ", ";
+      code += input(i);
+    }
+    return code + ")";
+  };
+  std::string code;
+  switch (expr.kind) {
+  case SimExprKind::Constant: {
+    code = cppType(resultType) + "({";
+    for (unsigned i = 0; i < (width + 63u) / 64u; ++i) {
+      if (i) code += ", ";
+      code += "0x" + llvm::utohexstr(expr.constant.getRawData()[i]) + "ull";
+    }
+    code += "})";
+    break;
   }
-  if (auto vr = dyn_cast<pyc::VAndReduceOp>(op)) {
-    return emitVectorReduce(vr, "v_and_reduce", "&");
+  case SimExprKind::Alias:
+  case SimExprKind::ResetActive:
+    code = input(0);
+    break;
+  case SimExprKind::Add: code = binary("+"); break;
+  case SimExprKind::Sub: code = binary("-"); break;
+  case SimExprKind::Mul: code = binary("*"); break;
+  case SimExprKind::And: code = binary("&"); break;
+  case SimExprKind::Or: code = binary("|"); break;
+  case SimExprKind::Xor: code = binary("^"); break;
+  case SimExprKind::Not: code = "(~" + input(0) + ")"; break;
+  case SimExprKind::Udiv: code = call("udiv", width, 2); break;
+  case SimExprKind::Urem: code = call("urem", width, 2); break;
+  case SimExprKind::Sdiv: code = call("sdiv", width, 2); break;
+  case SimExprKind::Srem: code = call("srem", width, 2); break;
+  case SimExprKind::Eq: code = call("eq", inputWidth(0), 2); break;
+  case SimExprKind::Ult: code = call("ult", inputWidth(0), 2); break;
+  case SimExprKind::Slt: code = call("slt", inputWidth(0), 2); break;
+  case SimExprKind::Mux:
+    code = call(type(expr.operands[0]).shape.empty() ? "mux" : "mux_vec",
+                width, 3);
+    break;
+  case SimExprKind::Select:
+    code = "(" + input(0) + ".toBool() ? " + input(1) + " : " + input(2) + ")";
+    break;
+  case SimExprKind::Trunc:
+  case SimExprKind::Zext:
+  case SimExprKind::Sext:
+  case SimExprKind::Extract: {
+    llvm::StringRef function = expr.kind == SimExprKind::Trunc ? "trunc" :
+                               expr.kind == SimExprKind::Zext ? "zext" :
+                               expr.kind == SimExprKind::Sext ? "sext" : "extract";
+    code = "pyc::cpp::" + function.str();
+    if (!type(expr.operands[0]).shape.empty()) code += "_vec";
+    code += "<" + std::to_string(width) + ", " +
+            std::to_string(inputWidth(0)) + ">(" + input(0);
+    if (expr.kind == SimExprKind::Extract)
+      code += ", " + std::to_string(expr.immediate) + "u";
+    code += ")";
+    break;
   }
-  if (auto vr = dyn_cast<pyc::VAddReduceOp>(op)) {
-    return emitVectorReduce(vr, "v_add_reduce", "+");
+  case SimExprKind::Shli:
+  case SimExprKind::Lshri:
+  case SimExprKind::Ashri:
+  case SimExprKind::Shl:
+  case SimExprKind::Lshr:
+  case SimExprKind::Ashr: {
+    llvm::StringRef function =
+        (expr.kind == SimExprKind::Shli || expr.kind == SimExprKind::Shl) ? "shl" :
+        (expr.kind == SimExprKind::Lshri || expr.kind == SimExprKind::Lshr) ? "lshr" : "ashr";
+    bool variable = expr.kind == SimExprKind::Shl ||
+                    expr.kind == SimExprKind::Lshr ||
+                    expr.kind == SimExprKind::Ashr;
+    code = "pyc::cpp::" + function.str() + "<" + std::to_string(width) +
+           ">(" + input(0) + ", " +
+           (variable ? "static_cast<unsigned>(" + input(1) + ".value())"
+                     : std::to_string(expr.immediate) + "u") + ")";
+    break;
   }
-  return op.emitError("unsupported combinational op for C++ emission");
+  case SimExprKind::Concat:
+    code = "pyc::cpp::concat(";
+    for (unsigned i = 0; i < expr.operands.size(); ++i) {
+      if (i) code += ", ";
+      code += input(i);
+    }
+    code += ")";
+    break;
+  case SimExprKind::VGet:
+    code = input(0) + "[" + std::to_string(expr.immediate) + "]";
+    break;
+  case SimExprKind::VCreate:
+    code = cppType(resultType) + "{{";
+    for (unsigned i = 0; i < expr.operands.size(); ++i) {
+      if (i) code += ", ";
+      code += input(i);
+    }
+    code += "}}";
+    break;
+  case SimExprKind::VBroadcast:
+    code = cppType(resultType) + "{{";
+    for (int64_t i = 0; i < expr.immediate; ++i) {
+      if (i) code += ", ";
+      code += input(0);
+    }
+    code += "}}";
+    break;
+  case SimExprKind::VBroadcastDim: {
+    const auto &shape = resultType.shape;
+    if (expr.dimension < 0 ||
+        static_cast<size_t>(expr.dimension) >= shape.size())
+      return failure();
+    uint64_t count = 1;
+    for (int64_t extent : shape) {
+      if (extent <= 0)
+        return failure();
+      count *= static_cast<uint64_t>(extent);
+    }
+    code = cppType(resultType) + "{{";
+    llvm::SmallVector<int64_t> indices(shape.size(), 0);
+    for (uint64_t lane = 0; lane < count; ++lane) {
+      if (lane)
+        code += ", ";
+      code += input(0);
+      for (size_t axis = 0; axis < shape.size(); ++axis)
+        if (static_cast<int64_t>(axis) != expr.dimension)
+          code += "[" + std::to_string(indices[axis]) + "]";
+      for (size_t axis = shape.size(); axis-- > 0;) {
+        if (++indices[axis] < shape[axis])
+          break;
+        indices[axis] = 0;
+      }
+    }
+    code += "}}";
+    break;
+  }
+  case SimExprKind::VOrReduce:
+  case SimExprKind::VAndReduce:
+  case SimExprKind::VAddReduce: {
+    llvm::StringRef token = expr.kind == SimExprKind::VOrReduce ? "|" :
+                            expr.kind == SimExprKind::VAndReduce ? "&" : "+";
+    const auto &shape = type(expr.operands[0]).shape;
+    auto reduce = [&](llvm::SmallVector<std::string> &terms) {
+      return expr.treeReduce ? treeReduceExpr(terms, token)
+                             : chainReduceExpr(terms, token);
+    };
+    if (expr.dimension < 0 || shape.size() == 1) {
+      llvm::SmallVector<std::string> terms;
+      if (shape.size() == 1) {
+        for (int64_t i = 0; i < shape[0]; ++i)
+          terms.push_back(input(0) + "[" + std::to_string(i) + "]");
+      } else if (shape.size() == 2) {
+        for (int64_t i = 0; i < shape[0]; ++i)
+          for (int64_t j = 0; j < shape[1]; ++j)
+            terms.push_back(input(0) + "[" + std::to_string(i) + "][" +
+                            std::to_string(j) + "]");
+      }
+      code = reduce(terms);
+    } else if (shape.size() == 2) {
+      code = cppType(resultType) + "{{";
+      int64_t outputs = expr.dimension == 0 ? shape[1] : shape[0];
+      int64_t lanes = expr.dimension == 0 ? shape[0] : shape[1];
+      for (int64_t i = 0; i < outputs; ++i) {
+        if (i) code += ", ";
+        llvm::SmallVector<std::string> terms;
+        for (int64_t j = 0; j < lanes; ++j) {
+          int64_t row = expr.dimension == 0 ? j : i;
+          int64_t col = expr.dimension == 0 ? i : j;
+          terms.push_back(input(0) + "[" + std::to_string(row) + "][" +
+                          std::to_string(col) + "]");
+        }
+        code += reduce(terms);
+      }
+      code += "}}";
+    }
+    break;
+  }
+  }
+  if (code.empty())
+    return failure();
+  if (expr.inlineIntoConsumer && inlineRhs) {
+    inlineRhs->try_emplace(expr.result, std::move(code));
+    return success();
+  }
+  os << "    " << name(expr.result) << " = " << code << ";\n";
+  return success();
 }
 
-static LogicalResult emitCombMethod(pyc::CombOp comb,
+static LogicalResult emitCombMethod(const SimGraph &graph,
+                                    const SimCombRegion &region,
+                                    const CombRegionStatementPlan &statements,
+                                    const llvm::DenseMap<unsigned,
+                                        CombRegionStatementPlan> &regionPlans,
                                     llvm::raw_ostream &os,
                                     NameTable &nt,
-                                    unsigned idx,
-                                    const CppEmitterOptions &opts) {
-  if (comb.getBody().empty())
-    return comb.emitError("pyc.comb must have a non-empty region");
+                                    unsigned idx) {
+  if (region.inputIds.size() != region.argumentIds.size() ||
+      region.resultIds.size() != region.yieldIds.size())
+    return region.source->emitError("simulation comb region is incomplete");
+  // The graph records block argument bindings and step order during IR import.
+  for (auto [argId, inputId] : llvm::zip(region.argumentIds,
+                                          region.inputIds))
+    nt.names.try_emplace(argId,
+                         nt.get(inputId));
+  std::function<LogicalResult(unsigned)> emitNested;
+  emitNested = [&](unsigned nestedId) -> LogicalResult {
+    const SimCombRegion &nested = graph.combRegions[nestedId];
+    for (auto [argId, inputId] : llvm::zip(nested.argumentIds,
+                                            nested.inputIds))
+      nt.names.try_emplace(argId,
+                           nt.get(inputId));
+    for (const auto &chunk : regionPlans.find(nestedId)->second.chunks)
+      for (const SimCombStep &step : chunk) {
+        if (step.expressionId != ~0u) {
+          if (failed(emitGraphExpr(graph, graph.expressions[step.expressionId],
+                                   os, nt)))
+            return failure();
+        } else if (failed(emitNested(step.nestedRegionId))) {
+          return failure();
+        }
+      }
+    for (auto [resultId, yieldId] : llvm::zip(nested.resultIds,
+                                               nested.yieldIds))
+      os << "    " << nt.get(resultId) << " = "
+         << nt.get(yieldId) << ";\n";
+    return success();
+  };
+  auto emitStep = [&](const SimCombStep &step) -> LogicalResult {
+    if (step.expressionId != ~0u)
+      return emitGraphExpr(graph, graph.expressions[step.expressionId],
+                           os, nt);
+    return emitNested(step.nestedRegionId);
+  };
+  auto emitYields = [&]() {
+    for (auto [resultId, yieldId] : llvm::zip(region.resultIds,
+                                              region.yieldIds))
+      os << "    " << nt.get(resultId) << " = "
+         << nt.get(yieldId) << ";\n";
+  };
 
-  Block &b = comb.getBody().front();
-  if (b.getNumArguments() != comb.getNumOperands())
-    return comb.emitError("pyc.comb body block argument count must match inputs");
-
-  // Map region args to the corresponding input values (by name).
-  for (auto [i, arg] : llvm::enumerate(b.getArguments()))
-    nt.names.try_emplace(arg, nt.get(comb.getInputs()[i]));
-
-  llvm::SmallVector<Operation *> combOps;
-  combOps.reserve(b.getOperations().size());
-  for (Operation &op : b) {
-    if (isa<pyc::YieldOp>(op))
-      break;
-    combOps.push_back(&op);
-  }
-
-  unsigned combChunkNodes = std::max(1u, opts.combChunkNodes);
-  if (combOps.size() > combChunkNodes) {
+  if (statements.chunks.size() > 1) {
     std::vector<std::string> partMethods;
-    partMethods.reserve((combOps.size() + combChunkNodes - 1) / combChunkNodes);
-    for (unsigned begin = 0, partIdx = 0; begin < combOps.size(); begin += combChunkNodes, ++partIdx) {
-      unsigned end = std::min<unsigned>(static_cast<unsigned>(combOps.size()), begin + combChunkNodes);
+    partMethods.reserve(statements.chunks.size());
+    for (auto [partIdx, chunk] : llvm::enumerate(statements.chunks)) {
       std::string partName = "eval_comb_" + std::to_string(idx) + "_part_" + std::to_string(partIdx);
       partMethods.push_back(partName);
       os << "  inline void " << partName << "() {\n";
-      for (unsigned i = begin; i < end; ++i) {
-        if (failed(emitCombAssign(*combOps[i], os, nt)))
+      for (const SimCombStep &step : chunk)
+        if (failed(emitStep(step)))
           return failure();
-      }
       os << "  }\n\n";
     }
 
@@ -858,162 +480,372 @@ static LogicalResult emitCombMethod(pyc::CombOp comb,
     for (const std::string &partName : partMethods)
       os << "    " << partName << "();\n";
 
-    auto y = dyn_cast_or_null<pyc::YieldOp>(b.getTerminator());
-    if (!y)
-      return comb.emitError("pyc.comb must terminate with pyc.yield");
-    if (y.getNumOperands() != comb.getNumResults())
-      return comb.emitError("pyc.yield operand count must match pyc.comb results");
-
-    for (auto [i, v] : llvm::enumerate(y.getOperands()))
-      os << "    " << nt.get(comb.getResult(i)) << " = " << nt.get(v) << ";\n";
+    emitYields();
     os << "  }\n\n";
     return success();
   }
 
   os << "  inline void eval_comb_" << idx << "() {\n";
-  for (Operation *op : combOps) {
-    if (failed(emitCombAssign(*op, os, nt)))
+  for (const SimCombStep &step : statements.chunks.front())
+    if (failed(emitStep(step)))
       return failure();
-  }
-
-  auto y = dyn_cast_or_null<pyc::YieldOp>(b.getTerminator());
-  if (!y)
-    return comb.emitError("pyc.comb must terminate with pyc.yield");
-  if (y.getNumOperands() != comb.getNumResults())
-    return comb.emitError("pyc.yield operand count must match pyc.comb results");
-
-  for (auto [i, v] : llvm::enumerate(y.getOperands()))
-    os << "    " << nt.get(comb.getResult(i)) << " = " << nt.get(v) << ";\n";
+  emitYields();
   os << "  }\n\n";
   return success();
 }
 
-static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEmitterOptions &opts) {
-  NameTable nt;
+static LogicalResult emitSimGroupMethod(const SimulationPlan &plan,
+                                        unsigned groupNodeId,
+                                        llvm::raw_ostream &os,
+                                        NameTable &nt, unsigned index,
+                                        const GroupActivationPlan *activation) {
+  const SimGraph &graph = plan.graph;
+  const GroupStatementPlan &statements =
+      plan.groupStatements.find(groupNodeId)->second;
+  std::string method = "eval_sim_group_" + std::to_string(index);
+  llvm::DenseMap<unsigned, std::string> inlineRhs;
+  for (unsigned id : statements.replicatedExpressionIds)
+    if (failed(emitGraphExpr(graph, graph.expressions[id], os, nt, &inlineRhs)))
+      return failure();
+  auto emitStatementChunk =
+      [&](const llvm::SmallVector<SimStatement> &chunk) -> LogicalResult {
+    for (const SimStatement &statement : chunk) {
+      if (statement.kind == SimStatementKind::Expression) {
+        if (failed(emitGraphExpr(graph,
+                                 graph.expressions[statement.expressionId],
+                                 os, nt, &inlineRhs)))
+          return failure();
+        continue;
+      }
+      os << "    if (" << nt.get(statement.selectorId)
+         << ".toBool()) {\n";
+      for (const PlannedMuxAssignment &assignment :
+           statement.muxAssignments) {
+        os << "      " << nt.get(assignment.resultId)
+           << " = " << nt.get(assignment.trueValueId)
+           << ";\n";
+      }
+      os << "    } else {\n";
+      for (const PlannedMuxAssignment &assignment :
+           statement.muxAssignments) {
+        os << "      " << nt.get(assignment.resultId)
+           << " = " << nt.get(assignment.falseValueId)
+           << ";\n";
+      }
+      os << "    }\n";
+    }
+    return success();
+  };
+  auto emitActivationCheck = [&]() {
+    if (!activation)
+      return;
+    std::string prefix = "_pyc_group_" + std::to_string(index);
+    auto emitInput = [&](unsigned i, unsigned inputId) {
+      const SimValue &input = graph.values[inputId];
+      if (i >= activation->usedBits.size() ||
+          activation->usedBits[i].isAllOnes()) {
+        os << nt.get(inputId);
+        return;
+      }
+      const llvm::APInt &mask = activation->usedBits[i];
+      unsigned width = input.type.width;
+      os << "(" << nt.get(inputId) << " & pyc::cpp::Wire<" << width << ">({";
+      for (unsigned word = 0; word < (width + 63u) / 64u; ++word) {
+        if (word)
+          os << ", ";
+        os << mask.extractBitsAsZExtValue(
+                  std::min(64u, width - word * 64u), word * 64u)
+           << "ull";
+      }
+      os << "}))";
+    };
+    os << "    if (" << prefix << "_valid";
+    for (auto [i, input] : llvm::enumerate(activation->inputIds)) {
+      const SimType &type = graph.values[input].type;
+      bool selectedElements = type.shape.size() == 2 &&
+                              i < activation->vectorElements.size() &&
+                              !activation->vectorElements[i].isAllOnes();
+      bool selectedLanes = !type.shape.empty() &&
+                           i < activation->vectorLanes.size() &&
+                           !activation->vectorLanes[i].isAllOnes();
+      if (selectedElements) {
+        const llvm::APInt &mask = activation->vectorElements[i];
+        unsigned columns = static_cast<unsigned>(type.shape[1]);
+        for (unsigned element = 0; element < mask.getBitWidth(); ++element)
+          if (mask[element]) {
+            unsigned row = element / columns, col = element % columns;
+            os << " && " << prefix << "_in_" << i << "[" << row << "]["
+               << col << "] == " << nt.get(input) << "[" << row << "]["
+               << col << "]";
+          }
+      } else if (selectedLanes) {
+        const llvm::APInt &mask = activation->vectorLanes[i];
+        for (unsigned lane = 0; lane < mask.getBitWidth(); ++lane)
+          if (mask[lane])
+            os << " && " << prefix << "_in_" << i << "[" << lane
+               << "] == " << nt.get(input) << "[" << lane << "]";
+      } else {
+        os << " && " << prefix << "_in_" << i << " == ";
+        emitInput(i, input);
+      }
+    }
+    os << ") {\n";
+    os << "      if (_pyc_sim_stats_enable) _pyc_sim_stats.group_cache_skips++;\n";
+    os << "      return;\n";
+    os << "    }\n";
+    for (auto [i, input] : llvm::enumerate(activation->inputIds)) {
+      const SimType &type = graph.values[input].type;
+      std::string cached = prefix + "_in_" + std::to_string(i);
+      if (type.shape.size() == 2 &&
+          i < activation->vectorElements.size() &&
+          !activation->vectorElements[i].isAllOnes()) {
+        const llvm::APInt &elements = activation->vectorElements[i];
+        unsigned columns = static_cast<unsigned>(type.shape[1]);
+        for (unsigned element = 0; element < elements.getBitWidth(); ++element)
+          if (elements[element]) {
+            unsigned row = element / columns, col = element % columns;
+            os << "    " << cached << "[" << row << "][" << col << "] = "
+               << nt.get(input) << "[" << row << "][" << col << "];\n";
+          }
+        continue;
+      }
+      if (!type.shape.empty() && i < activation->vectorLanes.size() &&
+          !activation->vectorLanes[i].isAllOnes()) {
+        const llvm::APInt &lanes = activation->vectorLanes[i];
+        for (unsigned lane = 0; lane < lanes.getBitWidth(); ++lane)
+          if (lanes[lane])
+            os << "    " << cached << "[" << lane << "] = "
+               << nt.get(input) << "[" << lane << "];\n";
+        continue;
+      }
+      os << "    " << prefix << "_in_" << i << " = ";
+      emitInput(i, input);
+      os << ";\n";
+    }
+    os << "    " << prefix << "_valid = true;\n";
+    os << "    if (_pyc_sim_stats_enable) _pyc_sim_stats.group_eval_calls++;\n";
+  };
+  std::set<unsigned> trackedOutputs;
+  if (auto it = plan.groupPropagations.find(groupNodeId);
+      it != plan.groupPropagations.end())
+    for (const GroupPropagationTarget &target : it->second)
+      trackedOutputs.insert(target.valueIds.begin(), target.valueIds.end());
+  auto oldOutputName = [](unsigned id) {
+    return "_pyc_old_group_value_" + std::to_string(id);
+  };
+  auto emitOutputSnapshots = [&]() {
+    for (unsigned value : trackedOutputs)
+      os << "    auto " << oldOutputName(value) << " = "
+         << nt.get(value) << ";\n";
+  };
+  auto emitPropagation = [&]() {
+    auto it = plan.groupPropagations.find(groupNodeId);
+    if (it == plan.groupPropagations.end())
+      return;
+    for (const GroupPropagationTarget &target : it->second) {
+      unsigned targetIndex = plan.groupByNode.lookup(target.groupNodeId);
+      os << "    if (";
+      for (auto [i, value] : llvm::enumerate(target.valueIds)) {
+        if (i)
+          os << " || ";
+        const SimType &type = graph.values[value].type;
+        if (type.shape.size() == 2 &&
+            !target.vectorElements[i].isAllOnes()) {
+          const llvm::APInt &elements = target.vectorElements[i];
+          unsigned columns = static_cast<unsigned>(type.shape[1]);
+          os << "(";
+          bool firstElement = true;
+          for (unsigned element = 0; element < elements.getBitWidth(); ++element) {
+            if (!elements[element])
+              continue;
+            if (!firstElement)
+              os << " || ";
+            firstElement = false;
+            unsigned row = element / columns, col = element % columns;
+            os << nt.get(value) << "[" << row << "][" << col << "] != "
+               << oldOutputName(value) << "[" << row << "][" << col << "]";
+          }
+          if (firstElement)
+            os << "false";
+          os << ")";
+          continue;
+        }
+        if (!type.shape.empty() &&
+            !target.vectorLanes[i].isAllOnes()) {
+          const llvm::APInt &lanes = target.vectorLanes[i];
+          os << "(";
+          bool firstLane = true;
+          for (unsigned lane = 0; lane < lanes.getBitWidth(); ++lane) {
+            if (!lanes[lane])
+              continue;
+            if (!firstLane)
+              os << " || ";
+            firstLane = false;
+            os << nt.get(value) << "[" << lane << "] != "
+               << oldOutputName(value) << "[" << lane << "]";
+          }
+          if (firstLane)
+            os << "false";
+          os << ")";
+          continue;
+        }
+        const llvm::APInt &mask = target.usedBits[i];
+        auto emitMaskedValue = [&](llvm::StringRef name) {
+          if (mask.isAllOnes()) {
+            os << name;
+            return;
+          }
+          unsigned width = graph.values[value].type.width;
+          os << "(" << name << " & pyc::cpp::Wire<" << width << ">({";
+          for (unsigned word = 0; word < (width + 63u) / 64u; ++word) {
+            if (word)
+              os << ", ";
+            os << mask.extractBitsAsZExtValue(
+                      std::min(64u, width - word * 64u), word * 64u)
+               << "ull";
+          }
+          os << "}))";
+        };
+        emitMaskedValue(nt.get(value));
+        os << " != ";
+        emitMaskedValue(oldOutputName(value));
+      }
+      os << ") _pyc_group_active_flags[" << targetIndex / 64u
+         << "] |= (1ull << " << targetIndex % 64u << ");\n";
+    }
+  };
+  if (statements.chunks.size() > 1) {
+    for (size_t part = 0; part < statements.chunks.size(); ++part) {
+      os << "  inline void " << method << "_part_" << part << "() {\n";
+      if (failed(emitStatementChunk(statements.chunks[part])))
+        return failure();
+      os << "  }\n\n";
+    }
+    os << "  inline void " << method << "() {\n";
+    emitActivationCheck();
+    emitOutputSnapshots();
+    for (size_t part = 0; part < statements.chunks.size(); ++part)
+      os << "    " << method << "_part_" << part << "();\n";
+    emitPropagation();
+    os << "  }\n\n";
+    return success();
+  }
+  os << "  inline void " << method << "() {\n";
+  emitActivationCheck();
+  emitOutputSnapshots();
+  if (failed(emitStatementChunk(statements.chunks.front())))
+    return failure();
+  emitPropagation();
+  os << "  }\n\n";
+  return success();
+}
 
-  if (!llvm::hasSingleElement(f.getBody()))
-    return f.emitError("C++ emitter currently supports single-block functions only");
+static LogicalResult emitFunc(const SimulationPlan &plan, llvm::raw_ostream &os, const CppEmitterOptions &opts) {
+  func::FuncOp f = plan.graph.function;
+  if (failed(plan.verify()))
+    return f.emitError("C++ emitter received an incomplete simulation plan");
+  NameTable nt(plan.graph);
 
-  Block &top = f.getBody().front();
-
-  std::string structName = sanitizeId(f.getSymName());
+  std::string structName = sanitizeId(plan.graph.functionName);
   os << "struct " << structName << " {\n";
 
   // Ports.
   std::vector<std::string> inNames;
-  inNames.reserve(f.getNumArguments());
+  inNames.reserve(plan.graph.inputValueIds.size());
   std::vector<std::string> inCanon;
-  inCanon.reserve(f.getNumArguments());
+  inCanon.reserve(plan.graph.inputValueIds.size());
   std::vector<std::string> outNames;
-  outNames.reserve(f.getNumResults());
+  outNames.reserve(plan.graph.outputValueIds.size());
   std::vector<std::string> outCanon;
-  outCanon.reserve(f.getNumResults());
-  for (auto [i, arg] : llvm::enumerate(f.getArguments())) {
-    inCanon.push_back(getPortCanonicalFieldPath(f, i, /*isResult=*/false));
-    std::string name = nt.unique(getPortName(f, i, /*isResult=*/false));
+  outCanon.reserve(plan.graph.outputValueIds.size());
+  for (auto [i, valueId] : llvm::enumerate(plan.graph.inputValueIds)) {
+    const SimValue &arg = plan.graph.values[valueId];
+    inCanon.push_back(plan.graph.inputPortPaths[i]);
+    std::string name = nt.unique(sanitizeId(inCanon.back()));
     inNames.push_back(name);
-    nt.names.try_emplace(arg, name);
-    os << "  " << cppType(arg.getType()) << " " << name << "{};\n";
+    nt.names.try_emplace(valueId, name);
+    os << "  " << cppType(arg.type) << " " << name << "{};\n";
   }
-  for (unsigned i = 0; i < f.getNumResults(); ++i) {
-    outCanon.push_back(getPortCanonicalFieldPath(f, i, /*isResult=*/true));
-    std::string name = nt.unique(getPortName(f, i, /*isResult=*/true));
+  for (unsigned i = 0; i < plan.graph.outputValueIds.size(); ++i) {
+    outCanon.push_back(plan.graph.outputPortPaths[i]);
+    std::string name = nt.unique(sanitizeId(outCanon.back()));
     outNames.push_back(name);
-    os << "  " << cppType(f.getResultTypes()[i]) << " " << name << "{};\n";
+    os << "  " << cppType(plan.graph.values[plan.graph.outputValueIds[i]].type)
+       << " " << name << "{};\n";
   }
   os << "\n";
 
   // Internal wires for op results (including inside pyc.comb regions).
   struct Decl {
     std::string name;
-    Type ty;
+    SimType type;
   };
   std::vector<Decl> decls;
-  decls.reserve(256);
-  f.walk([&](Operation *op) {
-    for (Value r : op->getResults()) {
-      decls.push_back(Decl{nt.get(r), r.getType()});
-    }
-  });
+  decls.reserve(plan.graph.declarationValueIds.size());
+  for (unsigned id : plan.graph.declarationValueIds) {
+    const SimValue &value = plan.graph.values[id];
+    decls.push_back(Decl{nt.get(id), value.type});
+  }
   std::sort(decls.begin(), decls.end(), [](const Decl &a, const Decl &b) { return a.name < b.name; });
   for (const Decl &d : decls)
-    os << "  " << cppType(d.ty) << " " << d.name << "{};\n";
+    os << "  " << cppType(d.type) << " " << d.name << "{};\n";
   os << "\n";
 
-  // Sequential primitive instances.
-  llvm::SmallVector<pyc::RegOp> regs;
-  llvm::SmallVector<pyc::FifoOp> fifos;
-  llvm::SmallVector<pyc::ByteMemOp> byteMems;
-  llvm::SmallVector<pyc::SyncMemOp> syncMems;
-  llvm::SmallVector<pyc::SyncMemDPOp> syncMemDPs;
-  llvm::SmallVector<pyc::AsyncFifoOp> asyncFifos;
-  llvm::SmallVector<pyc::CdcSyncOp> cdcSyncs;
-  llvm::SmallVector<pyc::InstanceOp> instances;
-  llvm::SmallVector<pyc::CombOp> combs;
-
-  for (Operation &op : top) {
-    if (auto r = dyn_cast<pyc::RegOp>(op))
-      regs.push_back(r);
-    else if (auto fifo = dyn_cast<pyc::FifoOp>(op))
-      fifos.push_back(fifo);
-    else if (auto mem = dyn_cast<pyc::ByteMemOp>(op))
-      byteMems.push_back(mem);
-    else if (auto mem = dyn_cast<pyc::SyncMemOp>(op))
-      syncMems.push_back(mem);
-    else if (auto mem = dyn_cast<pyc::SyncMemDPOp>(op))
-      syncMemDPs.push_back(mem);
-    else if (auto fifo = dyn_cast<pyc::AsyncFifoOp>(op))
-      asyncFifos.push_back(fifo);
-    else if (auto s = dyn_cast<pyc::CdcSyncOp>(op))
-      cdcSyncs.push_back(s);
-    else if (auto inst = dyn_cast<pyc::InstanceOp>(op))
-      instances.push_back(inst);
-    else if (auto comb = dyn_cast<pyc::CombOp>(op))
-      combs.push_back(comb);
+  for (auto [i, nodeIndex] : llvm::enumerate(plan.graph.groupedNodes)) {
+    auto activation = plan.groupActivations.find(nodeIndex);
+    if (activation == plan.groupActivations.end())
+      continue;
+    std::string prefix = "_pyc_group_" + std::to_string(i);
+    os << "  bool " << prefix << "_valid = false;\n";
+    for (auto [inputIndex, inputId] : llvm::enumerate(activation->second.inputIds))
+      os << "  " << cppType(plan.graph.values[inputId].type) << " " << prefix << "_in_"
+         << inputIndex << "{};\n";
+  }
+  if (!plan.packedActivationGroups.empty()) {
+    unsigned words = (plan.graph.groupedNodes.size() + 63u) / 64u;
+    os << "  std::uint64_t _pyc_group_active_flags[" << words << "] = {";
+    for (unsigned word = 0; word < words; ++word) {
+      if (word)
+        os << ", ";
+      os << "~0ull";
+    }
+    os << "};\n";
+  }
+  for (auto [i, group] : llvm::enumerate(plan.resetGroups)) {
+    (void)group;
+    os << "  bool _pyc_reset_group_clk_prev_" << i << " = false;\n";
   }
 
-  auto regKey = [&](pyc::RegOp r) { return nt.get(r.getQ()); };
-  auto fifoKey = [&](pyc::FifoOp f) { return nt.get(f.getInReady()); };
-  auto memKey = [&](pyc::ByteMemOp m) -> std::string {
-    if (auto nameAttr = m->getAttrOfType<StringAttr>("name"))
-      return sanitizeId(nameAttr.getValue());
-    return nt.get(m.getRdata());
+  // The simulation plan fixes primitive, instance and comb order.
+  llvm::SmallVector<unsigned> regs = plan.operationOrder.regs;
+  llvm::SmallVector<unsigned> fifos = plan.operationOrder.fifos;
+  llvm::SmallVector<unsigned> byteMems = plan.operationOrder.byteMems;
+  llvm::SmallVector<unsigned> syncMems = plan.operationOrder.syncMems;
+  llvm::SmallVector<unsigned> syncMemDPs = plan.operationOrder.syncMemDPs;
+  llvm::SmallVector<unsigned> asyncFifos = plan.operationOrder.asyncFifos;
+  llvm::SmallVector<unsigned> cdcSyncs = plan.operationOrder.cdcSyncs;
+  llvm::SmallVector<unsigned> instances = plan.operationOrder.instances;
+  auto graphValueName = [&](unsigned valueId) {
+    return nt.get(valueId);
   };
-  auto syncMemKey = [&](pyc::SyncMemOp m) -> std::string {
-    if (auto nameAttr = m->getAttrOfType<StringAttr>("name"))
-      return sanitizeId(nameAttr.getValue());
-    return nt.get(m.getRdata());
+  auto fifoInputName = [&](unsigned nodeId, unsigned index) {
+    return graphValueName(plan.graph.topNodes[nodeId].inputIds[index]);
   };
-  auto syncMemDPKey = [&](pyc::SyncMemDPOp m) -> std::string {
-    if (auto nameAttr = m->getAttrOfType<StringAttr>("name"))
-      return sanitizeId(nameAttr.getValue());
-    return nt.get(m.getRdata0());
+  auto fifoOutputName = [&](unsigned nodeId, unsigned index) {
+    return graphValueName(plan.graph.topNodes[nodeId].outputIds[index]);
   };
-  auto asyncFifoKey = [&](pyc::AsyncFifoOp f) { return nt.get(f.getInReady()); };
-  auto cdcKey = [&](pyc::CdcSyncOp s) { return nt.get(s.getOut()); };
-
-  std::sort(regs.begin(), regs.end(), [&](pyc::RegOp a, pyc::RegOp b) { return regKey(a) < regKey(b); });
-  std::sort(fifos.begin(), fifos.end(), [&](pyc::FifoOp a, pyc::FifoOp b) { return fifoKey(a) < fifoKey(b); });
-  std::sort(byteMems.begin(), byteMems.end(), [&](pyc::ByteMemOp a, pyc::ByteMemOp b) { return memKey(a) < memKey(b); });
-  std::sort(syncMems.begin(), syncMems.end(), [&](pyc::SyncMemOp a, pyc::SyncMemOp b) { return syncMemKey(a) < syncMemKey(b); });
-  std::sort(syncMemDPs.begin(), syncMemDPs.end(), [&](pyc::SyncMemDPOp a, pyc::SyncMemDPOp b) { return syncMemDPKey(a) < syncMemDPKey(b); });
-  std::sort(asyncFifos.begin(), asyncFifos.end(), [&](pyc::AsyncFifoOp a, pyc::AsyncFifoOp b) { return asyncFifoKey(a) < asyncFifoKey(b); });
-  std::sort(cdcSyncs.begin(), cdcSyncs.end(), [&](pyc::CdcSyncOp a, pyc::CdcSyncOp b) { return cdcKey(a) < cdcKey(b); });
-  auto combKey = [&](pyc::CombOp c) { return nt.get(c.getResult(0)); };
-  std::sort(combs.begin(), combs.end(), [&](pyc::CombOp a, pyc::CombOp b) { return combKey(a) < combKey(b); });
-
-  auto instKey = [&](pyc::InstanceOp i) -> std::string {
-    if (auto nameAttr = i->getAttrOfType<StringAttr>("name"))
-      return sanitizeId(nameAttr.getValue());
-    if (i.getNumResults() > 0)
-      return nt.get(i.getResult(0));
-    return "inst";
+  auto fifoInstanceName = [&](unsigned nodeId) {
+    return fifoOutputName(nodeId, 0) + "_inst";
   };
-  std::sort(instances.begin(), instances.end(), [&](pyc::InstanceOp a, pyc::InstanceOp b) { return instKey(a) < instKey(b); });
+  auto memoryInstanceName = [&](unsigned nodeId) {
+    const SimNode &mem = plan.graph.topNodes[nodeId];
+    return mem.primitiveHasName ? sanitizeId(mem.primitiveName)
+                                : graphValueName(mem.outputIds.front()) + "_inst";
+  };
 
   struct InstInfo {
-    pyc::InstanceOp op;
-    func::FuncOp callee;
+    unsigned nodeId;
+    std::string calleeName;
     std::string member;
     std::string seg;
     std::vector<std::string> inPorts;
@@ -1021,106 +853,63 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
   };
   std::vector<InstInfo> instInfos;
   instInfos.reserve(instances.size());
-  llvm::DenseMap<Operation *, unsigned> instIndex;
-  ModuleOp mod = f->getParentOfType<ModuleOp>();
-  if (!mod)
-    return f.emitError("C++ emitter: missing parent module for instance resolution");
-  std::vector<bool> instHasSequentialCallee{};
-
+  llvm::DenseMap<unsigned, unsigned> instIndex;
   if (!instances.empty()) {
-    for (auto inst : instances) {
-      auto calleeAttr = inst->getAttrOfType<FlatSymbolRefAttr>("callee");
-      if (!calleeAttr)
-        return inst.emitError("missing required FlatSymbolRefAttr `callee`");
-      auto callee = mod.lookupSymbol<func::FuncOp>(calleeAttr.getValue());
-      if (!callee)
-        return inst.emitError("callee symbol not found: ") << calleeAttr.getValue();
-
-      std::vector<std::string> inPorts;
-      std::vector<std::string> outPorts;
-      computeUniquePortNames(callee, inPorts, outPorts);
-      if (inPorts.size() != inst.getNumOperands())
-        return inst.emitError("operand count does not match callee signature: inst=")
-               << inst.getNumOperands() << ", callee=" << inPorts.size()
-               << " (" << callee.getSymName() << ")";
-      if (outPorts.size() != inst.getNumResults())
-        return inst.emitError("result count does not match callee signature: inst=")
-               << inst.getNumResults() << ", callee=" << outPorts.size()
-               << " (" << callee.getSymName() << ")";
+    for (unsigned nodeId : instances) {
+      const SimNode &inst = plan.graph.topNodes[nodeId];
+      const InstanceInterfacePlan &interface = plan.instanceInterfaces.find(nodeId)->second;
+      std::vector<std::string> inPorts = interface.inputPorts;
+      std::vector<std::string> outPorts = interface.outputPorts;
 
       std::string base = "inst";
-      if (auto nameAttr = inst->getAttrOfType<StringAttr>("name"))
-        base = sanitizeId(nameAttr.getValue());
+      if (inst.instanceHasName)
+        base = sanitizeId(inst.instanceName);
       else
-        base = sanitizeId(callee.getSymName()) + std::string("_inst");
+        base = sanitizeId(inst.instanceCallee) + std::string("_inst");
       std::string seg = base;
-      if (auto shortAttr = inst->getAttrOfType<StringAttr>("short_name"))
-        seg = sanitizeId(shortAttr.getValue());
+      if (inst.instanceHasShortName)
+        seg = sanitizeId(inst.instanceShortName);
       std::string member = nt.unique(base);
 
       unsigned idx = static_cast<unsigned>(instInfos.size());
-      instIndex.try_emplace(inst.getOperation(), idx);
-      instInfos.push_back(InstInfo{inst, callee, std::move(member), std::move(seg), std::move(inPorts), std::move(outPorts)});
+      instIndex.try_emplace(nodeId, idx);
+      instInfos.push_back(InstInfo{nodeId, inst.instanceCallee, std::move(member), std::move(seg), std::move(inPorts), std::move(outPorts)});
     }
 
-    llvm::DenseMap<Operation *, SeqStateKind> seqMemo{};
-    instHasSequentialCallee.reserve(instInfos.size());
-    for (const auto &ii : instInfos) {
-      instHasSequentialCallee.push_back(functionHasSequentialState(ii.callee, mod, seqMemo));
-    }
   }
 
   auto instancePackedCacheWordCount = [&](const InstInfo &ii) -> unsigned {
-    unsigned words = 0;
-    auto inst = ii.op;
-    for (unsigned i = 0; i < inst.getNumOperands(); ++i) {
-      unsigned inW = bitWidth(inst.getOperand(i).getType());
-      words += std::max(1u, (inW + 63u) / 64u);
-    }
-    return words;
+    return plan.instanceCaches.lookup(ii.nodeId).packedWords;
   };
-
-  // Medium fanout glue modules still explode into large TUs if they keep the
-  // per-port versioned cache form. Prefer the exact packed-word cache once an
-  // instance reaches moderate input width/count.
-  constexpr unsigned kPackedInstanceCacheOperandThreshold = 12;
-  constexpr unsigned kPackedInstanceCacheWordThreshold = 16;
   auto usePackedInstanceEvalCache = [&](const InstInfo &ii) -> bool {
-    auto inst = ii.op;
-    unsigned packedWords = instancePackedCacheWordCount(ii);
-    return (inst.getNumOperands() >= kPackedInstanceCacheOperandThreshold) || (packedWords >= kPackedInstanceCacheWordThreshold);
+    return plan.instanceCaches.lookup(ii.nodeId).usePackedWords;
   };
 
-  llvm::DenseMap<Operation *, std::string> byteMemInstName;
-  llvm::DenseMap<Operation *, std::string> syncMemInstName;
-  llvm::DenseMap<Operation *, std::string> syncMemDPInstName;
 
 	  if (!instInfos.empty()) {
 	    os << "  // Sub-modules.\n";
 	    for (const auto &ii : instInfos) {
-	      auto callee = ii.callee;
 	      // Decision 0012: Parent SimObjects own children via unique_ptr.
-	      os << "  std::unique_ptr<" << sanitizeId(callee.getSymName()) << "> " << ii.member
-	         << " = std::make_unique<" << sanitizeId(callee.getSymName()) << ">();\n";
+	      os << "  std::unique_ptr<" << sanitizeId(ii.calleeName) << "> " << ii.member
+	         << " = std::make_unique<" << sanitizeId(ii.calleeName) << ">();\n";
 	    }
 	    os << "\n";
 
     os << "  // Sub-module eval cache (default-on in C++; can be disabled with\n";
     os << "  // -DPYC_DISABLE_INSTANCE_EVAL_CACHE).\n";
     for (const auto &ii : instInfos) {
-      auto inst = ii.op;
+      const SimNode &inst = plan.graph.topNodes[ii.nodeId];
       os << "  bool " << ii.member << "_eval_cache_valid = false;\n";
       if (usePackedInstanceEvalCache(ii)) {
         os << "  std::array<std::uint64_t, " << instancePackedCacheWordCount(ii) << "> " << ii.member
            << "_eval_cache_words{};\n";
       } else {
-        for (unsigned i = 0; i < inst.getNumOperands(); ++i) {
+        for (unsigned i = 0; i < inst.inputIds.size(); ++i) {
           std::string cacheName = ii.member + "_eval_cache_in_" + std::to_string(i);
-          unsigned inW = bitWidth(inst.getOperand(i).getType());
-          os << "  " << cppType(inst.getOperand(i).getType()) << " " << cacheName << "{};\n";
+          os << "  " << cppType(plan.graph.values[inst.inputIds[i]].type) << " " << cacheName << "{};\n";
           os << "  std::uint64_t " << ii.member << "_eval_cache_in_ver_" << i << " = 1ull;\n";
           os << "  std::uint64_t " << ii.member << "_eval_cache_in_seen_ver_" << i << " = 0ull;\n";
-          if (inW <= 64)
+          if (plan.fingerprintInputs.contains(inst.inputIds[i]))
             os << "  std::uint64_t " << ii.member << "_eval_cache_in_fp_" << i << " = 0ull;\n";
         }
       }
@@ -1173,96 +962,91 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
       std::string cppRegInst;
       unsigned width = 0;
       bool isReg = false;
-      Type type;
+      SimType type;
     };
 
     // Decision 0003 / 0051-0052: infer probe kind for ports and named internal
     // objects. A value is considered stateful iff it directly returns the q
-    // output of a local pyc.reg (through optional pyc.alias wrappers).
-    std::vector<bool> outIsReg(f.getNumResults(), false);
-    std::vector<Value> outRegQ(f.getNumResults(), Value());
+    // output of a local pyc.reg through captured aliases or comb passthroughs.
+    std::vector<bool> outIsReg(plan.graph.outputValueIds.size(), false);
+    std::vector<unsigned> outRegQ(plan.graph.outputValueIds.size(), ~0u);
     std::vector<NamedProbeInfo> namedProbes;
-    if (!f.isDeclaration()) {
-      auto ret = dyn_cast_or_null<func::ReturnOp>(f.getBody().front().getTerminator());
-      if (!ret)
-        return f.emitError("missing return");
-      for (unsigned i = 0; i < f.getNumResults() && i < ret.getNumOperands(); ++i)
-        outRegQ[i] = findRegQFromValue(ret.getOperand(i));
-      for (unsigned i = 0; i < f.getNumResults(); ++i)
-        outIsReg[i] = static_cast<bool>(outRegQ[i]);
+    {
+      for (unsigned i = 0; i < plan.graph.outputValueIds.size(); ++i)
+        if (auto it = plan.registerProbeTargets.find(plan.graph.outputValueIds[i]);
+            it != plan.registerProbeTargets.end())
+          outRegQ[i] = it->second;
+      for (unsigned i = 0; i < plan.graph.outputValueIds.size(); ++i)
+        outIsReg[i] = outRegQ[i] != ~0u;
 
       llvm::StringSet<> seenNamedFields;
-      f.walk([&](Operation *op) {
-        auto nameAttr = op->getAttrOfType<StringAttr>("pyc.name");
-        if (!nameAttr || op->getNumResults() != 1)
-          return;
-        Value value = op->getResult(0);
-        unsigned width = bitWidth(value.getType());
+      for (unsigned id : plan.graph.namedProbeValueIds) {
+        const SimValue &signal = plan.graph.values[id];
+        unsigned width = signal.type.width;
         if (width == 0)
-          return;
-        std::string fieldPath = nameAttr.getValue().str();
+          continue;
+        std::string fieldPath = signal.probeName;
         if (!seenNamedFields.insert(fieldPath).second)
-          return;
-        Value regQ = findRegQFromValue(value);
+          continue;
+        unsigned regQ = ~0u;
+        if (auto it = plan.registerProbeTargets.find(id);
+            it != plan.registerProbeTargets.end())
+          regQ = it->second;
         namedProbes.push_back(NamedProbeInfo{
             fieldPath,
-            nt.get(value),
-            static_cast<bool>(regQ) ? (nt.get(regQ) + "_inst") : std::string(),
+            nt.get(id),
+            regQ != ~0u ? (nt.get(regQ) + "_inst") : std::string(),
             width,
-            static_cast<bool>(regQ),
-            value.getType(),
+            regQ != ~0u,
+            signal.type,
         });
-      });
+      }
       std::sort(namedProbes.begin(), namedProbes.end(), [](const NamedProbeInfo &a, const NamedProbeInfo &b) {
         return a.fieldPath < b.fieldPath;
       });
     }
 
-		  for (auto [i, arg] : llvm::enumerate(f.getArguments())) {
-		    unsigned w = bitWidth(arg.getType());
+		  for (auto [i, valueId] : llvm::enumerate(plan.graph.inputValueIds)) {
+        const SimType &type = plan.graph.values[valueId].type;
+		    unsigned w = type.width;
 		    if (w == 0)
-		      return f.emitError("invalid input port width for ProbeRegistry: ") << getPortCanonicalFieldPath(f, i, /*isResult=*/false);
-		    emitWireProbes(os, arg.getType(), w, inCanon[static_cast<unsigned>(i)], inNames[static_cast<unsigned>(i)]);
+		      return f.emitError("invalid input port width for ProbeRegistry: ") << inCanon[i];
+		    emitWireProbes(os, type, inCanon[static_cast<unsigned>(i)], inNames[static_cast<unsigned>(i)]);
 		  }
-		  for (unsigned i = 0; i < f.getNumResults(); ++i) {
-		    unsigned w = bitWidth(f.getResultTypes()[i]);
+		  for (unsigned i = 0; i < plan.graph.outputValueIds.size(); ++i) {
+        const SimType &type = plan.graph.values[plan.graph.outputValueIds[i]].type;
+		    unsigned w = type.width;
 		    if (w == 0)
-		      return f.emitError("invalid output port width for ProbeRegistry: ") << getPortCanonicalFieldPath(f, i, /*isResult=*/true);
-		    if (outIsReg[i] && !isa<VectorType>(f.getResultTypes()[i])) {
+		      return f.emitError("invalid output port width for ProbeRegistry: ") << outCanon[i];
+		    if (outIsReg[i] && type.shape.empty()) {
 		      os << "    reg.addReg<" << w << ">(reg_path(" << cppStringLiteral(outCanon[i]) << "), &" << outNames[i]
 		         << ", &" << nt.get(outRegQ[i]) << "_inst->pending, &" << nt.get(outRegQ[i]) << "_inst->qNext);\n";
 		    } else {
-		      emitWireProbes(os, f.getResultTypes()[i], w, outCanon[i], outNames[i]);
+		      emitWireProbes(os, type, outCanon[i], outNames[i]);
 		    }
 		  }
       for (const auto &named : namedProbes) {
-        if (named.isReg && !isa<VectorType>(named.type)) {
+        if (named.isReg && named.type.shape.empty()) {
           os << "    reg.addReg<" << named.width << ">(reg_path(" << cppStringLiteral(named.fieldPath) << "), &"
              << named.cppValue << ", &" << named.cppRegInst << "->pending, &" << named.cppRegInst << "->qNext);\n";
         } else {
-          emitWireProbes(os, named.type, named.width, named.fieldPath, named.cppValue);
+          emitWireProbes(os, named.type, named.fieldPath, named.cppValue);
         }
       }
-		  for (auto mem : byteMems) {
-		    std::string instName = nt.get(mem.getRdata()) + "_inst";
-		    if (auto nameAttr = mem->getAttrOfType<StringAttr>("name"))
-	      instName = sanitizeId(nameAttr.getValue());
+		  for (unsigned id : byteMems) {
+		    std::string instName = memoryInstanceName(id);
 	    os << "    reg.addMem(reg_path(\"" << instName << "\"), &" << instName << ", &" << instName
 	       << ".pendingWrite, &" << instName << ".latchedAddr, &" << instName << ".latchedData, &" << instName
 	       << ".latchedStrb);\n";
 	  }
-	  for (auto mem : syncMems) {
-	    std::string instName = nt.get(mem.getRdata()) + "_inst";
-	    if (auto nameAttr = mem->getAttrOfType<StringAttr>("name"))
-	      instName = sanitizeId(nameAttr.getValue());
+	  for (unsigned id : syncMems) {
+	    std::string instName = memoryInstanceName(id);
 	    os << "    if (" << instName << ") reg.addMem(reg_path(\"" << instName << "\"), " << instName << ", &" << instName
 	       << "->pendingWrite, &" << instName << "->latchedWaddr, &" << instName << "->latchedWdata, &" << instName
 	       << "->latchedWstrb);\n";
 	  }
-	  for (auto mem : syncMemDPs) {
-	    std::string instName = nt.get(mem.getRdata0()) + "_inst";
-	    if (auto nameAttr = mem->getAttrOfType<StringAttr>("name"))
-	      instName = sanitizeId(nameAttr.getValue());
+	  for (unsigned id : syncMemDPs) {
+	    std::string instName = memoryInstanceName(id);
 	    os << "    if (" << instName << ") reg.addMem(reg_path(\"" << instName << "\"), " << instName << ", &" << instName
 	       << "->pendingWrite, &" << instName << "->latchedWaddr, &" << instName << "->latchedWdata, &" << instName
 	       << "->latchedWstrb);\n";
@@ -1277,7 +1061,8 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
 	    for (const auto &ii : instInfos)
 	      os << "    reg_child(" << ii.member << ", \"" << ii.seg << "\");\n";
 	  }
-      auto probeAliases = loadProbeAliasesForTop(opts.probePlanPath, f.getSymName());
+      auto probeAliases = loadProbeAliasesForTop(opts.probePlanPath,
+                                                plan.graph.functionName);
       if (!probeAliases.empty()) {
         for (const auto &alias : probeAliases) {
           os << "    if (const auto *src = reg.findByPath(" << cppStringLiteral(alias.sourcePath) << "))\n";
@@ -1286,183 +1071,142 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
       }
 	  os << "  }\n\n";
 
-	  for (auto r : regs) {
-	    unsigned w = bitWidth(r.getQ().getType());
-	    if (w == 0)
-	      return r.emitError("invalid reg width");
-    if (isa<VectorType>(r.getQ().getType()))
-      os << "  pyc::cpp::pyc_vec_reg<" << cppType(r.getQ().getType()) << "> *" << nt.get(r.getQ()) << "_inst = nullptr;\n";
-    else
-      os << "  pyc::cpp::pyc_reg<" << w << "> *" << nt.get(r.getQ()) << "_inst = nullptr;\n";
-  }
-  for (auto fifo : fifos) {
-    unsigned w = bitWidth(fifo.getOutData().getType());
+  for (unsigned id : regs) {
+    const SimNode &reg = plan.graph.topNodes[id];
+    const SimValue &q = plan.graph.values[reg.outputIds.front()];
+    unsigned w = q.type.width;
     if (w == 0)
-      return fifo.emitError("invalid fifo width");
-    auto depthAttr = fifo->getAttrOfType<IntegerAttr>("depth");
-    if (!depthAttr)
-      return fifo.emitError("missing integer attribute `depth`");
-    auto depth = depthAttr.getValue().getZExtValue();
-    std::string instName = nt.get(fifo.getInReady()) + "_inst";
-    os << "  pyc::cpp::pyc_fifo<" << w << ", " << depth << "> " << instName << ";\n";
+      return reg.op->emitError("invalid reg width");
+    if (!q.type.shape.empty())
+      os << "  pyc::cpp::pyc_vec_reg<" << cppType(q.type) << "> *" << nt.get(reg.outputIds.front()) << "_inst = nullptr;\n";
+    else
+      os << "  pyc::cpp::pyc_reg<" << w << "> *" << nt.get(reg.outputIds.front()) << "_inst = nullptr;\n";
+  }
+  for (unsigned id : fifos) {
+    const SimNode &fifo = plan.graph.topNodes[id];
+    unsigned w = plan.graph.values[fifo.outputIds[2]].type.width;
+    if (w == 0)
+      return fifo.op->emitError("invalid fifo width");
+    std::string instName = fifoInstanceName(id);
+    os << "  pyc::cpp::pyc_fifo<" << w << ", " << fifo.primitiveDepth
+       << "> " << instName << ";\n";
     os << "  bool " << instName << "_eval_cache_valid = false;\n";
-    os << "  " << cppType(fifo.getInValid().getType()) << " " << instName << "_eval_cache_in_valid{};\n";
+    os << "  " << cppType(plan.graph.values[fifo.inputIds[2]].type) << " " << instName << "_eval_cache_in_valid{};\n";
     os << "  std::uint64_t " << instName << "_eval_cache_in_valid_ver = 1ull;\n";
     os << "  std::uint64_t " << instName << "_eval_cache_in_valid_seen_ver = 0ull;\n";
     os << "  std::uint64_t " << instName << "_eval_cache_in_valid_fp = 0ull;\n";
-    os << "  " << cppType(fifo.getInData().getType()) << " " << instName << "_eval_cache_in_data{};\n";
+    os << "  " << cppType(plan.graph.values[fifo.inputIds[3]].type) << " " << instName << "_eval_cache_in_data{};\n";
     os << "  std::uint64_t " << instName << "_eval_cache_in_data_ver = 1ull;\n";
     os << "  std::uint64_t " << instName << "_eval_cache_in_data_seen_ver = 0ull;\n";
-    if (w <= 64)
+    if (plan.fingerprintInputs.contains(fifo.inputIds[3]))
       os << "  std::uint64_t " << instName << "_eval_cache_in_data_fp = 0ull;\n";
-    os << "  " << cppType(fifo.getOutReady().getType()) << " " << instName << "_eval_cache_out_ready{};\n";
+    os << "  " << cppType(plan.graph.values[fifo.inputIds[4]].type) << " " << instName << "_eval_cache_out_ready{};\n";
     os << "  std::uint64_t " << instName << "_eval_cache_out_ready_ver = 1ull;\n";
     os << "  std::uint64_t " << instName << "_eval_cache_out_ready_seen_ver = 0ull;\n";
     os << "  std::uint64_t " << instName << "_eval_cache_out_ready_fp = 0ull;\n";
   }
-  for (auto mem : byteMems) {
-    auto addrTy = dyn_cast<IntegerType>(mem.getRaddr().getType());
-    auto dataTy = dyn_cast<IntegerType>(mem.getRdata().getType());
-    if (!addrTy || !dataTy)
-      return mem.emitError("C++ emitter only supports integer byte_mem types");
-    unsigned addrW = addrTy.getWidth();
-    unsigned dataW = dataTy.getWidth();
+  for (unsigned id : byteMems) {
+    const SimNode &mem = plan.graph.topNodes[id];
+    unsigned addrW = plan.graph.values[mem.inputIds[2]].type.width;
+    unsigned dataW = plan.graph.values[mem.outputIds.front()].type.width;
     if (addrW == 0)
-      return mem.emitError("invalid byte_mem addr width");
+      return mem.op->emitError("invalid byte_mem addr width");
     if (dataW == 0)
-      return mem.emitError("invalid byte_mem data width");
-
-    auto depthAttr = mem->getAttrOfType<IntegerAttr>("depth");
-    if (!depthAttr)
-      return mem.emitError("missing integer attribute `depth`");
-    auto depth = depthAttr.getValue().getZExtValue();
-
-    std::string instName = nt.get(mem.getRdata()) + "_inst";
-    if (auto nameAttr = mem->getAttrOfType<StringAttr>("name"))
-      instName = sanitizeId(nameAttr.getValue());
-    byteMemInstName.try_emplace(mem.getOperation(), instName);
-
-    os << "  pyc::cpp::pyc_byte_mem<" << addrW << ", " << dataW << ", " << depth << "> " << instName << ";\n";
+      return mem.op->emitError("invalid byte_mem data width");
+    std::string instName = memoryInstanceName(id);
+    os << "  pyc::cpp::pyc_byte_mem<" << addrW << ", " << dataW << ", " << mem.primitiveDepth << "> " << instName << ";\n";
     os << "  bool " << instName << "_eval_cache_valid = false;\n";
-    os << "  " << cppType(mem.getRst().getType()) << " " << instName << "_eval_cache_rst{};\n";
+    os << "  " << cppType(plan.graph.values[mem.inputIds[1]].type) << " " << instName << "_eval_cache_rst{};\n";
     os << "  std::uint64_t " << instName << "_eval_cache_rst_ver = 1ull;\n";
     os << "  std::uint64_t " << instName << "_eval_cache_rst_seen_ver = 0ull;\n";
     os << "  std::uint64_t " << instName << "_eval_cache_rst_fp = 0ull;\n";
-    os << "  " << cppType(mem.getRaddr().getType()) << " " << instName << "_eval_cache_raddr{};\n";
+    os << "  " << cppType(plan.graph.values[mem.inputIds[2]].type) << " " << instName << "_eval_cache_raddr{};\n";
     os << "  std::uint64_t " << instName << "_eval_cache_raddr_ver = 1ull;\n";
     os << "  std::uint64_t " << instName << "_eval_cache_raddr_seen_ver = 0ull;\n";
-    if (addrW <= 64)
+    if (plan.fingerprintInputs.contains(mem.inputIds[2]))
       os << "  std::uint64_t " << instName << "_eval_cache_raddr_fp = 0ull;\n";
-    os << "  " << cppType(mem.getWvalid().getType()) << " " << instName << "_eval_cache_wvalid{};\n";
+    os << "  " << cppType(plan.graph.values[mem.inputIds[3]].type) << " " << instName << "_eval_cache_wvalid{};\n";
     os << "  std::uint64_t " << instName << "_eval_cache_wvalid_ver = 1ull;\n";
     os << "  std::uint64_t " << instName << "_eval_cache_wvalid_seen_ver = 0ull;\n";
     os << "  std::uint64_t " << instName << "_eval_cache_wvalid_fp = 0ull;\n";
-    os << "  " << cppType(mem.getWaddr().getType()) << " " << instName << "_eval_cache_waddr{};\n";
+    os << "  " << cppType(plan.graph.values[mem.inputIds[4]].type) << " " << instName << "_eval_cache_waddr{};\n";
     os << "  std::uint64_t " << instName << "_eval_cache_waddr_ver = 1ull;\n";
     os << "  std::uint64_t " << instName << "_eval_cache_waddr_seen_ver = 0ull;\n";
-    if (addrW <= 64)
+    if (plan.fingerprintInputs.contains(mem.inputIds[4]))
       os << "  std::uint64_t " << instName << "_eval_cache_waddr_fp = 0ull;\n";
-    os << "  " << cppType(mem.getWdata().getType()) << " " << instName << "_eval_cache_wdata{};\n";
+    os << "  " << cppType(plan.graph.values[mem.inputIds[5]].type) << " " << instName << "_eval_cache_wdata{};\n";
     os << "  std::uint64_t " << instName << "_eval_cache_wdata_ver = 1ull;\n";
     os << "  std::uint64_t " << instName << "_eval_cache_wdata_seen_ver = 0ull;\n";
-    if (dataW <= 64)
+    if (plan.fingerprintInputs.contains(mem.inputIds[5]))
       os << "  std::uint64_t " << instName << "_eval_cache_wdata_fp = 0ull;\n";
-    os << "  " << cppType(mem.getWstrb().getType()) << " " << instName << "_eval_cache_wstrb{};\n";
+    os << "  " << cppType(plan.graph.values[mem.inputIds[6]].type) << " " << instName << "_eval_cache_wstrb{};\n";
     os << "  std::uint64_t " << instName << "_eval_cache_wstrb_ver = 1ull;\n";
     os << "  std::uint64_t " << instName << "_eval_cache_wstrb_seen_ver = 0ull;\n";
     os << "  std::uint64_t " << instName << "_eval_cache_wstrb_fp = 0ull;\n";
   }
-  for (auto mem : syncMems) {
-    auto addrTy = dyn_cast<IntegerType>(mem.getRaddr().getType());
-    auto dataTy = dyn_cast<IntegerType>(mem.getRdata().getType());
-    if (!addrTy || !dataTy)
-      return mem.emitError("C++ emitter only supports integer sync_mem types");
-    unsigned addrW = addrTy.getWidth();
-    unsigned dataW = dataTy.getWidth();
+  for (unsigned id : syncMems) {
+    const SimNode &mem = plan.graph.topNodes[id];
+    unsigned addrW = plan.graph.values[mem.inputIds[3]].type.width;
+    unsigned dataW = plan.graph.values[mem.outputIds.front()].type.width;
     if (addrW == 0)
-      return mem.emitError("invalid sync_mem addr width");
+      return mem.op->emitError("invalid sync_mem addr width");
     if (dataW == 0)
-      return mem.emitError("invalid sync_mem data width");
-
-    auto depthAttr = mem->getAttrOfType<IntegerAttr>("depth");
-    if (!depthAttr)
-      return mem.emitError("missing integer attribute `depth`");
-    auto depth = depthAttr.getValue().getZExtValue();
-
-    std::string instName = nt.get(mem.getRdata()) + "_inst";
-    if (auto nameAttr = mem->getAttrOfType<StringAttr>("name"))
-      instName = sanitizeId(nameAttr.getValue());
-    syncMemInstName.try_emplace(mem.getOperation(), instName);
-
-    os << "  pyc::cpp::pyc_sync_mem<" << addrW << ", " << dataW << ", " << depth << "> *" << instName
+      return mem.op->emitError("invalid sync_mem data width");
+    std::string instName = memoryInstanceName(id);
+    os << "  pyc::cpp::pyc_sync_mem<" << addrW << ", " << dataW << ", " << mem.primitiveDepth << "> *" << instName
        << " = nullptr;\n";
   }
-  for (auto mem : syncMemDPs) {
-    auto addrTy = dyn_cast<IntegerType>(mem.getRaddr0().getType());
-    auto dataTy = dyn_cast<IntegerType>(mem.getRdata0().getType());
-    if (!addrTy || !dataTy)
-      return mem.emitError("C++ emitter only supports integer sync_mem_dp types");
-    unsigned addrW = addrTy.getWidth();
-    unsigned dataW = dataTy.getWidth();
+  for (unsigned id : syncMemDPs) {
+    const SimNode &mem = plan.graph.topNodes[id];
+    unsigned addrW = plan.graph.values[mem.inputIds[3]].type.width;
+    unsigned dataW = plan.graph.values[mem.outputIds.front()].type.width;
     if (addrW == 0)
-      return mem.emitError("invalid sync_mem_dp addr width");
+      return mem.op->emitError("invalid sync_mem_dp addr width");
     if (dataW == 0)
-      return mem.emitError("invalid sync_mem_dp data width");
-
-    auto depthAttr = mem->getAttrOfType<IntegerAttr>("depth");
-    if (!depthAttr)
-      return mem.emitError("missing integer attribute `depth`");
-    auto depth = depthAttr.getValue().getZExtValue();
-
-    std::string instName = nt.get(mem.getRdata0()) + "_inst";
-    if (auto nameAttr = mem->getAttrOfType<StringAttr>("name"))
-      instName = sanitizeId(nameAttr.getValue());
-    syncMemDPInstName.try_emplace(mem.getOperation(), instName);
-
-    os << "  pyc::cpp::pyc_sync_mem_dp<" << addrW << ", " << dataW << ", " << depth << "> *" << instName
+      return mem.op->emitError("invalid sync_mem_dp data width");
+    std::string instName = memoryInstanceName(id);
+    os << "  pyc::cpp::pyc_sync_mem_dp<" << addrW << ", " << dataW << ", " << mem.primitiveDepth << "> *" << instName
        << " = nullptr;\n";
   }
-  for (auto fifo : asyncFifos) {
-    unsigned w = bitWidth(fifo.getOutData().getType());
+  for (unsigned id : asyncFifos) {
+    const SimNode &fifo = plan.graph.topNodes[id];
+    unsigned w = plan.graph.values[fifo.outputIds[2]].type.width;
     if (w == 0 || w > 64)
-      return fifo.emitError("C++ emitter only supports async_fifo widths 1..64 in the prototype");
-    auto depthAttr = fifo->getAttrOfType<IntegerAttr>("depth");
-    if (!depthAttr)
-      return fifo.emitError("missing integer attribute `depth`");
-    auto depth = depthAttr.getValue().getZExtValue();
-    std::string instName = nt.get(fifo.getInReady()) + "_inst";
-    os << "  pyc::cpp::pyc_async_fifo<" << w << ", " << depth << "> " << instName << ";\n";
+      return fifo.op->emitError("C++ emitter only supports async_fifo widths 1..64 in the prototype");
+    std::string instName = fifoInstanceName(id);
+    os << "  pyc::cpp::pyc_async_fifo<" << w << ", " << fifo.primitiveDepth
+       << "> " << instName << ";\n";
     os << "  bool " << instName << "_eval_cache_valid = false;\n";
-    os << "  " << cppType(fifo.getInRst().getType()) << " " << instName << "_eval_cache_in_rst{};\n";
+    os << "  " << cppType(plan.graph.values[fifo.inputIds[1]].type) << " " << instName << "_eval_cache_in_rst{};\n";
     os << "  std::uint64_t " << instName << "_eval_cache_in_rst_ver = 1ull;\n";
     os << "  std::uint64_t " << instName << "_eval_cache_in_rst_seen_ver = 0ull;\n";
     os << "  std::uint64_t " << instName << "_eval_cache_in_rst_fp = 0ull;\n";
-    os << "  " << cppType(fifo.getOutRst().getType()) << " " << instName << "_eval_cache_out_rst{};\n";
+    os << "  " << cppType(plan.graph.values[fifo.inputIds[3]].type) << " " << instName << "_eval_cache_out_rst{};\n";
     os << "  std::uint64_t " << instName << "_eval_cache_out_rst_ver = 1ull;\n";
     os << "  std::uint64_t " << instName << "_eval_cache_out_rst_seen_ver = 0ull;\n";
     os << "  std::uint64_t " << instName << "_eval_cache_out_rst_fp = 0ull;\n";
-    os << "  " << cppType(fifo.getInValid().getType()) << " " << instName << "_eval_cache_in_valid{};\n";
+    os << "  " << cppType(plan.graph.values[fifo.inputIds[4]].type) << " " << instName << "_eval_cache_in_valid{};\n";
     os << "  std::uint64_t " << instName << "_eval_cache_in_valid_ver = 1ull;\n";
     os << "  std::uint64_t " << instName << "_eval_cache_in_valid_seen_ver = 0ull;\n";
     os << "  std::uint64_t " << instName << "_eval_cache_in_valid_fp = 0ull;\n";
-    os << "  " << cppType(fifo.getInData().getType()) << " " << instName << "_eval_cache_in_data{};\n";
+    os << "  " << cppType(plan.graph.values[fifo.inputIds[5]].type) << " " << instName << "_eval_cache_in_data{};\n";
     os << "  std::uint64_t " << instName << "_eval_cache_in_data_ver = 1ull;\n";
     os << "  std::uint64_t " << instName << "_eval_cache_in_data_seen_ver = 0ull;\n";
-    if (w <= 64)
+    if (plan.fingerprintInputs.contains(fifo.inputIds[5]))
       os << "  std::uint64_t " << instName << "_eval_cache_in_data_fp = 0ull;\n";
-    os << "  " << cppType(fifo.getOutReady().getType()) << " " << instName << "_eval_cache_out_ready{};\n";
+    os << "  " << cppType(plan.graph.values[fifo.inputIds[6]].type) << " " << instName << "_eval_cache_out_ready{};\n";
     os << "  std::uint64_t " << instName << "_eval_cache_out_ready_ver = 1ull;\n";
     os << "  std::uint64_t " << instName << "_eval_cache_out_ready_seen_ver = 0ull;\n";
     os << "  std::uint64_t " << instName << "_eval_cache_out_ready_fp = 0ull;\n";
   }
-  for (auto s : cdcSyncs) {
-    unsigned w = bitWidth(s.getOut().getType());
+  for (unsigned id : cdcSyncs) {
+    const SimNode &cdc = plan.graph.topNodes[id];
+    const SimValue &out = plan.graph.values[cdc.outputIds.front()];
+    unsigned w = out.type.width;
     if (w == 0 || w > 64)
-      return s.emitError("C++ emitter only supports cdc_sync widths 1..64 in the prototype");
-    std::uint64_t stages = 2;
-    if (auto st = s->getAttrOfType<IntegerAttr>("stages"))
-      stages = st.getValue().getZExtValue();
-    os << "  pyc::cpp::pyc_cdc_sync<" << w << ", " << stages << "> " << nt.get(s.getOut()) << "_inst;\n";
+      return cdc.op->emitError("C++ emitter only supports cdc_sync widths 1..64 in the prototype");
+    os << "  pyc::cpp::pyc_cdc_sync<" << w << ", " << cdc.cdcStages
+       << "> " << nt.get(cdc.outputIds.front()) << "_inst;\n";
   }
   os << "\n";
 
@@ -1471,6 +1215,8 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
   os << "    std::uint64_t instance_cache_skips = 0;\n";
   os << "    std::uint64_t primitive_eval_calls = 0;\n";
   os << "    std::uint64_t primitive_cache_skips = 0;\n";
+  os << "    std::uint64_t group_eval_calls = 0;\n";
+  os << "    std::uint64_t group_cache_skips = 0;\n";
   os << "    std::uint64_t fallback_iterations = 0;\n";
   os << "  };\n";
   os << "  bool _pyc_sim_stats_enable = false;\n";
@@ -1500,6 +1246,8 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
   os << "    os << \"instance_cache_skips=\" << _pyc_sim_stats.instance_cache_skips << \"\\n\";\n";
   os << "    os << \"primitive_eval_calls=\" << _pyc_sim_stats.primitive_eval_calls << \"\\n\";\n";
   os << "    os << \"primitive_cache_skips=\" << _pyc_sim_stats.primitive_cache_skips << \"\\n\";\n";
+  os << "    os << \"group_eval_calls=\" << _pyc_sim_stats.group_eval_calls << \"\\n\";\n";
+  os << "    os << \"group_cache_skips=\" << _pyc_sim_stats.group_cache_skips << \"\\n\";\n";
   os << "    os << \"fallback_iterations=\" << _pyc_sim_stats.fallback_iterations << \"\\n\";\n";
   os << "  }\n\n";
   os << "  void dump_sim_stats_to_path(const char *path = nullptr) const {\n";
@@ -1515,16 +1263,19 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
   os << "  }\n\n";
 
   os << "  void _pyc_validate_primitive_bindings() const {\n";
-  for (auto r : regs)
-    os << "    if (!" << nt.get(r.getQ()) << "_inst) { std::cerr << \"pyc null reg binding: " << nt.get(r.getQ())
+  for (unsigned id : regs) {
+    const SimNode &reg = plan.graph.topNodes[id];
+    std::string qName = nt.get(reg.outputIds.front());
+    os << "    if (!" << qName << "_inst) { std::cerr << \"pyc null reg binding: " << qName
        << "_inst\" << \"\\n\"; std::abort(); }\n";
-  for (auto mem : syncMems) {
-    std::string instName = syncMemInstName.lookup(mem.getOperation());
+  }
+  for (unsigned id : syncMems) {
+    std::string instName = memoryInstanceName(id);
     os << "    if (!" << instName << ") { std::cerr << \"pyc null sync_mem binding: " << instName
        << "\" << \"\\n\"; std::abort(); }\n";
   }
-  for (auto mem : syncMemDPs) {
-    std::string instName = syncMemDPInstName.lookup(mem.getOperation());
+  for (unsigned id : syncMemDPs) {
+    std::string instName = memoryInstanceName(id);
     os << "    if (!" << instName << ") { std::cerr << \"pyc null sync_mem_dp binding: " << instName
        << "\" << \"\\n\"; std::abort(); }\n";
   }
@@ -1533,87 +1284,95 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
   // Constructor (wire members default-initialize to 0).
   os << "  " << structName << "()";
   bool firstInit = true;
-  for (auto fifo : fifos) {
+  for (unsigned id : fifos) {
     os << (firstInit ? " :\n" : ",\n");
     firstInit = false;
-    unsigned w = bitWidth(fifo.getOutData().getType());
-    auto depth = fifo->getAttrOfType<IntegerAttr>("depth").getValue().getZExtValue();
-    (void)w;
-    (void)depth;
-    os << "      " << nt.get(fifo.getInReady()) << "_inst(" << nt.get(fifo.getClk()) << ", " << nt.get(fifo.getRst())
-       << ", " << nt.get(fifo.getInValid()) << ", " << nt.get(fifo.getInReady()) << ", " << nt.get(fifo.getInData())
-       << ", " << nt.get(fifo.getOutValid()) << ", " << nt.get(fifo.getOutReady()) << ", " << nt.get(fifo.getOutData())
-       << ")";
+    os << "      " << fifoInstanceName(id) << "(" << fifoInputName(id, 0)
+       << ", " << fifoInputName(id, 1) << ", " << fifoInputName(id, 2)
+       << ", " << fifoOutputName(id, 0) << ", " << fifoInputName(id, 3)
+       << ", " << fifoOutputName(id, 1) << ", " << fifoInputName(id, 4)
+       << ", " << fifoOutputName(id, 2) << ")";
   }
-  for (auto mem : byteMems) {
+  for (unsigned id : byteMems) {
+    const SimNode &mem = plan.graph.topNodes[id];
     os << (firstInit ? " :\n" : ",\n");
     firstInit = false;
-    std::string instName = byteMemInstName.lookup(mem.getOperation());
-    os << "      " << instName << "(" << nt.get(mem.getClk()) << ", " << nt.get(mem.getRst()) << ", " << nt.get(mem.getRaddr())
-       << ", " << nt.get(mem.getRdata()) << ", " << nt.get(mem.getWvalid()) << ", " << nt.get(mem.getWaddr()) << ", "
-       << nt.get(mem.getWdata()) << ", " << nt.get(mem.getWstrb()) << ")";
+    os << "      " << memoryInstanceName(id) << "("
+       << graphValueName(mem.inputIds[0]) << ", "
+       << graphValueName(mem.inputIds[1]) << ", "
+       << graphValueName(mem.inputIds[2]) << ", "
+       << graphValueName(mem.outputIds.front());
+    for (unsigned i = 3; i < mem.inputIds.size(); ++i)
+      os << ", " << graphValueName(mem.inputIds[i]);
+    os << ")";
   }
-  for (auto fifo : asyncFifos) {
+  for (unsigned id : asyncFifos) {
     os << (firstInit ? " :\n" : ",\n");
     firstInit = false;
-    os << "      " << nt.get(fifo.getInReady()) << "_inst(" << nt.get(fifo.getInClk()) << ", " << nt.get(fifo.getInRst())
-       << ", " << nt.get(fifo.getInValid()) << ", " << nt.get(fifo.getInReady()) << ", " << nt.get(fifo.getInData())
-       << ", " << nt.get(fifo.getOutClk()) << ", " << nt.get(fifo.getOutRst()) << ", " << nt.get(fifo.getOutValid())
-       << ", " << nt.get(fifo.getOutReady()) << ", " << nt.get(fifo.getOutData()) << ")";
+    os << "      " << fifoInstanceName(id) << "(" << fifoInputName(id, 0)
+       << ", " << fifoInputName(id, 1) << ", " << fifoInputName(id, 4)
+       << ", " << fifoOutputName(id, 0) << ", " << fifoInputName(id, 5)
+       << ", " << fifoInputName(id, 2) << ", " << fifoInputName(id, 3)
+       << ", " << fifoOutputName(id, 1) << ", " << fifoInputName(id, 6)
+       << ", " << fifoOutputName(id, 2) << ")";
   }
-  for (auto s : cdcSyncs) {
+  for (unsigned id : cdcSyncs) {
+    const SimNode &cdc = plan.graph.topNodes[id];
     os << (firstInit ? " :\n" : ",\n");
     firstInit = false;
-    os << "      " << nt.get(s.getOut()) << "_inst(" << nt.get(s.getClk()) << ", " << nt.get(s.getRst()) << ", "
-       << nt.get(s.getIn()) << ", " << nt.get(s.getOut()) << ")";
+    os << "      " << nt.get(cdc.outputIds.front())
+       << "_inst(";
+    for (unsigned inputId : cdc.inputIds)
+      os << nt.get(inputId) << ", ";
+    os << nt.get(cdc.outputIds.front()) << ")";
   }
   os << " {\n";
-  for (auto r : regs) {
-    unsigned w = bitWidth(r.getQ().getType());
+  for (unsigned id : regs) {
+    const SimNode &reg = plan.graph.topNodes[id];
+    const SimValue &q = plan.graph.values[reg.outputIds.front()];
+    unsigned w = q.type.width;
     if (w == 0)
-      return r.emitError("invalid reg width");
-    if (isa<VectorType>(r.getQ().getType()))
-      os << "    " << nt.get(r.getQ()) << "_inst = new pyc::cpp::pyc_vec_reg<"
-         << cppType(r.getQ().getType()) << ">(";
+      return reg.op->emitError("invalid reg width");
+    std::string qName = nt.get(reg.outputIds.front());
+    if (!q.type.shape.empty())
+      os << "    " << qName << "_inst = new pyc::cpp::pyc_vec_reg<"
+         << cppType(q.type) << ">(";
     else
-      os << "    " << nt.get(r.getQ()) << "_inst = new pyc::cpp::pyc_reg<" << w << ">(";
-    os << nt.get(r.getClk()) << ", " << nt.get(r.getRst()) << ", " << nt.get(r.getEn()) << ", "
-       << nt.get(r.getNext()) << ", " << nt.get(r.getInit()) << ", " << nt.get(r.getQ()) << ");\n";
+      os << "    " << qName << "_inst = new pyc::cpp::pyc_reg<" << w << ">(";
+    for (unsigned inputId : reg.inputIds)
+      os << nt.get(inputId) << ", ";
+    os << qName << ");\n";
   }
-  for (auto mem : syncMems) {
-    auto addrTy = dyn_cast<IntegerType>(mem.getRaddr().getType());
-    auto dataTy = dyn_cast<IntegerType>(mem.getRdata().getType());
-    if (!addrTy || !dataTy)
-      return mem.emitError("C++ emitter only supports integer sync_mem types");
-    unsigned addrW = addrTy.getWidth();
-    unsigned dataW = dataTy.getWidth();
-    auto depthAttr = mem->getAttrOfType<IntegerAttr>("depth");
-    if (!depthAttr)
-      return mem.emitError("missing integer attribute `depth`");
-    auto depth = depthAttr.getValue().getZExtValue();
-    std::string instName = syncMemInstName.lookup(mem.getOperation());
-    os << "    " << instName << " = new pyc::cpp::pyc_sync_mem<" << addrW << ", " << dataW << ", " << depth << ">("
-       << nt.get(mem.getClk()) << ", " << nt.get(mem.getRst()) << ", " << nt.get(mem.getRen()) << ", "
-       << nt.get(mem.getRaddr()) << ", " << nt.get(mem.getRdata()) << ", " << nt.get(mem.getWvalid()) << ", "
-       << nt.get(mem.getWaddr()) << ", " << nt.get(mem.getWdata()) << ", " << nt.get(mem.getWstrb()) << ");\n";
+  for (unsigned id : syncMems) {
+    const SimNode &mem = plan.graph.topNodes[id];
+    unsigned addrW = plan.graph.values[mem.inputIds[3]].type.width;
+    unsigned dataW = plan.graph.values[mem.outputIds.front()].type.width;
+    std::string instName = memoryInstanceName(id);
+    os << "    " << instName << " = new pyc::cpp::pyc_sync_mem<" << addrW
+       << ", " << dataW << ", " << mem.primitiveDepth << ">(";
+    for (unsigned i = 0; i < 4; ++i)
+      os << graphValueName(mem.inputIds[i]) << ", ";
+    os << graphValueName(mem.outputIds.front());
+    for (unsigned i = 4; i < mem.inputIds.size(); ++i)
+      os << ", " << graphValueName(mem.inputIds[i]);
+    os << ");\n";
   }
-  for (auto mem : syncMemDPs) {
-    auto addrTy = dyn_cast<IntegerType>(mem.getRaddr0().getType());
-    auto dataTy = dyn_cast<IntegerType>(mem.getRdata0().getType());
-    if (!addrTy || !dataTy)
-      return mem.emitError("C++ emitter only supports integer sync_mem_dp types");
-    unsigned addrW = addrTy.getWidth();
-    unsigned dataW = dataTy.getWidth();
-    auto depthAttr = mem->getAttrOfType<IntegerAttr>("depth");
-    if (!depthAttr)
-      return mem.emitError("missing integer attribute `depth`");
-    auto depth = depthAttr.getValue().getZExtValue();
-    std::string instName = syncMemDPInstName.lookup(mem.getOperation());
-    os << "    " << instName << " = new pyc::cpp::pyc_sync_mem_dp<" << addrW << ", " << dataW << ", " << depth << ">("
-       << nt.get(mem.getClk()) << ", " << nt.get(mem.getRst()) << ", " << nt.get(mem.getRen0()) << ", "
-       << nt.get(mem.getRaddr0()) << ", " << nt.get(mem.getRdata0()) << ", " << nt.get(mem.getRen1()) << ", "
-       << nt.get(mem.getRaddr1()) << ", " << nt.get(mem.getRdata1()) << ", " << nt.get(mem.getWvalid()) << ", "
-       << nt.get(mem.getWaddr()) << ", " << nt.get(mem.getWdata()) << ", " << nt.get(mem.getWstrb()) << ");\n";
+  for (unsigned id : syncMemDPs) {
+    const SimNode &mem = plan.graph.topNodes[id];
+    unsigned addrW = plan.graph.values[mem.inputIds[3]].type.width;
+    unsigned dataW = plan.graph.values[mem.outputIds.front()].type.width;
+    std::string instName = memoryInstanceName(id);
+    os << "    " << instName << " = new pyc::cpp::pyc_sync_mem_dp<"
+       << addrW << ", " << dataW << ", " << mem.primitiveDepth << ">(";
+    for (unsigned i = 0; i < 4; ++i)
+      os << graphValueName(mem.inputIds[i]) << ", ";
+    os << graphValueName(mem.outputIds[0]) << ", "
+       << graphValueName(mem.inputIds[4]) << ", "
+       << graphValueName(mem.inputIds[5]) << ", "
+       << graphValueName(mem.outputIds[1]);
+    for (unsigned i = 6; i < mem.inputIds.size(); ++i)
+      os << ", " << graphValueName(mem.inputIds[i]);
+    os << ");\n";
   }
   os << "    _pyc_validate_primitive_bindings();\n";
   os << "    _pyc_init_runtime_controls();\n";
@@ -1623,134 +1382,46 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
   os << "  }\n\n";
 
   // Emit fused comb helpers.
-  for (auto [i, comb] : llvm::enumerate(combs)) {
-    if (failed(emitCombMethod(comb, os, nt, static_cast<unsigned>(i), opts)))
+  for (auto [i, nodeId] : llvm::enumerate(plan.operationOrder.combs)) {
+    unsigned regionId = plan.graph.topNodes[nodeId].combRegionId;
+    if (regionId >= plan.graph.combRegions.size())
+      return plan.graph.topNodes[nodeId].op->emitError("missing planned simulation comb region");
+    auto statements = plan.combRegionStatements.find(regionId);
+    if (statements == plan.combRegionStatements.end())
+      return plan.graph.topNodes[nodeId].op->emitError("missing planned comb statements");
+    if (failed(emitCombMethod(plan.graph, plan.graph.combRegions[regionId],
+                              statements->second, plan.combRegionStatements,
+                              os, nt,
+                              static_cast<unsigned>(i))))
+      return failure();
+  }
+  for (auto [i, nodeIndex] : llvm::enumerate(plan.graph.groupedNodes)) {
+    auto activation = plan.groupActivations.find(nodeIndex);
+    const GroupActivationPlan *activationPlan =
+        activation == plan.groupActivations.end() ? nullptr : &activation->second;
+    if (failed(emitSimGroupMethod(plan, nodeIndex, os, nt,
+                                  static_cast<unsigned>(i), activationPlan)))
       return failure();
   }
 
-  llvm::DenseMap<Operation *, unsigned> combIndex;
-  for (auto [i, comb] : llvm::enumerate(combs))
-    combIndex.try_emplace(comb.getOperation(), static_cast<unsigned>(i));
+  llvm::DenseMap<unsigned, unsigned> combIndex;
+  for (auto [i, nodeId] : llvm::enumerate(plan.operationOrder.combs))
+    combIndex.try_emplace(nodeId, static_cast<unsigned>(i));
 
-  auto topoOrder = [&](bool includePrims, llvm::SmallVector<Operation *> &ordered) -> bool {
-    ordered.clear();
-
-    llvm::SmallVector<Operation *> nodes;
-    llvm::SmallVector<std::string> nodeKey;
-    llvm::DenseMap<Operation *, unsigned> nodeIndex;
-
-    auto shouldInclude = [&](Operation &op) -> bool {
-      if (isa<func::ReturnOp>(op) || isa<pyc::WireOp>(op) || isa<pyc::RegOp>(op) || isa<pyc::SyncMemOp>(op) ||
-          isa<pyc::SyncMemDPOp>(op) || isa<pyc::CdcSyncOp>(op))
-        return false;
-      if (!includePrims &&
-          (isa<pyc::FifoOp>(op) || isa<pyc::AsyncFifoOp>(op) || isa<pyc::ByteMemOp>(op) || isa<pyc::InstanceOp>(op)))
-        return false;
-      return true;
-    };
-
-    for (Operation &op : top) {
-      if (!shouldInclude(op))
-        continue;
-      unsigned idx = static_cast<unsigned>(nodes.size());
-      nodes.push_back(&op);
-      nodeIndex.try_emplace(&op, idx);
-
-      std::string k;
-      if (auto a = dyn_cast<pyc::AssignOp>(op))
-        k = nt.get(a.getDst());
-      else if (op.getNumResults() > 0)
-        k = nt.get(op.getResult(0));
-      else
-        k = sanitizeId(op.getName().getStringRef()) + "_" + std::to_string(idx);
-      nodeKey.push_back(std::move(k));
+  auto emitGroupCall = [&](unsigned nodeId, llvm::StringRef indent) {
+    unsigned groupIndex = plan.groupByNode.lookup(nodeId);
+    if (plan.packedActivationGroups.contains(nodeId)) {
+      os << indent << "if (_pyc_group_active_flags[" << groupIndex / 64u
+         << "] & (1ull << " << groupIndex % 64u << ")) {\n";
+      os << indent << "  _pyc_group_active_flags[" << groupIndex / 64u
+         << "] &= ~(1ull << " << groupIndex % 64u << ");\n";
+      os << indent << "  eval_sim_group_" << groupIndex << "();\n";
+      os << indent << "} else if (_pyc_sim_stats_enable) {\n";
+      os << indent << "  _pyc_sim_stats.group_cache_skips++;\n";
+      os << indent << "}\n";
+    } else {
+      os << indent << "eval_sim_group_" << groupIndex << "();\n";
     }
-
-    llvm::DenseMap<Value, unsigned> valueProducer;
-    llvm::DenseMap<Value, unsigned> wireAssign;
-    llvm::DenseMap<Value, unsigned> wireAssignCount;
-
-    for (auto [idx, op] : llvm::enumerate(nodes)) {
-      for (Value r : op->getResults())
-        valueProducer.try_emplace(r, static_cast<unsigned>(idx));
-
-      if (auto a = dyn_cast<pyc::AssignOp>(*op)) {
-        Value dst = a.getDst();
-        unsigned &cnt = wireAssignCount[dst];
-        cnt++;
-        if (cnt == 1)
-          wireAssign[dst] = static_cast<unsigned>(idx);
-      }
-    }
-
-    // Multiple drivers to the same wire are not supported by the topo scheduler
-    // (imperative evaluation becomes ambiguous); fall back to bounded fixpoint.
-    for (auto &it : wireAssignCount) {
-      if (it.second > 1)
-        return false;
-    }
-    for (auto &it : wireAssign)
-      valueProducer[it.first] = it.second;
-
-    llvm::SmallVector<llvm::SmallVector<unsigned>> succ(nodes.size());
-    llvm::SmallVector<unsigned> indeg(nodes.size(), 0);
-
-    for (auto it : llvm::enumerate(nodes)) {
-      unsigned idx = it.index();
-      Operation *op = it.value();
-
-      llvm::SmallSet<unsigned, 8> deps;
-      auto addDep = [&](Value v) {
-        auto it = valueProducer.find(v);
-        if (it == valueProducer.end())
-          return;
-        unsigned p = it->second;
-        if (p == idx)
-          return;
-        deps.insert(p);
-      };
-
-      if (auto a = dyn_cast<pyc::AssignOp>(*op)) {
-        addDep(a.getSrc());
-      } else {
-        for (Value v : op->getOperands())
-          addDep(v);
-      }
-
-      indeg[idx] = static_cast<unsigned>(deps.size());
-      for (unsigned p : deps)
-        succ[p].push_back(static_cast<unsigned>(idx));
-    }
-
-    auto cmp = [&](unsigned a, unsigned b) { return nodeKey[a] > nodeKey[b]; };
-    std::vector<unsigned> heap;
-    heap.reserve(nodes.size());
-    for (unsigned i = 0; i < nodes.size(); ++i)
-      if (indeg[i] == 0)
-        heap.push_back(i);
-    std::make_heap(heap.begin(), heap.end(), cmp);
-
-    llvm::SmallVector<unsigned> out;
-    out.reserve(nodes.size());
-    while (!heap.empty()) {
-      std::pop_heap(heap.begin(), heap.end(), cmp);
-      unsigned n = heap.back();
-      heap.pop_back();
-      out.push_back(n);
-      for (unsigned s : succ[n]) {
-        if (--indeg[s] == 0) {
-          heap.push_back(s);
-          std::push_heap(heap.begin(), heap.end(), cmp);
-        }
-      }
-    }
-
-    if (out.size() != nodes.size())
-      return false;
-
-    for (unsigned idx : out)
-      ordered.push_back(nodes[idx]);
-    return true;
   };
 
   // eval_comb_pass(): evaluate all combinational ops/assigns.
@@ -1759,92 +1430,55 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
   // that defer wiring). To keep C++ simulation correct, eval() runs a small
   // fixed-point iteration that alternates comb evaluation and primitive eval.
   os << "  inline void eval_comb_pass() {\n";
-  llvm::SmallVector<Operation *> ordered;
-  if (!topoOrder(/*includePrims=*/false, ordered)) {
-    for (Operation &op : top) {
-      if (isa<func::ReturnOp>(op) || isa<pyc::WireOp>(op))
-        continue;
-      ordered.push_back(&op);
-    }
-  }
+  const auto &ordered = plan.combNodeOrder;
 
-  for (Operation *op : ordered) {
-    if (auto a = dyn_cast<pyc::AssignOp>(*op)) {
-      os << "    " << nt.get(a.getDst()) << " = " << nt.get(a.getSrc()) << ";\n";
+  for (unsigned nodeId : ordered) {
+    const SimNode &node = plan.graph.topNodes[nodeId];
+    const SimNodeAction &action = plan.nodeActions[nodeId];
+    Operation *op = node.op;
+    if (action.kind == SimNodeActionKind::Group) {
+      emitGroupCall(nodeId, "    ");
       continue;
     }
-    if (auto comb = dyn_cast<pyc::CombOp>(*op)) {
-      os << "    eval_comb_" << combIndex.lookup(comb.getOperation()) << "();\n";
+    if (action.kind == SimNodeActionKind::Assign) {
+      os << "    " << nt.get(action.targetId)
+         << " = " << nt.get(action.sourceId)
+         << ";\n";
       continue;
     }
-    if (auto a = dyn_cast<pyc::AssertOp>(*op)) {
-      std::string msg = "pyc.assert failed";
-      if (auto m = a.getMsgAttr())
-        msg = m.getValue().str();
-      os << "    if (!" << nt.get(a.getCond()) << ".toBool()) { std::cerr << " << cppStringLiteral(msg)
+    if (action.kind == SimNodeActionKind::CombRegion) {
+      os << "    eval_comb_" << combIndex.lookup(nodeId) << "();\n";
+      continue;
+    }
+    if (action.kind == SimNodeActionKind::Assert) {
+      os << "    if (!"
+         << nt.get(action.conditionId)
+         << ".toBool()) { std::cerr << "
+         << cppStringLiteral(action.message)
          << " << \"\\n\"; std::abort(); }\n";
       continue;
     }
-    if (isa<pyc::ConstantOp,
-            pyc::AddOp,
-            pyc::SubOp,
-            pyc::MulOp,
-            pyc::UdivOp,
-            pyc::UremOp,
-            pyc::SdivOp,
-            pyc::SremOp,
-            pyc::MuxOp,
-            pyc::AndOp,
-            pyc::OrOp,
-            pyc::XorOp,
-            pyc::NotOp,
-            pyc::ConcatOp,
-            pyc::AliasOp,
-            pyc::ResetActiveOp,
-            pyc::EqOp,
-            pyc::UltOp,
-            pyc::SltOp,
-            pyc::TruncOp,
-            pyc::ZextOp,
-            pyc::SextOp,
-            pyc::ExtractOp,
-            pyc::ShliOp,
-            pyc::LshriOp,
-            pyc::AshriOp,
-            pyc::ShlOp,
-            pyc::LshrOp,
-            pyc::AshrOp,
-            pyc::VGetOp,
-            pyc::VCreateOp,
-            pyc::VBroadcastOp,
-            pyc::VBroadcastDimOp,
-            pyc::VOrReduceOp,
-            pyc::VAndReduceOp,
-            pyc::VAddReduceOp,
-            arith::SelectOp>(*op)) {
-      if (failed(emitCombAssign(*op, os, nt)))
+    if (action.kind == SimNodeActionKind::Expression) {
+      if (failed(emitGraphExpr(plan.graph,
+                               plan.graph.expressions[action.expressionId],
+                               os, nt)))
         return failure();
       continue;
     }
-    if (isa<pyc::FifoOp,
-            pyc::AsyncFifoOp,
-            pyc::ByteMemOp,
-            pyc::SyncMemOp,
-            pyc::SyncMemDPOp,
-            pyc::CdcSyncOp,
-            pyc::InstanceOp,
-            pyc::RegOp>(*op)) {
+    if (action.kind == SimNodeActionKind::Fifo ||
+        action.kind == SimNodeActionKind::AsyncFifo ||
+        action.kind == SimNodeActionKind::ByteMem ||
+        action.kind == SimNodeActionKind::Instance ||
+        action.kind == SimNodeActionKind::Skip) {
       // Primitives are evaluated in eval(), and regs only tick.
       continue;
     }
-    if (isa<func::ReturnOp, pyc::WireOp>(*op))
-      continue;
     return op->emitError("unsupported op for C++ emission: ") << op->getName();
   }
   os << "  }\n\n";
 
-  llvm::SmallVector<Operation *> fullOrdered;
-  bool hasFullTopo = topoOrder(/*includePrims=*/true, fullOrdered);
+  const auto &fullOrdered = plan.evalNodeOrder;
+  bool hasFullTopo = plan.evalTopological;
 
   llvm::SmallVector<std::string> instanceEvalHelperNames;
   instanceEvalHelperNames.reserve(instInfos.size());
@@ -1854,13 +1488,13 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
   }
 
   auto emitInstanceEvalHelperDefinition = [&](const InstInfo &ii, llvm::StringRef helperName) {
-    auto inst = ii.op;
+    const SimNode &inst = plan.graph.topNodes[ii.nodeId];
     bool usePackedCache = usePackedInstanceEvalCache(ii);
     os << "  inline bool " << helperName << "() {\n";
     os << "    bool _pyc_inst_changed = false;\n";
     os << "    #ifdef PYC_DISABLE_INSTANCE_EVAL_CACHE\n";
-    for (unsigned i = 0; i < inst.getNumOperands(); ++i) {
-      std::string inValue = nt.get(inst.getOperand(i));
+    for (unsigned i = 0; i < inst.inputIds.size(); ++i) {
+      std::string inValue = graphValueName(inst.inputIds[i]);
       os << "    " << ii.member << "->" << ii.inPorts[i] << " = " << inValue << ";\n";
     }
     os << "    " << ii.member << "->eval();\n";
@@ -1872,15 +1506,15 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
     if (usePackedCache) {
       os << "    std::array<std::uint64_t, " << instancePackedCacheWordCount(ii) << "> _pyc_inputs{};\n";
       os << "    std::size_t _pyc_inputs_off = 0;\n";
-      for (unsigned i = 0; i < inst.getNumOperands(); ++i) {
-        std::string inValue = nt.get(inst.getOperand(i));
+      for (unsigned i = 0; i < inst.inputIds.size(); ++i) {
+        std::string inValue = graphValueName(inst.inputIds[i]);
         os << "    pyc::cpp::appendPackedWireWords(_pyc_inputs, _pyc_inputs_off, " << inValue << ");\n";
       }
       os << "    if (!" << changedFlag << " && (" << ii.member << "_eval_cache_words != _pyc_inputs)) " << changedFlag
          << " = true;\n";
       os << "    if (" << changedFlag << ") {\n";
-      for (unsigned i = 0; i < inst.getNumOperands(); ++i) {
-        std::string inValue = nt.get(inst.getOperand(i));
+      for (unsigned i = 0; i < inst.inputIds.size(); ++i) {
+        std::string inValue = graphValueName(inst.inputIds[i]);
         os << "      " << ii.member << "->" << ii.inPorts[i] << " = " << inValue << ";\n";
       }
       os << "      " << ii.member << "->eval();\n";
@@ -1894,14 +1528,13 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
       os << "    #endif\n";
     } else {
       os << "    #ifndef PYC_DISABLE_VERSIONED_INPUT_CACHE\n";
-      for (unsigned i = 0; i < inst.getNumOperands(); ++i) {
+      for (unsigned i = 0; i < inst.inputIds.size(); ++i) {
         std::string cacheName = ii.member + "_eval_cache_in_" + std::to_string(i);
-        std::string inValue = nt.get(inst.getOperand(i));
+        std::string inValue = graphValueName(inst.inputIds[i]);
         std::string verName = ii.member + "_eval_cache_in_ver_" + std::to_string(i);
         std::string seenName = ii.member + "_eval_cache_in_seen_ver_" + std::to_string(i);
-        unsigned inW = bitWidth(inst.getOperand(i).getType());
         os << "    if (" << ii.member << "_eval_cache_valid) {\n";
-        if (inW <= 64) {
+        if (plan.fingerprintInputs.contains(inst.inputIds[i])) {
           std::string fpName = ii.member + "_eval_cache_in_fp_" + std::to_string(i);
           os << "      std::uint64_t _pyc_fp_" << i << " = static_cast<std::uint64_t>(" << inValue << ".value());\n";
           os << "      if (" << fpName << " != _pyc_fp_" << i << ") {\n";
@@ -1917,7 +1550,7 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
         }
         os << "    } else {\n";
         os << "      " << cacheName << " = " << inValue << ";\n";
-        if (inW <= 64) {
+        if (plan.fingerprintInputs.contains(inst.inputIds[i])) {
           std::string fpName = ii.member + "_eval_cache_in_fp_" + std::to_string(i);
           os << "      " << fpName << " = static_cast<std::uint64_t>(" << inValue << ".value());\n";
         }
@@ -1928,7 +1561,7 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
         os << "    " << seenName << " = " << verName << ";\n";
       }
       os << "    if (" << changedFlag << ") {\n";
-      for (unsigned i = 0; i < inst.getNumOperands(); ++i) {
+      for (unsigned i = 0; i < inst.inputIds.size(); ++i) {
         std::string cacheName = ii.member + "_eval_cache_in_" + std::to_string(i);
         os << "      " << ii.member << "->" << ii.inPorts[i] << " = " << cacheName << ";\n";
       }
@@ -1938,16 +1571,16 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
       os << "      if (_pyc_sim_stats_enable) _pyc_sim_stats.instance_cache_skips++;\n";
       os << "    }\n";
       os << "    #else\n";
-      for (unsigned i = 0; i < inst.getNumOperands(); ++i) {
+      for (unsigned i = 0; i < inst.inputIds.size(); ++i) {
         std::string cacheName = ii.member + "_eval_cache_in_" + std::to_string(i);
-        std::string inValue = nt.get(inst.getOperand(i));
+        std::string inValue = graphValueName(inst.inputIds[i]);
         os << "    if (!" << changedFlag << " && (" << cacheName << " != " << inValue << ")) " << changedFlag
            << " = true;\n";
       }
       os << "    if (" << changedFlag << ") {\n";
-      for (unsigned i = 0; i < inst.getNumOperands(); ++i) {
+      for (unsigned i = 0; i < inst.inputIds.size(); ++i) {
         std::string cacheName = ii.member + "_eval_cache_in_" + std::to_string(i);
-        std::string inValue = nt.get(inst.getOperand(i));
+        std::string inValue = graphValueName(inst.inputIds[i]);
         os << "      " << ii.member << "->" << ii.inPorts[i] << " = " << inValue << ";\n";
         os << "      " << cacheName << " = " << inValue << ";\n";
       }
@@ -1961,8 +1594,8 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
       os << "    " << ii.member << "_eval_cache_valid = true;\n";
       os << "    #endif\n";
     }
-    for (unsigned i = 0; i < inst.getNumResults(); ++i)
-      os << "    " << nt.get(inst.getResult(i)) << " = " << ii.member << "->" << ii.outPorts[i] << ";\n";
+    for (unsigned i = 0; i < inst.outputIds.size(); ++i)
+      os << "    " << graphValueName(inst.outputIds[i]) << " = " << ii.member << "->" << ii.outPorts[i] << ";\n";
     os << "    return _pyc_inst_changed;\n";
     os << "  }\n\n";
   };
@@ -1972,7 +1605,7 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
 
   auto emitInstanceEvalWithCache =
       [&](const InstInfo &ii, llvm::StringRef indent, llvm::StringRef changedAnyVar = llvm::StringRef()) {
-    auto it = instIndex.find(const_cast<pyc::InstanceOp &>(ii.op).getOperation());
+    auto it = instIndex.find(ii.nodeId);
     if (it == instIndex.end())
       return;
     llvm::StringRef helperName = instanceEvalHelperNames[it->second];
@@ -1984,13 +1617,13 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
   };
 
   auto emitFifoEvalWithCache =
-      [&](pyc::FifoOp fifo, llvm::StringRef indent, llvm::StringRef changedAnyVar = llvm::StringRef()) {
-    std::string instName = nt.get(fifo.getInReady()) + "_inst";
+      [&](unsigned nodeId, llvm::StringRef indent, llvm::StringRef changedAnyVar = llvm::StringRef()) {
+    const SimNode &fifo = plan.graph.topNodes[nodeId];
+    std::string instName = fifoInstanceName(nodeId);
     std::string changedFlag = instName + "_eval_cache_changed";
-    std::string inValid = nt.get(fifo.getInValid());
-    std::string inData = nt.get(fifo.getInData());
-    std::string outReady = nt.get(fifo.getOutReady());
-    unsigned dataW = bitWidth(fifo.getInData().getType());
+    std::string inValid = fifoInputName(nodeId, 2);
+    std::string inData = fifoInputName(nodeId, 3);
+    std::string outReady = fifoInputName(nodeId, 4);
     os << indent << "#ifdef PYC_DISABLE_PRIMITIVE_EVAL_CACHE\n";
     os << indent << instName << ".eval();\n";
     os << indent << "if (_pyc_sim_stats_enable) _pyc_sim_stats.primitive_eval_calls++;\n";
@@ -2006,7 +1639,7 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
     os << indent << "    " << instName << "_eval_cache_in_valid = " << inValid << ";\n";
     os << indent << "    ++" << instName << "_eval_cache_in_valid_ver;\n";
     os << indent << "  }\n";
-    if (dataW <= 64) {
+    if (plan.fingerprintInputs.contains(fifo.inputIds[3])) {
       os << indent << "  std::uint64_t _pyc_fp_d = static_cast<std::uint64_t>(" << inData << ".value());\n";
       os << indent << "  if (" << instName << "_eval_cache_in_data_fp != _pyc_fp_d) {\n";
       os << indent << "    " << instName << "_eval_cache_in_data_fp = _pyc_fp_d;\n";
@@ -2030,7 +1663,7 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
     os << indent << "  " << instName << "_eval_cache_in_valid_fp = static_cast<std::uint64_t>(" << inValid << ".value());\n";
     os << indent << "  ++" << instName << "_eval_cache_in_valid_ver;\n";
     os << indent << "  " << instName << "_eval_cache_in_data = " << inData << ";\n";
-    if (dataW <= 64)
+    if (plan.fingerprintInputs.contains(fifo.inputIds[3]))
       os << indent << "  " << instName << "_eval_cache_in_data_fp = static_cast<std::uint64_t>(" << inData << ".value());\n";
     os << indent << "  ++" << instName << "_eval_cache_in_data_ver;\n";
     os << indent << "  " << instName << "_eval_cache_out_ready = " << outReady << ";\n";
@@ -2076,14 +1709,14 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
   };
 
   auto emitAsyncFifoEvalWithCache =
-      [&](pyc::AsyncFifoOp fifo, llvm::StringRef indent, llvm::StringRef changedAnyVar = llvm::StringRef()) {
-    std::string instName = nt.get(fifo.getInReady()) + "_inst";
+      [&](unsigned nodeId, llvm::StringRef indent, llvm::StringRef changedAnyVar = llvm::StringRef()) {
+    std::string instName = fifoInstanceName(nodeId);
     std::string changedFlag = instName + "_eval_cache_changed";
-    std::string inRst = nt.get(fifo.getInRst());
-    std::string outRst = nt.get(fifo.getOutRst());
-    std::string inValid = nt.get(fifo.getInValid());
-    std::string inData = nt.get(fifo.getInData());
-    std::string outReady = nt.get(fifo.getOutReady());
+    std::string inRst = fifoInputName(nodeId, 1);
+    std::string outRst = fifoInputName(nodeId, 3);
+    std::string inValid = fifoInputName(nodeId, 4);
+    std::string inData = fifoInputName(nodeId, 5);
+    std::string outReady = fifoInputName(nodeId, 6);
     os << indent << "#ifdef PYC_DISABLE_PRIMITIVE_EVAL_CACHE\n";
     os << indent << instName << ".eval();\n";
     os << indent << "if (_pyc_sim_stats_enable) _pyc_sim_stats.primitive_eval_calls++;\n";
@@ -2121,15 +1754,16 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
   };
 
   auto emitByteMemEvalWithCache =
-      [&](pyc::ByteMemOp mem, llvm::StringRef indent, llvm::StringRef changedAnyVar = llvm::StringRef()) {
-    std::string instName = byteMemInstName.lookup(mem.getOperation());
+      [&](unsigned nodeId, llvm::StringRef indent, llvm::StringRef changedAnyVar = llvm::StringRef()) {
+    const SimNode &mem = plan.graph.topNodes[nodeId];
+    std::string instName = memoryInstanceName(nodeId);
     std::string changedFlag = instName + "_eval_cache_changed";
-    std::string rst = nt.get(mem.getRst());
-    std::string raddr = nt.get(mem.getRaddr());
-    std::string wvalid = nt.get(mem.getWvalid());
-    std::string waddr = nt.get(mem.getWaddr());
-    std::string wdata = nt.get(mem.getWdata());
-    std::string wstrb = nt.get(mem.getWstrb());
+    std::string rst = graphValueName(mem.inputIds[1]);
+    std::string raddr = graphValueName(mem.inputIds[2]);
+    std::string wvalid = graphValueName(mem.inputIds[3]);
+    std::string waddr = graphValueName(mem.inputIds[4]);
+    std::string wdata = graphValueName(mem.inputIds[5]);
+    std::string wstrb = graphValueName(mem.inputIds[6]);
     os << indent << "#ifdef PYC_DISABLE_PRIMITIVE_EVAL_CACHE\n";
     os << indent << instName << ".eval();\n";
     os << indent << "if (_pyc_sim_stats_enable) _pyc_sim_stats.primitive_eval_calls++;\n";
@@ -2170,336 +1804,86 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
   };
 
   auto emitEvalNode =
-      [&](Operation *op, llvm::StringRef indent, llvm::StringRef changedAnyVar = llvm::StringRef()) -> LogicalResult {
-    if (auto fifo = dyn_cast<pyc::FifoOp>(*op)) {
-      emitFifoEvalWithCache(fifo, indent, changedAnyVar);
+      [&](unsigned nodeId, llvm::StringRef indent, llvm::StringRef changedAnyVar = llvm::StringRef()) -> LogicalResult {
+    const SimNode &node = plan.graph.topNodes[nodeId];
+    const SimNodeAction &action = plan.nodeActions[nodeId];
+    Operation *op = node.op;
+    if (action.kind == SimNodeActionKind::Group) {
+      emitGroupCall(nodeId, indent);
       return success();
     }
-    if (auto fifo = dyn_cast<pyc::AsyncFifoOp>(*op)) {
-      emitAsyncFifoEvalWithCache(fifo, indent, changedAnyVar);
+    if (action.kind == SimNodeActionKind::Fifo) {
+      emitFifoEvalWithCache(nodeId, indent, changedAnyVar);
       return success();
     }
-    if (auto mem = dyn_cast<pyc::ByteMemOp>(*op)) {
-      emitByteMemEvalWithCache(mem, indent, changedAnyVar);
+    if (action.kind == SimNodeActionKind::AsyncFifo) {
+      emitAsyncFifoEvalWithCache(nodeId, indent, changedAnyVar);
       return success();
     }
-    if (auto inst = dyn_cast<pyc::InstanceOp>(*op)) {
-      auto it = instIndex.find(inst.getOperation());
+    if (action.kind == SimNodeActionKind::ByteMem) {
+      emitByteMemEvalWithCache(nodeId, indent, changedAnyVar);
+      return success();
+    }
+    if (action.kind == SimNodeActionKind::Instance) {
+      auto it = instIndex.find(nodeId);
       if (it == instIndex.end())
-        return inst.emitError("internal error: missing instance metadata");
+        return op->emitError("internal error: missing instance metadata");
       auto &ii = instInfos[it->second];
       emitInstanceEvalWithCache(ii, indent, changedAnyVar);
       return success();
     }
-    if (auto a = dyn_cast<pyc::AssertOp>(*op)) {
-      std::string msg = "pyc.assert failed";
-      if (auto m = a.getMsgAttr())
-        msg = m.getValue().str();
-      os << indent << "if (!" << nt.get(a.getCond()) << ".toBool()) { std::cerr << " << cppStringLiteral(msg)
+    if (action.kind == SimNodeActionKind::Assert) {
+      os << indent << "if (!"
+         << nt.get(action.conditionId)
+         << ".toBool()) { std::cerr << "
+         << cppStringLiteral(action.message)
          << " << \"\\n\"; std::abort(); }\n";
       return success();
     }
-    if (auto a = dyn_cast<pyc::AssignOp>(*op)) {
-      os << indent << nt.get(a.getDst()) << " = " << nt.get(a.getSrc()) << ";\n";
+    if (action.kind == SimNodeActionKind::Assign) {
+      os << indent << nt.get(action.targetId)
+         << " = " << nt.get(action.sourceId)
+         << ";\n";
       return success();
     }
-    if (auto comb = dyn_cast<pyc::CombOp>(*op)) {
-      os << indent << "eval_comb_" << combIndex.lookup(comb.getOperation()) << "();\n";
+    if (action.kind == SimNodeActionKind::CombRegion) {
+      os << indent << "eval_comb_" << combIndex.lookup(nodeId) << "();\n";
       return success();
     }
-    if (isa<pyc::ConstantOp,
-            pyc::AddOp,
-            pyc::SubOp,
-            pyc::MulOp,
-            pyc::UdivOp,
-            pyc::UremOp,
-            pyc::SdivOp,
-            pyc::SremOp,
-            pyc::MuxOp,
-            pyc::AndOp,
-            pyc::OrOp,
-            pyc::XorOp,
-            pyc::NotOp,
-            pyc::ConcatOp,
-            pyc::AliasOp,
-            pyc::ResetActiveOp,
-            pyc::EqOp,
-            pyc::UltOp,
-            pyc::SltOp,
-            pyc::TruncOp,
-            pyc::ZextOp,
-            pyc::SextOp,
-            pyc::ExtractOp,
-            pyc::ShliOp,
-            pyc::LshriOp,
-            pyc::AshriOp,
-            pyc::ShlOp,
-            pyc::LshrOp,
-            pyc::AshrOp,
-            pyc::VGetOp,
-            pyc::VCreateOp,
-            pyc::VBroadcastOp,
-            pyc::VBroadcastDimOp,
-            pyc::VOrReduceOp,
-            pyc::VAndReduceOp,
-            pyc::VAddReduceOp,
-            arith::SelectOp>(*op)) {
-      if (failed(emitCombAssign(*op, os, nt)))
+    if (action.kind == SimNodeActionKind::Expression) {
+      if (failed(emitGraphExpr(plan.graph,
+                               plan.graph.expressions[action.expressionId],
+                               os, nt)))
         return failure();
       return success();
     }
     return op->emitError("unsupported op for C++ emission: ") << op->getName();
   };
 
-  struct SccCompPlan {
-    llvm::SmallVector<unsigned> nodes;
-    llvm::SmallVector<unsigned> succ;
-    unsigned indeg = 0;
-    std::string key;
-    bool cyclic = false;
-  };
-
-  auto buildEvalGraph = [&](llvm::SmallVector<Operation *> &nodes,
-                            llvm::SmallVector<std::string> &nodeKeys,
-                            llvm::SmallVector<llvm::SmallVector<unsigned>> &succ,
-                            llvm::SmallVector<unsigned> &indeg) -> bool {
-    nodes.clear();
-    nodeKeys.clear();
-    succ.clear();
-    indeg.clear();
-
-    llvm::DenseMap<Operation *, unsigned> nodeIndex;
-    for (Operation &op : top) {
-      if (isa<func::ReturnOp>(op) || isa<pyc::WireOp>(op) || isa<pyc::RegOp>(op) || isa<pyc::SyncMemOp>(op) ||
-          isa<pyc::SyncMemDPOp>(op) || isa<pyc::CdcSyncOp>(op))
-        continue;
-
-      unsigned idx = static_cast<unsigned>(nodes.size());
-      nodes.push_back(&op);
-      nodeIndex.try_emplace(&op, idx);
-      if (auto a = dyn_cast<pyc::AssignOp>(op))
-        nodeKeys.push_back(nt.get(a.getDst()));
-      else if (op.getNumResults() > 0)
-        nodeKeys.push_back(nt.get(op.getResult(0)));
-      else
-        nodeKeys.push_back(sanitizeId(op.getName().getStringRef()) + "_" + std::to_string(idx));
-    }
-
-    if (nodes.empty())
-      return false;
-
-    llvm::DenseMap<Value, unsigned> valueProducer;
-    llvm::DenseMap<Value, unsigned> wireAssign;
-    llvm::DenseMap<Value, unsigned> wireAssignCount;
-    for (auto it : llvm::enumerate(nodes)) {
-      unsigned idx = static_cast<unsigned>(it.index());
-      Operation *op = it.value();
-      for (Value r : op->getResults())
-        valueProducer.try_emplace(r, idx);
-      if (auto a = dyn_cast<pyc::AssignOp>(*op)) {
-        Value dst = a.getDst();
-        unsigned &cnt = wireAssignCount[dst];
-        cnt++;
-        if (cnt == 1)
-          wireAssign[dst] = idx;
-      }
-    }
-    for (auto &it : wireAssignCount) {
-      if (it.second > 1)
-        return false;
-    }
-    for (auto &it : wireAssign)
-      valueProducer[it.first] = it.second;
-
-    succ.assign(nodes.size(), {});
-    indeg.assign(nodes.size(), 0u);
-    for (auto it : llvm::enumerate(nodes)) {
-      unsigned idx = static_cast<unsigned>(it.index());
-      Operation *op = it.value();
-      llvm::SmallSet<unsigned, 8> deps;
-      auto addDep = [&](Value v) {
-        auto pIt = valueProducer.find(v);
-        if (pIt == valueProducer.end())
-          return;
-        unsigned p = pIt->second;
-        if (p == idx)
-          return;
-        deps.insert(p);
-      };
-      if (auto a = dyn_cast<pyc::AssignOp>(*op))
-        addDep(a.getSrc());
-      else
-        for (Value v : op->getOperands())
-          addDep(v);
-      indeg[idx] = static_cast<unsigned>(deps.size());
-      for (unsigned p : deps)
-        succ[p].push_back(idx);
-    }
-    return true;
-  };
-
-  llvm::SmallVector<Operation *> sccNodes;
-  llvm::SmallVector<std::string> sccNodeKeys;
-  llvm::SmallVector<llvm::SmallVector<unsigned>> sccSucc;
-  llvm::SmallVector<unsigned> sccIndeg;
-  llvm::SmallVector<SccCompPlan> sccPlans;
-  llvm::SmallVector<unsigned> sccCompOrder;
-  bool hasSccWorklistPlan = false;
-
-  if (buildEvalGraph(sccNodes, sccNodeKeys, sccSucc, sccIndeg)) {
-    std::vector<int> index(sccNodes.size(), -1);
-    std::vector<int> low(sccNodes.size(), 0);
-    std::vector<unsigned> stack;
-    std::vector<bool> inStack(sccNodes.size(), false);
-    llvm::SmallVector<unsigned> nodeToComp(sccNodes.size(), 0);
-    int nextIndex = 0;
-
-    std::function<void(unsigned)> strongconnect = [&](unsigned v) {
-      index[v] = nextIndex;
-      low[v] = nextIndex;
-      ++nextIndex;
-      stack.push_back(v);
-      inStack[v] = true;
-
-      for (unsigned w : sccSucc[v]) {
-        if (index[w] < 0) {
-          strongconnect(w);
-          low[v] = std::min(low[v], low[w]);
-        } else if (inStack[w]) {
-          low[v] = std::min(low[v], index[w]);
-        }
-      }
-
-      if (low[v] == index[v]) {
-        SccCompPlan comp;
-        while (!stack.empty()) {
-          unsigned w = stack.back();
-          stack.pop_back();
-          inStack[w] = false;
-          nodeToComp[w] = static_cast<unsigned>(sccPlans.size());
-          comp.nodes.push_back(w);
-          if (w == v)
-            break;
-        }
-        std::sort(comp.nodes.begin(), comp.nodes.end(), [&](unsigned a, unsigned b) { return sccNodeKeys[a] < sccNodeKeys[b]; });
-        comp.key = sccNodeKeys[comp.nodes.front()];
-        sccPlans.push_back(std::move(comp));
-      }
-    };
-
-    for (unsigned v = 0; v < sccNodes.size(); ++v)
-      if (index[v] < 0)
-        strongconnect(v);
-
-    llvm::SmallVector<llvm::SmallSet<unsigned, 8>> compSuccSet(sccPlans.size());
-    for (unsigned v = 0; v < sccNodes.size(); ++v) {
-      unsigned cv = nodeToComp[v];
-      for (unsigned w : sccSucc[v]) {
-        unsigned cw = nodeToComp[w];
-        if (cv == cw) {
-          if (v == w || sccPlans[cv].nodes.size() > 1)
-            sccPlans[cv].cyclic = true;
-          continue;
-        }
-        compSuccSet[cv].insert(cw);
-      }
-      if (sccPlans[cv].nodes.size() > 1)
-        sccPlans[cv].cyclic = true;
-    }
-
-    for (unsigned c = 0; c < sccPlans.size(); ++c) {
-      for (unsigned s : compSuccSet[c]) {
-        sccPlans[c].succ.push_back(s);
-        sccPlans[s].indeg++;
-      }
-      std::sort(sccPlans[c].succ.begin(), sccPlans[c].succ.end(),
-                [&](unsigned a, unsigned b) { return sccPlans[a].key < sccPlans[b].key; });
-    }
-
-    auto cmpComp = [&](unsigned a, unsigned b) { return sccPlans[a].key > sccPlans[b].key; };
-    std::vector<unsigned> heap;
-    for (unsigned i = 0; i < sccPlans.size(); ++i)
-      if (sccPlans[i].indeg == 0)
-        heap.push_back(i);
-    std::make_heap(heap.begin(), heap.end(), cmpComp);
-    while (!heap.empty()) {
-      std::pop_heap(heap.begin(), heap.end(), cmpComp);
-      unsigned c = heap.back();
-      heap.pop_back();
-      sccCompOrder.push_back(c);
-      for (unsigned s : sccPlans[c].succ) {
-        if (--sccPlans[s].indeg == 0) {
-          heap.push_back(s);
-          std::push_heap(heap.begin(), heap.end(), cmpComp);
-        }
-      }
-    }
-
-    if (sccCompOrder.size() == sccPlans.size()) {
-      for (const auto &comp : sccPlans) {
-        if (comp.cyclic) {
-          hasSccWorklistPlan = true;
-          break;
-        }
-      }
-    } else {
-      hasSccWorklistPlan = false;
-    }
-  }
+  const auto &sccPlans = plan.sccOrder;
+  bool hasSccWorklistPlan = plan.useSccWorklist;
 
   // eval(): attempt a single-pass topological netlist schedule; if the graph has
   // cycles, fall back to a bounded fixed-point iteration.
   if (!hasFullTopo) {
-    unsigned numPrims = static_cast<unsigned>(instInfos.size() + fifos.size() + asyncFifos.size() + byteMems.size());
+    unsigned numPrims = plan.primitiveCount;
 
     std::vector<std::string> primGroupMethods;
     if (numPrims > 0) {
-      constexpr unsigned kPrimGroupSize = 64;
-      unsigned groupIdx = 0;
-      unsigned inGroup = 0;
-      auto openGroup = [&]() {
-        std::string methodName = "eval_prim_group_" + std::to_string(groupIdx++);
+      for (auto [groupIdx, chunk] : llvm::enumerate(plan.primitiveEvalChunks)) {
+        std::string methodName = "eval_prim_group_" + std::to_string(groupIdx);
         primGroupMethods.push_back(methodName);
         os << "  inline void " << methodName << "(bool &_pyc_prim_changed) {\n";
-        inGroup = 0;
-      };
-      auto closeGroup = [&]() { os << "  }\n\n"; };
-      auto ensureGroup = [&]() {
-        if (primGroupMethods.empty() || inGroup >= kPrimGroupSize) {
-          if (!primGroupMethods.empty())
-            closeGroup();
-          openGroup();
-        }
-      };
-      auto bumpGroup = [&]() { ++inGroup; };
-
-      for (const auto &ii : instInfos) {
-        ensureGroup();
-        emitInstanceEvalWithCache(ii, "    ", "_pyc_prim_changed");
-        bumpGroup();
+        for (unsigned id : chunk)
+          if (failed(emitEvalNode(id, "    ", "_pyc_prim_changed")))
+            return failure();
+        os << "  }\n\n";
       }
-      for (auto fifo : fifos) {
-        ensureGroup();
-        emitFifoEvalWithCache(fifo, "    ", "_pyc_prim_changed");
-        bumpGroup();
-      }
-      for (auto fifo : asyncFifos) {
-        ensureGroup();
-        emitAsyncFifoEvalWithCache(fifo, "    ", "_pyc_prim_changed");
-        bumpGroup();
-      }
-      for (auto mem : byteMems) {
-        ensureGroup();
-        emitByteMemEvalWithCache(mem, "    ", "_pyc_prim_changed");
-        bumpGroup();
-      }
-      if (!primGroupMethods.empty())
-        closeGroup();
     }
 
     os << "  inline void eval_fixpoint_fallback_path() {\n";
     if (numPrims > 0) {
-      os << "    for (unsigned _i = 0; _i < " << numPrims << "u; ++_i) {\n";
+      os << "    for (unsigned _i = 0; _i < " << plan.fallbackIterationLimit << "u; ++_i) {\n";
       os << "      if (_pyc_sim_stats_enable) _pyc_sim_stats.fallback_iterations++;\n";
       os << "      bool _pyc_prim_changed = false;\n";
       for (const std::string &methodName : primGroupMethods)
@@ -2512,28 +1896,29 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
 
     if (hasSccWorklistPlan && numPrims > 0) {
       std::vector<std::string> sccCompMethods;
-      sccCompMethods.reserve(sccCompOrder.size());
-      constexpr unsigned kSccNodeChunk = 256;
+      sccCompMethods.reserve(sccPlans.size());
+      const unsigned kSccNodeChunk = plan.sccChunkNodes;
       unsigned compOrdinal = 0;
-      for (unsigned c : sccCompOrder) {
-        const auto &comp = sccPlans[c];
+      for (const auto &comp : sccPlans) {
         std::string methodName = "eval_scc_comp_" + std::to_string(compOrdinal++);
         std::vector<std::string> partMethods;
-        partMethods.reserve((comp.nodes.size() + kSccNodeChunk - 1) / kSccNodeChunk);
+        partMethods.reserve((comp.nodeIds.size() + kSccNodeChunk - 1) / kSccNodeChunk);
 
-        for (size_t begin = 0, partIdx = 0; begin < comp.nodes.size(); begin += kSccNodeChunk, ++partIdx) {
-          size_t end = std::min(comp.nodes.size(), begin + static_cast<size_t>(kSccNodeChunk));
+        for (size_t begin = 0, partIdx = 0; begin < comp.nodeIds.size(); begin += kSccNodeChunk, ++partIdx) {
+          size_t end = std::min(comp.nodeIds.size(), begin + static_cast<size_t>(kSccNodeChunk));
           std::string partName = methodName + "_part_" + std::to_string(partIdx);
           partMethods.push_back(partName);
           if (comp.cyclic) {
             os << "  inline void " << partName << "(bool &_pyc_prim_changed) {\n";
             for (size_t i = begin; i < end; ++i)
-              if (failed(emitEvalNode(sccNodes[comp.nodes[i]], "    ", "_pyc_prim_changed")))
+              if (failed(emitEvalNode(comp.nodeIds[i],
+                                      "    ", "_pyc_prim_changed")))
                 return failure();
           } else {
             os << "  inline void " << partName << "() {\n";
             for (size_t i = begin; i < end; ++i)
-              if (failed(emitEvalNode(sccNodes[comp.nodes[i]], "    ")))
+              if (failed(emitEvalNode(comp.nodeIds[i],
+                                      "    ")))
                 return failure();
           }
           os << "  }\n\n";
@@ -2542,7 +1927,7 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
         sccCompMethods.push_back(methodName);
         os << "  inline void " << methodName << "() {\n";
         if (comp.cyclic) {
-          unsigned iterCap = std::max(2u, numPrims + static_cast<unsigned>(comp.nodes.size()) + 2u);
+          unsigned iterCap = comp.iterationLimit;
           os << "    bool _pyc_converged = false;\n";
           os << "    for (unsigned _pyc_iter = 0; _pyc_iter < " << iterCap << "u; ++_pyc_iter) {\n";
           os << "      if (_pyc_sim_stats_enable) _pyc_sim_stats.fallback_iterations++;\n";
@@ -2571,7 +1956,7 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
 
   std::vector<std::string> topoEvalMethods;
   if (hasFullTopo && !fullOrdered.empty()) {
-    unsigned evalTopoChunkNodes = std::max(1u, opts.evalTopoChunkNodes);
+    unsigned evalTopoChunkNodes = plan.evalChunkNodes;
     if (fullOrdered.size() > evalTopoChunkNodes) {
       topoEvalMethods.reserve((fullOrdered.size() + evalTopoChunkNodes - 1) / evalTopoChunkNodes);
       for (unsigned begin = 0, chunkIdx = 0; begin < fullOrdered.size(); begin += evalTopoChunkNodes, ++chunkIdx) {
@@ -2593,13 +1978,13 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
       for (const std::string &methodName : topoEvalMethods)
         os << "    " << methodName << "();\n";
     } else {
-      for (Operation *op : fullOrdered)
-        if (failed(emitEvalNode(op, "    ")))
+      for (unsigned nodeId : fullOrdered)
+        if (failed(emitEvalNode(nodeId, "    ")))
           return failure();
     }
   } else {
     os << "    eval_comb_pass();\n";
-    unsigned numPrims = static_cast<unsigned>(instInfos.size() + fifos.size() + asyncFifos.size() + byteMems.size());
+    unsigned numPrims = plan.primitiveCount;
     if (hasSccWorklistPlan && numPrims > 0) {
       os << "    if (_pyc_sim_fast_enable) {\n";
       os << "      #ifndef PYC_DISABLE_SCC_WORKLIST_EVAL\n";
@@ -2616,11 +2001,9 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
   }
 
   // Connect return values to output ports.
-  auto ret = dyn_cast_or_null<func::ReturnOp>(f.getBody().front().getTerminator());
-  if (!ret)
-    return f.emitError("missing return");
-  for (auto [i, v] : llvm::enumerate(ret.getOperands()))
-    os << "    " << outNames[i] << " = " << nt.get(v) << ";\n";
+  for (auto [i, id] : llvm::enumerate(plan.graph.outputValueIds))
+    os << "    " << outNames[i] << " = "
+       << nt.get(id) << ";\n";
 
   os << "  }\n\n";
 
@@ -2629,38 +2012,35 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
   // Large designs can produce enormous tick bodies (notably JanusBccBackendCompat), which
   // makes a single translation unit fragile and slow to compile. Split tick into helper
   // parts so --cpp-split=module can shard tick across multiple .cpp files.
-  constexpr unsigned kTickChunk = 256;
-
-  auto emitTickComputePart = [&](unsigned begin, unsigned end, unsigned partIdx) {
+  auto emitTickComputePart = [&](const llvm::SmallVector<unsigned> &chunk,
+                                 unsigned partIdx) {
     os << "  inline void tick_compute_part_" << partIdx << "() {\n";
     // Sub-modules (inputs + tick_compute).
-    for (unsigned i = begin; i < end && i < instInfos.size(); ++i) {
-      const auto &ii = instInfos[i];
-      auto inst = ii.op;
-      for (unsigned j = 0; j < inst.getNumOperands(); ++j)
-        os << "    " << ii.member << "->" << ii.inPorts[j] << " = " << nt.get(inst.getOperand(j)) << ";\n";
+    for (unsigned nodeId : chunk) {
+      const auto &ii = instInfos[instIndex.lookup(nodeId)];
+      const SimNode &inst = plan.graph.topNodes[ii.nodeId];
+      for (unsigned j = 0; j < inst.inputIds.size(); ++j)
+        os << "    " << ii.member << "->" << ii.inPorts[j] << " = " << graphValueName(inst.inputIds[j]) << ";\n";
       os << "    " << ii.member << "->tick_compute();\n";
     }
     os << "  }\n\n";
   };
 
-  auto emitTickCommitPart = [&](unsigned begin, unsigned end, unsigned partIdx) {
+  auto emitTickCommitPart = [&](const llvm::SmallVector<unsigned> &chunk,
+                                unsigned partIdx) {
     os << "  inline void tick_commit_part_" << partIdx << "() {\n";
     // Sub-modules.
-    for (unsigned i = begin; i < end && i < instInfos.size(); ++i)
-      os << "    " << instInfos[i].member << "->tick_commit();\n";
+    for (unsigned nodeId : chunk)
+      os << "    " << instInfos[instIndex.lookup(nodeId)].member << "->tick_commit();\n";
     os << "  }\n\n";
   };
 
   // Emit chunked submodule tick helpers.
-  unsigned subParts = 0;
-  if (!instInfos.empty()) {
-    for (unsigned b = 0; b < instInfos.size(); b += kTickChunk)
-      emitTickComputePart(b, std::min<unsigned>(static_cast<unsigned>(instInfos.size()), b + kTickChunk), subParts++);
-    unsigned commitParts = 0;
-    for (unsigned b = 0; b < instInfos.size(); b += kTickChunk)
-      emitTickCommitPart(b, std::min<unsigned>(static_cast<unsigned>(instInfos.size()), b + kTickChunk), commitParts++);
-  }
+  unsigned subParts = plan.instanceTickChunks.size();
+  for (auto [part, chunk] : llvm::enumerate(plan.instanceTickChunks))
+    emitTickComputePart(chunk, static_cast<unsigned>(part));
+  for (auto [part, chunk] : llvm::enumerate(plan.instanceTickChunks))
+    emitTickCommitPart(chunk, static_cast<unsigned>(part));
 
   os << "  void tick_compute() {\n";
   if (!instInfos.empty()) {
@@ -2669,58 +2049,110 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
       os << "    tick_compute_part_" << i << "();\n";
   }
   os << "    // Local sequential primitives.\n";
-  for (auto r : regs)
-    os << "    " << nt.get(r.getQ()) << "_inst->tick_compute();\n";
-  for (auto fifo : fifos)
-    os << "    " << nt.get(fifo.getInReady()) << "_inst.tick_compute();\n";
-  for (auto mem : byteMems)
-    os << "    " << byteMemInstName.lookup(mem.getOperation()) << ".tick_compute();\n";
-  for (auto mem : syncMems)
-    os << "    " << syncMemInstName.lookup(mem.getOperation()) << "->tick_compute();\n";
-  for (auto mem : syncMemDPs)
-    os << "    " << syncMemDPInstName.lookup(mem.getOperation()) << "->tick_compute();\n";
-  for (auto fifo : asyncFifos)
-    os << "    " << nt.get(fifo.getInReady()) << "_inst.tick_compute();\n";
-  for (auto s : cdcSyncs)
-    os << "    " << nt.get(s.getOut()) << "_inst.tick_compute();\n";
+  auto regInstanceName = [&](unsigned id) {
+    const SimNode &reg = plan.graph.topNodes[id];
+    return nt.get(reg.outputIds.front()) + "_inst";
+  };
+  for (const SimTickAction &action : plan.localTickComputeActions) {
+    unsigned id = action.id;
+    switch (action.kind) {
+    case SimTickActionKind::ResetGroup: {
+      const ResetGroupPlan &group = plan.resetGroups[id];
+      std::string suffix = std::to_string(id);
+      std::string now = "_pyc_reset_group_clk_now_" + suffix;
+      std::string edge = "_pyc_reset_group_edge_" + suffix;
+      std::string previous = "_pyc_reset_group_clk_prev_" + suffix;
+      os << "    bool " << now << " = " << nt.get(group.clockValueId) << ".toBool();\n";
+      os << "    bool " << edge << " = !" << previous << " && " << now << ";\n";
+      os << "    " << previous << " = " << now << ";\n";
+      os << "    if (" << edge << ") {\n";
+      os << "      if (" << nt.get(group.resetValueId) << ".toBool()) {\n";
+      for (unsigned regId : group.regNodeIds)
+        os << "        " << regInstanceName(regId) << "->posedge_reset_compute();\n";
+      os << "      } else {\n";
+      for (unsigned regId : group.regNodeIds)
+        os << "        " << regInstanceName(regId) << "->posedge_data_compute();\n";
+      os << "      }\n";
+      os << "    } else if (" << now << ") {\n";
+      for (unsigned regId : group.regNodeIds)
+        os << "      " << regInstanceName(regId) << "->noedge_update();\n";
+      os << "    } else {\n";
+      for (unsigned regId : group.regNodeIds)
+        os << "      " << regInstanceName(regId) << "->negedge_update();\n";
+      os << "    }\n";
+      break;
+    }
+    case SimTickActionKind::Reg:
+      os << "    " << regInstanceName(id) << "->tick_compute();\n";
+      break;
+    case SimTickActionKind::Fifo:
+    case SimTickActionKind::AsyncFifo:
+      os << "    " << fifoInstanceName(id) << ".tick_compute();\n";
+      break;
+    case SimTickActionKind::ByteMem:
+      os << "    " << memoryInstanceName(id) << ".tick_compute();\n";
+      break;
+    case SimTickActionKind::SyncMem:
+    case SimTickActionKind::SyncMemDP:
+      os << "    " << memoryInstanceName(id) << "->tick_compute();\n";
+      break;
+    case SimTickActionKind::CdcSync:
+      os << "    " << nt.get(plan.graph.topNodes[id].outputIds.front())
+         << "_inst.tick_compute();\n";
+      break;
+    }
+  }
   os << "  }\n\n";
 
   os << "  void tick_commit() {\n";
   if (!instInfos.empty()) {
     os << "    // Sub-modules.\n";
-    unsigned commitParts = (static_cast<unsigned>(instInfos.size()) + kTickChunk - 1) / kTickChunk;
-    for (unsigned i = 0; i < commitParts; ++i)
+    for (unsigned i = 0; i < subParts; ++i)
       os << "    tick_commit_part_" << i << "();\n";
   }
   os << "    // Local sequential primitives.\n";
-  for (auto r : regs)
-    os << "    " << nt.get(r.getQ()) << "_inst->tick_commit();\n";
-  for (auto fifo : fifos)
-    os << "    " << nt.get(fifo.getInReady()) << "_inst.tick_commit();\n";
-  for (auto mem : byteMems)
-    os << "    " << byteMemInstName.lookup(mem.getOperation()) << ".tick_commit();\n";
-  for (auto mem : syncMems)
-    os << "    " << syncMemInstName.lookup(mem.getOperation()) << "->tick_commit();\n";
-  for (auto mem : syncMemDPs)
-    os << "    " << syncMemDPInstName.lookup(mem.getOperation()) << "->tick_commit();\n";
-  for (auto fifo : asyncFifos)
-    os << "    " << nt.get(fifo.getInReady()) << "_inst.tick_commit();\n";
-  for (auto s : cdcSyncs)
-    os << "    " << nt.get(s.getOut()) << "_inst.tick_commit();\n";
+  for (const SimTickAction &action : plan.localTickCommitActions) {
+    unsigned id = action.id;
+    switch (action.kind) {
+    case SimTickActionKind::ResetGroup:
+      llvm_unreachable("reset groups cannot commit as one action");
+    case SimTickActionKind::Reg:
+      os << "    " << regInstanceName(id) << "->tick_commit();\n";
+      break;
+    case SimTickActionKind::Fifo:
+    case SimTickActionKind::AsyncFifo:
+      os << "    " << fifoInstanceName(id) << ".tick_commit();\n";
+      break;
+    case SimTickActionKind::ByteMem:
+      os << "    " << memoryInstanceName(id) << ".tick_commit();\n";
+      break;
+    case SimTickActionKind::SyncMem:
+    case SimTickActionKind::SyncMemDP:
+      os << "    " << memoryInstanceName(id) << "->tick_commit();\n";
+      break;
+    case SimTickActionKind::CdcSync:
+      os << "    " << nt.get(plan.graph.topNodes[id].outputIds.front())
+         << "_inst.tick_commit();\n";
+      break;
+    }
+  }
   if (!instInfos.empty()) {
     os << "    // Force re-eval on next eval() only for stateful sub-modules.\n";
     for (unsigned i = 0; i < instInfos.size(); ++i) {
-      if (i < instHasSequentialCallee.size() && instHasSequentialCallee[i]) {
+      if (plan.invalidateCachesOnCommit.contains(instInfos[i].nodeId)) {
         os << "    " << instInfos[i].member << "_eval_cache_valid = false;\n";
       }
     }
   }
-  for (auto fifo : fifos)
-    os << "    " << nt.get(fifo.getInReady()) << "_inst_eval_cache_valid = false;\n";
-  for (auto mem : byteMems)
-    os << "    " << byteMemInstName.lookup(mem.getOperation()) << "_eval_cache_valid = false;\n";
-	  for (auto fifo : asyncFifos)
-	    os << "    " << nt.get(fifo.getInReady()) << "_inst_eval_cache_valid = false;\n";
+  for (unsigned id : fifos)
+    if (plan.invalidateCachesOnCommit.contains(id))
+      os << "    " << fifoInstanceName(id) << "_eval_cache_valid = false;\n";
+  for (unsigned id : byteMems)
+    if (plan.invalidateCachesOnCommit.contains(id))
+      os << "    " << memoryInstanceName(id) << "_eval_cache_valid = false;\n";
+	  for (unsigned id : asyncFifos)
+	    if (plan.invalidateCachesOnCommit.contains(id))
+	      os << "    " << fifoInstanceName(id) << "_eval_cache_valid = false;\n";
 	  os << "  }\n\n";
 
 	  // Decision 0027: provide explicit comb/tick/commit APIs + high-level step().
@@ -2730,10 +2162,13 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
 	  os << "  void commit() { tick_commit(); }\n";
 	  os << "  void transfer() { tick_commit(); }\n";
 	  os << "  void step() {\n";
-	  os << "    comb();\n";
-	  os << "    tick();\n";
-	  os << "    commit();\n";
-	  os << "    comb();\n";
+	  for (SimulationPhase phase : plan.stepPhases) {
+	    switch (phase) {
+	    case SimulationPhase::Comb: os << "    comb();\n"; break;
+	    case SimulationPhase::TickCompute: os << "    tick();\n"; break;
+	    case SimulationPhase::TickCommit: os << "    commit();\n"; break;
+	    }
+	  }
 	  os << "  }\n";
 
 	  os << "};\n\n";
@@ -2742,7 +2177,7 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
 
 } // namespace
 
-LogicalResult emitCpp(ModuleOp module, llvm::raw_ostream &os, const CppEmitterOptions &opts) {
+LogicalResult emitCpp(const ModuleSimulationPlan &plan, llvm::raw_ostream &os, const CppEmitterOptions &opts) {
   os << "// pyCircuit C++ emission (prototype)\n";
   os << "#include <cstdlib>\n";
   os << "#include <cstdint>\n";
@@ -2753,63 +2188,8 @@ LogicalResult emitCpp(ModuleOp module, llvm::raw_ostream &os, const CppEmitterOp
   os << "#include <cpp/pyc_sim.hpp>\n\n";
   os << "namespace pyc::gen {\n\n";
 
-  // Emit structs in dependency order so submodule types are defined before use.
-  llvm::SmallVector<func::FuncOp> funcs;
-  for (auto f : module.getOps<func::FuncOp>())
-    funcs.push_back(f);
-
-  llvm::StringMap<unsigned> indexByName;
-  for (auto [i, f] : llvm::enumerate(funcs))
-    indexByName.try_emplace(f.getSymName(), static_cast<unsigned>(i));
-
-  llvm::SmallVector<llvm::SmallVector<unsigned>> succ(funcs.size());
-  llvm::SmallVector<unsigned> indeg(funcs.size(), 0);
-
-  for (auto it : llvm::enumerate(funcs)) {
-    unsigned callerIdx = static_cast<unsigned>(it.index());
-    func::FuncOp f = it.value();
-    f.walk([&](pyc::InstanceOp inst) {
-      auto calleeAttr = inst->getAttrOfType<FlatSymbolRefAttr>("callee");
-      if (!calleeAttr)
-        return;
-      auto it = indexByName.find(calleeAttr.getValue());
-      if (it == indexByName.end())
-        return;
-      unsigned calleeIdx = it->second;
-      succ[calleeIdx].push_back(callerIdx);
-      indeg[callerIdx]++;
-    });
-  }
-
-  // Kahn topological sort; tie-break by symbol name for determinism.
-  auto cmp = [&](unsigned a, unsigned b) { return funcs[a].getSymName() > funcs[b].getSymName(); };
-  std::vector<unsigned> heap;
-  heap.reserve(funcs.size());
-  for (unsigned i = 0; i < funcs.size(); ++i)
-    if (indeg[i] == 0)
-      heap.push_back(i);
-  std::make_heap(heap.begin(), heap.end(), cmp);
-
-  llvm::SmallVector<unsigned> order;
-  order.reserve(funcs.size());
-  while (!heap.empty()) {
-    std::pop_heap(heap.begin(), heap.end(), cmp);
-    unsigned n = heap.back();
-    heap.pop_back();
-    order.push_back(n);
-    for (unsigned s : succ[n]) {
-      if (--indeg[s] == 0) {
-        heap.push_back(s);
-        std::push_heap(heap.begin(), heap.end(), cmp);
-      }
-    }
-  }
-
-  if (order.size() != funcs.size())
-    return module.emitError("C++ emitter: module instance graph has a cycle");
-
-  for (unsigned idx : order) {
-    if (failed(emitFunc(funcs[idx], os, opts)))
+  for (const SimulationPlan &function : plan.functions) {
+    if (failed(emitFunc(function, os, opts)))
       return failure();
   }
 
@@ -2817,9 +2197,8 @@ LogicalResult emitCpp(ModuleOp module, llvm::raw_ostream &os, const CppEmitterOp
   return success();
 }
 
-LogicalResult emitCppFunc(ModuleOp module, func::FuncOp f, llvm::raw_ostream &os, const CppEmitterOptions &opts) {
-  (void)module;
-  return emitFunc(f, os, opts);
+LogicalResult emitCppFunc(const SimulationPlan &plan, llvm::raw_ostream &os, const CppEmitterOptions &opts) {
+  return emitFunc(plan, os, opts);
 }
 
 } // namespace pyc

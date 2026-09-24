@@ -451,9 +451,13 @@ static std::optional<LogicalResult> emitScalarOpAssign(Operation &op, raw_ostrea
     unsigned ow = outTy.getWidth();
     if (ow == iw)
       os << "assign " << nt.get(s.getResult()) << " = " << nt.get(s.getIn()) << ";\n";
-    else
-      os << "assign " << nt.get(s.getResult()) << " = {{" << (ow - iw) << "{" << nt.get(s.getIn()) << "["
-         << (iw - 1) << "]}}, " << nt.get(s.getIn()) << "};\n";
+    else {
+      os << "assign " << nt.get(s.getResult()) << " = {{" << (ow - iw)
+         << "{" << nt.get(s.getIn());
+      if (iw != 1)
+        os << "[" << (iw - 1) << "]";
+      os << "}}, " << nt.get(s.getIn()) << "};\n";
+    }
     return success();
   }
   if (auto ex = dyn_cast<pyc::ExtractOp>(op)) {
@@ -761,8 +765,12 @@ static LogicalResult emitComb(pyc::CombOp comb, raw_ostream &os, NameTable &nt) 
   for (Operation &op : b) {
     if (isa<pyc::YieldOp>(op))
       break;
-    if (failed(emitNetlistOp(op, os, nt)))
+    if (auto nested = dyn_cast<pyc::CombOp>(op)) {
+      if (failed(emitComb(nested, os, nt)))
+        return failure();
+    } else if (failed(emitNetlistOp(op, os, nt))) {
       return failure();
+    }
   }
 
   auto yield = dyn_cast_or_null<pyc::YieldOp>(b.getTerminator());

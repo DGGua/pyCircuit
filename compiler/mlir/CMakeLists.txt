@@ -136,7 +136,11 @@ else()
   message(STATUS "MLIRRegisterAllPasses not found; skipping pyc-opt (pycc only)")
 endif()
 
-add_executable(pycc tools/pycc.cpp lib/Emit/VerilogEmitter.cpp lib/Emit/CppEmitter.cpp)
+add_executable(pycc tools/pycc.cpp lib/Emit/VerilogEmitter.cpp lib/Emit/CppEmitter.cpp
+  lib/Simulation/SimulationAST.cpp
+  lib/Simulation/SimGraph.cpp
+  lib/Simulation/SimGraphPasses.cpp
+  lib/Simulation/SimulationPlan.cpp)
 llvm_update_compile_flags(pycc)
 set_target_properties(pycc PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"

@@ -144,255 +144,195 @@ public:
           : module_(module), func_(func), sum_(sum), clockBitByValue_(clockBitByValue), wireDrivers_(wireDrivers),
             clockCache_(clockCache), combCache_(combCache) {}
 
-      llvm::BitVector domain(Value v) {
-        if (!v || !isIntType(v.getType()))
+      llvm::BitVector domain(Value root) {
+        if (!root || !isIntType(root.getType()))
           return emptyDom();
-        if (auto it = domMemo_.find(v); it != domMemo_.end())
+        if (auto it = domMemo_.find(root); it != domMemo_.end())
           return it->second;
-        if (!domVisiting_.insert(v).second)
+        if (domVisiting_.contains(root))
           return emptyDom();
 
-        llvm::BitVector out = emptyDom();
-
-        if (auto barg = dyn_cast<BlockArgument>(v)) {
-          (void)barg;
-          domVisiting_.erase(v);
-          domMemo_.try_emplace(v, out);
-          return out;
-        }
-
-        Operation *def = v.getDefiningOp();
-        if (!def) {
-          domVisiting_.erase(v);
-          domMemo_.try_emplace(v, out);
-          return out;
-        }
-
-        // Sequential cut points define clock domains.
-        if (auto r = dyn_cast<pyc::RegOp>(def)) {
-          out = domOfClock(r.getClk());
-          domVisiting_.erase(v);
-          domMemo_.try_emplace(v, out);
-          return out;
-        }
-        if (auto f = dyn_cast<pyc::FifoOp>(def)) {
-          out = domOfClock(f.getClk());
-          domVisiting_.erase(v);
-          domMemo_.try_emplace(v, out);
-          return out;
-        }
-        if (auto m = dyn_cast<pyc::SyncMemOp>(def)) {
-          out = domOfClock(m.getClk());
-          domVisiting_.erase(v);
-          domMemo_.try_emplace(v, out);
-          return out;
-        }
-        if (auto m = dyn_cast<pyc::SyncMemDPOp>(def)) {
-          out = domOfClock(m.getClk());
-          domVisiting_.erase(v);
-          domMemo_.try_emplace(v, out);
-          return out;
-        }
-        if (auto m = dyn_cast<pyc::ByteMemOp>(def)) {
-          out = domOfClock(m.getClk());
-          domVisiting_.erase(v);
-          domMemo_.try_emplace(v, out);
-          return out;
-        }
-        if (auto c = dyn_cast<pyc::CdcSyncOp>(def)) {
-          out = domOfClock(c.getClk());
-          domVisiting_.erase(v);
-          domMemo_.try_emplace(v, out);
-          return out;
-        }
-        if (auto a = dyn_cast<pyc::AsyncFifoOp>(def)) {
-          unsigned resIdx = 0;
-          if (auto r = dyn_cast<OpResult>(v))
-            resIdx = r.getResultNumber();
-          // Results: (in_ready, out_valid, out_data)
-          if (resIdx == 0)
-            out = domOfClock(a.getInClk());
-          else
-            out = domOfClock(a.getOutClk());
-          domVisiting_.erase(v);
-          domMemo_.try_emplace(v, out);
-          return out;
-        }
-
-        if (isa<arith::ConstantOp, pyc::ConstantOp>(def)) {
-          domVisiting_.erase(v);
-          domMemo_.try_emplace(v, out);
-          return out;
-        }
-
-        if (auto w = dyn_cast<pyc::WireOp>(def)) {
-          (void)w;
-          auto it = wireDrivers_.find(v);
-          if (it != wireDrivers_.end()) {
-            for (Value src : it->second)
-              out |= domain(src);
+        struct Frame {
+          Value value;
+          llvm::SmallVector<Value, 4> dependencies;
+          llvm::BitVector result;
+          size_t next = 0;
+          bool initialized = false;
+        };
+        llvm::SmallVector<Frame> stack;
+        stack.push_back(Frame{root});
+        while (!stack.empty()) {
+          Frame &frame = stack.back();
+          Value value = frame.value;
+          if (domMemo_.count(value)) {
+            stack.pop_back();
+            continue;
           }
-          domVisiting_.erase(v);
-          domMemo_.try_emplace(v, out);
-          return out;
-        }
-
-        if (auto a = dyn_cast<pyc::AliasOp>(def)) {
-          out = domain(a.getIn());
-          domVisiting_.erase(v);
-          domMemo_.try_emplace(v, out);
-          return out;
-        }
-
-        if (auto ra = dyn_cast<pyc::ResetActiveOp>(def)) {
-          out = domain(ra.getRst());
-          domVisiting_.erase(v);
-          domMemo_.try_emplace(v, out);
-          return out;
-        }
-
-        if (auto comb = dyn_cast<pyc::CombOp>(def)) {
-          unsigned resIdx = 0;
-          if (auto r = dyn_cast<OpResult>(v))
-            resIdx = r.getResultNumber();
-          out = domainOfCombResult(comb, resIdx);
-          domVisiting_.erase(v);
-          domMemo_.try_emplace(v, out);
-          return out;
-        }
-
-        if (auto inst = dyn_cast<pyc::InstanceOp>(def)) {
-          unsigned resIdx = 0;
-          if (auto r = dyn_cast<OpResult>(v))
-            resIdx = r.getResultNumber();
-          out = domainOfInstanceResult(inst, resIdx);
-          domVisiting_.erase(v);
-          domMemo_.try_emplace(v, out);
-          return out;
-        }
-
-        // Generic combinational op: union operand domains.
-        for (Value opnd : def->getOperands()) {
-          if (opnd && isIntType(opnd.getType()))
-            out |= domain(opnd);
-          if (opnd && isa<pyc::ResetType>(opnd.getType()))
-            out |= domain(opnd);
-        }
-
-        domVisiting_.erase(v);
-        domMemo_.try_emplace(v, out);
-        return out;
-      }
-
-      llvm::BitVector argDeps(Value v) {
-        if (!v || !isIntType(v.getType()))
-          return emptyArgs();
-        if (auto it = argMemo_.find(v); it != argMemo_.end())
-          return it->second;
-        if (!argVisiting_.insert(v).second)
-          return emptyArgs();
-
-        llvm::BitVector out = emptyArgs();
-
-        if (auto barg = dyn_cast<BlockArgument>(v)) {
-          Operation *parent = barg.getOwner() ? barg.getOwner()->getParentOp() : nullptr;
-          if (auto f = dyn_cast_or_null<func::FuncOp>(parent)) {
-            if (f == func_) {
-              out.set(static_cast<unsigned>(barg.getArgNumber()));
-              argVisiting_.erase(v);
-              argMemo_.try_emplace(v, out);
-              return out;
+          if (!frame.initialized) {
+            frame.initialized = true;
+            domVisiting_.insert(value);
+            frame.result = emptyDom();
+            if (!isa<BlockArgument>(value)) {
+              Operation *def = value.getDefiningOp();
+              if (auto reg = dyn_cast_or_null<pyc::RegOp>(def))
+                frame.result = domOfClock(reg.getClk());
+              else if (auto fifo = dyn_cast_or_null<pyc::FifoOp>(def))
+                frame.result = domOfClock(fifo.getClk());
+              else if (auto mem = dyn_cast_or_null<pyc::SyncMemOp>(def))
+                frame.result = domOfClock(mem.getClk());
+              else if (auto mem = dyn_cast_or_null<pyc::SyncMemDPOp>(def))
+                frame.result = domOfClock(mem.getClk());
+              else if (auto mem = dyn_cast_or_null<pyc::ByteMemOp>(def))
+                frame.result = domOfClock(mem.getClk());
+              else if (auto cdc = dyn_cast_or_null<pyc::CdcSyncOp>(def))
+                frame.result = domOfClock(cdc.getClk());
+              else if (auto fifo = dyn_cast_or_null<pyc::AsyncFifoOp>(def)) {
+                unsigned resultNumber = cast<OpResult>(value).getResultNumber();
+                frame.result = domOfClock(resultNumber == 0
+                                              ? fifo.getInClk()
+                                              : fifo.getOutClk());
+              } else if (isa_and_nonnull<arith::ConstantOp, pyc::ConstantOp>(def)) {
+                // Constants have no clock domain.
+              } else if (auto wire = dyn_cast_or_null<pyc::WireOp>(def)) {
+                (void)wire;
+                if (auto it = wireDrivers_.find(value); it != wireDrivers_.end())
+                  frame.dependencies.append(it->second.begin(), it->second.end());
+              } else if (auto alias = dyn_cast_or_null<pyc::AliasOp>(def))
+                frame.dependencies.push_back(alias.getIn());
+              else if (auto reset = dyn_cast_or_null<pyc::ResetActiveOp>(def))
+                frame.dependencies.push_back(reset.getRst());
+              else if (auto comb = dyn_cast_or_null<pyc::CombOp>(def)) {
+                if (!comb.getBody().empty()) {
+                  auto yield = dyn_cast_or_null<pyc::YieldOp>(
+                      comb.getBody().front().getTerminator());
+                  unsigned resultNumber = cast<OpResult>(value).getResultNumber();
+                  if (yield && resultNumber < yield.getValues().size())
+                    frame.dependencies.push_back(yield.getValues()[resultNumber]);
+                }
+              } else if (auto inst = dyn_cast_or_null<pyc::InstanceOp>(def)) {
+                unsigned resultNumber = cast<OpResult>(value).getResultNumber();
+                frame.result = domainOfInstanceResult(inst, resultNumber);
+              } else if (def) {
+                for (Value operand : def->getOperands())
+                  if (operand && (isIntType(operand.getType()) ||
+                                  isResetType(operand.getType())))
+                    frame.dependencies.push_back(operand);
+              }
             }
           }
-
-          if (auto comb = dyn_cast_or_null<pyc::CombOp>(parent)) {
-            unsigned idx = static_cast<unsigned>(barg.getArgNumber());
-            auto inputs = comb.getInputs();
-            if (idx < inputs.size())
-              out = argDeps(inputs[idx]);
-            argVisiting_.erase(v);
-            argMemo_.try_emplace(v, out);
-            return out;
+          bool pushed = false;
+          while (frame.next < frame.dependencies.size()) {
+            Value dep = frame.dependencies[frame.next++];
+            if (!dep || !isIntType(dep.getType()) || domMemo_.count(dep) ||
+                domVisiting_.contains(dep))
+              continue;
+            stack.push_back(Frame{dep});
+            pushed = true;
+            break;
           }
-
-          argVisiting_.erase(v);
-          argMemo_.try_emplace(v, out);
-          return out;
+          if (pushed)
+            continue;
+          for (Value dep : frame.dependencies)
+            if (auto it = domMemo_.find(dep); it != domMemo_.end())
+              frame.result |= it->second;
+          domMemo_.try_emplace(value, frame.result);
+          domVisiting_.erase(value);
+          stack.pop_back();
         }
+        return domMemo_.lookup(root);
+      }
 
-        Operation *def = v.getDefiningOp();
-        if (!def) {
-          argVisiting_.erase(v);
-          argMemo_.try_emplace(v, out);
-          return out;
-        }
+      llvm::BitVector argDeps(Value root) {
+        if (!root || !isIntType(root.getType()))
+          return emptyArgs();
+        if (auto it = argMemo_.find(root); it != argMemo_.end())
+          return it->second;
+        if (argVisiting_.contains(root))
+          return emptyArgs();
 
-        if (isSequentialCut(def)) {
-          argVisiting_.erase(v);
-          argMemo_.try_emplace(v, out);
-          return out;
-        }
-
-        if (isa<arith::ConstantOp, pyc::ConstantOp>(def)) {
-          argVisiting_.erase(v);
-          argMemo_.try_emplace(v, out);
-          return out;
-        }
-
-        if (auto w = dyn_cast<pyc::WireOp>(def)) {
-          (void)w;
-          auto it = wireDrivers_.find(v);
-          if (it != wireDrivers_.end()) {
-            for (Value src : it->second)
-              out |= argDeps(src);
+        struct Frame {
+          Value value;
+          llvm::SmallVector<Value, 4> dependencies;
+          llvm::BitVector result;
+          size_t next = 0;
+          bool initialized = false;
+        };
+        llvm::SmallVector<Frame> stack;
+        stack.push_back(Frame{root});
+        while (!stack.empty()) {
+          Frame &frame = stack.back();
+          Value value = frame.value;
+          if (argMemo_.count(value)) {
+            stack.pop_back();
+            continue;
           }
-          argVisiting_.erase(v);
-          argMemo_.try_emplace(v, out);
-          return out;
+          if (!frame.initialized) {
+            frame.initialized = true;
+            argVisiting_.insert(value);
+            frame.result = emptyArgs();
+            if (auto arg = dyn_cast<BlockArgument>(value)) {
+              Operation *parent = arg.getOwner()
+                                      ? arg.getOwner()->getParentOp()
+                                      : nullptr;
+              if (auto function = dyn_cast_or_null<func::FuncOp>(parent)) {
+                if (function == func_)
+                  frame.result.set(static_cast<unsigned>(arg.getArgNumber()));
+              } else if (auto comb = dyn_cast_or_null<pyc::CombOp>(parent)) {
+                unsigned index = static_cast<unsigned>(arg.getArgNumber());
+                if (index < comb.getInputs().size())
+                  frame.dependencies.push_back(comb.getInputs()[index]);
+              }
+            } else {
+              Operation *def = value.getDefiningOp();
+              if (!def || isSequentialCut(def) ||
+                  isa<arith::ConstantOp, pyc::ConstantOp>(def)) {
+                // State cuts and constants do not depend on input arguments.
+              } else if (auto wire = dyn_cast<pyc::WireOp>(def)) {
+                (void)wire;
+                if (auto it = wireDrivers_.find(value); it != wireDrivers_.end())
+                  frame.dependencies.append(it->second.begin(), it->second.end());
+              } else if (auto alias = dyn_cast<pyc::AliasOp>(def))
+                frame.dependencies.push_back(alias.getIn());
+              else if (auto reset = dyn_cast<pyc::ResetActiveOp>(def))
+                frame.dependencies.push_back(reset.getRst());
+              else if (auto comb = dyn_cast<pyc::CombOp>(def)) {
+                if (!comb.getBody().empty()) {
+                  auto yield = dyn_cast_or_null<pyc::YieldOp>(
+                      comb.getBody().front().getTerminator());
+                  unsigned resultNumber = cast<OpResult>(value).getResultNumber();
+                  if (yield && resultNumber < yield.getValues().size())
+                    frame.dependencies.push_back(yield.getValues()[resultNumber]);
+                }
+              } else if (auto inst = dyn_cast<pyc::InstanceOp>(def)) {
+                unsigned resultNumber = cast<OpResult>(value).getResultNumber();
+                frame.result = argDepsOfInstanceResult(inst, resultNumber);
+              } else {
+                for (Value operand : def->getOperands())
+                  if (operand && isIntType(operand.getType()))
+                    frame.dependencies.push_back(operand);
+              }
+            }
+          }
+          bool pushed = false;
+          while (frame.next < frame.dependencies.size()) {
+            Value dep = frame.dependencies[frame.next++];
+            if (!dep || !isIntType(dep.getType()) || argMemo_.count(dep) ||
+                argVisiting_.contains(dep))
+              continue;
+            stack.push_back(Frame{dep});
+            pushed = true;
+            break;
+          }
+          if (pushed)
+            continue;
+          for (Value dep : frame.dependencies)
+            if (auto it = argMemo_.find(dep); it != argMemo_.end())
+              frame.result |= it->second;
+          argMemo_.try_emplace(value, frame.result);
+          argVisiting_.erase(value);
+          stack.pop_back();
         }
-
-        if (auto a = dyn_cast<pyc::AliasOp>(def)) {
-          out = argDeps(a.getIn());
-          argVisiting_.erase(v);
-          argMemo_.try_emplace(v, out);
-          return out;
-        }
-
-        if (auto ra = dyn_cast<pyc::ResetActiveOp>(def)) {
-          out = argDeps(ra.getRst());
-          argVisiting_.erase(v);
-          argMemo_.try_emplace(v, out);
-          return out;
-        }
-
-        if (auto comb = dyn_cast<pyc::CombOp>(def)) {
-          unsigned resIdx = 0;
-          if (auto r = dyn_cast<OpResult>(v))
-            resIdx = r.getResultNumber();
-          out = argDepsOfCombResult(comb, resIdx);
-          argVisiting_.erase(v);
-          argMemo_.try_emplace(v, out);
-          return out;
-        }
-
-        if (auto inst = dyn_cast<pyc::InstanceOp>(def)) {
-          unsigned resIdx = 0;
-          if (auto r = dyn_cast<OpResult>(v))
-            resIdx = r.getResultNumber();
-          out = argDepsOfInstanceResult(inst, resIdx);
-          argVisiting_.erase(v);
-          argMemo_.try_emplace(v, out);
-          return out;
-        }
-
-        for (Value opnd : def->getOperands()) {
-          if (opnd && isIntType(opnd.getType()))
-            out |= argDeps(opnd);
-        }
-
-        argVisiting_.erase(v);
-        argMemo_.try_emplace(v, out);
-        return out;
+        return argMemo_.lookup(root);
       }
 
     private:

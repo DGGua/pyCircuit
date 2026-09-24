@@ -2,6 +2,8 @@
 #include "pyc/Dialect/PYC/PYCOps.h"
 #include "pyc/Emit/CppEmitter.h"
 #include "pyc/Emit/VerilogEmitter.h"
+#include "pyc/Simulation/SimGraphPasses.h"
+#include "pyc/Simulation/SimulationAST.h"
 #include "pyc/Support/PassIRDumper.h"
 #include "pyc/Transforms/Passes.h"
 
@@ -174,6 +176,31 @@ static llvm::cl::opt<bool> cppOnlyPreserveOps(
     "cpp-only-preserve-ops",
     llvm::cl::desc("Preserve operation-granular C++ scheduling in --sim-mode=cpp-only (disables comb fusion)"),
     llvm::cl::init(false));
+
+static llvm::cl::opt<bool> simGroupActivation(
+    "sim-group-activation",
+    llvm::cl::desc("Enable input-change activation for pure SimGraph groups"),
+    llvm::cl::init(true));
+
+static llvm::cl::opt<bool> simUsedBitActivation(
+    "sim-used-bit-activation",
+    llvm::cl::desc("Compare only demanded input bits for SimGraph groups"),
+    llvm::cl::init(true));
+
+static llvm::cl::opt<bool> simExpressionInlining(
+    "sim-expression-inlining",
+    llvm::cl::desc("Inline cheap single-use SimGraph expressions within groups"),
+    llvm::cl::init(true));
+
+static llvm::cl::opt<bool> simReplication(
+    "sim-replication",
+    llvm::cl::desc("Replicate cheap singleton expressions into consumer groups"),
+    llvm::cl::init(true));
+
+static llvm::cl::opt<unsigned> simSupernodeMaxSize(
+    "sim-supernode-max-size",
+    llvm::cl::desc("Maximum operations in a SimGraph supernode (0 disables partitioning)"),
+    llvm::cl::init(35));
 
 static llvm::cl::opt<bool> unrollVector(
     "unroll-vector",
@@ -2033,6 +2060,27 @@ static LogicalResult writeProfileJson(llvm::StringRef outPath, const llvm::json:
   return writeFile(outPath, buf);
 }
 
+static FailureOr<pyc::SimulationPlan> buildCppSimulationPlan(
+    func::FuncOp function, bool enableCombFusion,
+    const pyc::SimulationPlanningOptions &planningOptions) {
+  auto ast = pyc::buildSimulationAST(function);
+  if (failed(ast))
+    return failure();
+  auto graph = pyc::buildSimGraph(*ast);
+  if (failed(graph))
+    return failure();
+  pyc::SimGraphPassOptions graphOptions;
+  graphOptions.enableCombFusion = enableCombFusion;
+  graphOptions.enableGroupActivation = simGroupActivation && enableCombFusion;
+  graphOptions.enableUsedBitActivation = simUsedBitActivation;
+  graphOptions.enableExpressionInlining = simExpressionInlining;
+  graphOptions.enableReplication = simReplication;
+  graphOptions.supernodeMaxSize = simSupernodeMaxSize;
+  if (failed(pyc::runSimGraphPasses(*graph, graphOptions)))
+    return failure();
+  return pyc::buildSimulationPlan(std::move(*graph), planningOptions);
+}
+
 int main(int argc, char **argv) {
   llvm::InitLLVM y(argc, argv);
   llvm::cl::ParseCommandLineOptions(argc, argv, "pycc\n");
@@ -2325,7 +2373,9 @@ int main(int argc, char **argv) {
   pm.addPass(pyc::createCheckClockDomainsPass());
   pm.addNestedPass<func::FuncOp>(pyc::createPackI1RegsPass());
   const bool enableFuseComb = (!cppOnly) || !cppOnlyPreserveOps;
-  if (enableFuseComb)
+  // C++ groups the same consecutive operations in SimGraph after hardware
+  // legalization. Keep the existing MLIR fusion pass for Verilog unchanged.
+  if (enableFuseComb && emitKind != "cpp")
     pm.addNestedPass<func::FuncOp>(pyc::createFuseCombPass());
   pm.addPass(createCanonicalizerPass(canonicalizeCfg));
   pm.addPass(createCSEPass());
@@ -2566,10 +2616,9 @@ int main(int argc, char **argv) {
       llvm::json::Array cppFiles;
       std::vector<CppManifestSource> cppManifestSources;
       pyc::CppEmitterOptions cppEmitOpts;
-      if (cppShardMaxAstNodes > 0) {
-        cppEmitOpts.evalTopoChunkNodes = cppShardMaxAstNodes;
-        cppEmitOpts.combChunkNodes = cppShardMaxAstNodes;
-      }
+      pyc::SimulationPlanningOptions planningOpts;
+      if (cppShardMaxAstNodes > 0)
+        planningOpts.evalChunkNodes = planningOpts.combChunkNodes = cppShardMaxAstNodes;
       cppEmitOpts.probePlanPath = probePlanPath;
 
       // Collect direct dependencies per module for header includes.
@@ -2631,7 +2680,8 @@ int main(int argc, char **argv) {
         std::string emitted;
         {
           llvm::raw_string_ostream emitOs(emitted);
-          if (failed(pyc::emitCppFunc(*module, f, emitOs, cppEmitOpts)))
+          auto plan = buildCppSimulationPlan(f, enableFuseComb, planningOpts);
+          if (failed(plan) || failed(pyc::emitCppFunc(*plan, emitOs, cppEmitOpts)))
             return 1;
           emitOs.flush();
         }
@@ -2916,12 +2966,19 @@ int main(int argc, char **argv) {
   }
   if (emitKind == "cpp") {
     pyc::CppEmitterOptions cppEmitOpts;
-    if (cppShardMaxAstNodes > 0) {
-      cppEmitOpts.evalTopoChunkNodes = cppShardMaxAstNodes;
-      cppEmitOpts.combChunkNodes = cppShardMaxAstNodes;
-    }
+    pyc::SimulationPlanningOptions planningOpts;
+    if (cppShardMaxAstNodes > 0)
+      planningOpts.evalChunkNodes = planningOpts.combChunkNodes = cppShardMaxAstNodes;
     cppEmitOpts.probePlanPath = probePlanPath;
-    if (failed(pyc::emitCpp(*module, os, cppEmitOpts)))
+    std::vector<pyc::SimulationPlan> functions;
+    for (auto f : module->getOps<func::FuncOp>()) {
+      auto functionPlan = buildCppSimulationPlan(f, enableFuseComb, planningOpts);
+      if (failed(functionPlan))
+        return 1;
+      functions.push_back(std::move(*functionPlan));
+    }
+    auto plan = pyc::buildModuleSimulationPlan(*module, std::move(functions));
+    if (failed(plan) || failed(pyc::emitCpp(*plan, os, cppEmitOpts)))
       return 1;
     if (failed(writeSingleOutputStats()))
       return 1;
