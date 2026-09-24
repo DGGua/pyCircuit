@@ -1,23 +1,17 @@
 # Delay-line 与周期状态优化
 
-本文说明 pyCircuit 周期状态优化的设计、实现、正确性边界和实测效果，供设计评审、
-性能分析和后续维护使用。当前实现覆盖：
+本文说明 pyCircuit 周期状态优化的设计、实现和正确性边界。当前实现覆盖：
 
 - 一等 MLIR 状态操作 `pyc.delay_line`；
-- Stage 0 状态优化机会分析；
 - Stage 1 等价状态合并、结构化寄存器链识别和重复 delay-line 共享；
 - Stage 1.5 有界的 canonicalize/CSE 与第二轮状态细化；
 - Stage 2 通用整数 state-lane packing；
 - Stage 3 共享 history 的中间 `pyc.delay_tap`；
 - 默认开启的受约束 pipeline retiming 与共同 delay 下沉；
 - 默认性能优先的显式观测身份清理；
-- C++/Verilog lowering、统计、probe/trace 适配和跨后端等价门禁。
+- C++/Verilog lowering、编译统计、probe/trace 适配和仓库内的等价测试。
 
-详细实验记录见
-[reports/delay_line/](../reports/delay_line/README.md)，专项复现和验证脚本见
-[verification/delay_line_combine/](../verification/delay_line_combine/README.md)。
-
-文档状态：2026-08-20，描述 `cycle-combine` 分支当前实现和默认策略。
+文档状态：描述 `cycle-combine` 分支当前实现和默认策略。
 
 ## 1. 问题、目标与当前结论
 
@@ -62,14 +56,8 @@ C++ 生成的默认配置为：
 `delay_line`、retiming 和 lane packing。需要优化后的 Verilog 时显式传入
 `--state-delay-opt=structural`。
 
-在 `xs_core` workload 上，相对完全关闭状态/delay 优化，默认配置将：
-
-- compile-stats `reg_count` 从 29,364 降到 10,684，减少 63.62%；
-- logical state bits 从 147,364 降到 92,171，减少约 37.45%；
-- C++ header 从 38,489,749 B 降到 21,255,837 B，缩小 44.78%；
-- 同机 `pycc --emit=cpp` 从 22.56 s 降到 20.63 s，改善 8.55%。
-
-这些数据说明的是 C++ model 结构和生成性能，不等价于 RTL 综合面积同比下降。
+等价状态合并会减少逻辑位数。delay line 和 lane packing 减少 C++ 里的状态对象数量，
+不减少逻辑位数，也不等于综合后的触发器数量。
 
 ## 2. 核心语义：`pyc.delay_line`
 
@@ -164,10 +152,6 @@ Stage 1.5 固定运行一次 canonicalize+CSE 和第二轮状态优化。这样�
 eliminate-wires
 eliminate-dead-state
         │
-        ▼
-Stage 0: analyze-state-optimization
-         analyze-retiming
-        │
         ├─ structural performance mode:
         │    strip-state-observability
         │    eliminate-dead-state
@@ -191,7 +175,7 @@ comb/clock/logic-depth gates → stats → C++ or Verilog emitter
 
 ```text
 --state-delay-opt=off
-    只运行 Stage 0 分析，不执行状态/delay 改写
+    不执行状态合并、delay line、retiming 或 packing
 
 --state-delay-opt=generated
     只处理 pyc.generated="cycle_balance"，保留原有观测边界
@@ -203,7 +187,7 @@ comb/clock/logic-depth gates → stats → C++ or Verilog emitter
     启用受约束的组合逻辑跨状态重排；structural 模式下当前默认
 
 --state-retime=off
-    保留 Stage 0-3，只关闭 retiming，作为简单 delay-line 对照
+    保留等价合并、delay line 和 packing，只关闭 retiming
 
 --state-retime-max-stages=0
     单个 computed pipeline 的最大寄存器级数；0 表示不单独限制
@@ -241,18 +225,9 @@ legacy `--combine-delay-chains=false` 强制 `off`。未显式设置
 
 自动化可直接审计实际策略，不必从命令行默认值反推。
 
-## 5. Stage 0：机会分析和观测边界
+## 5. 观测边界
 
-`pyc-analyze-state-optimization` 只分析，不改 IR。它在 off、generated 和
-structural 三种策略下都运行，记录：
-
-- 看到的 reg 数和 cycle-balance reg 数；
-- 被显式观测身份 pin 住的状态数；
-- 完全等价状态候选；
-- generated 和 structural 串行链候选；
-- 只有 structural 模式才能利用的链。
-
-Stage 0 使用
+改写 pass 使用
 [`StateObservabilityAnalysis`](../compiler/mlir/lib/Transforms/StateOptimization.cpp)
 识别以下物理状态身份：
 
@@ -262,12 +237,8 @@ Stage 0 使用
 - 稳定的非 cycle-balance `pyc.name`；
 - 状态 q 之后携带上述属性的 alias 链。
 
-Stage 0 在清理显式观测身份之前运行，所以即使默认性能模式随后放弃这些身份，统计
-仍能报告原始设计中有多少状态被标记为可观测。
-
-`state_opt_merge_candidates` 也采用这一保守观测边界。默认性能模式清理 identity 后，
-Stage 1 的实际 `state_opt_regs_merged` 可能略高于 Stage 0 候选数；这不是统计错误，而是
-两个字段分别回答“保留原始观测时有多少机会”和“当前策略实际改写了多少状态”。
+`pyc-analyze-state-optimization` 和 `pyc-analyze-retiming` 只统计这些机会，不改 IR。
+`pycc` 默认不跑它们。需要这份机会账本时，用 `pyc-opt` 单独调用。
 
 ## 6. 默认性能模式：显式观测身份清理
 
@@ -562,10 +533,9 @@ i1 lane。显式观测保留模式跳过旧 i1 packer，因为它不保留观测
 
 ## 10. 受约束 Retiming：把计算链变成共享历史
 
-Retiming 由独立的 [`RetimePipelinesPass.cpp`](../compiler/mlir/lib/Transforms/RetimePipelinesPass.cpp)
-完成，包含 analysis-only 的 `pyc-analyze-retiming` 和实际改写的
-`pyc-retime-pipelines`。它不依赖 `pyc.generated="cycle_balance"`，默认在 structural
-性能模式中开启。
+Retiming 由 [`RetimePipelinesPass.cpp`](../compiler/mlir/lib/Transforms/RetimePipelinesPass.cpp)
+里的 `pyc-retime-pipelines` 完成。它不依赖 `pyc.generated="cycle_balance"`，默认在
+structural 性能模式中开启。
 
 ### 10.1 单源 computed pipeline
 
@@ -621,8 +591,8 @@ history。中间值被模块输出、assert、组合 consumer，甚至另一寄�
 等价状态 merge 通常比局部 retiming 收益更大，因此先运行两轮 merge 和一次
 canonicalize/CSE。随后 retiming 可以在普通直连 chain matcher 之前选择较长的
 computed pipeline，避免一个短分支寄存器抢走主链 head。最后再形成/共享普通
-delay-line 和 tap，并执行 lane packing。这个优先级在 `xs_core` 上避免了 retiming
-先占用状态而损失大规模等价 merge 的回归。
+delay-line 和 tap，并执行 lane packing。先做等价合并，是为了避免局部 retiming
+先占住状态、错过更大的合并。
 
 ### 10.5 实测结果
 
@@ -636,13 +606,8 @@ delay-line 和 tap，并执行 lane packing。这个优先级在 `xs_core` 上�
 | 默认 retiming | 2,550.2 | 481 | 15,392 | 32 | baseline |
 
 默认改写 33 个 region，统计移除 464 个 state primitive 和 992 bit。三组 checksum
-一致。该数据说明 computed pipeline workload 的 C++ 调度收益，不代表任意设计或 RTL
-PPA 都有相同比例。
-
-`xs_core` 的当前 MLIR 在先完成等价 merge 后，没有通过默认收益/init/depth门槛的
-retiming region；retime on/off 最终结构均为 10,684 logical stages、92,171 bit。
-开启分析和 matcher 使单次 C++ emission 从 18.75 s 增至 20.63 s。这个结果说明默认
-策略是“积极搜索、无收益则不改写”，也说明后续仍需优化大图候选分析成本。
+一致。该数据说明这条合成流水线的 C++ 调度收益，不代表任意设计或综合结果都有相同比例。
+没有通过 init、收益或深度证明的候选保持原样。
 
 ## 11. 后端表示
 
@@ -707,26 +672,7 @@ extract，并通过
 depth=128 的 logical state bits 仍是 `128 × 8 = 1024`。收益来自 O(depth) 个 C++
 状态对象和调度变成一个 O(1) ring primitive。
 
-### 12.2 大型 workload：Stage 1/1.5/2/3 与 retiming
-
-输入为 `/tmp/xs_core.delay_only.mlir`，命令统一使用
-`--emit=cpp --logic-depth=1000`。时间为同机单次测量，用于量级对比。
-
-| 策略 | `reg_count` | state bits | delay lines | pack groups | pycc | C++ header |
-|---|---:|---:|---:|---:|---:|---:|
-| off | 29,364 | 147,364 | 0 | 0 | 22.56 s | 38,489,749 B |
-| structural, retime=off, pack=192 | 10,684 | 92,171 | 2,497 | 842 | **18.75 s** | 21,255,837 B |
-| 默认 structural, retime=pipeline, pack=192 | 10,684 | 92,171 | 2,497 | 842 | 20.63 s | 21,255,837 B |
-
-默认模式相对 off：
-
-- 合并 19,135 个等价 state，记录移除 55,177 bits；
-- 形成 2,497 个最终 delay-line，累计 depth 4,999，并生成 2,494 个中间 tap；
-- packing 处理 6,204 个 state op，形成 842 个 pack group；
-- 通过 packing 净减少 5,362 个 state primitive；
-- 剥离 43,014 个显式观测属性，删除 3 个无功能用途观测 alias；
-- header 缩小 44.78%。简单策略的 emission 最快；默认 retiming 在本 workload 没有
-  合法且有收益的改写，候选搜索增加约 1.88 s 编译时间。
+### 12.2 各项改写分别改变什么
 
 保留模式和性能模式的 primitive 数不能只归因于观测清理：保留模式还会跳过旧 i1
 packing。state bits 的主要下降来自等价状态合并，不是 lane packing。
@@ -791,8 +737,8 @@ packing。state bits 的主要下降来自等价状态合并，不是 lane packi
 | `state_retime_policy` | off/pipeline 实际 retiming 策略 |
 | `state_opt_preserve_observability` | 是否保留显式状态身份 |
 | `state_opt_pack_width` | 实际 Stage 2 width 上限 |
-| `state_opt_regs_seen/generated/pinned` | Stage 0 状态和原始观测边界 |
-| `state_opt_merge_candidates` | Stage 0 保守视角的等价状态候选 |
+| `state_opt_regs_seen/generated/pinned` | 仅 `pyc-analyze-state-optimization` 写入；默认 `pycc` 为 0 |
+| `state_opt_merge_candidates` | 同上，保守观测边界下的等价状态候选 |
 | `state_opt_regs_merged` | 两轮实际合并的 reg 数 |
 | `state_opt_reg_bits_removed` | 等价状态合并移除的逻辑 bits |
 | `state_opt_merge_rounds` | structural 合并轮数 |
@@ -831,54 +777,17 @@ pycc input.mlir --emit=none \
 单文件编译统计写入 `<output>.stats.json`；out-dir 模式写入
 `compile_stats.json`；`--profile-json` 的 `compile_stats` 也包含同一账本。
 
-## 15. 验证矩阵
-
-当前门禁覆盖：
-
-| Gate | 覆盖 | 结果 |
-|---|---|---|
-| `state_delay_optimization_smoke.sh` | 默认激进、显式保留、无 marker chain、named/debug、alias control、跨 pack bucket 依赖、probe slice runtime | PASS |
-| `check_state_retime_models.py` | off/delay-only/retimed/default，reset、enable stall、computed pipeline、stateful fanout、共同下沉，613 cycles | C++/Verilog/参考模型一致 |
-| `check_cascade_state_models.py` | Stage 1.5 两轮合并，397 cycles | C++/Verilog 一致 |
-| `check_state_lane_pack_models.py` | reg/delay packing，421 cycles，state bits 72 不变 | C++/Verilog 一致 |
-| `check_structural_state_models.py` | off/generated/structural，reset 和 enable stall，383 cycles | 全模型一致 |
-| `check_duplicate_shared_models.py` | duplicate history sharing，257 cycles和中途 reset | 全模型一致 |
-| `check_verilator_trace.py` | depth=2/4/16，共 192 edges | 匹配独立参考 |
-| `check_generated_models.py` | depth=2/8/32/128，各 10,000 cycles | C++/Verilog checksum 一致 |
-| `delay_line_diagnostics_smoke.sh` | verifier、clock/comb/depth diagnostics | PASS |
-
-专项 checksum：
-
-```text
-cascade     67021053103975750
-lane pack   9437495441151636951
-structural  7835895766999024842
-duplicate   16967771760616252376
-```
-
-常用验证命令：
+## 15. 仓库内的验证
 
 ```bash
 bash compiler/mlir/test/state_delay_optimization_smoke.sh
 bash compiler/mlir/test/delay_line_diagnostics_smoke.sh
-python3 verification/delay_line_combine/check_generated_models.py
-python3 verification/delay_line_combine/check_duplicate_shared_models.py
-python3 verification/delay_line_combine/check_structural_state_models.py
-python3 verification/delay_line_combine/check_cascade_state_models.py
-python3 verification/delay_line_combine/check_state_lane_pack_models.py
-python3 verification/delay_line_combine/check_verilator_trace.py
+python3 compiler/mlir/test/check_state_delay_tap_models.py
 python3 compiler/mlir/test/check_state_retime_models.py
 ```
 
-Pack width 性能复现：
-
-```bash
-python3 verification/delay_line_combine/run_state_pack_benchmark.py \
-  --lanes 128 --cycles 500000 --repeats 3 --widths 0,128,192,256
-
-python3 verification/delay_line_combine/run_state_retime_benchmark.py \
-  --lanes 32 --depth 16 --cycles 300000 --repeats 5 --logic-depth 32
-```
+`state_delay_optimization_smoke.sh` 覆盖默认策略、显式保留、delay tap、lane packing
+和 probe。两个 Python 检查分别核对 delay tap 与 retiming 的 C++ 结果。
 
 ## 16. 修改文件与职责
 
@@ -886,7 +795,7 @@ python3 verification/delay_line_combine/run_state_retime_benchmark.py \
 |---|---|---|
 | Frontend | [`v5.py`](../compiler/frontend/pycircuit/v5.py)、[`dsl.py`](../compiler/frontend/pycircuit/dsl.py)、[`hw.py`](../compiler/frontend/pycircuit/hw.py) | 生成并传播 cycle-balance provenance |
 | Dialect | [`PYCOps.td`](../compiler/mlir/include/pyc/Dialect/PYC/PYCOps.td)、[`PYCOps.cpp`](../compiler/mlir/lib/Dialect/PYC/PYCOps.cpp) | 定义和验证 `pyc.delay_line` |
-| Analysis | [`AnalyzeStateOptimizationPass.cpp`](../compiler/mlir/lib/Transforms/AnalyzeStateOptimizationPass.cpp)、[`StateOptimization.cpp`](../compiler/mlir/lib/Transforms/StateOptimization.cpp) | 候选统计、观测边界、状态值归一化和等价证明 |
+| Analysis | [`StateOptimization.cpp`](../compiler/mlir/lib/Transforms/StateOptimization.cpp) | 观测边界、状态值归一化和等价证明。机会统计 pass 不在 `pycc` 默认管线中 |
 | Transform | [`StripStateObservabilityPass.cpp`](../compiler/mlir/lib/Transforms/StripStateObservabilityPass.cpp) | 性能模式清理显式状态身份 |
 | Transform | [`CombineDelayChainsPass.cpp`](../compiler/mlir/lib/Transforms/CombineDelayChainsPass.cpp) | 等价 state、串行 chain、delay sharing 和两轮统计 |
 | Transform | [`RetimePipelinesPass.cpp`](../compiler/mlir/lib/Transforms/RetimePipelinesPass.cpp) | computed pipeline history、共同 delay 下沉、init/depth/cost 证明 |
@@ -895,8 +804,7 @@ python3 verification/delay_line_combine/run_state_retime_benchmark.py \
 | Gates | [`CheckClockDomainsPass.cpp`](../compiler/mlir/lib/Transforms/CheckClockDomainsPass.cpp)、[`CheckCombCyclesPass.cpp`](../compiler/mlir/lib/Transforms/CheckCombCyclesPass.cpp)、[`CheckLogicDepthPass.cpp`](../compiler/mlir/lib/Transforms/CheckLogicDepthPass.cpp) | 把 delay-line 视为时序边界并执行 legality 检查 |
 | C++ | [`CppEmitter.cpp`](../compiler/mlir/lib/Emit/CppEmitter.cpp)、[`pyc_primitives.hpp`](../runtime/cpp/pyc_primitives.hpp)、[`pyc_probe_registry.hpp`](../runtime/cpp/pyc_probe_registry.hpp)、[`pyc_trace_bin.hpp`](../runtime/cpp/pyc_trace_bin.hpp) | ring runtime、packed slice probe 和 trace |
 | Verilog | [`VerilogEmitter.cpp`](../compiler/mlir/lib/Emit/VerilogEmitter.cpp)、[`pyc_delay_line.v`](../runtime/verilog/pyc_delay_line.v) | 可综合 delay-line lowering |
-| Tests | [`state_delay_optimization.mlir`](../compiler/mlir/test/state_delay_optimization.mlir)、[`state_observability_performance.mlir`](../compiler/mlir/test/state_observability_performance.mlir)、[`state_optimization_stage15_stage2.mlir`](../compiler/mlir/test/state_optimization_stage15_stage2.mlir)、[`state_retime_pipeline.mlir`](../compiler/mlir/test/state_retime_pipeline.mlir)、[`state_delay_optimization_smoke.sh`](../compiler/mlir/test/state_delay_optimization_smoke.sh)、[`check_state_retime_models.py`](../compiler/mlir/test/check_state_retime_models.py) | Stage 0-3 与 retiming 正反例、默认策略、双后端 checksum 和运行时 probe gate |
-| Verification | [`verification/delay_line_combine/`](../verification/delay_line_combine/README.md) | 跨 backend 等价、benchmark 和复现 |
+| Tests | [`state_delay_optimization_smoke.sh`](../compiler/mlir/test/state_delay_optimization_smoke.sh)、[`delay_line_diagnostics_smoke.sh`](../compiler/mlir/test/delay_line_diagnostics_smoke.sh)、[`check_state_delay_tap_models.py`](../compiler/mlir/test/check_state_delay_tap_models.py)、[`check_state_retime_models.py`](../compiler/mlir/test/check_state_retime_models.py) | 默认策略、delay tap、retiming 和运行时 probe |
 
 ## 17. 当前没有实现的优化
 

@@ -255,7 +255,7 @@ designs/outerCube/
 # gate outputs
 docs/gates
 
-# Brach Dev
+# Local experiment notes and harnesses.
 verification
 docs/superpowers
 reports

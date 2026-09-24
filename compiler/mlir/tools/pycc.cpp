@@ -2320,53 +2320,13 @@ static void printCompileStats(const CompileStatsSummary &s) {
                << (s.stateOptPreserveObservability ? "true" : "false")
                << ", pack_width=" << s.stateOptPackWidth
                << ", regs=" << s.regCount << " (" << s.regBits << " bits)"
-               << ", delay_lines=" << s.delayLineCount << " (depth_total=" << s.delayLineDepthTotal << ")"
-               << ", delay_chain={chains:" << s.delayChainsCombined
-               << ", regs:" << s.delayChainRegsCombined
-               << ", aliases:" << s.delayChainAliasesRemoved
-               << ", created:" << s.delayChainDelayLinesCreated
-               << ", merged:" << s.delayChainDelayLinesMerged
-               << ", reads:" << s.delayChainStateReadsBefore << "->"
-               << s.delayChainStateReadsAfter
-               << ", writes:" << s.delayChainStateWritesBefore << "->"
-               << s.delayChainStateWritesAfter
-               << ", taps:" << s.delayChainTapsCreated
-               << ", tap_uses:" << s.delayChainTapUsesRewritten << "}"
-               << ", retime_opt={candidates:" << s.retimeCandidateRegions
-               << "/" << s.retimeCandidateRegs
-               << ", candidate_comb:" << s.retimeCandidateCombOps
-               << ", rewritten:" << s.retimeRegionsRewritten
-               << "/" << s.retimeRegsRewritten
-               << ", primitives_removed:"
-               << s.retimeStatePrimitivesRemoved
-               << ", taps:" << s.retimeTapsCreated
-               << ", comb_cloned:" << s.retimeCombOpsCloned
-               << ", common_sinks:" << s.retimeCommonDelaySinks
-               << "/" << s.retimeCommonDelaySourceStates
-               << ", comb_moved:" << s.retimeCombOpsMoved
-               << ", bits_removed:" << s.retimeStateBitsRemoved
-               << ", blocked_init:" << s.retimeBlockedInit
-               << ", blocked_cost:" << s.retimeBlockedCost << "}"
-               << ", state_opt={seen:" << s.stateOptRegsSeen
-               << ", generated:" << s.stateOptGeneratedRegs
-               << ", pinned:" << s.stateOptPinnedRegs
-               << ", merge_candidates:" << s.stateOptMergeCandidates
-               << ", merged:" << s.stateOptRegsMerged
-               << ", bits_removed:" << s.stateOptRegBitsRemoved
-               << ", structural_chains:" << s.stateOptStructuralChainsCombined
-               << ", structural_regs:" << s.stateOptStructuralChainRegsCombined
-               << ", rounds:" << s.stateOptMergeRounds
-               << ", cascade_merged:" << s.stateOptCascadeRegsMerged
-               << ", pack_groups:" << s.stateOptPackGroups
-               << ", packed_ops:" << s.stateOptPackedStateOps
-               << ", primitives_removed:"
-               << s.stateOptStatePrimitivesRemoved
-               << ", pack_bits:" << s.stateOptPackBits
-               << ", obs_attrs_stripped:"
-               << s.stateOptObservabilityAttrsStripped
-               << ", obs_aliases_removed:"
-               << s.stateOptObservationAliasesRemoved
-               << "}"
+               << ", delay_lines=" << s.delayLineCount
+               << " (depth_total=" << s.delayLineDepthTotal << ")"
+               << ", merged=" << s.stateOptRegsMerged
+               << ", bits_removed=" << s.stateOptRegBitsRemoved
+               << ", delay_chains=" << s.delayChainsCombined
+               << ", pack_groups=" << s.stateOptPackGroups
+               << ", retime_rewritten=" << s.retimeRegionsRewritten
                << ", mems=" << s.memCount << " (" << s.memBits << " bits)"
                << ", max_depth=" << s.maxLogicDepth << "/" << s.logicDepthLimit
                << ", WNS=" << s.wns << ", TNS=" << s.tns
@@ -2804,15 +2764,12 @@ int main(int argc, char **argv) {
     pm.addNestedPass<func::FuncOp>(pyc::createVectorUnrollPass());
   pm.addNestedPass<func::FuncOp>(pyc::createEliminateWiresPass());
   pm.addNestedPass<func::FuncOp>(pyc::createEliminateDeadStatePass());
-  // Stage 0 is diagnostics-only and runs for all policies, including off, so
-  // baselines retain visibility into missed optimization opportunities.
-  pm.addNestedPass<func::FuncOp>(pyc::createAnalyzeStateOptimizationPass());
-  pm.addNestedPass<func::FuncOp>(pyc::createAnalyzeRetimingPass());
+  // Opportunity-only analyzers stay available through pyc-opt. They do not
+  // change the circuit, so pycc does not run them on the compile path.
   if (enableStateDelayOptimization &&
       stateDelayMode == pyc::DelayChainMode::Structural &&
       !stateOptPreserveObservability) {
-    // Performance mode intentionally drops explicit state identity. Run this
-    // after Stage 0 so diagnostics still report the original observation pins.
+    // Performance mode intentionally drops explicit state identity.
     pm.addNestedPass<func::FuncOp>(
         pyc::createStripStateObservabilityPass());
     pm.addNestedPass<func::FuncOp>(pyc::createEliminateDeadStatePass());

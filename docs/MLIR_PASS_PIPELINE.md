@@ -32,8 +32,7 @@
 | 14 | `pyc-unroll-vector` | function | 将 Vector 计算、连接和状态展开为标量 lane 操作。 | `--unroll-vector` |
 | 15 | `pyc-eliminate-wires` | function | 消除可直接替换的 `pyc.wire` / `pyc.assign` 中间连接。 | 始终 |
 | 16 | `pyc-eliminate-dead-state` | function | 删除对可观察行为无影响的寄存器、存储等状态。 | 始终 |
-| 17 | `pyc-analyze-state-optimization` + `pyc-analyze-retiming` | function | 记录状态候选、pin、控制边界和保守 retiming 机会统计；不改 IR。 | 始终 |
-| 17a | `pyc-strip-state-observability` | function | 性能模式移除状态 debug/probe/trace/name 身份，保留功能数据流；Stage 0 统计已在此前完成。 | structural 且未开启 `--state-opt-preserve-observability` |
+| 17 | `pyc-strip-state-observability` | function | 性能模式移除状态 debug/probe/trace/name 身份，保留功能数据流。 | structural 且未开启 `--state-opt-preserve-observability` |
 | 17b | `pyc-eliminate-dead-state` | function | 清理观测身份移除后不再有功能用途的状态。 | 同上 |
 | 18 | `pyc-combine-delay-chains{merge-only=true}` | function | Stage 1：第一轮等价状态合并；generated 兼容模式仍执行原 all-in-one pass。 | `--state-delay-opt` 非 `off` |
 | 19 | `canonicalize` + `cse` | module | Stage 1.5：让第一轮状态合并暴露的组合锥共享一次。 | structural 模式 |
@@ -64,7 +63,7 @@ C++ 路径在统计和 emit 之前还会跑第 36 项 `pyc-cpp-placement`。
 ## Vector 分支
 
 第 14–16、22 项是 Vector 处理相关步骤。`pyc-eliminate-wires`（15）与
-`pyc-eliminate-dead-state`（16）**始终执行**；性能 structural 模式还会在 17a/17b
+`pyc-eliminate-dead-state`（16）**始终执行**；性能 structural 模式还会在 17/17b
 再次清理已放弃观测身份的 dead state；互斥的只有 unroll（14）与 SLP（22）：
 
 ```text
@@ -96,6 +95,8 @@ PYC dialect folder 是常量语义的唯一来源：它折叠标量运算、全�
 | Pass | 基本功能 |
 | --- | --- |
 | `pyc-prune-ports` | 删除未使用的函数端口，并同步更新调用点。可由 `pyc-opt` 单独调用，但 `pycc` 默认管线不添加它。 |
+| `pyc-analyze-state-optimization` | 统计等价状态和寄存器链机会，不改 IR。 |
+| `pyc-analyze-retiming` | 统计可重定时的流水线机会，不改 IR。 |
 
 ## 相关源码
 
