@@ -88,13 +88,13 @@ diff /tmp/pir/0046_before_*eliminate-wires* /tmp/pir/0047_after_*eliminate-wires
 File names are `NNNN_<before|after>_<NN>_<pass>__L<level>[_FAILED].mlir`, so
 lexical order matches execution order, before/after of one pass share the same
 `<NN>`, `__L0` is a module-level pass and `__L1` is func-nested, and a failed
-pass gets an `__FAILED` suffix (the file begins with `// PASS FAILED`).
+pass gets a `_FAILED` suffix (the file begins with `// PASS FAILED`).
 
 Flags:
 
 | Flag | Default | Purpose |
 |------|---------|---------|
-| `--dump-pass-ir=<dir>` | (empty = off) | Output directory. `auto` means `<--out-dir>/pass_ir` so dumps travel with profile/gate artifacts. |
+| `--dump-pass-ir=<dir>` | (empty = off) | Output directory. On `pycc`, `auto` means `<--out-dir>/pass_ir`. `pyc-opt` requires an explicit directory (`auto` is rejected). |
 | `--dump-pass-ir-phase=before\|after\|both` | `both` | Which phase(s) to record. |
 | `--dump-pass-ir-filter=<regex>` | (empty = all) | ECMAScript-style regex on the pass short name (e.g. `eliminate-wires|fuse-comb`). |
 | `--dump-pass-ir-max-lines=<N>` | `0` (unlimited) | Truncate each file after N lines (appends `// truncated at N lines`). |

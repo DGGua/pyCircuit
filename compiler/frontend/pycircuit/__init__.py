@@ -12,6 +12,8 @@ from .connectors import (
     RegConnector,
     WireConnector,
 )
+from .bitfield import BitfieldSignal, BitfieldSpec, BitfieldView
+from .enums import EnumSignal, PycEnum, auto, enumeration
 from .design import const, function, module, probe as _probe_decorator, testbench as _testbench_decorator
 from .hw import Bundle, Circuit, ClockDomain, Pop, Reg, Wire, cat, sext, trunc, unsigned, zext
 from .jit import JitError, compile
@@ -65,6 +67,13 @@ __all__ = [
     "Connector",
     "ConnectorBundle",
     "ConnectorStruct",
+    "BitfieldSignal",
+    "BitfieldSpec",
+    "BitfieldView",
+    "EnumSignal",
+    "PycEnum",
+    "auto",
+    "enumeration",
     "Bundle",
     "Circuit",
     "ClockDomain",

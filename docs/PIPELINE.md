@@ -41,7 +41,7 @@ Default backend hierarchy policy:
 Write the MLIR IR before and/or after every pass to a directory so the effect
 of any single pass is directly diffable. Diagnostics only; disabled by
 default (zero overhead when not requested). Works on both `pycc` and
-`pyc-opt`.
+`pyc-opt` (pass an explicit dump directory on `pyc-opt`).
 
 ```bash
 pycc foo.pyc --emit=none --dump-pass-ir=/tmp/pir
@@ -50,10 +50,30 @@ diff /tmp/pir/*_before_*eliminate-wires*.mlir /tmp/pir/*_after_*eliminate-wires*
 
 Related flags: `--dump-pass-ir-phase=before|after|both`,
 `--dump-pass-ir-filter=<regex>`, `--dump-pass-ir-max-lines=<N>`, and
-`--dump-pass-ir=auto` (resolves to `<--out-dir>/pass_ir`). Coexists with
-`--profile-pass-timing` / `--profile-json`.
+`--dump-pass-ir=auto` on **`pycc` only** (resolves to `<--out-dir>/pass_ir`).
+Coexists with `--profile-pass-timing` / `--profile-json`.
 
 See [mlir_pass_ir_dump.md](mlir_pass_ir_dump.md) for full details.
+
+### C++ member placement (always-on for `--emit=cpp`)
+
+After legality gates, `pycc --emit=cpp` runs `pyc-cpp-placement`. Comb
+temporaries that stay inside one method become function-local `Wire<>`
+instead of SimObject struct members. There is no opt-in flag.
+
+```bash
+pycc foo.pyc --emit=cpp --out-dir out --cpp-split=module
+```
+
+See [cpp_member_placement.md](cpp_member_placement.md).
+
+### Optional C++ device hpp PCH
+
+`--cpp-pch` records device module headers for CMake
+`target_precompile_headers`. It does not change emit text and requires
+`--cpp-split=module`.
+
+See [cpp_device_pch.md](cpp_device_pch.md).
 
 ## CLI entrypoints
 

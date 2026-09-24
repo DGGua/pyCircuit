@@ -1,4 +1,5 @@
 #include "pyc/Transforms/Passes.h"
+#include "pyc/Transforms/StateOptimization.h"
 
 #include "pyc/Dialect/PYC/PYCOps.h"
 
@@ -17,6 +18,8 @@ namespace pyc {
 namespace {
 
 static bool isFusableCombOp(Operation *op) {
+  if (shouldKeepStateOptimization(op) || hasStableStateName(op))
+    return false;
   return isa<pyc::ConstantOp,
              pyc::AddOp,
              pyc::SubOp,

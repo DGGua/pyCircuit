@@ -2035,6 +2035,13 @@ def _canonical_hash(payload: dict[str, Any]) -> str:
     return hashlib.sha256(blob).hexdigest()
 
 
+def _backend_build_flag_hashes(build_flags: dict[str, Any], *, cpp_pch: bool) -> tuple[str, str]:
+    """Return shared-backend and C++-specific cache keys."""
+    shared_hash = _canonical_hash(build_flags)
+    cpp_hash = _canonical_hash({**build_flags, "cpp_pch": bool(cpp_pch)})
+    return shared_hash, cpp_hash
+
+
 def _load_json(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
 
@@ -2180,6 +2187,45 @@ def _resolve_probe_outputs(
     return (probe_manifest, {"version": 1, "probes": probe_entries}, probe_plan_path)
 
 
+def _derive_trace_codegen_plan(
+    *,
+    trace_plan: TracePlan | None,
+    probe_manifest: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Project selected internal named values onto their defining modules.
+
+    The trace DSL remains the sole selection authority.  This smaller plan is
+    consumed only by C++ placement so selected comb locals have stable storage
+    for VCD sampling; ports already have stable member storage.
+    """
+
+    selected = (
+        {str(path) for path in trace_plan.enabled_signals}
+        if trace_plan is not None
+        else set()
+    )
+    modules: dict[str, set[str]] = {}
+    raw_probes = probe_manifest.get("probes", [])
+    if isinstance(raw_probes, list):
+        for raw in raw_probes:
+            if not isinstance(raw, Mapping):
+                continue
+            canonical_path = str(raw.get("canonical_path", "")).strip()
+            if canonical_path not in selected or str(raw.get("dir", "")) != "internal":
+                continue
+            module = str(raw.get("module", "")).strip()
+            field = str(raw.get("field_path", "")).strip()
+            if module and field:
+                modules.setdefault(module, set()).add(field)
+    return {
+        "version": 1,
+        "modules": {
+            module: sorted(fields)
+            for module, fields in sorted(modules.items())
+        },
+    }
+
+
 def _cmd_build(args: argparse.Namespace) -> int:
     src = Path(args.python_file).resolve()
     out_dir = Path(args.out_dir).resolve()
@@ -2263,8 +2309,6 @@ def _cmd_build(args: argparse.Namespace) -> int:
         "--inline-policy=off",
         "--hierarchy-policy=strict",
     ]
-    if args.cpp_pch:
-        pycc_hard_hierarchy_flags.append("--cpp-pch")
 
     build_flags = {
         "pycc": str(pycc.resolve()),
@@ -2278,8 +2322,12 @@ def _cmd_build(args: argparse.Namespace) -> int:
         "tb_schedule_mode": str(args.tb_schedule_mode),
         "frontend_contract": FRONTEND_CONTRACT,
     }
-    build_flags_hash = _canonical_hash(build_flags)
+    cpp_build_flags = {**build_flags, "cpp_pch": bool(args.cpp_pch)}
+    build_flags_hash, cpp_build_flags_hash = _backend_build_flag_hashes(
+        build_flags, cpp_pch=bool(args.cpp_pch)
+    )
     same_flags = str(cache.get("build_flags_hash", "")) == build_flags_hash
+    cpp_same_flags = str(cache.get("cpp_build_flags_hash", "")) == cpp_build_flags_hash
 
     design_key = "__design_pyc"
     old_hashes = dict(cache.get("module_hashes", {}))
@@ -2357,40 +2405,76 @@ def _cmd_build(args: argparse.Namespace) -> int:
         trace_path = out_dir / "trace_plan.json"
         _save_json(trace_path, trace_plan.as_dict())
         manifest["trace_plan"] = str(trace_path.relative_to(out_dir))
+    trace_codegen_plan = _derive_trace_codegen_plan(
+        trace_plan=trace_plan,
+        probe_manifest=probe_manifest_obj,
+    )
+    trace_codegen_plan_path: Path | None = None
+    if trace_plan is not None:
+        trace_codegen_plan_path = out_dir / "trace_codegen_plan.json"
+        _save_json(trace_codegen_plan_path, trace_codegen_plan)
+        manifest["trace_codegen_plan"] = str(
+            trace_codegen_plan_path.relative_to(out_dir)
+        )
 
     tb_cpp_out = out_dir / "tb" / f"{tb_name}.cpp"
     tb_sv_out = out_dir / "tb" / f"{tb_name}.sv"
     for sym in sorted(module_paths.keys()):
         mp = module_paths[sym]
         h = _module_hash(mp)
-        module_hashes[sym] = h
-        unchanged = same_flags and old_hashes.get(sym) == h
+        trace_fields = list(trace_codegen_plan["modules"].get(sym, []))
+        cpp_key = f"cpp:{sym}"
+        cpp_hash = _canonical_hash(
+            {"module_hash": h, "trace_fields": trace_fields}
+        )
+        verilog_key = f"verilog:{sym}"
+        module_hashes[cpp_key] = cpp_hash
+        module_hashes[verilog_key] = h
 
         cpp_out_dir = device_cpp_root / sym
-        cpp_ready = cpp_out_dir.is_dir() and any(cpp_out_dir.glob("*.cpp")) and any(cpp_out_dir.glob("*.hpp"))
-        if do_cpp and not (unchanged and cpp_ready):
+        cpp_ready = (
+            cpp_out_dir.is_dir()
+            and any(cpp_out_dir.glob("*.cpp"))
+            and any(cpp_out_dir.glob("*.hpp"))
+            and (cpp_out_dir / "cpp_compile_manifest.json").is_file()
+        )
+        cpp_unchanged = cpp_same_flags and old_hashes.get(cpp_key) == cpp_hash
+        if do_cpp and not (cpp_unchanged and cpp_ready):
             cpp_out_dir.mkdir(parents=True, exist_ok=True)
+            trace_codegen_args = (
+                [
+                    "--trace-codegen-plan",
+                    str(trace_codegen_plan_path),
+                ]
+                if trace_codegen_plan_path is not None
+                else []
+            )
+            cpp_args = [
+                str(pycc),
+                str(mp),
+                "--emit=cpp",
+                *pycc_hard_hierarchy_flags,
+                "--out-dir",
+                str(cpp_out_dir),
+                "--cpp-split=module",
+                "--probe-plan",
+                str(probe_plan_path),
+                *trace_codegen_args,
+                f"--logic-depth={logic_depth}",
+            ]
+            if args.cpp_pch:
+                cpp_args.append("--cpp-pch")
             pycc_jobs.append(
                 (
                     f"cpp:{sym}",
-                    [
-                        str(pycc),
-                        str(mp),
-                        "--emit=cpp",
-                        *pycc_hard_hierarchy_flags,
-                        "--out-dir",
-                        str(cpp_out_dir),
-                        "--cpp-split=module",
-                        "--probe-plan",
-                        str(probe_plan_path),
-                        f"--logic-depth={logic_depth}",
-                    ],
+                    cpp_args,
                 )
             )
 
         verilog_out_dir = device_v_root / sym
         verilog_ready = verilog_out_dir.is_dir() and any(verilog_out_dir.glob("*.v"))
-        if do_v and not (unchanged and verilog_ready):
+        verilog_unchanged = same_flags and old_hashes.get(verilog_key) == h
+        if do_v and not (verilog_unchanged and verilog_ready):
             verilog_out_dir.mkdir(parents=True, exist_ok=True)
             pycc_jobs.append(
                 (
@@ -2624,6 +2708,8 @@ def _cmd_build(args: argparse.Namespace) -> int:
             "pycc": str(pycc),
             "build_flags": build_flags,
             "build_flags_hash": build_flags_hash,
+            "cpp_build_flags": cpp_build_flags,
+            "cpp_build_flags_hash": cpp_build_flags_hash,
             "jit_cache_key": jit_key,
             "jit_cache_inputs": jit_inputs,
             "last_pycc_jobs": int(len(pycc_jobs)),

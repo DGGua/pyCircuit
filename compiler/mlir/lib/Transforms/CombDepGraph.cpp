@@ -15,7 +15,8 @@ namespace {
 static constexpr int64_t kUnreachable = -1;
 
 static bool isSequentialCut(Operation *op) {
-  return isa<pyc::RegOp, pyc::FifoOp, pyc::ByteMemOp, pyc::SyncMemOp, pyc::SyncMemDPOp, pyc::AsyncFifoOp, pyc::CdcSyncOp>(op);
+  return isa<pyc::RegOp, pyc::DelayLineOp, pyc::FifoOp, pyc::ByteMemOp, pyc::SyncMemOp,
+             pyc::SyncMemDPOp, pyc::AsyncFifoOp, pyc::CdcSyncOp>(op);
 }
 
 static int64_t ceilLog2(int64_t n) {
@@ -57,7 +58,7 @@ static int64_t opCost(Operation *op) {
   if (isSequentialCut(op))
     return 0;
   if (isa<pyc::WireOp, pyc::AliasOp, pyc::ResetActiveOp, pyc::ConstantOp, pyc::CombOp, pyc::YieldOp,
-          arith::ConstantOp>(op))
+          pyc::DelayTapOp, arith::ConstantOp>(op))
     return 0;
   if (isa<pyc::VGetOp, pyc::VCreateOp, pyc::VBroadcastOp>(op))
     return 0;

@@ -63,12 +63,12 @@ std::string sanitizeForFileName(llvm::StringRef s) {
   return out;
 }
 
-/// Format a 4-digit zero-padded sequence number. Wraps at 9999 to keep file
-/// names a fixed width; rare for real designs (pipeline depth ~25 passes).
+/// Format a sequence number with a *minimum* width of 4 zero-padded digits.
+/// Values >= 10000 grow naturally (e.g. 10000) so filenames never collide and
+/// lexical order still matches execution order for a fixed digit length within
+/// each magnitude band.
 std::string formatSeq(unsigned n) {
-  char buf[8];
-  if (n > 9999)
-    n = 9999;
+  char buf[16];
   std::snprintf(buf, sizeof(buf), "%04u", n);
   return std::string(buf);
 }
@@ -106,13 +106,18 @@ struct PassIRDumper::Impl {
   /// Monotonic counter shared across all phases; guarantees lexical order =
   /// execution order. Incremented once per emitted file.
   unsigned seq = 0;
-  /// Monotonic per-pass index (separate from seq) so before/after of the same
-  /// pass share a stable `NN` number, making diff pairs easy to spot.
-  unsigned passIndex = 0;
+  /// Monotonic per-pass counter. Each `runBeforePass` takes the next value and
+  /// stores it on `frameStack` so the matching `runAfterPass*` reuses the same
+  /// `<NN>` even if nested passes ran in between.
+  unsigned nextPassIndex = 0;
 
-  /// Nested-pass depth stack. `runBeforePass` pushes; `runAfterPass*` pops.
+  /// Nesting frame: level + the pass index assigned at `runBeforePass`.
   /// Top-level (module) passes are level 0; func-nested are level 1+.
-  std::vector<unsigned> levelStack;
+  struct Frame {
+    unsigned level = 0;
+    unsigned passIndex = 0;
+  };
+  std::vector<Frame> frameStack;
 
   /// Optional compiled regex. Constructed once. Uses llvm::Regex (no exceptions,
   /// matches LLVM/MLIR -fno-exceptions build default).
@@ -156,9 +161,9 @@ struct PassIRDumper::Impl {
   }
 
   /// Write the IR of `op` for phase `which` ("before"/"after"). `failed` adds
-  /// the `__FAILED` suffix and a `// PASS FAILED` header line.
-  void write(const std::string &shortName, unsigned level, Operation *op,
-             const char *which, bool failed) {
+  /// the `_FAILED` suffix and a `// PASS FAILED` header line.
+  void write(const std::string &shortName, unsigned level, unsigned passIdx,
+             Operation *op, const char *which, bool failed) {
     if (!enabled || !op)
       return;
     if (!matchesPass(shortName))
@@ -166,7 +171,7 @@ struct PassIRDumper::Impl {
 
     const unsigned curSeq = seq++;
     std::string fileName = formatSeq(curSeq) + "_" + which + "_" +
-                           formatSeq(passIndex) + "_" +
+                           formatSeq(passIdx) + "_" +
                            sanitizeForFileName(shortName) + "__L" +
                            std::to_string(level);
     if (failed)
@@ -207,39 +212,46 @@ PassIRDumper::~PassIRDumper() = default;
 void PassIRDumper::runBeforePass(Pass *pass, Operation *op) {
   if (!impl_->enabled)
     return;
-  // Determine nesting level: top-level pass has no parent on the stack.
-  const unsigned level = static_cast<unsigned>(impl_->levelStack.size());
-  impl_->levelStack.push_back(level);
-  ++impl_->passIndex; // assign a fresh index for this pass run
+  // Nesting level = current stack depth before push. Capture a fresh pass
+  // index on the frame so nested passes cannot steal the outer `<NN>`.
+  const unsigned level = static_cast<unsigned>(impl_->frameStack.size());
+  const unsigned passIdx = ++impl_->nextPassIndex;
+  impl_->frameStack.push_back({level, passIdx});
 
   const std::string name = passShortName(pass);
   if (impl_->opts.wantBefore())
-    impl_->write(name, level, op, "before", /*failed=*/false);
+    impl_->write(name, level, passIdx, op, "before", /*failed=*/false);
 }
 
 void PassIRDumper::runAfterPass(Pass *pass, Operation *op) {
   if (!impl_->enabled)
     return;
   unsigned level = 0;
-  if (!impl_->levelStack.empty()) {
-    level = impl_->levelStack.back();
-    impl_->levelStack.pop_back();
+  unsigned passIdx = 0;
+  if (!impl_->frameStack.empty()) {
+    level = impl_->frameStack.back().level;
+    passIdx = impl_->frameStack.back().passIndex;
+    impl_->frameStack.pop_back();
   }
   if (impl_->opts.wantAfter())
-    impl_->write(passShortName(pass), level, op, "after", /*failed=*/false);
+    impl_->write(passShortName(pass), level, passIdx, op, "after",
+                 /*failed=*/false);
 }
 
 void PassIRDumper::runAfterPassFailed(Pass *pass, Operation *op) {
   if (!impl_->enabled)
     return;
   unsigned level = 0;
-  if (!impl_->levelStack.empty()) {
-    level = impl_->levelStack.back();
-    impl_->levelStack.pop_back();
+  unsigned passIdx = 0;
+  if (!impl_->frameStack.empty()) {
+    level = impl_->frameStack.back().level;
+    passIdx = impl_->frameStack.back().passIndex;
+    impl_->frameStack.pop_back();
   }
   // Always write the after-image on failure, even if phase == "before", so the
   // failure state is never lost.
-  impl_->write(passShortName(pass), level, op, "after", /*failed=*/true);
+  impl_->write(passShortName(pass), level, passIdx, op, "after",
+               /*failed=*/true);
 }
 
 } // namespace pyc
