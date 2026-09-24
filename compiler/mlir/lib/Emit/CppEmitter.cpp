@@ -727,10 +727,16 @@ static LogicalResult emitCombAssign(Operation &op, llvm::raw_ostream &os, NameTa
     unsigned w = bitWidth(s.getLhs().getType());
     if (w == 0)
       return s.emitError("invalid slt width");
+    const bool vectorResult = isa<VectorType>(s.getResult().getType());
     assignExpr(s.getResult(), s.getType(), os, nt,
                [&](llvm::raw_ostream &e) {
-                 e << "pyc::cpp::Wire<1>((pyc::cpp::slt<" << w << ">(" << nt.get(s.getLhs()) << ", "
-                   << nt.get(s.getRhs()) << ")) ? 1u : 0u)";
+                 if (vectorResult) {
+                   e << "pyc::cpp::slt<" << w << ">(" << nt.get(s.getLhs()) << ", "
+                     << nt.get(s.getRhs()) << ")";
+                 } else {
+                   e << "pyc::cpp::Wire<1>((pyc::cpp::slt<" << w << ">(" << nt.get(s.getLhs()) << ", "
+                     << nt.get(s.getRhs()) << ")) ? 1u : 0u)";
+                 }
                },
                ps);
     return success();

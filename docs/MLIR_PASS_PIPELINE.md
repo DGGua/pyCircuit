@@ -55,9 +55,11 @@
 | 33 | `pyc-check-flat-types` | function | 验证所有 operand/result 类型均可被目标 emitter 表示。 | 始终 |
 | 34 | `pyc-check-no-dynamic` | function | 拒绝残留的 `scf.*`、`index` 等动态结构。 | 始终 |
 | 35 | `pyc-check-logic-depth` | module | 计算组合逻辑深度并按 `--logic-depth` 限制拒绝超限设计。 | 始终 |
-| 36 | `pyc-collect-compile-stats` | function | 写入寄存器、存储和硬件位数等编译统计属性。 | 始终 |
+| 36 | `pyc-cpp-placement` | module | 为 C++ emit 标注 comb 方法切分与 struct/local 存储；带 `pyc.name` 的值留在结构体上，供探针和 trace 取样。 | 仅 `--emit=cpp` |
+| 37 | `pyc-collect-compile-stats` | function | 写入寄存器、存储和硬件位数等编译统计属性。 | 始终 |
 
 通过第 33–35 项 legality gate 后，`pycc` 才调用 C++ 或 Verilog emitter。
+C++ 路径在统计和 emit 之前还会跑第 36 项 `pyc-cpp-placement`。
 
 ## Vector 分支
 

@@ -20,6 +20,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <limits>
+#include <optional>
 #include <queue>
 #include <string>
 #include <vector>
@@ -486,23 +487,24 @@ static llvm::SmallVector<pyc::CombOp> collectTopLevelCombs(func::FuncOp f) {
   return combs;
 }
 
-/// Returns true for values that must remain struct members (cannot be
-/// localized).
+/// Returns true for values that must remain struct members (cannot be localized).
 static bool pinToStruct(Value v, const llvm::StringSet<> &traceSelectedFields) {
   Operation *def = v.getDefiningOp();
   if (!def)
     return true;
 
-  if (auto name = def->getAttrOfType<StringAttr>("pyc.name");
-      name && traceSelectedFields.contains(name.getValue()))
+  // Named values are registered as probes, and trace-selected fields are a
+  // subset of those names. Their addresses must stay valid for the model.
+  (void)traceSelectedFields;
+  if (def->hasAttr("pyc.name"))
     return true;
 
   // Top-level comb results and state-holding ops always live on the struct.
   if (isa<pyc::CombOp>(def))
     return true;
-  if (isa<pyc::RegOp, pyc::InstanceOp, pyc::FifoOp, pyc::ByteMemOp,
-          pyc::SyncMemOp, pyc::SyncMemDPOp, pyc::AsyncFifoOp, pyc::CdcSyncOp>(
-          def))
+  if (isa<pyc::RegOp, pyc::DelayLineOp, pyc::InstanceOp, pyc::FifoOp,
+          pyc::ByteMemOp, pyc::SyncMemOp, pyc::SyncMemDPOp, pyc::AsyncFifoOp,
+          pyc::CdcSyncOp>(def))
     return true;
 
   // Values defined inside a comb but used outside it must be struct members.
@@ -570,8 +572,8 @@ runCppMemberPlacement(func::FuncOp f, unsigned combChunkNodes,
   llvm::DenseSet<Value> crossPartValues;
   llvm::SmallVector<pyc::CombOp> combs = collectTopLevelCombs(f);
   for (auto [i, comb] : llvm::enumerate(combs))
-    assignCombOpMethods(comb, static_cast<unsigned>(i), combChunkNodes,
-                        opToMethod, crossPartValues, summary);
+    assignCombOpMethods(comb, static_cast<unsigned>(i), combChunkNodes, opToMethod,
+                        crossPartValues, summary);
 
   llvm::SmallVector<Value> candidates;
   f.walk([&](Operation *op) {
@@ -592,7 +594,6 @@ runCppMemberPlacement(func::FuncOp f, unsigned combChunkNodes,
   // One additional demotion applies: a value that crosses part methods cannot
   // be a method-local Wire<> (it would be invisible to the other part), so it
   // is promoted to a struct member even though it passes the boundary test.
-  llvm::StringSet<> noTraceSelectedFields;
   for (Value v : candidates) {
     Operation *def = v.getDefiningOp();
 
@@ -607,17 +608,10 @@ runCppMemberPlacement(func::FuncOp f, unsigned combChunkNodes,
 
     // Pinned-to-struct values (block args, state ops, comb results, values
     // escaping their comb) always live on the struct.
-    bool tracePinned = false;
-    if (def) {
-      if (auto name = def->getAttrOfType<StringAttr>("pyc.name"))
-        tracePinned = traceSelectedFields.contains(name.getValue());
-    }
-    const bool tracePromoted =
-        tracePinned && !pinToStruct(v, noTraceSelectedFields);
     if (pinToStruct(v, traceSelectedFields)) {
       annotatePlacement(v, CppStorageKind::Struct, {});
       summary.structMembers++;
-      if (!def || tracePromoted)
+      if (!def || def->hasAttr("pyc.name"))
         summary.probePinnedStruct++;
       continue;
     }
@@ -701,7 +695,8 @@ struct CppPlacementPass
     : public PassWrapper<CppPlacementPass, OperationPass<ModuleOp>> {
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(CppPlacementPass)
 
-  CppPlacementPass(unsigned chunkNodes, std::string planPath)
+  CppPlacementPass(unsigned chunkNodes = CppEmitterOptions::kDefaultCombChunkNodes,
+                   std::string planPath = {})
       : combChunkNodes(chunkNodes), traceCodegenPlanPath(std::move(planPath)) {}
 
   StringRef getArgument() const override { return "pyc-cpp-placement"; }
@@ -805,5 +800,7 @@ std::unique_ptr<Pass> createCppPlacementPass(unsigned combChunkNodes,
   return std::make_unique<CppPlacementPass>(combChunkNodes,
                                             std::move(traceCodegenPlanPath));
 }
+
+static PassRegistration<CppPlacementPass> pass;
 
 } // namespace pyc

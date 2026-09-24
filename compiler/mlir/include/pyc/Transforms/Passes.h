@@ -51,8 +51,8 @@ std::unique_ptr<::mlir::Pass> createCheckLogicDepthPass(unsigned logicDepth);
 std::unique_ptr<::mlir::Pass> createCollectCompileStatsPass();
 std::unique_ptr<::mlir::Pass> createFlattenInstancesPass();
 /// C++ emit prep: sets module comb chunk size and runs member placement.
-/// The optional trace codegen plan pins selected named values to stable
-/// struct storage so generated VCD registration can sample them.
+/// Named values stay on the struct so probes and VCD sampling keep stable
+/// addresses. A trace codegen plan, when given, must name fields that exist.
 std::unique_ptr<::mlir::Pass>
 createCppPlacementPass(unsigned combChunkNodes,
                        std::string traceCodegenPlanPath = {});
