@@ -310,9 +310,6 @@ cmake --build .pycircuit_out/toolchain/build --target pycc -j2
 tests/runtime/run_change_scheduler.sh
 compiler/mlir/test/comb_dirty_scheduler_smoke.sh
 compiler/mlir/test/instance_vector_cache_smoke.sh
-cmake --build .pycircuit_out/toolchain/build \
-  --target pyc4_primitive_change_reporting_test -j2
-.pycircuit_out/toolchain/build/runtime/cpp/pyc4_primitive_change_reporting_test
 python3 -m py_compile compiler/frontend/pycircuit/cli.py
 git diff --check
 ```

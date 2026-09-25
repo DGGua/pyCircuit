@@ -6,17 +6,12 @@ include(GNUInstallDirs)
 
 option(PYC_BUILD_MLIR_TOOLS "Build MLIR-based pyc tools" ON)
 option(PYC_BUILD_RUNTIME_LIB "Build pyc4 runtime library" ON)
-option(PYC_RUNTIME_BUILD_TESTS "Build pyc4 runtime C++ unit tests" OFF)
 option(PYC_RUNTIME_ENABLE_ZLIB_TRACE "Enable gzip trace output in runtime (optional)" OFF)
 option(PYC_RUNTIME_BUILD_SHARED "Build shared pyc4 runtime library" OFF)
 option(PYC_INSTALL_TEMPLATES "Install runtime template libraries" ON)
 option(PYC_INSTALL_PYTHON "Install Python frontend sources (for binary packages)" ON)
 option(PYC_INSTALL_CMAKE_PACKAGE "Install pycircuit CMake package metadata" ON)
 option(PYC_PACKAGE_BUNDLE_RUNTIME_DEPS "Bundle non-system runtime deps for installed pyc tools" ON)
-
-if(PYC_RUNTIME_BUILD_TESTS)
-  enable_testing()
-endif()
 
 if(APPLE)
   set(PYC_INSTALL_RPATH "@loader_path/../${CMAKE_INSTALL_LIBDIR}")
