@@ -47,7 +47,17 @@ def decode_lane(inst, pc, gpr, word_index, program_len: int, read_gpr):
     arith_shift = (funct7 == u(7, 0x20)) & (funct3 == u(3, 5)) & (is_alu_op | is_opimm)
     alu_y = alu_result(rs1_val, mux(is_alu_op, rs2_val, imm_i), funct3, subtract, arith_shift)
     link = pc + u(32, 4)
-    scalar_y = mux(is_lui, imm_u, mux(is_auipc, pc + imm_u, mux(is_jal | is_jalr, link, alu_y)))
+    # vsetvli writes VLMAX. This slice is e32, m1, VLEN=128, so VLMAX is 4.
+    funct6 = funct7[1:7]
+    is_opv = opcode == u(7, 0x57)
+    is_vset = is_opv & (funct3 == u(3, 7))
+    is_valu = is_opv & (funct3 == u(3, 0)) & (
+        (funct6 == u(6, 0)) | (funct6 == u(6, 9)) | (funct6 == u(6, 10)) | (funct6 == u(6, 11))
+    )
+    is_vle = (opcode == u(7, 0x07)) & (funct3 == u(3, 6))
+    is_vse = (opcode == u(7, 0x27)) & (funct3 == u(3, 6))
+    is_vec = is_vset | is_valu | is_vle | is_vse
+    scalar_y = mux(is_vset, u(32, 4), mux(is_lui, imm_u, mux(is_auipc, pc + imm_u, mux(is_jal | is_jalr, link, alu_y))))
 
     eq = rs1_val == rs2_val
     lts = rs1_val.as_signed() < rs2_val.as_signed()
@@ -75,14 +85,14 @@ def decode_lane(inst, pc, gpr, word_index, program_len: int, read_gpr):
     is_tohost = is_store & (funct3 == u(3, 2)) & (mem_addr == u(32, 0))
     # Opcode class only. Address checks stay on the memory enable so the
     # issue mask does not include the adder.
-    legal = is_opimm | is_alu_op | is_m | is_lui | is_auipc | is_jal | is_jalr | is_branch | is_load | is_store | is_ebreak
-    writes_reg = (is_opimm | is_alu_op | is_lui | is_auipc | is_jal | is_jalr | legal_load | is_m) & (rd != u(5, 0))
+    legal = is_opimm | is_alu_op | is_m | is_lui | is_auipc | is_jal | is_jalr | is_branch | is_load | is_store | is_ebreak | is_vec
+    writes_reg = (is_opimm | is_alu_op | is_lui | is_auipc | is_jal | is_jalr | legal_load | is_m | is_vset) & (rd != u(5, 0))
     writes_pack = (is_opimm | is_alu_op | is_lui | is_auipc) & (rd != u(5, 0))
     reads_rs1 = is_alu_op | is_opimm | is_m | is_branch | is_load | is_store | is_jalr
     reads_rs2 = is_alu_op | is_m | is_branch | is_store
     # Opcode-only tail. Address math stays out of this mask so four lanes
-    # do not stack adders into the next-PC path.
-    blocks = is_load | is_store | is_mul | is_divop | is_ebreak | is_jal | is_jalr | is_branch
+    # do not stack adders into the next-PC path. Vector ops issue alone.
+    blocks = is_load | is_store | is_mul | is_divop | is_ebreak | is_jal | is_jalr | is_branch | is_vec
     pack_ok = is_opimm | is_alu_op | is_lui | is_auipc
     past_end = word_index >= u(8, program_len)
     return {
@@ -112,4 +122,9 @@ def decode_lane(inst, pc, gpr, word_index, program_len: int, read_gpr):
         "pack_ok": pack_ok,
         "past_end": past_end,
         "signed_div": (funct3 == u(3, 4)) | (funct3 == u(3, 6)),
+        "funct6": funct6,
+        "is_vset": is_vset,
+        "is_valu": is_valu,
+        "is_vle": is_vle,
+        "is_vse": is_vse,
     }

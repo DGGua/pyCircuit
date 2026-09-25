@@ -1,17 +1,17 @@
-"""Placeholder for Coral's decoupled RVV backend.
+"""Vector command port for the Coral NPU slice.
 
-S1 does not dispatch vector instructions. The port stays idle so the top-level
-boundary matches the scalar / vector / matrix split. Integer vector ALU, MAC,
-and load/store arrive in a later stage.
+The scalar core owns the vector register file. This module only publishes the
+command wires the tests already check. ``rvv_idle`` is low while a unit-stride
+vector load or store is stepping through DTCM.
 """
 
 from __future__ import annotations
 
-from pycircuit import CycleAwareCircuit, u
+from pycircuit import CycleAwareCircuit, u, wire_of
 
 
-def tie_rvv(m: CycleAwareCircuit) -> None:
-    """Publish a ready-and-idle vector command port with no queued command."""
+def tie_rvv(m: CycleAwareCircuit, idle) -> None:
+    """Publish the vector command port. ``idle`` is 1 when no vector memory beat is in flight."""
     m.output("rvv_cmd_valid", u(1, 0))
     m.output("rvv_cmd_ready", u(1, 1))
-    m.output("rvv_idle", u(1, 1))
+    m.output("rvv_idle", wire_of(idle))

@@ -187,6 +187,49 @@ def ebreak() -> int:
     return 0x00100073
 
 
+def vsetvli(rd: int, rs1: int, vtype: int = 0x10) -> int:
+    """``vsetvli``. Default vtype is e32, m1, ta=0, ma=0. rs1=x0 means VLMAX."""
+    return ((vtype & 0x7FF) << 20) | ((rs1 & 0x1F) << 15) | (7 << 12) | ((rd & 0x1F) << 7) | 0x57
+
+
+def _vopvv(funct6: int, vd: int, vs2: int, vs1: int) -> int:
+    """OPIVV. Assembly order is ``vd, vs1, vs2``; vs1 is bits 19:15 and vs2 is bits 24:20."""
+    return (
+        ((funct6 & 0x3F) << 26)
+        | (1 << 25)
+        | ((vs2 & 0x1F) << 20)
+        | ((vs1 & 0x1F) << 15)
+        | ((vd & 0x1F) << 7)
+        | 0x57
+    )
+
+
+def vadd_vv(vd: int, vs1: int, vs2: int) -> int:
+    return _vopvv(0x00, vd, vs2, vs1)
+
+
+def vand_vv(vd: int, vs1: int, vs2: int) -> int:
+    return _vopvv(0x09, vd, vs2, vs1)
+
+
+def vor_vv(vd: int, vs1: int, vs2: int) -> int:
+    return _vopvv(0x0A, vd, vs2, vs1)
+
+
+def vxor_vv(vd: int, vs1: int, vs2: int) -> int:
+    return _vopvv(0x0B, vd, vs2, vs1)
+
+
+def vle32(vd: int, rs1: int) -> int:
+    """Unit-stride ``vle32.v vd, (rs1)``."""
+    return (1 << 25) | ((rs1 & 0x1F) << 15) | (6 << 12) | ((vd & 0x1F) << 7) | 0x07
+
+
+def vse32(vs3: int, rs1: int) -> int:
+    """Unit-stride ``vse32.v vs3, (rs1)``."""
+    return (1 << 25) | ((rs1 & 0x1F) << 15) | (6 << 12) | ((vs3 & 0x1F) << 7) | 0x27
+
+
 def _stype(imm: int, rs2: int, rs1: int, funct3: int) -> int:
     imm &= 0xFFF
     return (

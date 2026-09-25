@@ -8,7 +8,9 @@ Branches and jumps end the window. Retirement is in lane order, so an earlier
 write lands before a later one in the same cycle.
 
 Multiply still commits on the second cycle. Divide still steps one bit per
-cycle. A store word to address 0 writes ``tohost`` and stops the PC.
+cycle. Integer vector ops are e32, m1, VLEN=128: add and logic retire in the
+issue cycle, and a unit-stride load or store moves one word per cycle.
+A store word to address 0 writes ``tohost`` and stops the PC.
 """
 
 from __future__ import annotations
@@ -17,7 +19,9 @@ from pycircuit import CycleAwareCircuit, CycleAwareDomain, mux, u, wire_of
 
 from matrix.tiles import tie_matrix
 from mem.dtcm import attach_dtcm
+from rvv.alu import extract_lane, insert_lane, vv_op
 from rvv.backend import tie_rvv
+from scalar.core_util import cat_imm
 from scalar.lane import decode_lane
 from scalar.muldiv import div_step, mul_result
 
@@ -32,7 +36,7 @@ def elaborate(m: CycleAwareCircuit, domain: CycleAwareDomain, program: tuple[int
     tohost = domain.signal(width=32, reset_value=0, name="tohost")
     filled = domain.signal(width=1, reset_value=0, name="filled")
     cooked = domain.signal(width=1, reset_value=0, name="cooked")
-    # 0 = issue, 1 = commit a multiply, 2 = divider busy.
+    # 0 = issue, 1 = commit a multiply, 2 = divider busy, 3 = vector memory.
     phase = domain.signal(width=2, reset_value=0, name="phase")
     div_count = domain.signal(width=6, reset_value=0, name="div_count")
     div_quot = domain.signal(width=32, reset_value=0, name="div_quot")
@@ -48,6 +52,13 @@ def elaborate(m: CycleAwareCircuit, domain: CycleAwareDomain, program: tuple[int
     tgt = domain.signal(width=32, reset_value=0, name="tgt")
     redir_r = domain.signal(width=1, reset_value=0, name="redir_r")
     gpr = [domain.signal(width=32, reset_value=0, name=f"x{i}") for i in range(32)]
+    vrf = [domain.signal(width=128, reset_value=0, name=f"v{i}") for i in range(32)]
+    vbeat = domain.signal(width=3, reset_value=0, name="vbeat")
+    vbase = domain.signal(width=15, reset_value=0, name="vbase")
+    vdst = domain.signal(width=5, reset_value=0, name="vdst")
+    vload = domain.signal(width=1, reset_value=0, name="vload")
+    vsrc = domain.signal(width=128, reset_value=0, name="vsrc")
+    vacc = domain.signal(width=128, reset_value=0, name="vacc")
 
     lanes = []
     for i, inst in enumerate(win):
@@ -88,8 +99,14 @@ def elaborate(m: CycleAwareCircuit, domain: CycleAwareDomain, program: tuple[int
     funct3 = head["funct3"]
     rd = head["rd"]
     store_w = head["legal_store"] & issue[0]
-    wstrb = mux(funct3 == u(3, 0), u(4, 0x1), mux(funct3 == u(3, 1), u(4, 0x3), u(4, 0xF))).zext(8)
-    rdata = attach_dtcm(m, domain, mem_addr[0:15], store_w, mem_addr[0:15], rs2_val.zext(64), wstrb)[0:32]
+    scalar_strb = mux(funct3 == u(3, 0), u(4, 0x1), mux(funct3 == u(3, 1), u(4, 0x3), u(4, 0xF))).zext(8)
+    vec_mem = phase == u(2, 3)
+    beat_off = cat_imm(u(10, 0), vbeat, u(2, 0))
+    mem_off = mux(vec_mem, vbase + beat_off, mem_addr[0:15])
+    mem_we = mux(vec_mem, ~vload, store_w)
+    mem_data = mux(vec_mem, extract_lane(vsrc, vbeat).zext(64), rs2_val.zext(64))
+    mem_strb = mux(vec_mem, u(8, 0xF), scalar_strb)
+    rdata = attach_dtcm(m, domain, mem_off, mem_we, mem_off, mem_data, mem_strb)[0:32]
     narrow = mux(funct3[0:1], rdata[0:16].sext(width=32), rdata[0:8].sext(width=32))
     wide = mux(funct3[0:1], rdata[0:16].zext(width=32), rdata[0:8].zext(width=32))
     load_val = mux(funct3 == u(3, 2), rdata, mux(funct3[2:3], wide, narrow))
@@ -112,7 +129,8 @@ def elaborate(m: CycleAwareCircuit, domain: CycleAwareDomain, program: tuple[int
     seq = mux(issue[3], pc + u(32, 16), mux(issue[2], pc + u(32, 12), mux(issue[1], pc + u(32, 8), pc + u(32, 4))))
     # Only lane 0 can redirect: a branch or jump ends the packet.
     pc_now = mux(issue[0] & redir_r, tgt, seq)
-    hold = (issue[0] & (head["is_mul"] | head["is_divop"])) | ((phase == u(2, 2)) & ~div_done)
+    start_vmem = issue[0] & (head["is_vle"] | head["is_vse"])
+    hold = (issue[0] & (head["is_mul"] | head["is_divop"])) | ((phase == u(2, 2)) & ~div_done) | start_vmem | vec_mem
     is_mem_op = (head["inst"][0:7] == u(7, 0x03)) | (head["inst"][0:7] == u(7, 0x23))
     bad_mem = issue[0] & is_mem_op & ~head["legal_load"] & ~head["legal_store"] & ~head["is_tohost"]
     stop = ready & (head["past_end"] | ~head["legal"] | (issue[0] & (head["is_ebreak"] | head["is_tohost"])) | bad_mem)
@@ -125,12 +143,14 @@ def elaborate(m: CycleAwareCircuit, domain: CycleAwareDomain, program: tuple[int
     m.output("itcm_rdata", wire_of(head["inst"]))
     m.output("dtcm_we", wire_of(store_w))
     m.output("dtcm_wdata", wire_of(rs2_val))
-    tie_rvv(m)
+    tie_rvv(m, ~vec_mem)
     tie_matrix(m)
 
     # Next-state muxes must be built before domain.next().
     finish_md = running & ((phase == u(2, 1)) | div_done)
-    pc_d = mux(finish_md, pc + u(32, 4), mux(advance, pc_now, pc))
+    finish_vec = running & vec_mem & (vbeat == u(3, 3))
+    finish_busy = finish_md | finish_vec
+    pc_d = mux(finish_busy, pc + u(32, 4), mux(advance, pc_now, pc))
     halted_d = mux(stop, u(1, 1), halted)
     tohost_d = mux(issue[0] & head["is_tohost"], rs2_val, tohost)
     phase_d = mux(
@@ -142,7 +162,11 @@ def elaborate(m: CycleAwareCircuit, domain: CycleAwareDomain, program: tuple[int
             mux(
                 issue[0] & head["is_divop"],
                 u(2, 2),
-                mux((phase == u(2, 1)) | div_done, u(2, 0), phase),
+                mux(
+                    start_vmem,
+                    u(2, 3),
+                    mux((phase == u(2, 1)) | div_done | finish_vec, u(2, 0), phase),
+                ),
             ),
         ),
     )
@@ -161,9 +185,19 @@ def elaborate(m: CycleAwareCircuit, domain: CycleAwareDomain, program: tuple[int
     div_is_div_d = mux(start_div, (funct3 == u(3, 4)) | (funct3 == u(3, 5)), div_is_div)
     div_orig_d = mux(start_div, rs1_val, div_orig)
 
+    start_valu = issue[0] & head["is_valu"]
+    vnext = insert_lane(vacc, rdata, vbeat)
+    vbeat_d = mux(start_vmem, u(3, 0), mux(vec_mem & ~finish_vec, vbeat + u(3, 1), vbeat))
+    vbase_d = mux(start_vmem, rs1_val[0:15], vbase)
+    vdst_d = mux(start_vmem, rd, vdst)
+    vload_d = mux(start_vmem, head["is_vle"], vload)
+    vsrc_d = mux(start_vmem, _read_vrf(vrf, rd), vsrc)
+    vacc_d = mux(vec_mem & vload, vnext, vacc)
+    valu_y = vv_op(_read_vrf(vrf, head["rs1"]), _read_vrf(vrf, head["rs2"]), head["funct6"])
+
     cooking = filled & ~cooked & issuing & running & ~hold
-    refill_pc = mux(finish_md, pc + u(32, 4), mux(advance, pc_now, pc))
-    refill = (~filled) | advance | finish_md
+    refill_pc = mux(finish_busy, pc + u(32, 4), mux(advance, pc_now, pc))
+    refill = (~filled) | advance | finish_busy
     win_d = []
     yreg_d = []
     for i in range(4):
@@ -182,6 +216,12 @@ def elaborate(m: CycleAwareCircuit, domain: CycleAwareDomain, program: tuple[int
             lane = lanes[i]
             nxt = mux(issue[i] & lane["writes_pack"] & (lane["rd"] == u(5, reg)), yreg[i], nxt)
         gpr_d.append(nxt)
+    vrf_d = []
+    for reg in range(32):
+        loaded = finish_vec & vload & (vdst == u(5, reg))
+        nxt = mux(loaded, vnext, vrf[reg])
+        nxt = mux(start_valu & (rd == u(5, reg)), valu_y, nxt)
+        vrf_d.append(nxt)
 
     domain.next()
     pc <<= pc_d
@@ -207,6 +247,23 @@ def elaborate(m: CycleAwareCircuit, domain: CycleAwareDomain, program: tuple[int
     redir_r <<= redir_d
     for i, nxt in enumerate(gpr_d, start=1):
         gpr[i] <<= nxt
+    vbeat <<= vbeat_d
+    vbase <<= vbase_d
+    vdst <<= vdst_d
+    vload <<= vload_d
+    vsrc <<= vsrc_d
+    vacc <<= vacc_d
+    for i, nxt in enumerate(vrf_d):
+        vrf[i] <<= nxt
+
+
+def _read_vrf(vrf: list, idx) -> object:
+    """Binary tree, same shape as the GPR read, over 128-bit vector registers."""
+    level = list(vrf)
+    for bit in range(5):
+        sel = idx[bit : bit + 1]
+        level = [mux(sel, level[i + 1], level[i]) for i in range(0, len(level), 2)]
+    return level[0]
 
 
 def _read_gpr(gpr: list, idx) -> object:
