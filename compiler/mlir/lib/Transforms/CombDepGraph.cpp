@@ -189,14 +189,15 @@ resolveResultTransfer(Operation *op, unsigned resultIndex, ModuleOp module,
             << calleeAttr.getValue();
         return failure();
       }
-      // A separate .pyc has no callee body in this module. Depend on every
-      // input so dirty scheduling cannot skip a real combinational path.
-      transfer.baseDepth = 1;
-      transfer.edgeKind = CombDepEdgeKind::InstancePort;
-      transfer.operandDependencies.reserve(instance.getNumOperands());
-      for (unsigned inputIndex = 0; inputIndex < instance.getNumOperands();
-           ++inputIndex)
-        transfer.operandDependencies.push_back({inputIndex, 1});
+      // A separate .pyc has no callee body in this module.  Treat the
+      // instance's results as sequential cuts (state sources) here: without a
+      // hardened summary we cannot distinguish combinational pass-through
+      // ports from registered outputs, and inventing all-input->all-output
+      // combinational edges would fail legal registered feedback in the
+      // parent as a same-tick cycle.  Cross-instance combinational depth is a
+      // full-design gate; logic-depth and clock-domain checks apply their own
+      // pessimistic fallbacks against the callee.
+      transfer.baseDepth = 0;
       return transfer;
     }
     if (summary->numArgs != instance.getNumOperands() ||

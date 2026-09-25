@@ -450,10 +450,19 @@ public:
         }
 
         const FuncClockSummary *calleeSum = clockCache_.getFuncSummary(callee);
-        if (!calleeSum)
+        if (!calleeSum || resIdx >= calleeSum->resultDomains.size()) {
+          // Declaration-only callees have no clock summary in this
+          // compilation unit.  Pessimistically union the domain of every
+          // integer input so combinational pass-through through a stub is
+          // still visible to the caller's clock-domain check.
+          if (callee.isDeclaration() || callee.getBody().empty()) {
+            for (Value operand : inst.getInputs()) {
+              if (operand && isIntType(operand.getType()))
+                out |= domain(operand);
+            }
+          }
           return out;
-        if (resIdx >= calleeSum->resultDomains.size())
-          return out;
+        }
 
         const llvm::BitVector &calleeDom = calleeSum->resultDomains[resIdx];
         auto inputs = inst.getInputs();
@@ -508,8 +517,19 @@ public:
         }
 
         const FuncCombSummary *combSum = combCache_.getFuncSummary(callee);
-        if (!combSum || resIdx >= combSum->results.size())
+        if (!combSum || resIdx >= combSum->results.size()) {
+          // Declaration-only callees have no comb summary in this
+          // compilation unit.  Pessimistically union the arg-dependency set
+          // of every integer input so cross-clock reachability through a
+          // stub still propagates to argSinkDomains and to callers.
+          if (callee.isDeclaration() || callee.getBody().empty()) {
+            for (Value operand : inst.getInputs()) {
+              if (operand && isIntType(operand.getType()))
+                out |= argDeps(operand);
+            }
+          }
           return out;
+        }
 
         const CombResultSummary &rs = combSum->results[resIdx];
         auto inputs = inst.getInputs();
