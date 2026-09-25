@@ -9,6 +9,8 @@ namespace pyc {
 std::unique_ptr<::mlir::Pass> createCombCanonicalizePass();
 std::unique_ptr<::mlir::Pass> createInlineFunctionsPass();
 std::unique_ptr<::mlir::Pass> createFuseCombPass();
+/// Reject pyc.comb bodies that are not deterministic and exactly comparable.
+std::unique_ptr<::mlir::Pass> createCheckCombMemoizablePass();
 std::unique_ptr<::mlir::Pass> createEliminateWiresPass();
 std::unique_ptr<::mlir::Pass> createPackI1RegsPass();
 std::unique_ptr<::mlir::Pass> createLowerSCFToPYCStaticPass();
@@ -17,6 +19,7 @@ std::unique_ptr<::mlir::Pass> createCheckHierarchyDisciplinePass();
 std::unique_ptr<::mlir::Pass> createCheckNoDynamicPass();
 std::unique_ptr<::mlir::Pass> createCheckCombCyclesPass();
 std::unique_ptr<::mlir::Pass> createCheckClockDomainsPass();
+std::unique_ptr<::mlir::Pass> createPlanChangeDrivenSchedulePass();
 std::unique_ptr<::mlir::Pass> createCheckFlatTypesPass();
 std::unique_ptr<::mlir::Pass> createPrunePortsPass();
 std::unique_ptr<::mlir::Pass> createEliminateDeadStatePass();

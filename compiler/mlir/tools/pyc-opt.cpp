@@ -43,6 +43,7 @@ static void forceLinkPycPasses() {
   // Touch each pass factory to force-link the implementations.
   (void)pyc::createCombCanonicalizePass();
   (void)pyc::createFuseCombPass();
+  (void)pyc::createCheckCombMemoizablePass();
   (void)pyc::createEliminateWiresPass();
   (void)pyc::createPackI1RegsPass();
   (void)pyc::createLowerSCFToPYCStaticPass();
@@ -57,6 +58,7 @@ static void forceLinkPycPasses() {
   (void)pyc::createCheckNoDynamicPass();
   (void)pyc::createCheckCombCyclesPass();
   (void)pyc::createCheckClockDomainsPass();
+  (void)pyc::createPlanChangeDrivenSchedulePass();
   (void)pyc::createCheckLogicDepthPass(0);
   (void)pyc::createCollectCompileStatsPass();
   (void)pyc::createInlineFunctionsPass();
