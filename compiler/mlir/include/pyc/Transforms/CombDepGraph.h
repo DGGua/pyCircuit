@@ -17,11 +17,6 @@
 
 namespace pyc {
 
-/// Hardened declaration-stub summary produced from the full-design graph.
-inline constexpr llvm::StringLiteral kCombDepSummaryAttr =
-    "pyc.comb_dep_summary.v1";
-inline constexpr int64_t kCombDepSummaryVersion = 1;
-
 // Summary of how a callee's output depends on its inputs within the tick/comb
 // phase (i.e. across combinational logic only; sequential/stateful ops are
 // cut points).

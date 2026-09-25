@@ -147,7 +147,21 @@ public:
         }
 
         Operation *def = v.getDefiningOp();
-        if (!def || isSequentialOp(def)) {
+        if (auto fifo = dyn_cast<pyc::FifoOp>(def)) {
+          auto result = dyn_cast<OpResult>(v);
+          // in_ready depends on out_ready. Other FIFO results are state.
+          if (result && result.getResultNumber() == 0 &&
+              fifo.getNumOperands() > 4)
+            d = self(self, fifo.getOperand(4)) + 1;
+          else
+            d = 0;
+        } else if (auto mem = dyn_cast<pyc::ByteMemOp>(def)) {
+          // Asynchronous read data depends on raddr.
+          if (mem.getNumOperands() > 2)
+            d = self(self, mem.getOperand(2)) + 1;
+          else
+            d = 0;
+        } else if (!def || isSequentialOp(def)) {
           d = 0;
         } else if (isa<arith::ConstantOp, pyc::ConstantOp>(def)) {
           d = 0;

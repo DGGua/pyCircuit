@@ -8,8 +8,6 @@
 #include "llvm/ADT/BitVector.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
-#include "llvm/Support/JSON.h"
-#include "llvm/Support/raw_ostream.h"
 
 #include <algorithm>
 #include <functional>
@@ -186,16 +184,20 @@ resolveResultTransfer(Operation *op, unsigned resultIndex, ModuleOp module,
     }
     const FuncCombSummary *summary = cache.getFuncSummary(callee);
     if (!summary) {
-      if (callee.isDeclaration()) {
-        instance.emitError("callee dependency summary is unavailable for @")
-            << calleeAttr.getValue()
-            << "; declaration-only callees require hardened '"
-            << kCombDepSummaryAttr << "' metadata";
-      } else {
+      if (!(callee.isDeclaration() || callee.getBody().empty())) {
         instance.emitError("failed to compute callee comb summary for @")
             << calleeAttr.getValue();
+        return failure();
       }
-      return failure();
+      // A separate .pyc has no callee body in this module. Depend on every
+      // input so dirty scheduling cannot skip a real combinational path.
+      transfer.baseDepth = 1;
+      transfer.edgeKind = CombDepEdgeKind::InstancePort;
+      transfer.operandDependencies.reserve(instance.getNumOperands());
+      for (unsigned inputIndex = 0; inputIndex < instance.getNumOperands();
+           ++inputIndex)
+        transfer.operandDependencies.push_back({inputIndex, 1});
+      return transfer;
     }
     if (summary->numArgs != instance.getNumOperands() ||
         summary->numResults != instance.getNumResults()) {
@@ -456,132 +458,6 @@ private:
 
 CombDepGraphCache::CombDepGraphCache(ModuleOp module) : module_(module) {}
 
-static std::string typeToStableString(Type type) {
-  std::string text;
-  llvm::raw_string_ostream stream(text);
-  type.print(stream);
-  stream.flush();
-  return text;
-}
-
-static bool validateHardenedTypeList(func::FuncOp func,
-                                     const llvm::json::Array *encodedTypes,
-                                     TypeRange actualTypes,
-                                     StringRef fieldName) {
-  if (!encodedTypes || encodedTypes->size() != actualTypes.size()) {
-    func.emitError("declaration comb summary type arity mismatch in '")
-        << fieldName << "'";
-    return false;
-  }
-  for (auto [index, actualType] : llvm::enumerate(actualTypes)) {
-    auto encodedType = (*encodedTypes)[index].getAsString();
-    if (!encodedType || *encodedType != typeToStableString(actualType)) {
-      func.emitError("declaration comb summary type mismatch in '")
-          << fieldName << "' at index " << index << ": expected "
-          << actualType;
-      return false;
-    }
-  }
-  return true;
-}
-
-static std::unique_ptr<FuncCombSummary>
-parseHardenedCombSummary(func::FuncOp func, StringAttr encoded) {
-  auto parsed = llvm::json::parse(encoded.getValue());
-  auto *object = parsed ? parsed->getAsObject() : nullptr;
-  if (!object) {
-    func.emitError("invalid '")
-        << kCombDepSummaryAttr << "' JSON object";
-    return nullptr;
-  }
-  auto version = object->getInteger("version");
-  auto symbol = object->getString("symbol");
-  auto numArgs = object->getInteger("num_args");
-  auto numResults = object->getInteger("num_results");
-  auto *argTypes = object->getArray("arg_types");
-  auto *resultTypes = object->getArray("result_types");
-  auto *results = object->getArray("results");
-  if (!version || *version != kCombDepSummaryVersion || !symbol ||
-      *symbol != func.getSymName() || !numArgs || !numResults || !results ||
-      *numArgs < 0 || *numResults < 0 ||
-      static_cast<uint64_t>(*numArgs) >
-          std::numeric_limits<unsigned>::max() ||
-      static_cast<uint64_t>(*numResults) >
-          std::numeric_limits<unsigned>::max() ||
-      static_cast<uint64_t>(*numArgs) != func.getNumArguments() ||
-      static_cast<uint64_t>(*numResults) != func.getNumResults() ||
-      results->size() != static_cast<size_t>(*numResults)) {
-    func.emitError("declaration comb summary identity/arity mismatch in '")
-        << kCombDepSummaryAttr << "'";
-    return nullptr;
-  }
-  if (!validateHardenedTypeList(func, argTypes, func.getArgumentTypes(),
-                                "arg_types") ||
-      !validateHardenedTypeList(func, resultTypes, func.getResultTypes(),
-                                "result_types"))
-    return nullptr;
-
-  auto summary = std::make_unique<FuncCombSummary>();
-  summary->numArgs = static_cast<unsigned>(*numArgs);
-  summary->numResults = static_cast<unsigned>(*numResults);
-  summary->results.resize(summary->numResults);
-  for (auto [resultIndex, value] : llvm::enumerate(*results)) {
-    auto *resultObject = value.getAsObject();
-    auto baseDepth =
-        resultObject ? resultObject->getInteger("base_depth") : std::nullopt;
-    auto *argDeps =
-        resultObject ? resultObject->getArray("arg_deps") : nullptr;
-    auto *argDepth =
-        resultObject ? resultObject->getArray("arg_depth") : nullptr;
-    if (!resultObject || !baseDepth || !argDeps || !argDepth ||
-        *baseDepth < kUnreachable ||
-        argDepth->size() != summary->numArgs) {
-      func.emitError("malformed result entry ")
-          << resultIndex << " in '" << kCombDepSummaryAttr << "'";
-      return nullptr;
-    }
-    CombResultSummary &result = summary->results[resultIndex];
-    result.baseDepth = *baseDepth;
-    result.argDeps = llvm::BitVector(summary->numArgs, false);
-    for (const llvm::json::Value &dependency : *argDeps) {
-      auto index = dependency.getAsInteger();
-      if (!index || *index < 0 ||
-          static_cast<uint64_t>(*index) >= summary->numArgs) {
-        func.emitError("invalid arg dependency in '")
-            << kCombDepSummaryAttr << "' result " << resultIndex;
-        return nullptr;
-      }
-      if (result.argDeps.test(static_cast<unsigned>(*index))) {
-        func.emitError("duplicate arg dependency in '")
-            << kCombDepSummaryAttr << "' result " << resultIndex;
-        return nullptr;
-      }
-      result.argDeps.set(static_cast<unsigned>(*index));
-    }
-    result.argDepth.reserve(summary->numArgs);
-    for (const llvm::json::Value &depthValue : *argDepth) {
-      auto depth = depthValue.getAsInteger();
-      if (!depth || *depth < kUnreachable) {
-        func.emitError("invalid arg depth in '")
-            << kCombDepSummaryAttr << "' result " << resultIndex;
-        return nullptr;
-      }
-      result.argDepth.push_back(*depth);
-    }
-    for (unsigned inputIndex = 0; inputIndex < summary->numArgs;
-         ++inputIndex) {
-      bool reachable = result.argDepth[inputIndex] != kUnreachable;
-      if (result.argDeps.test(inputIndex) != reachable) {
-        func.emitError("arg_deps/arg_depth disagreement in '")
-            << kCombDepSummaryAttr << "' result " << resultIndex
-            << " input " << inputIndex;
-        return nullptr;
-      }
-    }
-  }
-  return summary;
-}
-
 const FuncCombSummary *CombDepGraphCache::getFuncSummary(func::FuncOp func) {
   if (!func)
     return nullptr;
@@ -589,21 +465,10 @@ const FuncCombSummary *CombDepGraphCache::getFuncSummary(func::FuncOp func) {
   if (auto it = cache_.find(key); it != cache_.end())
     return it->second.get();
 
-  // Multi-.pyc builds harden the full-design dependency/depth summary onto
-  // declaration stubs before running semantic passes.  Refuse to invent an
-  // imprecise summary when that contract is absent.
-  if (func.isDeclaration() || func.getBody().empty()) {
-    auto encoded = func->getAttrOfType<StringAttr>(kCombDepSummaryAttr);
-    if (!encoded)
-      return nullptr;
-    std::unique_ptr<FuncCombSummary> summary =
-        parseHardenedCombSummary(func, encoded);
-    if (!summary)
-      return nullptr;
-    const FuncCombSummary *out = summary.get();
-    cache_.try_emplace(key, std::move(summary));
-    return out;
-  }
+  // Declaration stubs have no body in this compilation unit. Callers use a
+  // pessimistic all-input dependence instead of a summary that nothing emits.
+  if (func.isDeclaration() || func.getBody().empty())
+    return nullptr;
 
   if (!inProgress_.insert(key).second) {
     func.emitError("recursive instance graph detected while computing comb summary");

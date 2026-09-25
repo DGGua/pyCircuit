@@ -43,6 +43,10 @@ grep -q "combinational cycle detected" "${cross_cycle_log}"
 grep -q "a_input" "${cross_cycle_log}"
 grep -q "b_input" "${cross_cycle_log}"
 
+"${PYCC}" \
+  "${ROOT}/compiler/mlir/test/Inputs/change_schedule_missing_summary.mlir" \
+  --emit=none -o /dev/null
+
 nonmemoizable_log="${OUT}/comb_nonmemoizable.log"
 if "${PYCC}" "${ROOT}/compiler/mlir/test/Inputs/comb_nonmemoizable.mlir" \
     --emit=none -o /dev/null >"${nonmemoizable_log}" 2>&1; then
@@ -150,10 +154,6 @@ if [[ -x "${PYC_OPT}" ]]; then
     "${ROOT}/compiler/mlir/test/Inputs/change_schedule_tampered.mlir" \
     --pyc-check-change-driven-schedule \
     "change-driven schedule summary does not match canonical graph"
-  expect_failure \
-    "${ROOT}/compiler/mlir/test/Inputs/change_schedule_missing_summary.mlir" \
-    --pyc-plan-change-driven-schedule \
-    "callee dependency summary is unavailable"
   expect_failure \
     "${ROOT}/compiler/mlir/test/Inputs/change_schedule_cycle.mlir" \
     --pyc-plan-change-driven-schedule \

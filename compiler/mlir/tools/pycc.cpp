@@ -2340,7 +2340,6 @@ int main(int argc, char **argv) {
     pm.addInstrumentation(std::move(passIRDumperStorage));
   }
   pm.addPass(pyc::createCheckFrontendContractPass());
-  pm.addNestedPass<func::FuncOp>(pyc::createCheckCombMemoizablePass());
   pm.addPass(pyc::createInlineFunctionsPass());
   if (wantFlatten)
     pm.addPass(pyc::createFlattenInstancesPass());
