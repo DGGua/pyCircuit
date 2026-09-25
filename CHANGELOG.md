@@ -6,10 +6,6 @@ This project is still in an early prototype stage; APIs and generated outputs ma
 
 - C++ emitter: make change-driven dirty scheduling mandatory and remove the
   `--comb-update=always|guarded|dirty` compatibility switch.
-- Remove the experimental module-pipeline analysis/rewrite pass, metadata
-  contract, and `--module-pipeline` compatibility switch.
-- Remove the optional static comb partition/supernode passes, metadata, and
-  `--comb-partition` compatibility switches; retain comb memoization legality.
 - Add `pyc.concat` lowering for readable `{a, b, c}` packed concatenations in generated Verilog and C++.
 - Improve generated identifier readability and traceability (scope + file/line name mangling).
 - C++ emitter: add default-on hierarchical instance input-change cache to skip redundant submodule `eval()` calls; add `PYC_DISABLE_INSTANCE_EVAL_CACHE` override for A/B checks.

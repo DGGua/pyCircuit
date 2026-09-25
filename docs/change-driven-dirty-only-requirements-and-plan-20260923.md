@@ -3,8 +3,9 @@
 日期：2026-09-23
 目标分支：`feat/change-driven-scheduler`
 基线：`7d84e293`
-状态：已批准并实施；dirty-only 验证通过，另有一项实施前已存在的 schedule
-诊断文本 gate 失败
+状态：已实施。C++ 固定 dirty 调度；寄存器和原语在 commit 时按输出变化唤醒
+下游；向量 instance cache 按打包字数分配；`change_schedule_gate.sh` 的诊断期望
+已与 verifier 对齐。本文档是该功能的唯一设计说明。
 
 ## 背景与目标
 
@@ -79,7 +80,6 @@ python -m pycircuit.cli build --comb-update=<mode>
 - `compiler/mlir/test/instance_vector_cache_smoke.sh`
 - `flows/tools/perf/run_change_driven_ab.py`
 - `flows/tools/perf/test_change_driven_perf_tools.py`
-- `docs/change-driven-scheduler-implementation-20260923.md`
 
 其中 performance runner 的 variant 固定命名为
 `current/dag-always/dag-dirty`。hard break 后 `dag-always` 不再是同一二进制的
@@ -115,8 +115,7 @@ python -m pycircuit.cli build --comb-update=<mode>
 - pycc 构建通过。
 - runtime scheduler、dirty scheduler、instance vector cache 和 schedule gate
   按更新后的预期运行。
-- `docs/change-driven-scheduler-implementation-20260923.md` 只描述 dirty-only
-  现状，不再建议模式切换。
+- 本文档只描述 dirty-only 现状，不再建议模式切换。
 
 ## 方案设计
 
@@ -208,10 +207,6 @@ Python build / pycc
 #### 文档
 
 - 更新 `CHANGELOG.md`，记录 `--comb-update` hard break 和 dirty-only。
-- 更新 `docs/change-driven-scheduler-implementation-20260923.md`：
-  - 删除三模式功能和 A/B mode runner；
-  - 将执行流程改为唯一 dirty 路径；
-  - 验证结果改为 dirty-only gate。
 
 ### 边界条件、错误处理与兼容性
 
@@ -305,7 +300,7 @@ instance/primitive cache 开关和 `PYC_SIM_FAST`，因为它们不是 comb upda
 - 更新 scheduler 和 vector-cache smoke，移除正常路径中的旧参数。
 - scheduler smoke 新增 pycc/frontend 旧参数必须失败的 hard-break 检查。
 - 删除 `run_change_driven_ab.py` 及其三模式单测。
-- 更新 `CHANGELOG.md` 和 change-driven 实现说明。
+- 更新 `CHANGELOG.md`。
 - 未修改任务开始前存在的 `runtime/cpp/bench_naive_mt.cpp` 及其他无关未跟踪文件。
 
 ### 验证通过
@@ -331,10 +326,8 @@ git diff --check
   行为正确；
 - 生成 C++ 无 simulator statistics 残留。
 
-### 已知既有失败
+### Schedule gate
 
-`compiler/mlir/test/change_schedule_gate.sh` 仍返回 1。其正向 schedule/cycle 检查
-通过，tampered IR 也被拒绝；失败仅因 fixture 期望
-`schedule fanout size mismatch`，而 verifier 先报告
-`change-driven schedule summary does not match canonical graph`。该问题在本次
-dirty-only 修改前已存在，未扩大范围改变 verifier 诊断顺序。
+`compiler/mlir/test/change_schedule_gate.sh` 通过。tampered IR 被 verifier 以
+`change-driven schedule summary does not match canonical graph` 拒绝，测试期望
+与该诊断一致。

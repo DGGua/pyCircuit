@@ -728,12 +728,10 @@ FunctionCombDepGraph::build(func::FuncOp func, CombDepGraphCache &cache) {
   return std::move(graph);
 }
 
-unsigned FunctionCombDepGraph::ensureNode(Value value, bool isCutSource) {
+unsigned FunctionCombDepGraph::ensureNode(Value value) {
   auto found = valueToNode_.find(value);
-  if (found != valueToNode_.end()) {
-    nodes_[found->second].isCutSource |= isCutSource;
+  if (found != valueToNode_.end())
     return found->second;
-  }
 
   CombDepValueNode node;
   node.value = value;
@@ -741,7 +739,6 @@ unsigned FunctionCombDepGraph::ensureNode(Value value, bool isCutSource) {
   if (auto result = dyn_cast<OpResult>(value))
     node.resultIndex = result.getResultNumber();
   node.stableOrdinal = static_cast<unsigned>(nodes_.size());
-  node.isCutSource = isCutSource;
   unsigned id = static_cast<unsigned>(nodes_.size());
   nodes_.push_back(std::move(node));
   valueToNode_.try_emplace(value, id);
@@ -831,7 +828,6 @@ LogicalResult FunctionCombDepGraph::construct(CombDepGraphCache &cache) {
                        "function CombDepGraph");
           return failure();
         }
-        ensureNode(result, transfer->baseDepth != kUnreachable);
         if (transfer->kind == ResultTransferKind::WireDriver)
           continue;
         for (const OperandDependency &dependency :
@@ -848,31 +844,7 @@ LogicalResult FunctionCombDepGraph::construct(CombDepGraphCache &cache) {
       }
     }
   }
-  // Attach depth to the canonical value nodes once, using the same transfer
-  // implementation that supplies callee summaries and primitive semantics.
-  // CheckLogicDepthPass consumes these annotations instead of rebuilding an
-  // independent recursive dependence model.
-  FuncAnalyzer analyzer(module, func_, cache);
-  for (CombDepValueNode &node : nodes_) {
-    DepInfo info = analyzer.analyze(node.value);
-    int64_t depth = std::max<int64_t>(0, info.baseDepth);
-    for (int64_t argumentDepth : info.argDepth)
-      depth = std::max(depth, argumentDepth);
-    node.logicDepth = depth;
-  }
-  if (analyzer.failed())
-    return failure();
   return success();
-}
-
-const CombDepValueNode *FunctionCombDepGraph::lookup(Value value) const {
-  auto id = lookupNodeId(value);
-  return id ? &nodes_[*id] : nullptr;
-}
-
-CombDepValueNode *FunctionCombDepGraph::lookup(Value value) {
-  auto id = lookupNodeId(value);
-  return id ? &nodes_[*id] : nullptr;
 }
 
 std::optional<unsigned>

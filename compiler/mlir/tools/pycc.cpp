@@ -2363,7 +2363,6 @@ int main(int argc, char **argv) {
   if (!unrollVector)
     pm.addNestedPass<func::FuncOp>(pyc::createSLPPackWiresPass());
   pm.addNestedPass<func::FuncOp>(pyc::createCombCanonicalizePass());
-  pm.addPass(pyc::createCheckCombCyclesPass());
   pm.addPass(pyc::createCheckClockDomainsPass());
   pm.addNestedPass<func::FuncOp>(pyc::createPackI1RegsPass());
   const bool enableFuseComb = (!cppOnly) || !cppOnlyPreserveOps;
@@ -2375,6 +2374,8 @@ int main(int argc, char **argv) {
   pm.addNestedPass<func::FuncOp>(pyc::createEliminateDeadInstancesPass());
   pm.addPass(createSymbolDCEPass());
   pm.addNestedPass<func::FuncOp>(pyc::createCheckCombMemoizablePass());
+  // Fusion moves combinational ops into pyc.comb regions. The canonical graph
+  // still sees those dependencies, so one check after fusion is sufficient.
   pm.addPass(pyc::createCheckCombCyclesPass());
   pm.addPass(pyc::createPlanChangeDrivenSchedulePass());
   pm.addPass(pyc::createCheckChangeDrivenSchedulePass());
@@ -2663,7 +2664,6 @@ int main(int argc, char **argv) {
         os << "// pyCircuit C++ emission (split)\n";
         os << "#pragma once\n";
         os << "#include <array>\n";
-        os << "#include <chrono>\n";
         os << "#include <cstdlib>\n";
         os << "#include <cstdint>\n";
         os << "#include <fstream>\n";

@@ -20,8 +20,6 @@ namespace pyc {
 /// Hardened declaration-stub summary produced from the full-design graph.
 inline constexpr llvm::StringLiteral kCombDepSummaryAttr =
     "pyc.comb_dep_summary.v1";
-inline constexpr llvm::StringLiteral kCombDepSummaryFileSchema =
-    "pyc.comb_dep_summary";
 inline constexpr int64_t kCombDepSummaryVersion = 1;
 
 // Summary of how a callee's output depends on its inputs within the tick/comb
@@ -84,17 +82,13 @@ struct CombDepEdge {
 
 /// A canonical Decision-0127 value node.  Nodes represent values observable
 /// during the same tick; edges encode value dependence.  Sequential results
-/// are source nodes (isCutSource=true), while asynchronous primitive results
-/// retain their real operand dependencies.
+/// are graph sources, while asynchronous primitive results retain their real
+/// operand dependencies.
 struct CombDepValueNode {
   mlir::Value value;
   mlir::Operation *producer = nullptr;
   unsigned resultIndex = 0;
   unsigned stableOrdinal = 0;
-  bool isCutSource = false;
-  /// Maximum same-TICK logic depth reaching this value, computed by the same
-  /// transfer contract used to construct instance/primitive/comb edges.
-  int64_t logicDepth = 0;
   llvm::SmallVector<unsigned> incomingEdges;
   llvm::SmallVector<unsigned> outgoingEdges;
 };
@@ -113,8 +107,6 @@ public:
   llvm::ArrayRef<CombDepValueNode> getNodes() const { return nodes_; }
   llvm::ArrayRef<CombDepEdge> getEdges() const { return edges_; }
 
-  const CombDepValueNode *lookup(mlir::Value value) const;
-  CombDepValueNode *lookup(mlir::Value value);
   std::optional<unsigned> lookupNodeId(mlir::Value value) const;
 
   /// Deterministic value-node topological order.  Returns failure if the
@@ -127,7 +119,7 @@ public:
 private:
   explicit FunctionCombDepGraph(mlir::func::FuncOp func) : func_(func) {}
 
-  unsigned ensureNode(mlir::Value value, bool isCutSource = false);
+  unsigned ensureNode(mlir::Value value);
   void addEdge(mlir::Value source, mlir::Value target, CombDepEdgeKind kind,
                mlir::Operation *owner, unsigned operandIndex);
   mlir::LogicalResult construct(CombDepGraphCache &cache);

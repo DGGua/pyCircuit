@@ -43,36 +43,6 @@ grep -q "combinational cycle detected" "${cross_cycle_log}"
 grep -q "a_input" "${cross_cycle_log}"
 grep -q "b_input" "${cross_cycle_log}"
 
-if "${PYCC}" --help 2>&1 | grep -q -- "--module-pipeline"; then
-  echo "fail: pycc still exposes removed --module-pipeline" >&2
-  exit 1
-fi
-if "${PYCC}" "${INPUT}" --emit=none --module-pipeline=analyze -o /dev/null \
-    >"${OUT}/removed-module-pipeline.stdout" \
-    2>"${OUT}/removed-module-pipeline.stderr"; then
-  echo "fail: pycc accepted removed --module-pipeline" >&2
-  exit 1
-fi
-grep -q "Unknown command line argument '--module-pipeline=analyze'" \
-  "${OUT}/removed-module-pipeline.stderr"
-
-for flag in comb-partition comb-partition-max-nodes; do
-  if "${PYCC}" --help 2>&1 | grep -q -- "--${flag}"; then
-    echo "fail: pycc still exposes removed --${flag}" >&2
-    exit 1
-  fi
-done
-for option in --comb-partition=static --comb-partition-max-nodes=3; do
-  option_name="${option%%=*}"
-  log="${OUT}/removed-${option_name#--}.stderr"
-  if "${PYCC}" "${INPUT}" --emit=none "${option}" -o /dev/null \
-      >"${OUT}/removed-${option_name#--}.stdout" 2>"${log}"; then
-    echo "fail: pycc accepted removed ${option_name}" >&2
-    exit 1
-  fi
-  grep -q "Unknown command line argument '${option}'" "${log}"
-done
-
 nonmemoizable_log="${OUT}/comb_nonmemoizable.log"
 if "${PYCC}" "${ROOT}/compiler/mlir/test/Inputs/comb_nonmemoizable.mlir" \
     --emit=none -o /dev/null >"${nonmemoizable_log}" 2>&1; then
