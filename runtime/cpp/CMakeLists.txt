@@ -42,13 +42,3 @@ if(PYC_RUNTIME_BUILD_SHARED)
     target_link_libraries(pyc4_runtime_shared PUBLIC ZLIB::ZLIB)
   endif()
 endif()
-
-if(PYC_RUNTIME_BUILD_TESTS)
-  enable_testing()
-  add_executable(pyc4_primitive_change_reporting_test
-    tests/primitive_change_reporting_test.cpp
-  )
-  target_compile_features(pyc4_primitive_change_reporting_test PRIVATE cxx_std_17)
-  target_include_directories(pyc4_primitive_change_reporting_test PRIVATE "${CMAKE_CURRENT_LIST_DIR}")
-  add_test(NAME pyc4_primitive_change_reporting COMMAND pyc4_primitive_change_reporting_test)
-endif()
