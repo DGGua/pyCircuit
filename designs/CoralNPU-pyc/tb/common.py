@@ -27,7 +27,10 @@ def run_until_halt(t: Tb, *, instructions: int, tohost: int, cycles: int | None 
     tb = CycleAwareTb(t)
     tb.clock("clk")
     tb.reset("rst", cycles_asserted=2, cycles_deasserted=1)
-    steps = instructions if cycles is None else cycles
+    # Each packet cooks for a cycle before it retires, and a branch or memory
+    # op ends the packet. Halt and tohost stay set, so extra steps still see
+    # the architectural result.
+    steps = (instructions if cycles is None else cycles) + 40
     tb.timeout(max(64, steps + 2))
     for _ in range(steps):
         tb.next()
