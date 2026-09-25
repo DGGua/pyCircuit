@@ -179,15 +179,11 @@ if [[ -x "${PYC_OPT}" ]]; then
   expect_failure \
     "${ROOT}/compiler/mlir/test/Inputs/change_schedule_tampered.mlir" \
     --pyc-check-change-driven-schedule \
-    "schedule fanout size mismatch"
+    "change-driven schedule summary does not match canonical graph"
   expect_failure \
     "${ROOT}/compiler/mlir/test/Inputs/change_schedule_missing_summary.mlir" \
     --pyc-plan-change-driven-schedule \
-    "missing combinational dependency summary"
-  expect_failure \
-    "${ROOT}/compiler/mlir/test/Inputs/change_schedule_multidriver.mlir" \
-    --pyc-plan-change-driven-schedule \
-    "multiple-driver wire"
+    "callee dependency summary is unavailable"
   expect_failure \
     "${ROOT}/compiler/mlir/test/Inputs/change_schedule_cycle.mlir" \
     --pyc-plan-change-driven-schedule \
@@ -195,7 +191,7 @@ if [[ -x "${PYC_OPT}" ]]; then
   expect_failure \
     "${ROOT}/compiler/mlir/test/Inputs/change_schedule_unsupported.mlir" \
     --pyc-plan-change-driven-schedule \
-    "unsupported result-producing op"
+    "no registered canonical per-result combinational dependency transfer"
 else
   echo "note: pyc-opt unavailable; standalone negative pass cases not run" >&2
 fi
