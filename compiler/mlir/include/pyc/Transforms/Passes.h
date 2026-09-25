@@ -20,7 +20,6 @@ std::unique_ptr<::mlir::Pass> createCheckNoDynamicPass();
 std::unique_ptr<::mlir::Pass> createCheckCombCyclesPass();
 std::unique_ptr<::mlir::Pass> createCheckClockDomainsPass();
 std::unique_ptr<::mlir::Pass> createPlanChangeDrivenSchedulePass();
-std::unique_ptr<::mlir::Pass> createCheckChangeDrivenSchedulePass();
 std::unique_ptr<::mlir::Pass> createCheckFlatTypesPass();
 std::unique_ptr<::mlir::Pass> createPrunePortsPass();
 std::unique_ptr<::mlir::Pass> createEliminateDeadStatePass();

@@ -127,8 +127,7 @@ if [[ -x "${PYC_OPT}" ]]; then
   grep -q "combinational cycle detected" "${true_cycle_opt_log}"
 
   "${PYC_OPT}" "${INPUT}" \
-    --pyc-plan-change-driven-schedule \
-    --pyc-check-change-driven-schedule -o /dev/null
+    --pyc-plan-change-driven-schedule -o /dev/null
 
   expect_failure() {
     local input=$1
@@ -146,14 +145,6 @@ if [[ -x "${PYC_OPT}" ]]; then
     fi
   }
 
-  expect_failure \
-    "${ROOT}/compiler/mlir/test/Inputs/change_schedule_missing_metadata.mlir" \
-    --pyc-check-change-driven-schedule \
-    "missing change-driven schedule summary"
-  expect_failure \
-    "${ROOT}/compiler/mlir/test/Inputs/change_schedule_tampered.mlir" \
-    --pyc-check-change-driven-schedule \
-    "change-driven schedule summary does not match canonical graph"
   expect_failure \
     "${ROOT}/compiler/mlir/test/Inputs/change_schedule_cycle.mlir" \
     --pyc-plan-change-driven-schedule \

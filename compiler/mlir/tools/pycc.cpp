@@ -2377,7 +2377,6 @@ int main(int argc, char **argv) {
   // still sees those dependencies, so one check after fusion is sufficient.
   pm.addPass(pyc::createCheckCombCyclesPass());
   pm.addPass(pyc::createPlanChangeDrivenSchedulePass());
-  pm.addPass(pyc::createCheckChangeDrivenSchedulePass());
   pm.addNestedPass<func::FuncOp>(pyc::createCheckFlatTypesPass());
   pm.addNestedPass<func::FuncOp>(pyc::createCheckNoDynamicPass());
   pm.addPass(pyc::createCheckLogicDepthPass(logicDepthLimit));

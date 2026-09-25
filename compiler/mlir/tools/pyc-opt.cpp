@@ -59,7 +59,6 @@ static void forceLinkPycPasses() {
   (void)pyc::createCheckCombCyclesPass();
   (void)pyc::createCheckClockDomainsPass();
   (void)pyc::createPlanChangeDrivenSchedulePass();
-  (void)pyc::createCheckChangeDrivenSchedulePass();
   (void)pyc::createCheckLogicDepthPass(0);
   (void)pyc::createCollectCompileStatsPass();
   (void)pyc::createInlineFunctionsPass();

@@ -136,8 +136,16 @@ FailureOr<ChangeSchedulePlan> buildChangeDrivenSchedule(func::FuncOp func) {
     node.id = scheduled.index();
     node.slot = scheduled.index();
     node.rank = ranks[textualIndex];
-    for (unsigned target : successors[textualIndex])
-      node.fanout.push_back(textualToSchedule[target]);
+    for (unsigned target : successors[textualIndex]) {
+      uint64_t targetId = textualToSchedule[target];
+      // Schedule ids follow topological order, so a backward edge means the
+      // successor numbering itself is wrong.
+      if (targetId <= node.id) {
+        func.emitError("schedule fanout edge is not forward");
+        return failure();
+      }
+      node.fanout.push_back(targetId);
+    }
     llvm::sort(node.fanout);
     plan.edgeCount += node.fanout.size();
     plan.rankCount = std::max(plan.rankCount, node.rank + 1);

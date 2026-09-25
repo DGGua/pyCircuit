@@ -38,8 +38,7 @@ struct ChangeSchedulePlan {
   uint64_t rankCount = 0;
 };
 
-/// Builds the deterministic function-local schedule consumed by the planner
-/// and independently recomputed by the verifier.
+/// Builds the deterministic function-local schedule written by the planner.
 mlir::FailureOr<ChangeSchedulePlan>
 buildChangeDrivenSchedule(mlir::func::FuncOp func);
 
