@@ -17,7 +17,7 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 
-def run_until_halt(t: Tb, *, instructions: int, tohost: int) -> None:
+def run_until_halt(t: Tb, *, instructions: int, tohost: int, cycles: int | None = None) -> None:
     """Step once per instruction, then check the mailbox and the halt bit.
 
     Instruction 0 commits on the clock that produces cycle-0 outputs, matching
@@ -27,12 +27,13 @@ def run_until_halt(t: Tb, *, instructions: int, tohost: int) -> None:
     tb = CycleAwareTb(t)
     tb.clock("clk")
     tb.reset("rst", cycles_asserted=2, cycles_deasserted=1)
-    tb.timeout(64)
-    for _ in range(instructions):
+    steps = instructions if cycles is None else cycles
+    tb.timeout(max(64, steps + 2))
+    for _ in range(steps):
         tb.next()
     tb.expect("halted", 1)
     tb.expect("tohost", tohost)
     tb.expect("rvv_idle", 1)
     tb.expect("matrix_idle", 1)
     tb.expect("matrix_tile0", 0)
-    tb.finish(at=instructions)
+    tb.finish(at=steps)

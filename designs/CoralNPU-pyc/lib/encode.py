@@ -118,21 +118,85 @@ def bge(rs1: int, rs2: int, imm: int) -> int:
     return branch(5, rs1, rs2, imm)
 
 
+def lb(rd: int, rs1: int, imm: int) -> int:
+    return _itype(imm, rs1, 0, rd, 0x03)
+
+
+def lh(rd: int, rs1: int, imm: int) -> int:
+    return _itype(imm, rs1, 1, rd, 0x03)
+
+
+def lw(rd: int, rs1: int, imm: int) -> int:
+    return _itype(imm, rs1, 2, rd, 0x03)
+
+
+def lbu(rd: int, rs1: int, imm: int) -> int:
+    return _itype(imm, rs1, 4, rd, 0x03)
+
+
+def lhu(rd: int, rs1: int, imm: int) -> int:
+    return _itype(imm, rs1, 5, rd, 0x03)
+
+
+def sb(rs2: int, rs1: int, imm: int) -> int:
+    return _stype(imm, rs2, rs1, 0)
+
+
+def sh(rs2: int, rs1: int, imm: int) -> int:
+    return _stype(imm, rs2, rs1, 1)
+
+
 def sw(rs2: int, rs1: int, imm: int) -> int:
-    """Store word. Address 0 is the S1 mailbox (``tohost``), not full DTCM."""
+    """Store word. Address 0 is the mailbox (``tohost``). Other stores hit DTCM."""
+    return _stype(imm, rs2, rs1, 2)
+
+
+def mul(rd: int, rs1: int, rs2: int) -> int:
+    return op(0x01, rs2, rs1, 0, rd)
+
+
+def mulh(rd: int, rs1: int, rs2: int) -> int:
+    return op(0x01, rs2, rs1, 1, rd)
+
+
+def mulhsu(rd: int, rs1: int, rs2: int) -> int:
+    return op(0x01, rs2, rs1, 2, rd)
+
+
+def mulhu(rd: int, rs1: int, rs2: int) -> int:
+    return op(0x01, rs2, rs1, 3, rd)
+
+
+def div(rd: int, rs1: int, rs2: int) -> int:
+    return op(0x01, rs2, rs1, 4, rd)
+
+
+def divu(rd: int, rs1: int, rs2: int) -> int:
+    return op(0x01, rs2, rs1, 5, rd)
+
+
+def rem(rd: int, rs1: int, rs2: int) -> int:
+    return op(0x01, rs2, rs1, 6, rd)
+
+
+def remu(rd: int, rs1: int, rs2: int) -> int:
+    return op(0x01, rs2, rs1, 7, rd)
+
+
+def ebreak() -> int:
+    return 0x00100073
+
+
+def _stype(imm: int, rs2: int, rs1: int, funct3: int) -> int:
     imm &= 0xFFF
     return (
         (((imm >> 5) & 0x7F) << 25)
         | ((rs2 & 0x1F) << 20)
         | ((rs1 & 0x1F) << 15)
-        | (0x2 << 12)
+        | ((funct3 & 0x7) << 12)
         | ((imm & 0x1F) << 7)
         | 0x23
     )
-
-
-def ebreak() -> int:
-    return 0x00100073
 
 
 def _itype(imm: int, rs1: int, funct3: int, rd: int, opcode: int) -> int:
