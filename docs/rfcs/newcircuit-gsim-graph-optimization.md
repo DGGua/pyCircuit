@@ -1,213 +1,114 @@
 # NewCircuit: GSIM optimization ownership and coverage
 
-Status: partial implementation. The Hardware MLIR pipeline covers
-some value-level mechanisms, including GSIM's concat-equality, the disjoint
-shifted-OR equality variant, one-hot shift-extraction patterns, narrowing
-of single-use add/sub/mul and fixed shifts under an observed bit slice, and
-shared narrowing of add/sub/mul, mux and fixed shifts with multiple slice
-readers, splitting a wide
-bitwise value into shared segments across disjoint or overlapping slice
-consumers, splitting a scalar mux at separated observed slices while sharing
-overlapping segments, mapping partial `trunc`, `zext` and `sext` readers to
-source bits or extension fill, and recomposing a slice that
-spans several concatenation fields. An unnamed scalar register observed only
-through slices is split at slice boundaries before both backends; overlapping
-readers share the common state segment. A vector register read only at fixed
-outer indices is split recursively into observed scalar lanes, including
-multi-dimensional vectors. Elementwise vector expressions with only fixed-index
-readers are likewise lowered through each dimension to observed scalar lanes.
-The supported operations now include arithmetic and remainder, bitwise logic,
-comparisons, scalar-condition `arith.select`, width casts, extracts and
-fixed/dynamic shifts; all readers of an
-expression are rewritten in one pass and identical lane readers share a
-scalar result. Fixed-index vector state and expression splitting no longer
-has a fixed 64-reader cap. Low-width truncations narrow modular add/sub/mul.
-Fixed-index reads of `v_broadcast_dim` now select a source lane or a smaller
-broadcast before either backend. Multi-reader constant-amount dynamic shifts become fixed
-shifts in Hardware MLIR. Multi-reader right shifts form an input slice with
-zero or sign extension when the demanded prefix reaches the fill region.
-Rank-2 vector reductions observed through only selected output indices now
-reduce just those rows or columns in Hardware MLIR, for OR, AND and modular
-addition in both chain and tree modes.
-The selected-column reduction also exposes only the needed scalar cells of
-an unnamed rank-2 vector register through the existing register lane splitter.
-SimGraph captures typed pure expressions, including nested `pyc.comb` bodies,
-as graph-owned opcode/operand/attribute descriptions. Each `pyc.comb` region
-also has graph-owned argument, step and yield IDs, including recursive region
-IDs for nested `pyc.comb`; the dialect verifier rejects effectful body steps.
-SimulationAST first freezes every supported pure expression's opcode, constant,
-index or shift immediate, reduction dimension and reduction mode. SimGraph
-imports those descriptions instead of rereading pure-operation semantics from
-MLIR during graph construction. It also records every node's execution kind,
-primitive depth and name, instance symbol and display names, CDC stages and
-assertion message before graph construction. It also resolves instance port
-paths, records whether the callee contains state, and freezes function port
-paths and structural-emission mode. Graph construction imports nested
-`pyc.comb` arguments, steps and yields from AST regions and imports expression
-operands and results from AST nodes. The AST still borrows source operations
-and values for structural verification and signal identity. It snapshots value
-types, use counts, observability, naming hints and declaration order; graph
-construction imports these facts instead of querying source values again.
-The C++ emitter now dispatches every supported pure operation through
-`SimExpr`, including vector dimension broadcasts; the old MLIR operation
-dispatch for pure expressions has been removed.
-Nested comb helper generation now takes planned region and node IDs directly.
-SimulationPlan also fixes step chunks for every comb region, including nested
-regions, and verifies the chunk sequence before emission.
-Register construction and tick bindings now use graph value IDs and captured
-types. Graph-owned output roots and named probe IDs feed a SimulationPlan map
-from alias/comb passthrough values to local register outputs; the C++ emitter
-uses that map for probe registration.
-CDC synchronizer stage counts, inputs and outputs are captured and verified in
-SimGraph, then used for constructor and tick emission.
-Single-clock FIFO depth, data width, port bindings and cache inputs follow the
-same path; its emitted C++ remains byte-for-byte identical on the focused
-fixture.
-Dual-clock FIFO depth and bindings are likewise captured in SimGraph; the
-focused generated C++ is byte-for-byte identical to the prior path.
-All memory node kinds capture depth and optional instance name in SimGraph.
-All three memory families now use graph value IDs for C++ port bindings,
-constructors, probe registration and tick calls. The byte memory's eval cache
-inputs also use graph IDs. Focused generated C++ is byte-for-byte identical to
-the prior path for each family.
-Layered instance nodes capture callee and display names, plus the callee's
-input and output port paths. The module plan uses those graph nodes to order
-callees before callers. Instance port matching is verified at graph build;
-unique C++ port names are fixed in SimulationPlan from captured paths. The emitter reads the
-planned ports, graph value IDs and cache decisions for instance evaluation and
-tick calls. SimulationPlan also fixes instance tick-compute/commit chunks.
-The initial graph also captures input/output port paths, input IDs and result
-declaration order. The emitter declares ports, internal signals and group cache
-inputs from graph value types rather than walking source operations for these
-declarations.
-Signal name bases and explicit-name flags are captured in the graph. The C++
-emitter's naming table now allocates names from graph value IDs and those
-captured hints; it does not inspect PYC MLIR operations or types. The graph
-also captures the function symbol and a source-backed flag for each value,
-which the emitter uses in place of MLIR handles. Borrowed source handles
-remain for graph verification and diagnostics.
-Graph nodes also carry a verified execution category. Pure graph grouping,
-dependency scheduling, operation ordering, plan validation and the eval
-dispatch consume that captured category.
-SimGraph Passes read captured expression kinds, value IDs, source-backed flags
-and the structural-emission setting; they no longer inspect MLIR operation
-attributes or result lists while choosing graph rewrites.
-SimulationPlan now allocates scheduling keys from graph value IDs and captured
-operation names, derives group-propagation mask widths from graph types, and
-orders modules by captured function names. Source handles remain for boundary
-verification and diagnostics.
-SimulationPlan also records one verified execution action per graph node:
-assignment, assertion, pure expression, comb-region call, group call, primitive
-call or skip. The eval and combinational C++ emit paths render these planned
-actions instead of selecting behavior from MLIR operations or graph node kinds.
-The plan also fixes fallback primitive evaluation chunks and local tick-compute
-and tick-commit action sequences. The emitter renders these verified sequences;
-the register reset-group action shares one clock edge and reset check across
-registers with the same controls.
-It forms dependency
-components within pure runs, coarsens the execution DAG using GSIM's
-out-degree-one, in-degree-one and equal-predecessor sibling rules with quotient
-cycle checks, splits oversized components and runs a bounded global initial
-partition over consecutive pure DAG nodes, inlines
-cheap single-use scalar expressions, replicates a cheap singleton expression
-into distinct consumer groups when its standalone evaluation can be removed,
-including one-use sources, repeated uses in the same target group and a
-two-operation scalar fragment formed by successive copies. After copying,
-the empty source execution node is removed from the DAG. Same-group inlining
-covers scalar arithmetic, comparisons and fixed-index reads while bounding
-the expression tree to two modeled host operations. It groups at least six
-independent mux nodes with a common scalar selector before
-partition when their operands are available at the first mux, then marks
-large mux runs for one C++ condition branch, moving independent expressions
-between the muxes after that branch,
-and propagates exact scalar bit demand backward across partitions for
-activation, including bits fixed by constant AND/OR operands and through
-nested pure `pyc.comb` argument/yield bindings and three dynamic-shift opcodes
-when their shift amount is constant or dynamic. Dynamic amounts use a
-logarithmic bit-mask dilation over all possible shift distances. Expensive
-remaining pure singleton expressions also receive activity checks, excluding
-constants and aliases whose comparison would cost more than assignment.
-A packed activity bitmap propagates demanded output-bit changes between
-topologically ordered pure groups whose inputs all come from other groups.
-For fixed-index vector reads, activation and packed propagation compare only
-the observed outer lanes. When a rank-2 input is read through fixed row and
-column indices, activity and packed propagation compare just the observed
-elements. The group input cache also updates only those selected lanes or
-elements when the group runs. Other vector operations still use full-input
-comparisons.
-The remaining GSIM mechanisms below are not yet reproduced.
+The target is the enabled compiler pipeline in the local read-only `gsim/`
+snapshot, adapted to PYC hardware semantics. The source-level decisions,
+including differences from the paper and disabled source functions, are in
+[newcircuit-gsim-source-audit.md](newcircuit-gsim-source-audit.md).
 
-This request extends the older NewCircuit v1.0 architecture-only scope.
-Preserve PYC hardware semantics, module SimObject boundaries, and Decision
-0127/0128/0134/0135 legality rules. The references are GSIM's `src/main.cpp`
-pipeline and the DAC 2025 paper. The local `gsim/` snapshot is read-only.
+The implementation includes Hardware MLIR value/state transformations,
+SimGraph coarsening, partitioning and replication, and verified SimulationPlan
+activity, reset and statement scheduling. The acceptance corpus checks the
+intended IR/graph structure as well as values. It is not a proof of equivalence
+for every legal circuit or a reproduction of the paper's large-core speedups.
 
-## Stage ownership
+## Ownership and current coverage
 
-The dividing rule is the effect of a transformation. A pass that changes a
-hardware value, width, state object, alias, constant, or observable root belongs
-to Hardware MLIR Passes and must be verified there for both C++ and Verilog.
-A pass that changes only evaluation granularity, activity, replication for
-execution, or scheduling belongs to SimGraph Passes or SimulationPlan. Some
-GSIM source functions combine both concerns and need more than one NewCircuit
-pass.
+Hardware changes belong to dialect operations and shared MLIR passes before
+both C++ and Verilog. Execution-only decisions belong to SimGraph and
+SimulationPlan. The emitter renders the verified plan. Decisions
+0112/0114/0115/0116/0121/0122/0127/0128/0129/0134/0135 remain binding.
 
-| GSIM stage or mechanism | NewCircuit owner | Current coverage | Missing work |
-|---|---|---|---|
-| `splitArray`, width inference | Hardware MLIR | Typed PYC IR, optional `VectorUnroll`, flat-type gate, recursive fixed-index lane splitting for vector registers and observed elementwise expressions, including arithmetic/remainder, bitwise logic, comparisons, scalar-condition selects, casts, extracts and shifts; fixed-index reads through dimension broadcasts and selected output lanes of rank-2 OR/AND/add reductions; no fixed reader cap | General aggregate splitting for memory shapes, dynamic indices and observable probes. |
-| `detectLoop` | Hardware MLIR legality | `CheckCombCycles`, including hierarchy | Keep its gate before graph building. |
-| `removeDeadNodes`, dead registers and aliases | Hardware MLIR | Canonicalizer, CSE, dead-instance/state and wire elimination; `RemoveDeadValues` where supported | Audit named probes, observability and all state roots against GSIM cases. |
-| `constantAnalysis`, value-level `exprOpt`, `aliasAnalysis`, `patternDetect` | Hardware MLIR | SCCP, canonicalizer, `CombCanonicalize`, `EliminateWires`; concat-equality, disjoint shifted-OR equality and one-hot extraction | Extend the patterns to the remaining legal shapes and identities with PYC width, reset and value-model proofs. |
-| `commonExpr` for value equivalence | Hardware MLIR | CSE | Add guarded extraction or materialization rules after cost analysis. |
-| `usedBits`, value-level `splitNodes` | Hardware MLIR | Vector canonicalization/unrolling; extraction and truncation pushed through bitwise NOT, single and multiple concatenation fields; partial readers of `trunc`, `zext` and `sext` mapped to source bits or fill; shared bitwise and scalar mux segments for overlapping slice readers; single-use and multi-reader narrow add/sub/mul and mux; fixed left/logical-right/arithmetic-right shifts including zero and sign fill for both single and multiple readers; multi-reader constant-amount dynamic shifts canonicalized first; unnamed scalar registers split at every observed slice boundary, including overlapping readers; bitwise/state slice splitting uses a boundary sweep without a fixed reader-count cap; recursive fixed-index vector register lanes and fixed-index `v_broadcast_dim` reads | General array segment splitting and register cases with observable-probe handling. |
-| `usedBits`, activity-level `splitNodes` | SimGraph Passes | Backward exact bit demand across captured expressions, nested pure comb regions and partitions narrows input-change checks | Split graph nodes whose bit ranges activate independently. |
-| Cost-driven execution inlining and extraction | SimGraph Passes | Graph-owned pure expressions; scalar arithmetic, comparisons, fixed-index reads, casts and bitwise expressions inline when all readers stay in one group, their modeled repeated evaluation costs no more than one evaluation plus materialization, and the resulting inline tree has at most two modeled operations. This includes two-reader one-operation expressions and zero-cost aliases/constants with more readers | Add broader operation and host cost model, materialization/extraction and cross-group graph rewrites. |
-| `graphPartition` supernode coarsening and bounded partition | SimGraph Passes | Dependency components within pure runs; out-degree-one, in-degree-one and sibling coarsening across unrelated `pyc.comb` regions; bounded dynamic programming within an oversized component and over consecutive pure graph nodes, with effectful cuts; independent common-selector scalar mux nodes are grouped before partition and runs of at least six emit one branch even when unrelated expressions separate them | General shared-condition expression trees and exact source cost/bounds. GSIM's `graphRefine` function exists but is not invoked in its published pipeline. PYC has mux expressions but no FIRRTL `when` node. |
-| `replicationOpt` for host execution | SimGraph Passes | Scalar singleton expressions up to 64 bits, including arithmetic, comparisons and fixed-index reads from materialized vector inputs, are copied into pure consumer groups when GSIM's singleton cost threshold permits; a source with one use or several uses in one group creates one copy, and an empty source execution node is removed. Previously copied scalar dependencies can be copied recursively within the same cost bound. Upstream pure values may be used if their source computation stays materialized | Extend to general compound DAG fragments, dynamic/aggregate array expressions and the full recursive expression cost rule. |
-| Active-bit propagation and packed checks | SimGraph Passes, SimulationPlan and runtime | Group input-change activation, exact demanded-bit comparisons, fixed-index outer-vector-lane and rank-2 element comparisons for cache checks and packed propagation, pure singleton activation except constants/aliases, packed activity bits for topological pure-group dependencies, demanded-bit output-change propagation, existing instance/primitive caches, and planned batches of registers sharing clock/reset that check the edge and reset once | Activity for effectful nodes, packed checks across effectful boundaries and a full GSIM reset slow path. |
-| `topoSort`, `generateStmtTree`, `instsGenerator` | SimulationPlan lowering | SimulationAST freezes pure-expression semantics, effectful-node execution metadata, instance port paths/state classification, function ports and nested comb-region bindings before graph import; dependency order, SCC fallback, phase and cache plans are keyed by graph node/value IDs; assignment and assertion execution data, register, CDC, both FIFO, all memory and instance bindings, output roots and named probes are captured in SimGraph; pure groups and comb regions lower to verified planned chunks; assignment, assertion, pure-expression, comb/group-call and primitive-call actions are verified per node; fallback primitive evaluation chunks and local tick-compute/commit sequences are planned and verified; instance port names and register probe passthroughs are resolved in the plan | Lower remaining names through graph-owned descriptions and build complete statement trees for primitive internals and tick phases. |
-| `cppEmitter` | C++ emitter | Emits planned order and group checks; all supported pure operations use graph-owned expression semantics, while eval dispatch renders verified per-node SimulationPlan actions | Lower primitive internals and remaining names without rediscovering MLIR semantics. |
+| Enabled GSIM mechanism | NewCircuit implementation and boundaries | Acceptance gate |
+|---|---|---|
+| Width inference, legality, dead nodes, aliases, constants, expression patterns | Typed PYC IR; existing cycle/depth/domain gates, SCCP, canonicalization, CSE and state cleanup. Concat/shifted-OR equality, one-hot extraction and partial cast/shift readers run in shared Hardware MLIR. | `simulation_plan`, `semantic` |
+| `splitArray` and aggregate demand | Recursive fixed-index vector state/expression lanes, dimension broadcasts and selected rank-two reductions. Named lane aliases keep distinct probes. Observable aggregate values remain whole through SLP, register packing and optional vector unrolling. Source optional splitting rejects variable indices. | `array_split`, `simulation_plan` |
+| `usedBits`, value-level `splitNodes` | Shared scalar bitwise/mux segments, modular arithmetic narrowing, fixed shifts and casts, single-reader and overlapping register slices; truncation propagates through bitwise, cast, mux/select and fixed-shift chains to the greedy fixed point; pure comb result/input boundaries carry partial demand without removing the regions. Dynamic left shifts preserve low-prefix demand. Width/keep roots remain barriers. Memory storage remains full-width because every legal PYC memory exposes hash/watch/dump. | `scalar_demand`, `scalar_fixedpoint`, `array_split`, `simulation_plan` |
+| Observable roots | Explicit `debug_keep` values acquire retained observation aliases before generic cleanup; a dedicated non-hardware resource prevents DCE/CSE from dropping them. Nested comb effects retain the root without creating state or a combinational cut. Name-only unused values remain hints under the existing contract. | `array_split`, `simulation_plan` |
+| `commonExpr` | Shared MLIR SSA values plus CSE cover existing whole-node expression equivalence. Source selective whole-node CSE is distinct from arbitrary subtree extraction. | `simulation_plan`, `replication` |
+| Correlation coarsening | One reverse out-degree-one pass, one forward in-degree-one pass, then sibling merging; immediate quotient updates, cycle checks, exact recipient-size guards and collision-safe predecessor-set comparison. | `partition` |
+| Initial partition | Default dynamic programming operates on indivisible coarse units, distinct quotient edges and the first minimum-cost tie. `--sim-supernode-max-size` is a soft target: an oversized coarse unit remains whole. `--sim-supernode-strict-bound=true` retains the earlier experimental hard-bound policy. Zero disables partitioning. | `partition` |
+| Shared conditions / statement trees | Dependency-ready pure scheduling collects at least six scalar mux/select nodes sharing a selector, including late-ready operands and inlined branch trees. Verifiers reject interdependent batches and crossing source effect boundaries. PYC SSA muxes replace FIRRTL last-connect `when`. | `shared_condition` |
+| Cost-driven inline / `replicationOpt` | Cost-bounded scalar expression trees inline within groups. Singleton supernodes can replicate compound trees using recursive host-operation cost times distinct consumer groups `<3`; source execution and stale outputs are removed. Wide/aggregate results, observed roots and effectful boundaries stay materialized. | `replication`, `simulation_plan` |
+| Exact demand and activation | Backward scalar masks cross nested comb argument/yield bindings and dynamic shifts; fixed vector lanes/elements receive selective checks. Group input caches and packed propagation use the same demand. | `simulation_plan`, `activity` |
+| Packed propagation across state/effects | Complete producers publish changes in their actual eval/commit phases: registers, CDC, memories, FIFOs and instances as well as pure nodes. SCC/effect cases without a complete publication schedule keep conservative caches. Byte-memory and async-FIFO outputs can publish from both eval and commit. | `activity`, `primitive_activity`, `semantic` |
+| Packed checks and activation cost | The plan chooses branchless writes for at most three bitmap words and one shared branch above that cost. Consecutive groups in one eight-bit block receive an outer quiet check; code chunks cannot silently break a planned batch. | `activity` |
+| Reset slow path | Registers sharing controls use outlined reset helpers and one unlikely reset branch. Pending next state is applied at commit, retaining TICK/XFER and repeated-call behavior. No reset effect is moved into `comb()`. | `activity`, `simulation_plan`, `semantic` |
+| Topological order, primitive/hierarchy execution and C++ emission | SimulationAST freezes expression semantics and effectful bindings; SimGraph owns node/value IDs; SimulationPlan verifies order, statements, activity, caches, chunks and phases. C++ renders graph expressions and planned actions. Existing hierarchy, SCC fallback and runtime primitives remain the PYC implementation. | `simulation_plan`, `primitive_activity`, `semantic` |
 
-## Representation needed for full coverage
+Wide dynamic shift amounts also normalize in shared MLIR before conversion to a
+host `unsigned`, preserving overshift behavior and unknown amount propagation.
+This prevents a 64/128-bit amount such as `1 << 32` from becoming zero in C++.
 
-`SimGraph` now owns pure expression opcode, operand IDs, widths, constants and
-attributes. Its nodes and edges carry graph value IDs, explicit expression
-users and DAG validation; the replication pass creates synthetic expression
-and value IDs without changing PYC IR. The C++ emitter generates top-level and
-nested pure expressions from these descriptions. SimulationPlan stores
-execution and SCC orders as graph node IDs. The graph still borrows MLIR
-`Operation *` and `Value` for construction-time verification, use counts and
-diagnostics. C++ signal names, expression semantics, effectful bindings and
-instance ports are captured before emission. Assignment
-sources/targets and assertion conditions/messages are captured as graph-owned
-execution data. All supported steps inside `pyc.comb` use graph expression or
-nested-region IDs. Planning decisions
-for order, activity and caches now use graph node/value IDs.
-Full GSIM coverage requires:
+Source `graphRefine`, `mergeRegister` and `constructRegs` are disabled and are
+not implementation requirements. FIRRTL width/clock inference and invalid-value
+rules cannot replace PYC's explicit types, enables, CDC and observation phases.
+There is no legal unobserved anonymous PYC memory to narrow: PYC942 requires a
+stable name and the runtime exposes full storage. The memory negative gate
+checks this boundary, including high-byte writes and old-data behavior.
 
-1. Stable graph identities for signals and expressions, with opcode, width,
-   signedness, operands, constants, slices, and source location. Graph rewrites
-   must redirect uses without mutating legalized PYC IR.
-2. Explicit current-state and next-state boundaries, memory/FIFO/CDC effects,
-   instance boundaries, assertions, named probes and output roots. The MLIR
-   `CombDepGraph` remains the hardware legality authority.
-3. A graph-native `SimulationPlan` containing expression order, partitions,
-   per-bit activity, cache inputs, phase decisions and statements for every
-   effectful operation. Pure groups already lower to planned statements; the
-   remaining effectful paths still need this representation.
-4. Graph verification before and after every pass: complete use-def edges,
-   widths/slices, acyclicity at combinational cuts, roots and hierarchy safety.
+## Validation entry point
 
-## Verification contract
+```sh
+CCACHE_DISABLE=1 PYC_SIM_JOBS=2 \
+  PYC_GATE_RUN_ID=newcircuit-gsim-20260926 \
+  bash tests/newcircuit/run_gsim_reproduction_gate.sh
+```
 
-- For each behavior-changing Hardware MLIR pass, compare both C++ and Verilog
-  against the same legalized design, including named probes, reset, memory,
-  nested `pyc.comb`, cross-instance feedback and wide vector slices.
-- For every SimGraph pass, compare optimized and disabled simulation over
-  multiple cycles and assert the intended graph transformation or activation
-  count occurred. Output equality alone does not prove coverage.
-- Track compile time, generated C++ size, simulator throughput and activation
-  counts on identical large designs before claiming GSIM-level performance.
+The umbrella runs `simulation_plan`, `partition`, `replication`,
+`shared_condition`, `array_split`, `scalar_demand`, `scalar_fixedpoint`, `activity`,
+`primitive_activity`, and the repository's semantic regressions. Dedicated
+checks require both structural evidence and an independent value oracle;
+execution rewrites compare enabled/disabled variants. Hardware rewrites are
+checked in C++ and Verilog, including reset, observations and X/Z boundaries.
+
+`benchmark_gsim_pipeline.py` measures compile time, emitted size and evaluation
+throughput with an independently checked checksum. It is a synthetic 260-stage
+DAG with infrequent input changes, not a GSIM/XiangShan benchmark. No large-core
+or paper-level performance claim follows from it.
+
+The local CMake configuration does not provide `MLIRRegisterAllPasses`, so the
+optional `pyc-opt` target is excluded; build validation uses `pycc`.
+
+The older evidence below records earlier stages of implementation. Its group
+counts, policy descriptions and byte-identical comparisons describe those
+revisions; the current gate explicitly requests strict bounds where a fixture
+needs one-operation partitions. Default-policy behavior has a separate gate.
+
+## Gate evidence (2026-09-26–27)
+
+The final `pycc` build and all ten gate suites above passed. The complete main
+suite and the remaining suites ran separately against the same compiler;
+`docs/gates/logs/newcircuit-gsim-20260926/gsim_reproduction_summary.json`
+records the compiler SHA256 and accepted logs. API hygiene, shell/Python syntax
+and `git diff --check` also passed. No reference GSIM source was changed.
+
+The added scalar fixed-point gate covers 19 shapes, each with 4,096 C++ and
+Verilog cycles, including partial state, reset/enable, casts, mux/select and
+nested comb interfaces. Full-width and retained observations have negative
+structural checks. The scalar shift gate covers 64/128-bit amounts, overshifts
+and X/Z amounts. Simulator diagnostics are checked independently of exit status.
+
+The optional `run_gsim_reference_gate.sh` compares matching FIRRTL/PYC designs
+using one independent oracle. GSIM and NewCircuit each passed 197,632 cases,
+with digest `e4ccd8d72edf7475`. This used a non-official GCC 13.1 reference build
+and a checked small-model fallback, because Clang >=19 was unavailable; details
+are in `reference-toolchain.txt` and the source audit. It validates small
+combinational arithmetic/mux/slice behavior, not large-core performance.
+
+After the compile/gate jobs finished, the synthetic activity benchmark ran
+10,000,000 evaluations three times per variant. Both variants matched the
+independent checksum `327574114848`.
+
+| Variant | Median elapsed | Evaluations/second | Emitted C++ bytes |
+|---|---:|---:|---:|
+| Default activity | 0.463253 s | 21.59 million | 28,423 |
+| `--sim-group-activation=false` | 2.347100 s | 4.26 million | 27,391 |
+
+The 5.07x ratio applies only to this 260-stage DAG with state changes every
+64 evaluations. Emission took about 0.043/0.042 seconds and C++ compilation
+1.85/1.69 seconds. All individual samples are in `benchmark.json`; this is
+neither a comparison against GSIM throughput nor a reproduction of the paper's
+large-core results.
 
 ## Gate evidence (2026-09-24)
 

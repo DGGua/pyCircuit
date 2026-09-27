@@ -73,8 +73,20 @@ pipeline. The graph verifier checks that the stored dependency set is complete.
 `--sim-group-activation=false` disables the activation pass for equivalence
 and performance comparisons. `--sim-used-bit-activation=false` keeps full
 input comparisons; `--sim-supernode-max-size=0` disables bounded partitioning.
-The remaining GSIM scope is recorded in
+The default partition preserves indivisible coarse units, so this size is a
+soft target. `--sim-supernode-strict-bound=true` selects the earlier hard-bound
+policy for experiments. Source mechanisms, PYC adaptations and acceptance gates
+are recorded in
 `docs/rfcs/newcircuit-gsim-graph-optimization.md`.
+
+The 2026-09-26 continuation adds recursive scalar replication, dependency-ready
+shared-selector branches, activity publication from state and primitive phases,
+branchless small-fanout updates, byte-wide quiet checks and outlined reset work.
+Explicit observation roots now survive generic MLIR cleanup and lane splitting,
+SLP, register packing and vector unrolling. The shared Hardware MLIR demand
+rewrites and wide shift legalization are tested on both output paths. See
+`docs/rfcs/newcircuit-gsim-source-audit.md` for the enabled-source audit and
+`tests/newcircuit/run_gsim_reproduction_gate.sh` for the combined gate.
 
 `SimGraph` borrows MLIR operations and values and must be built and consumed
 before the legalized PYC module changes. Its top nodes can be grouped without

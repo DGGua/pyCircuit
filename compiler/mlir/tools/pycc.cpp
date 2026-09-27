@@ -209,8 +209,13 @@ static llvm::cl::opt<bool> simReplication(
 
 static llvm::cl::opt<unsigned> simSupernodeMaxSize(
     "sim-supernode-max-size",
-    llvm::cl::desc("Maximum operations in a SimGraph supernode (0 disables partitioning)"),
+    llvm::cl::desc("GSIM partition size target; coarsened nodes remain indivisible (0 disables partitioning)"),
     llvm::cl::init(35));
+
+static llvm::cl::opt<bool> simSupernodeStrictBound(
+    "sim-supernode-strict-bound",
+    llvm::cl::desc("Use legacy strict-size partitioning, splitting coarsened nodes"),
+    llvm::cl::init(false));
 
 static llvm::cl::opt<bool> unrollVector(
     "unroll-vector",
@@ -2099,6 +2104,7 @@ static FailureOr<pyc::SimulationPlan> buildCppSimulationPlan(
   graphOptions.enableExpressionInlining = simExpressionInlining;
   graphOptions.enableReplication = simReplication;
   graphOptions.supernodeMaxSize = simSupernodeMaxSize;
+  graphOptions.strictSupernodeBound = simSupernodeStrictBound;
   if (failed(pyc::runSimGraphPasses(*graph, graphOptions)))
     return failure();
   return pyc::buildSimulationPlan(std::move(*graph), planningOptions);
@@ -2389,6 +2395,7 @@ int main(int argc, char **argv) {
   pm.addPass(createSymbolDCEPass());
   if (inlineDecision.enableInline)
     pm.addPass(createInlinerPass());
+  pm.addNestedPass<func::FuncOp>(pyc::createPreserveObservationsPass());
   pm.addPass(createCanonicalizerPass(canonicalizeCfg));
   pm.addPass(createCSEPass());
   pm.addPass(createSCCPPass());

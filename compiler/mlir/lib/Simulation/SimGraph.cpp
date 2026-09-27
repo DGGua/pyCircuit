@@ -402,10 +402,19 @@ LogicalResult SimGraph::verify() {
     return function.emitError("simulation graph declarations are stale");
   llvm::DenseSet<Operation *> represented;
   llvm::DenseSet<unsigned> representedCombRegions;
+  llvm::DenseMap<unsigned, unsigned> replicaOwners;
   llvm::DenseSet<unsigned> inlinedValues;
   for (const SimExpr &expr : expressions)
     if (expr.inlineIntoConsumer)
       inlinedValues.insert(expr.result);
+  llvm::DenseMap<Operation *, unsigned> conditionSegments;
+  unsigned conditionSegment = 0;
+  for (const SimNode &node : fineNodes) {
+    if (node.kind == SimNodeKind::Expression || node.kind == SimNodeKind::PureGroup)
+      conditionSegments.try_emplace(node.op, conditionSegment);
+    else
+      ++conditionSegment;
+  }
   for (const SimNode &node : topNodes) {
     if (!node.op || node.operations.empty() || node.operations.front() != node.op)
       return function.emitError("simulation graph has a node without a source operation");
@@ -580,12 +589,17 @@ LogicalResult SimGraph::verify() {
     for (auto [op, id] : llvm::zip(node.operations, node.expressionIds))
       if (id >= expressions.size() || expressions[id].source != op)
         return node.op->emitError("simulation expression mapping is stale");
-    for (unsigned id : node.replicatedExpressionIds)
+    for (unsigned id : node.replicatedExpressionIds) {
       if (id >= expressions.size() || expressions[id].source ||
           !expressions[id].inlineIntoConsumer ||
+          expressions[id].omitOriginalEvaluation ||
           expressions[id].result >= values.size() ||
           values[expressions[id].result].source)
         return node.op->emitError("simulation replicated expression is invalid");
+      if (!replicaOwners.try_emplace(expressions[id].result,
+                                    &node - topNodes.data()).second)
+        return node.op->emitError("simulation replicated expression has multiple owners");
+    }
     unsigned previousBatchEnd = 0;
     for (const MuxConditionBatch &batch : node.muxConditionBatches) {
       if (batch.begin < previousBatchEnd || batch.end > node.expressionIds.size() ||
@@ -593,18 +607,26 @@ LogicalResult SimGraph::verify() {
           values[batch.selectorId].type.width != 1 ||
           !values[batch.selectorId].type.shape.empty())
         return node.op->emitError("simulation mux condition batch is invalid");
+      llvm::DenseSet<unsigned> batchResults;
+      for (unsigned index = batch.begin; index < batch.end; ++index)
+        batchResults.insert(expressions[node.expressionIds[index]].result);
+      unsigned batchSegment = conditionSegments.lookup(
+          expressions[node.expressionIds[batch.begin]].source);
       for (unsigned index = batch.begin; index < batch.end; ++index) {
         const SimExpr &expr = expressions[node.expressionIds[index]];
-        if (expr.kind != SimExprKind::Mux || expr.operands.size() != 3 ||
+        if ((expr.kind != SimExprKind::Mux && expr.kind != SimExprKind::Select) ||
+            expr.operands.size() != 3 ||
             expr.operands[0] != batch.selectorId ||
             expr.result >= values.size() ||
             expr.inlineIntoConsumer || expr.omitOriginalEvaluation ||
             !values[expr.result].type.shape.empty() ||
-            !values[expr.result].source)
+            !values[expr.result].source ||
+            conditionSegments.lookup(expr.source) != batchSegment)
           return node.op->emitError("simulation mux condition step is invalid");
-        for (unsigned operand : expr.operands)
-          if (operand >= values.size() || !values[operand].source ||
-              inlinedValues.contains(operand))
+        for (auto [position, operand] : llvm::enumerate(expr.operands))
+          if (operand >= values.size() || batchResults.contains(operand) ||
+              (!values[operand].source && !inlinedValues.contains(operand)) ||
+              (position == 0 && inlinedValues.contains(operand)))
             return node.op->emitError("simulation mux condition operand is invalid");
       }
       previousBatchEnd = batch.end;
@@ -655,7 +677,7 @@ LogicalResult SimGraph::verify() {
     for (Operation *op : node.operations)
       if (!represented.insert(op).second)
         return op->emitError("simulation graph represents an operation more than once");
-    if (node.operations.size() > 1) {
+    if (node.operations.size() > 1 || !node.replicatedExpressionIds.empty()) {
       llvm::DenseSet<unsigned> produced;
       llvm::DenseSet<unsigned> expectedInputs;
       llvm::DenseSet<Value> expectedOutputs;
@@ -834,7 +856,24 @@ LogicalResult SimGraph::verify() {
   for (const SimNode &node : topNodes)
     graphUses.insert(node.inputIds.begin(), node.inputIds.end());
   for (const SimExpr &expr : expressions)
-    graphUses.insert(expr.operands.begin(), expr.operands.end());
+    if (!expr.omitOriginalEvaluation)
+      graphUses.insert(expr.operands.begin(), expr.operands.end());
+  for (auto [index, node] : llvm::enumerate(topNodes)) {
+    auto verifyReplicaInputs = [&](unsigned id) {
+      for (unsigned operand : expressions[id].operands)
+        if (!values[operand].sourceBacked &&
+            (!replicaOwners.count(operand) ||
+             replicaOwners.lookup(operand) != index))
+          return false;
+      return true;
+    };
+    for (unsigned id : node.expressionIds)
+      if (!verifyReplicaInputs(id))
+        return node.op->emitError("simulation expression uses a replica outside its group");
+    for (unsigned id : node.replicatedExpressionIds)
+      if (!verifyReplicaInputs(id))
+        return node.op->emitError("simulation replica uses a value outside its group");
+  }
   for (const SimExpr &expr : expressions) {
     if (expr.result >= values.size() || !values[expr.result].type.width)
       return function.emitError("simulation expression has an invalid result");
@@ -863,6 +902,8 @@ LogicalResult SimGraph::verify() {
     if (expr.omitOriginalEvaluation) {
       if (values[expr.result].observable || graphUses.contains(expr.result))
         return function.emitError("simulation omitted an observable expression");
+    } else if (!expr.source && !replicaOwners.count(expr.result)) {
+      return function.emitError("simulation replicated expression lacks a group");
     }
   }
   for (auto [id, expr] : llvm::enumerate(expressions))

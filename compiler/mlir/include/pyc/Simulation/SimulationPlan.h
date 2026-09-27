@@ -45,6 +45,27 @@ struct GroupPropagationTarget {
   llvm::SmallVector<llvm::APInt> vectorElements;
 };
 
+struct ActivityWordMask {
+  unsigned word = 0;
+  uint64_t mask = 0;
+};
+
+struct ActivityPublication {
+  // Targets with identical change predicates share one comparison and a set
+  // of packed stores. Predicate.groupNodeId identifies the first target only.
+  GroupPropagationTarget predicate;
+  llvm::SmallVector<ActivityWordMask> stores;
+  bool branchless = false;
+};
+
+struct ActivityBatch {
+  llvm::SmallVector<unsigned> nodeIds;
+  // All nodes in a nonzero-mask batch are adjacent packed pure groups. An
+  // effectful or externally polled node always has its own zero-mask batch.
+  unsigned word = 0;
+  uint64_t mask = 0;
+};
+
 enum class SimStatementKind : unsigned char { Expression, MuxCondition };
 
 struct PlannedMuxAssignment {
@@ -141,11 +162,18 @@ struct SimulationPlan {
   // One executable action per graph node. The emitter renders this action
   // without choosing behavior from an MLIR operation or graph node kind.
   llvm::SmallVector<SimNodeAction> nodeActions;
-  // A packed activity bit replaces input comparison only when every input of
-  // the target group has a unique, scheduled pure-group producer.
+  // A packed activity bit is valid only when every input has a unique producer
+  // that publishes changes after evaluation or at the state commit boundary.
   llvm::DenseSet<unsigned> packedActivationGroups;
+  // Sources include pure groups, individual expressions/comb regions,
+  // assignments, evaluated primitives/instances and committed state outputs.
   llvm::DenseMap<unsigned, llvm::SmallVector<GroupPropagationTarget, 0>>
       groupPropagations;
+  llvm::DenseSet<unsigned> commitPropagationNodes;
+  llvm::DenseMap<unsigned, llvm::SmallVector<ActivityPublication, 0>>
+      activityPublications;
+  llvm::SmallVector<ActivityBatch> combActivityBatches;
+  llvm::SmallVector<llvm::SmallVector<ActivityBatch>> evalActivityChunks;
   llvm::SmallVector<ResetGroupPlan> resetGroups;
   llvm::SmallVector<SimTickAction> localTickComputeActions;
   llvm::SmallVector<SimTickAction> localTickCommitActions;

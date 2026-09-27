@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <limits>
+#include <set>
 #include <vector>
 
 using namespace mlir;
@@ -238,100 +239,133 @@ static void rebuildGroupInputs(SimGraph &graph, SimNode &group) {
     collect(id);
 }
 
-// GSIM merges independent condition-controlled nodes before partitioning.
-// PYC represents these choices as mux values. Gather source-backed scalar
-// muxes with one selector inside an effect-free run when every operand is
-// available before the first mux. This permits the later statement planner to
-// emit one branch even when unrelated DAG nodes separate the muxes.
+// Delay condition-controlled nodes while their pure operand producers become
+// ready. A batch contains only simultaneously ready nodes, so contracting it
+// cannot introduce a quotient cycle. Non-candidates keep deterministic order.
+static llvm::SmallVector<llvm::SmallVector<unsigned>> readyConditionSchedule(
+    const std::vector<llvm::DenseSet<unsigned>> &predecessors,
+    llvm::ArrayRef<unsigned> selectors, unsigned maxBatchSize) {
+  const unsigned count = predecessors.size();
+  std::vector<llvm::SmallVector<unsigned>> successors(count);
+  std::vector<unsigned> remaining(count);
+  std::set<unsigned> ready;
+  for (unsigned i = 0; i < count; ++i) {
+    remaining[i] = predecessors[i].size();
+    if (!remaining[i])
+      ready.insert(i);
+    for (unsigned predecessor : predecessors[i])
+      successors[predecessor].push_back(i);
+  }
+  llvm::SmallVector<llvm::SmallVector<unsigned>> result;
+  unsigned scheduled = 0;
+  while (!ready.empty()) {
+    llvm::SmallVector<unsigned> selected;
+    for (unsigned index : ready)
+      if (selectors[index] == ~0u) {
+        selected.push_back(index);
+        break;
+      }
+    if (selected.empty()) {
+      llvm::DenseMap<unsigned, llvm::SmallVector<unsigned>> candidates;
+      for (unsigned index : ready)
+        if (candidates[selectors[index]].size() < maxBatchSize)
+          candidates[selectors[index]].push_back(index);
+      for (unsigned index : ready)
+        if (candidates[selectors[index]].size() >= 6) {
+          selected = candidates[selectors[index]];
+          break;
+        }
+    }
+    if (selected.empty())
+      selected.push_back(*ready.begin());
+    for (unsigned index : selected)
+      ready.erase(index);
+    for (unsigned index : selected)
+      for (unsigned successor : successors[index])
+        if (--remaining[successor] == 0)
+          ready.insert(successor);
+    scheduled += selected.size();
+    result.push_back(std::move(selected));
+  }
+  if (scheduled != count)
+    result.clear();
+  return result;
+}
+
+// Form shared-condition units before coarsening. Pure operands that originally
+// followed the first mux can be scheduled first; effectful nodes remain cuts.
 static void runSharedMuxGroupingPass(SimGraph &graph, unsigned maxSize) {
   if (maxSize < 6)
     return;
-  llvm::DenseMap<unsigned, llvm::SmallVector<unsigned>> at;
-  llvm::DenseSet<unsigned> selected;
+  llvm::DenseSet<unsigned> oldGroups(graph.groupedNodes.begin(),
+                                   graph.groupedNodes.end());
+  llvm::SmallVector<SimNode, 0> grouped;
+  llvm::SmallVector<unsigned> groupIds;
+  auto appendOriginal = [&](unsigned index) {
+    if (oldGroups.contains(index))
+      groupIds.push_back(grouped.size());
+    grouped.push_back(std::move(graph.topNodes[index]));
+  };
   for (unsigned begin = 0; begin < graph.topNodes.size();) {
     if (!isPureGraphNode(graph.topNodes[begin])) {
-      ++begin;
+      appendOriginal(begin++);
       continue;
     }
     unsigned end = begin + 1;
     while (end < graph.topNodes.size() && isPureGraphNode(graph.topNodes[end]))
       ++end;
+    const unsigned count = end - begin;
     llvm::DenseMap<unsigned, unsigned> producer;
-    for (unsigned i = begin; i < end; ++i)
-      for (unsigned value : graph.topNodes[i].outputIds)
+    for (unsigned i = 0; i < count; ++i)
+      for (unsigned value : graph.topNodes[begin + i].outputIds)
         producer.try_emplace(value, i);
-    auto eligible = [&](unsigned index) {
-      const SimNode &node = graph.topNodes[index];
-      if (node.kind != SimNodeKind::Expression ||
-          node.expressionIds.size() != 1 || node.operations.size() != 1)
-        return false;
+    std::vector<llvm::DenseSet<unsigned>> predecessors(count);
+    llvm::SmallVector<unsigned> selectors(count, ~0u);
+    for (unsigned i = 0; i < count; ++i) {
+      const SimNode &node = graph.topNodes[begin + i];
+      for (unsigned value : node.inputIds)
+        if (auto it = producer.find(value); it != producer.end() && it->second != i)
+          predecessors[i].insert(it->second);
+      if (node.kind != SimNodeKind::Expression || node.expressionIds.size() != 1)
+        continue;
       const SimExpr &expr = graph.expressions[node.expressionIds.front()];
-      if (expr.kind != SimExprKind::Mux || expr.operands.size() != 3 ||
-          !graph.values[expr.result].type.shape.empty() ||
-          !graph.values[expr.result].sourceBacked)
-        return false;
+      if ((expr.kind != SimExprKind::Mux && expr.kind != SimExprKind::Select) ||
+          expr.operands.size() != 3 ||
+          !graph.values[expr.result].type.shape.empty())
+        continue;
       const SimType &selector = graph.values[expr.operands[0]].type;
-      return selector.shape.empty() && selector.width == 1 &&
-             llvm::all_of(expr.operands, [&](unsigned operand) {
-               return graph.values[operand].sourceBacked;
-             });
-    };
-    for (unsigned first = begin; first < end; ++first) {
-      if (selected.contains(first) || !eligible(first))
-        continue;
-      unsigned selector =
-          graph.expressions[graph.topNodes[first].expressionIds.front()]
-              .operands[0];
-      llvm::SmallVector<unsigned> matches;
-      for (unsigned i = first; i < end && matches.size() < maxSize; ++i) {
-        if (selected.contains(i) || !eligible(i))
+      if (selector.shape.empty() && selector.width == 1)
+        selectors[i] = expr.operands[0];
+    }
+    auto schedule = readyConditionSchedule(predecessors, selectors, maxSize);
+    bool hasBatch = llvm::any_of(schedule, [](const auto &batch) {
+      return batch.size() >= 6;
+    });
+    if (!hasBatch) {
+      for (unsigned i = begin; i < end; ++i)
+        appendOriginal(i);
+    } else {
+      for (const auto &batch : schedule) {
+        if (batch.size() == 1) {
+          appendOriginal(begin + batch.front());
           continue;
-        const SimExpr &expr =
-            graph.expressions[graph.topNodes[i].expressionIds.front()];
-        if (expr.operands[0] != selector ||
-            !llvm::all_of(expr.operands, [&](unsigned operand) {
-              auto it = producer.find(operand);
-              return it == producer.end() || it->second < first;
-            }))
-          continue;
-        matches.push_back(i);
+        }
+        SimNode node;
+        node.kind = SimNodeKind::PureGroup;
+        for (unsigned index : batch) {
+          const SimNode &member = graph.topNodes[begin + index];
+          node.operations.append(member.operations.begin(), member.operations.end());
+          node.expressionIds.append(member.expressionIds.begin(), member.expressionIds.end());
+          node.outputs.append(member.outputs.begin(), member.outputs.end());
+          node.outputIds.append(member.outputIds.begin(), member.outputIds.end());
+        }
+        node.op = node.operations.front();
+        rebuildGroupInputs(graph, node);
+        groupIds.push_back(grouped.size());
+        grouped.push_back(std::move(node));
       }
-      if (matches.size() < 6)
-        continue;
-      at.try_emplace(first, matches);
-      for (unsigned i : matches)
-        selected.insert(i);
     }
     begin = end;
-  }
-  if (at.empty())
-    return;
-  llvm::DenseSet<unsigned> oldGroups(graph.groupedNodes.begin(),
-                                     graph.groupedNodes.end());
-  llvm::SmallVector<SimNode, 0> grouped;
-  llvm::SmallVector<unsigned> groupIds;
-  for (unsigned i = 0; i < graph.topNodes.size(); ++i) {
-    if (auto found = at.find(i); found != at.end()) {
-      SimNode node;
-      node.kind = SimNodeKind::PureGroup;
-      for (unsigned memberId : found->second) {
-        const SimNode &member = graph.topNodes[memberId];
-        node.operations.append(member.operations.begin(),
-                               member.operations.end());
-        node.expressionIds.append(member.expressionIds.begin(),
-                                  member.expressionIds.end());
-        node.outputs.append(member.outputs.begin(), member.outputs.end());
-        node.outputIds.append(member.outputIds.begin(), member.outputIds.end());
-      }
-      node.op = node.operations.front();
-      rebuildGroupInputs(graph, node);
-      groupIds.push_back(grouped.size());
-      grouped.push_back(std::move(node));
-    } else if (!selected.contains(i)) {
-      if (oldGroups.contains(i))
-        groupIds.push_back(grouped.size());
-      grouped.push_back(std::move(graph.topNodes[i]));
-    }
   }
   graph.topNodes = std::move(grouped);
   graph.groupedNodes = std::move(groupIds);
@@ -451,7 +485,7 @@ static void runGlobalInitialPartitionPass(SimGraph &graph, unsigned maxSize) {
 // GSIM's out-degree-one, in-degree-one, and sibling grouping on graph nodes.
 // Effectful nodes participate in the dependency test but are never merged.
 // A quotient cycle would change evaluation order, so reject that merge.
-static void runGraphCoarseningPass(SimGraph &graph) {
+static void runGraphCoarseningPass(SimGraph &graph, bool strictBound) {
   const unsigned count = graph.topNodes.size();
   if (count < 2)
     return;
@@ -495,6 +529,11 @@ static void runGraphCoarseningPass(SimGraph &graph) {
           unsigned current = todo.pop_back_val();
           if (current == to)
             return true;
+          // PYC keeps a state primitive as one node, whereas GSIM separates
+          // register source/destination nodes. A path through committed state
+          // is not an alternate combinational path between the candidates.
+          if (!strictBound && graph.topNodes[current].stateBoundary)
+            continue;
           for (unsigned successor : next[current])
             if (seen.insert(successor).second)
               todo.push_back(successor);
@@ -504,12 +543,46 @@ static void runGraphCoarseningPass(SimGraph &graph) {
       llvm::DenseSet<unsigned> used;
       unsigned merged = 0;
       auto tryMerge = [&](unsigned a, unsigned b, unsigned sizeLimit) {
-        if (a == b || used.contains(a) || used.contains(b) ||
-            !pure(a) || !pure(b) ||
-            opCount[a] + opCount[b] > sizeLimit ||
+        // GSIM bounds the existing recipient, not the resulting unit. Its
+        // out/in passes receive into b; the sibling pass receives into a.
+        unsigned recipient = kind == MergeKind::Sibling ? a : b;
+        unsigned source = kind == MergeKind::Sibling ? b : a;
+        bool exceedsBound = strictBound
+                                ? opCount[a] + opCount[b] > sizeLimit
+                                : kind == MergeKind::Sibling
+                                      ? opCount[recipient] >= 30
+                                      : opCount[recipient] > 7000;
+        if (a == b || (strictBound && (used.contains(a) || used.contains(b))) ||
+            !pure(a) || !pure(b) || exceedsBound ||
             (next[a].contains(b) && next[b].contains(a)) ||
             hasAlternatePath(a, b) || hasAlternatePath(b, a))
           return false;
+        if (!strictBound) {
+          // Update the quotient immediately so the rest of this single pass
+          // sees earlier contractions, as GSIM's mutable supernode graph does.
+          parent[source] = recipient;
+          opCount[recipient] += opCount[source];
+          for (unsigned predecessor : prev[source]) {
+            next[predecessor].erase(source);
+            if (predecessor != recipient) {
+              next[predecessor].insert(recipient);
+              prev[recipient].insert(predecessor);
+            }
+          }
+          for (unsigned successor : next[source]) {
+            prev[successor].erase(source);
+            if (successor != recipient) {
+              prev[successor].insert(recipient);
+              next[recipient].insert(successor);
+            }
+          }
+          prev[recipient].erase(source);
+          next[recipient].erase(source);
+          prev[source].clear();
+          next[source].clear();
+          ++merged;
+          return true;
+        }
         // Preserve the earlier source node as the quotient representative.
         if (a > b)
           std::swap(a, b);
@@ -528,11 +601,11 @@ static void runGraphCoarseningPass(SimGraph &graph) {
         for (unsigned i = 0; i < count; ++i)
           if (root(i) == i && pure(i) && prev[i].size() == 1)
             tryMerge(i, *prev[i].begin(), 7000);
-      } else {
+      } else if (strictBound) {
         llvm::DenseMap<uint64_t, unsigned> pendingSibling;
         for (unsigned i = 0; i < count; ++i) {
           if (root(i) != i || !pure(i) || prev[i].empty() ||
-              opCount[i] >= 30)
+              (strictBound && opCount[i] >= 30))
             continue;
           uint64_t signature = prev[i].size();
           for (unsigned predecessor : prev[i])
@@ -546,16 +619,47 @@ static void runGraphCoarseningPass(SimGraph &graph) {
                           return prev[other].contains(p);
                         });
             if (same && tryMerge(other, i, 58)) {
-              pendingSibling.erase(it);
+              if (strictBound)
+                pendingSibling.erase(it);
               continue;
             }
           }
           pendingSibling[signature] = i;
         }
+      } else {
+        // A predecessor hash is only a bucket key: different predecessor sets
+        // can have the same sum. Keep all distinct candidates, as GSIM does.
+        llvm::DenseMap<uint64_t, llvm::SmallVector<unsigned>> siblingBuckets;
+        for (unsigned i = 0; i < count; ++i) {
+          if (root(i) != i || !pure(i) || prev[i].empty())
+            continue;
+          uint64_t signature = prev[i].size();
+          for (unsigned predecessor : prev[i])
+            signature += (static_cast<uint64_t>(predecessor) + 1) *
+                         UINT64_C(0x9e3779b97f4a7c15);
+          bool matched = false;
+          for (unsigned &candidate : siblingBuckets[signature]) {
+            if (prev[candidate].size() != prev[i].size() ||
+                !llvm::all_of(prev[i], [&](unsigned p) {
+                  return prev[candidate].contains(p);
+                }))
+              continue;
+            matched = true;
+            if (!tryMerge(candidate, i, 0))
+              candidate = i;
+            break;
+          }
+          if (!matched)
+            siblingBuckets[signature].push_back(i);
+        }
       }
       if (!merged)
         break;
       changedAny = true;
+      // The published source runs each correlation rule once, in order.
+      // Repeating to a fixed point can merge additional unrelated siblings.
+      if (!strictBound)
+        break;
     }
   }
   if (!changedAny)
@@ -603,7 +707,7 @@ static void runGraphCoarseningPass(SimGraph &graph) {
 }
 
 // GSIM removes a singleton node when the expression cost times the number of
-// consumer supernodes is below its singleton threshold of three. The copies
+// distinct consumer nodes is below its singleton threshold of three. The copies
 // are graph expressions and never rewrite legalized hardware IR.
 static int replicationOpCost(SimExprKind kind) {
   switch (kind) {
@@ -647,171 +751,201 @@ static int replicationOpCost(SimExprKind kind) {
 
 static void runReplicationPass(SimGraph &graph) {
   llvm::DenseMap<unsigned, unsigned> producerByValue;
-  for (auto [id, expr] : llvm::enumerate(graph.expressions))
-    producerByValue.try_emplace(expr.result, static_cast<unsigned>(id));
-  llvm::DenseSet<unsigned> requiredMaterialized;
   llvm::DenseMap<unsigned, unsigned> groupByExpression;
+  llvm::DenseMap<unsigned, llvm::SmallVector<unsigned, 2>> users;
+  llvm::DenseSet<unsigned> requiredMaterialized;
   llvm::DenseSet<unsigned> grouped(graph.groupedNodes.begin(),
                                    graph.groupedNodes.end());
-  for (auto [index, node] : llvm::enumerate(graph.topNodes))
-    if (node.kind == SimNodeKind::Expression ||
-        node.kind == SimNodeKind::PureGroup)
+  for (auto [id, expr] : llvm::enumerate(graph.expressions)) {
+    producerByValue.try_emplace(expr.result, static_cast<unsigned>(id));
+    for (unsigned operand : expr.operands)
+      users[operand].push_back(static_cast<unsigned>(id));
+  }
+  for (auto [index, node] : llvm::enumerate(graph.topNodes)) {
+    if (isPureGraphNode(node)) {
       for (unsigned id : node.expressionIds)
         groupByExpression.try_emplace(id, static_cast<unsigned>(index));
-  for (const SimNode &source : graph.topNodes) {
-    if (source.operations.size() != 1 || source.expressionIds.size() != 1)
+      for (unsigned id : node.replicatedExpressionIds)
+        groupByExpression.try_emplace(id, static_cast<unsigned>(index));
+    } else {
+      requiredMaterialized.insert(node.inputIds.begin(), node.inputIds.end());
+    }
+  }
+  for (auto [sourceIndex, source] : llvm::enumerate(graph.topNodes)) {
+    if (!isPureGraphNode(source) || source.expressionIds.empty())
       continue;
-    unsigned sourceId = source.expressionIds[0];
-    const SimExpr original = graph.expressions[sourceId];
-    const SimValue value = graph.values[original.result];
-    if (value.observable || requiredMaterialized.contains(original.result) ||
-        !value.type.shape.empty() ||
-        value.type.width > 64 || value.sourceUseCount == 0)
-      continue;
-    int cost = replicationOpCost(original.kind);
-    if (cost < 0)
-      continue;
-    llvm::DenseSet<unsigned> localSynthetic;
+    // A scalar DAG with one escaping result is one execution expression.
+    // Reconstruct its local AST even when the general host inlining policy
+    // chose to materialize an internal operation (for example a mux/divide).
+    // Groups with multiple escaping roots still contain multiple members.
+    llvm::DenseSet<unsigned> localValues;
+    for (unsigned id : source.expressionIds)
+      localValues.insert(graph.expressions[id].result);
     for (unsigned id : source.replicatedExpressionIds)
-      localSynthetic.insert(graph.expressions[id].result);
-    std::function<int(unsigned)> operandCost = [&](unsigned id) -> int {
-      const SimValue &operand = graph.values[id];
-      auto producer = producerByValue.find(id);
-      // GSIM permits a cheap scalar read from an already materialized array.
-      // The vector itself must remain available; copying it would duplicate
-      // aggregate construction and invalidate the singleton cost model.
-      if (!operand.type.shape.empty()) {
-        if (!operand.sourceBacked ||
-            (producer != producerByValue.end() &&
-             graph.expressions[producer->second].omitOriginalEvaluation))
-          return -1;
-        return 0;
+      localValues.insert(graph.expressions[id].result);
+    unsigned rootId = ~0u;
+    bool multipleRoots = false;
+    for (unsigned id : source.expressionIds) {
+      unsigned valueId = graph.expressions[id].result;
+      bool escapes = graph.values[valueId].observable ||
+                     requiredMaterialized.contains(valueId);
+      for (unsigned userId : users[valueId]) {
+        const SimExpr &user = graph.expressions[userId];
+        if (!user.omitOriginalEvaluation &&
+            llvm::is_contained(user.operands, valueId) &&
+            (!groupByExpression.count(userId) ||
+             groupByExpression.lookup(userId) != sourceIndex))
+          escapes = true;
       }
-      if (operand.type.width > 64)
-        return -1;
-      if (operand.sourceBacked)
-        return producer != producerByValue.end() &&
-                       graph.expressions[producer->second].omitOriginalEvaluation
-                   ? -1 : 0;
-      if (!localSynthetic.contains(id) || producer == producerByValue.end())
-        return -1;
-      const SimExpr &inner = graph.expressions[producer->second];
-      if (graph.values[inner.result].sourceBacked ||
-          !inner.inlineIntoConsumer)
-        return -1;
-      int result = replicationOpCost(inner.kind);
-      if (result < 0)
-        return -1;
-      for (unsigned input : inner.operands) {
-        int child = operandCost(input);
-        if (child < 0)
-          return -1;
-        result += child;
-        if (result >= 3)
-          return result;
+      if (escapes) {
+        multipleRoots |= rootId != ~0u;
+        rootId = id;
       }
-      return result;
-    };
-    for (unsigned operand : original.operands) {
-      int operandOperationCount = operandCost(operand);
-      if (operandOperationCount < 0) {
-        cost = -1;
+    }
+    if (multipleRoots || rootId == ~0u)
+      continue;
+    const unsigned rootValue = graph.expressions[rootId].result;
+    bool canCopy = true;
+    for (unsigned id : localValues) {
+      const SimValue &value = graph.values[id];
+      if (value.observable || requiredMaterialized.contains(id) ||
+          !value.type.shape.empty() || value.type.width > 64) {
+        canCopy = false;
         break;
       }
-      cost += operandOperationCount;
     }
-    if (cost < 0)
+    if (!canCopy)
+      continue;
+    llvm::DenseMap<unsigned, int> costs;
+    std::function<int(unsigned)> expressionCost = [&](unsigned id) -> int {
+      if (!localValues.contains(id)) {
+        auto producer = producerByValue.find(id);
+        // A materialized value is a leaf, even if it is a wide integer or
+        // an array. The copied operation must still have a scalar result of
+        // at most BASIC_WIDTH. Aggregate construction is never copied.
+        return graph.values[id].sourceBacked &&
+                       (producer == producerByValue.end() ||
+                        !graph.expressions[producer->second].omitOriginalEvaluation)
+                   ? 0 : -1;
+      }
+      if (auto it = costs.find(id); it != costs.end())
+        return it->second;
+      const SimExpr &expr = graph.expressions[producerByValue.lookup(id)];
+      int cost = replicationOpCost(expr.kind);
+      if (cost < 0)
+        return -1;
+      for (unsigned operand : expr.operands) {
+        int child = expressionCost(operand);
+        if (child < 0)
+          return -1;
+        // Count repeated DAG references as repeated inline evaluation, and
+        // saturate at the strict GSIM threshold rather than overflowing.
+        cost = std::min(3, cost + child);
+      }
+      costs.try_emplace(id, cost);
+      return cost;
+    };
+    const int cost = expressionCost(rootValue);
+    if (cost < 0 || cost >= 3)
       continue;
     llvm::SmallVector<std::pair<unsigned, unsigned>> consumers;
     llvm::DenseSet<unsigned> distinctUsers;
-    for (unsigned userId : value.expressionUsers) {
+    for (unsigned userId : users[rootValue]) {
+      const SimExpr &user = graph.expressions[userId];
+      // The use list also contains old source expressions retained for
+      // diagnostics and operands redirected by previous copies.
+      if (user.omitOriginalEvaluation ||
+          !llvm::is_contained(user.operands, rootValue) ||
+          !distinctUsers.insert(userId).second)
+        continue;
       auto it = groupByExpression.find(userId);
-      if (it == groupByExpression.end()) {
-        consumers.clear();
+      if (it == groupByExpression.end() || it->second == sourceIndex) {
+        canCopy = false;
         break;
       }
       consumers.emplace_back(it->second, userId);
-      distinctUsers.insert(userId);
     }
-    if (consumers.size() != value.sourceUseCount)
+    if (!canCopy || consumers.empty() ||
+        (cost && distinctUsers.size() >= (3u + cost - 1u) / cost))
       continue;
-    if (static_cast<unsigned>(cost) * distinctUsers.size() >= 3u)
+    // No internal source value may escape with the removed execution node.
+    for (unsigned id : localValues) {
+      if (id == rootValue)
+        continue;
+      for (unsigned userId : users[id]) {
+        const SimExpr &user = graph.expressions[userId];
+        if (!user.omitOriginalEvaluation &&
+            llvm::is_contained(user.operands, id) &&
+            (!groupByExpression.count(userId) ||
+             groupByExpression.lookup(userId) != sourceIndex))
+          canCopy = false;
+      }
+    }
+    if (!canCopy)
       continue;
     llvm::SmallVector<unsigned> orderedGroups;
     for (auto [groupIndex, consumerId] : consumers) {
       (void)consumerId;
-      if (llvm::find(orderedGroups, groupIndex) == orderedGroups.end())
+      if (!llvm::is_contained(orderedGroups, groupIndex))
         orderedGroups.push_back(groupIndex);
     }
     for (unsigned groupIndex : orderedGroups) {
       llvm::DenseMap<unsigned, unsigned> copiedValues;
-      std::function<unsigned(unsigned)> copyOperand = [&](unsigned id) -> unsigned {
-        if (graph.values[id].sourceBacked)
+      llvm::SmallVector<unsigned> copiedExpressions;
+      std::function<unsigned(unsigned)> copyValue = [&](unsigned id) -> unsigned {
+        if (!localValues.contains(id))
           return id;
         if (auto it = copiedValues.find(id); it != copiedValues.end())
           return it->second;
-        SimExpr inner = graph.expressions[producerByValue.lookup(id)];
-        for (unsigned &operand : inner.operands)
-          operand = copyOperand(operand);
+        SimExpr copy = graph.expressions[producerByValue.lookup(id)];
+        for (unsigned &operand : copy.operands)
+          operand = copyValue(operand);
         unsigned newValue = graph.values.size();
-        graph.values.push_back(SimValue{graph.values[id].type, Value{}, 1, false});
-        inner.source = nullptr;
-        inner.result = newValue;
-        inner.inlineIntoConsumer = true;
-        inner.omitOriginalEvaluation = false;
+        const SimType type = graph.values[id].type;
+        graph.values.push_back(SimValue{type, Value{}, 0, false});
+        copy.source = nullptr;
+        copy.result = newValue;
+        copy.inlineIntoConsumer = true;
+        copy.omitOriginalEvaluation = false;
         unsigned newExpression = graph.expressions.size();
-        graph.expressions.push_back(std::move(inner));
+        graph.expressions.push_back(std::move(copy));
+        for (unsigned operand : graph.expressions.back().operands)
+          users[operand].push_back(newExpression);
         producerByValue.try_emplace(newValue, newExpression);
-        graph.topNodes[groupIndex].replicatedExpressionIds.push_back(newExpression);
+        groupByExpression.try_emplace(newExpression, groupIndex);
+        copiedExpressions.push_back(newExpression);
         copiedValues.try_emplace(id, newValue);
         return newValue;
       };
-      unsigned useCount = 0;
-      llvm::DenseSet<unsigned> groupUsers;
-      for (auto [consumerGroup, consumerId] : consumers)
-        if (consumerGroup == groupIndex && groupUsers.insert(consumerId).second)
-          for (unsigned operand : graph.expressions[consumerId].operands)
-            useCount += operand == original.result;
-      unsigned cloneValue = graph.values.size();
-      graph.values.push_back(SimValue{value.type, Value{}, useCount, false});
-      SimExpr clone = original;
-      for (unsigned &operand : clone.operands)
-        operand = copyOperand(operand);
-      clone.source = nullptr;
-      clone.result = cloneValue;
-      clone.inlineIntoConsumer = true;
-      clone.omitOriginalEvaluation = false;
-      unsigned cloneId = graph.expressions.size();
-      graph.expressions.push_back(std::move(clone));
-      producerByValue.try_emplace(cloneValue, cloneId);
-      graph.topNodes[groupIndex].replicatedExpressionIds.push_back(cloneId);
+      unsigned cloneValue = copyValue(rootValue);
+      auto &replicas = graph.topNodes[groupIndex].replicatedExpressionIds;
+      replicas.insert(replicas.begin(), copiedExpressions.begin(),
+                      copiedExpressions.end());
+      for (auto [consumerGroup, consumerId] : consumers) {
+        if (consumerGroup != groupIndex)
+          continue;
+        for (unsigned &operand : graph.expressions[consumerId].operands)
+          if (operand == rootValue) {
+            operand = cloneValue;
+            users[cloneValue].push_back(consumerId);
+          }
+      }
       if (grouped.insert(groupIndex).second)
         graph.groupedNodes.push_back(groupIndex);
-      for (unsigned consumerId : groupUsers)
-        for (unsigned &operand : graph.expressions[consumerId].operands)
-          if (operand == original.result)
-            operand = cloneValue;
       rebuildGroupInputs(graph, graph.topNodes[groupIndex]);
     }
-    std::function<void(unsigned)> requireInputs = [&](unsigned id) {
-      if (graph.values[id].sourceBacked) {
-        if (producerByValue.count(id))
-          requiredMaterialized.insert(id);
-        return;
-      }
-      const SimExpr &inner = graph.expressions[producerByValue.lookup(id)];
-      for (unsigned operand : inner.operands)
-        requireInputs(operand);
-    };
-    for (unsigned operand : original.operands)
-      requireInputs(operand);
-    graph.expressions[sourceId].omitOriginalEvaluation = true;
+    for (unsigned id : source.expressionIds)
+      graph.expressions[id].omitOriginalEvaluation = true;
+    for (unsigned id : source.replicatedExpressionIds)
+      graph.expressions[id].omitOriginalEvaluation = true;
   }
   llvm::SmallVector<SimNode, 0> kept;
   llvm::SmallVector<unsigned> remap(graph.topNodes.size(), ~0u);
   for (auto [index, node] : llvm::enumerate(graph.topNodes)) {
-    if (node.operations.size() == 1 && node.expressionIds.size() == 1 &&
-        graph.expressions[node.expressionIds.front()].omitOriginalEvaluation)
+    if (!node.expressionIds.empty() &&
+        llvm::all_of(node.expressionIds, [&](unsigned id) {
+          return graph.expressions[id].omitOriginalEvaluation;
+        }))
       continue;
     remap[index] = kept.size();
     kept.push_back(std::move(node));
@@ -847,98 +981,75 @@ static void runSingletonActivationPass(SimGraph &graph) {
   llvm::sort(graph.groupedNodes);
 }
 
-// GSIM coalesces a sufficiently large set of FIRRTL when nodes with a common
-// condition. PYC represents the corresponding value choice as mux expressions.
-// The global partition has already formed execution groups. Move independent
-// scalar muxes with a shared selector together, then mark the resulting runs
-// for one conditional statement. Every moved mux must read only values that
-// were available before the first mux in its run.
+// Schedule the pure expression DAG before forming common-selector statements.
+// Inlined branch expressions remain graph expressions and are rendered inside
+// the selected branch. The selector itself stays materialized.
 static void runMuxConditionBatchPass(SimGraph &graph) {
   llvm::DenseSet<unsigned> inlinedValues;
   for (const SimExpr &expr : graph.expressions)
     if (expr.inlineIntoConsumer)
       inlinedValues.insert(expr.result);
+  llvm::DenseMap<Operation *, unsigned> sourceSegments;
+  unsigned segment = 0;
+  for (const SimNode &node : graph.fineNodes) {
+    if (isPureGraphNode(node))
+      sourceSegments.try_emplace(node.op, segment);
+    else
+      ++segment;
+  }
   for (unsigned groupIndex : graph.groupedNodes) {
     SimNode &group = graph.topNodes[groupIndex];
     group.muxConditionBatches.clear();
-    auto eligible = [&](unsigned index) {
-      const SimExpr &expr = graph.expressions[group.expressionIds[index]];
-      if (expr.kind != SimExprKind::Mux || expr.operands.size() != 3 ||
-          expr.inlineIntoConsumer || expr.omitOriginalEvaluation ||
-          !graph.values[expr.result].type.shape.empty())
-        return false;
-      const SimType &selector = graph.values[expr.operands[0]].type;
-      if (!selector.shape.empty() || selector.width != 1)
-        return false;
+    unsigned count = group.expressionIds.size();
+    llvm::DenseMap<unsigned, unsigned> producer;
+    for (unsigned i = 0; i < count; ++i)
+      producer.try_emplace(graph.expressions[group.expressionIds[i]].result, i);
+    std::vector<llvm::DenseSet<unsigned>> predecessors(count);
+    llvm::SmallVector<unsigned> selectors(count, ~0u);
+    llvm::DenseMap<std::pair<unsigned, unsigned>, unsigned> conditionKeys;
+    for (unsigned i = 0; i < count; ++i) {
+      const SimExpr &expr = graph.expressions[group.expressionIds[i]];
       for (unsigned operand : expr.operands)
-        if (!graph.values[operand].sourceBacked ||
-            inlinedValues.contains(operand))
-          return false;
-      return graph.values[expr.result].sourceBacked;
+        if (auto it = producer.find(operand); it != producer.end())
+          predecessors[i].insert(it->second);
+      if ((expr.kind != SimExprKind::Mux && expr.kind != SimExprKind::Select) ||
+          expr.operands.size() != 3 || expr.inlineIntoConsumer ||
+          expr.omitOriginalEvaluation ||
+          !graph.values[expr.result].type.shape.empty() ||
+          !graph.values[expr.result].sourceBacked)
+        continue;
+      unsigned selectorId = expr.operands[0];
+      const SimValue &selector = graph.values[selectorId];
+      if (selector.type.shape.empty() && selector.type.width == 1 &&
+          selector.sourceBacked && !inlinedValues.contains(selectorId)) {
+        auto key = std::make_pair(sourceSegments.lookup(expr.source), selectorId);
+        auto [it, inserted] = conditionKeys.try_emplace(key, conditionKeys.size());
+        (void)inserted;
+        selectors[i] = it->second;
+      }
+    }
+    auto schedule = readyConditionSchedule(predecessors, selectors, count);
+    if (!llvm::any_of(schedule, [](const auto &batch) { return batch.size() >= 6; }))
+      continue;
+    llvm::SmallVector<unsigned> order;
+    for (const auto &batch : schedule) {
+      unsigned begin = order.size();
+      order.append(batch.begin(), batch.end());
+      if (batch.size() >= 6)
+        group.muxConditionBatches.push_back(
+            {begin, static_cast<unsigned>(order.size()),
+             graph.expressions[group.expressionIds[batch.front()]].operands[0]});
+    }
+    auto applyOrder = [&](auto &items) {
+      auto original = items;
+      for (auto [i, oldIndex] : llvm::enumerate(order))
+        items[i] = original[oldIndex];
     };
-    llvm::DenseSet<unsigned> produced;
-    for (unsigned id : group.expressionIds)
-      produced.insert(graph.expressions[id].result);
-    for (unsigned begin = 0; begin < group.expressionIds.size(); ++begin) {
-      if (!eligible(begin))
-        continue;
-      unsigned selector = graph.expressions[group.expressionIds[begin]].operands[0];
-      llvm::DenseSet<unsigned> availableBefore;
-      for (unsigned i = 0; i < begin; ++i)
-        availableBefore.insert(graph.expressions[group.expressionIds[i]].result);
-      llvm::SmallVector<unsigned> selected;
-      for (unsigned i = begin; i < group.expressionIds.size(); ++i) {
-        if (!eligible(i))
-          continue;
-        const SimExpr &expr = graph.expressions[group.expressionIds[i]];
-        if (expr.operands[0] != selector ||
-            !llvm::all_of(expr.operands, [&](unsigned operand) {
-              return !produced.contains(operand) || availableBefore.contains(operand);
-            }))
-          continue;
-        selected.push_back(i);
-      }
-      if (selected.size() < 6)
-        continue;
-      bool contiguous = selected.back() - selected.front() + 1 == selected.size();
-      if (!contiguous) {
-        llvm::DenseSet<unsigned> chosen(selected.begin(), selected.end());
-        llvm::SmallVector<unsigned> order;
-        for (unsigned i = 0; i < begin; ++i)
-          order.push_back(i);
-        order.append(selected.begin(), selected.end());
-        for (unsigned i = begin; i < group.expressionIds.size(); ++i)
-          if (!chosen.contains(i))
-            order.push_back(i);
-        auto applyOrder = [&](auto &items) {
-          auto original = items;
-          for (auto [i, oldIndex] : llvm::enumerate(order))
-            items[i] = original[oldIndex];
-        };
-        applyOrder(group.operations);
-        applyOrder(group.expressionIds);
-        applyOrder(group.outputs);
-        applyOrder(group.outputIds);
-        group.op = group.operations.front();
-      }
-      begin += selected.size() - 1;
-    }
-    for (unsigned begin = 0; begin < group.expressionIds.size();) {
-      if (!eligible(begin)) {
-        ++begin;
-        continue;
-      }
-      unsigned selector =
-          graph.expressions[group.expressionIds[begin]].operands[0];
-      unsigned end = begin + 1;
-      while (end < group.expressionIds.size() && eligible(end) &&
-             graph.expressions[group.expressionIds[end]].operands[0] ==
-                 selector)
-        ++end;
-      if (end - begin > 5)
-        group.muxConditionBatches.push_back({begin, end, selector});
-      begin = end;
-    }
+    applyOrder(group.operations);
+    applyOrder(group.expressionIds);
+    applyOrder(group.outputs);
+    applyOrder(group.outputIds);
+    group.op = group.operations.front();
   }
 }
 
@@ -1413,22 +1524,24 @@ LogicalResult runSimGraphPasses(SimGraph &graph,
     return graph.verify();
   };
   bool structural = graph.structuralEmission;
-  if (!structural && options.enableCombFusion) {
+  if (!structural && options.enableCombFusion && options.strictSupernodeBound) {
     runConsecutiveCombGroupingPass(graph);
     if (failed(verifyRewrite()))
       return failure();
   }
   if (!structural && options.enableCombFusion) {
-    runSharedMuxGroupingPass(graph, options.supernodeMaxSize);
+    runSharedMuxGroupingPass(graph, options.strictSupernodeBound
+                                       ? options.supernodeMaxSize
+                                       : std::numeric_limits<unsigned>::max());
     if (failed(verifyRewrite()))
       return failure();
   }
   if (!structural && options.enableCombFusion) {
-    runGraphCoarseningPass(graph);
+    runGraphCoarseningPass(graph, options.strictSupernodeBound);
     if (failed(verifyRewrite()))
       return failure();
   }
-  if (!structural && options.enableCombFusion) {
+  if (!structural && options.enableCombFusion && options.strictSupernodeBound) {
     runSuperNodePartitionPass(graph, options.supernodeMaxSize);
     if (failed(verifyRewrite()))
       return failure();

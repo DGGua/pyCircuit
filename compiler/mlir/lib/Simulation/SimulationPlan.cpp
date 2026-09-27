@@ -338,37 +338,78 @@ static void buildSccOrder(const DependencyGraph &graph, SimulationPlan &plan) {
   }
 }
 
+static bool hasCommitOnlyOutputs(const SimNode &node) {
+  return node.kind == SimNodeKind::Reg || node.kind == SimNodeKind::SyncMem ||
+         node.kind == SimNodeKind::SyncMemDP || node.kind == SimNodeKind::CdcSync;
+}
+
+static bool publishesOnCommit(const SimNode &node) {
+  // Async FIFO and byte-memory commit methods also refresh their public read
+  // outputs. A later eval snapshot alone would miss those changes.
+  return hasCommitOnlyOutputs(node) || node.kind == SimNodeKind::ByteMem ||
+         node.kind == SimNodeKind::AsyncFifo;
+}
+
+static bool canPublishActivity(const SimulationPlan &plan, unsigned producer,
+                               unsigned target,
+                               const llvm::DenseMap<unsigned, unsigned> &combPosition,
+                               const llvm::DenseMap<unsigned, unsigned> &evalPosition) {
+  const SimNode &node = plan.graph.topNodes[producer];
+  if (hasCommitOnlyOutputs(node))
+    return true;
+  switch (plan.nodeActions[producer].kind) {
+  case SimNodeActionKind::Group:
+  case SimNodeActionKind::Expression:
+  case SimNodeActionKind::Assign:
+  case SimNodeActionKind::CombRegion:
+    return combPosition.count(producer) && combPosition.count(target) &&
+           combPosition.lookup(producer) < combPosition.lookup(target);
+  case SimNodeActionKind::Fifo:
+  case SimNodeActionKind::AsyncFifo:
+  case SimNodeActionKind::ByteMem:
+  case SimNodeActionKind::Instance:
+    // Hierarchical state feedback may require repeated SCC evaluation. Keep
+    // its existing cache protocol until a complete publication order exists.
+    return plan.evalTopological && evalPosition.count(producer) &&
+           evalPosition.count(target) &&
+           evalPosition.lookup(producer) < evalPosition.lookup(target);
+  default:
+    return false;
+  }
+}
+
 static void planPackedGroupActivation(SimulationPlan &plan) {
   if (!plan.combTopological || plan.graph.hasAmbiguousDrivers)
     return;
   llvm::DenseMap<unsigned, unsigned> position;
   for (auto [order, id] : llvm::enumerate(plan.combNodeOrder))
     position.try_emplace(id, static_cast<unsigned>(order));
+  llvm::DenseMap<unsigned, unsigned> evalPosition;
+  for (auto [order, id] : llvm::enumerate(plan.evalNodeOrder))
+    evalPosition.try_emplace(id, static_cast<unsigned>(order));
   llvm::DenseMap<unsigned, llvm::DenseMap<unsigned, unsigned>> inputProducer;
   for (const SimEdge &edge : plan.graph.edges)
-    if (plan.groupByNode.count(edge.producer) &&
-        plan.groupActivations.count(edge.consumer))
+    if (plan.groupActivations.count(edge.consumer) &&
+        canPublishActivity(plan, edge.producer, edge.consumer, position,
+                           evalPosition))
       inputProducer[edge.consumer].try_emplace(edge.valueId, edge.producer);
   for (unsigned target : plan.graph.groupedNodes) {
     if (!plan.groupActivations.count(target))
       continue;
-    bool allFromGroups = true;
+    bool allPublished = true;
     for (unsigned value : plan.graph.topNodes[target].inputIds) {
       auto it = inputProducer[target].find(value);
-      if (it == inputProducer[target].end() ||
-          !position.count(it->second) || !position.count(target) ||
-          position.lookup(it->second) >= position.lookup(target)) {
-        allFromGroups = false;
+      if (it == inputProducer[target].end()) {
+        allPublished = false;
         break;
       }
     }
-    if (allFromGroups)
+    if (allPublished)
       plan.packedActivationGroups.insert(target);
   }
   std::map<std::pair<unsigned, unsigned>, std::set<unsigned>> propagation;
   for (const SimEdge &edge : plan.graph.edges)
-    if (plan.groupByNode.count(edge.producer) &&
-        plan.packedActivationGroups.contains(edge.consumer))
+    if (plan.packedActivationGroups.contains(edge.consumer))
       propagation[{edge.producer, edge.consumer}].insert(edge.valueId);
   for (const auto &[pair, values] : propagation) {
     GroupPropagationTarget target;
@@ -399,7 +440,66 @@ static void planPackedGroupActivation(SimulationPlan &plan) {
         target.vectorElements.emplace_back(1, 1);
     }
     plan.groupPropagations[pair.first].push_back(std::move(target));
+    if (publishesOnCommit(plan.graph.topNodes[pair.first]))
+      plan.commitPropagationNodes.insert(pair.first);
   }
+}
+
+static bool sameActivityPredicate(const GroupPropagationTarget &a,
+                                  const GroupPropagationTarget &b) {
+  return a.valueIds == b.valueIds && a.usedBits == b.usedBits &&
+         a.vectorLanes == b.vectorLanes && a.vectorElements == b.vectorElements;
+}
+
+static void planActivityPublications(SimulationPlan &plan) {
+  for (const auto &[source, targets] : plan.groupPropagations) {
+    auto &publications = plan.activityPublications[source];
+    for (const GroupPropagationTarget &target : targets) {
+      auto it = llvm::find_if(publications, [&](const ActivityPublication &pub) {
+        return sameActivityPredicate(pub.predicate, target);
+      });
+      if (it == publications.end()) {
+        publications.emplace_back();
+        it = publications.end() - 1;
+        it->predicate = target;
+      }
+      unsigned group = plan.groupByNode.lookup(target.groupNodeId);
+      unsigned word = group / 64u;
+      auto store = llvm::find_if(it->stores, [&](const ActivityWordMask &s) {
+        return s.word == word;
+      });
+      if (store == it->stores.end())
+        it->stores.push_back(ActivityWordMask{word, uint64_t{1} << (group % 64u)});
+      else
+        store->mask |= uint64_t{1} << (group % 64u);
+    }
+    // GSIM selects masked stores for at most three bitmap updates and one
+    // common branch for larger fanout. PYC uses aligned uint64_t words.
+    for (ActivityPublication &pub : publications)
+      pub.branchless = pub.stores.size() <= 3;
+  }
+}
+
+static llvm::SmallVector<ActivityBatch>
+planActivityBatches(const SimulationPlan &plan, llvm::ArrayRef<unsigned> nodes) {
+  llvm::SmallVector<ActivityBatch> batches;
+  for (unsigned node : nodes) {
+    if (!plan.packedActivationGroups.contains(node)) {
+      batches.push_back(ActivityBatch{{node}, 0, 0});
+      continue;
+    }
+    unsigned group = plan.groupByNode.lookup(node);
+    unsigned word = group / 64u;
+    // Limit outer checks to eight adjacent groups, as in the source byte
+    // block check, without aliasing wide stores through smaller integers.
+    unsigned byte = group / 8u;
+    if (batches.empty() || !batches.back().mask ||
+        plan.groupByNode.lookup(batches.back().nodeIds.front()) / 8u != byte)
+      batches.push_back(ActivityBatch{{}, word, 0});
+    batches.back().nodeIds.push_back(node);
+    batches.back().mask |= uint64_t{1} << (group % 64u);
+  }
+  return batches;
 }
 
 static void planGroupStatements(SimulationPlan &plan) {
@@ -726,7 +826,8 @@ LogicalResult SimulationPlan::verify() const {
               graph.expressions[group.expressionIds[cursor + offset]];
           const PlannedMuxAssignment &assignment =
               statement.muxAssignments[offset];
-          if (expr.kind != SimExprKind::Mux || expr.operands.size() != 3 ||
+          if ((expr.kind != SimExprKind::Mux && expr.kind != SimExprKind::Select) ||
+              expr.operands.size() != 3 ||
               expr.operands[0] != statement.selectorId ||
               assignment.resultId != expr.result ||
               assignment.trueValueId != expr.operands[1] ||
@@ -745,6 +846,9 @@ LogicalResult SimulationPlan::verify() const {
   llvm::DenseMap<unsigned, unsigned> combPosition;
   for (auto [position, id] : llvm::enumerate(combNodeOrder))
     combPosition.try_emplace(id, static_cast<unsigned>(position));
+  llvm::DenseMap<unsigned, unsigned> evalPosition;
+  for (auto [position, id] : llvm::enumerate(evalNodeOrder))
+    evalPosition.try_emplace(id, static_cast<unsigned>(position));
   for (unsigned target : packedActivationGroups) {
     if (!groupByNode.count(target) || !groupActivations.count(target))
       return failure();
@@ -752,9 +856,8 @@ LogicalResult SimulationPlan::verify() const {
       bool covered = false;
       for (const SimEdge &edge : graph.edges)
         if (edge.consumer == target && edge.valueId == input &&
-            groupByNode.count(edge.producer) &&
-            combPosition.count(edge.producer) && combPosition.count(target) &&
-            combPosition.lookup(edge.producer) < combPosition.lookup(target))
+            canPublishActivity(*this, edge.producer, target, combPosition,
+                               evalPosition))
           covered = true;
       if (!covered)
         return failure();
@@ -762,15 +865,19 @@ LogicalResult SimulationPlan::verify() const {
   }
   std::set<std::tuple<unsigned, unsigned, unsigned>> expectedPropagation;
   for (const SimEdge &edge : graph.edges)
-    if (groupByNode.count(edge.producer) &&
-        packedActivationGroups.contains(edge.consumer))
+    if (packedActivationGroups.contains(edge.consumer))
       expectedPropagation.emplace(edge.producer, edge.consumer, edge.valueId);
   std::set<std::tuple<unsigned, unsigned, unsigned>> actualPropagation;
+  llvm::DenseSet<unsigned> expectedCommitSources;
   for (const auto &entry : groupPropagations) {
-    if (!groupByNode.count(entry.first))
+    if (entry.first >= graph.topNodes.size())
       return failure();
+    if (publishesOnCommit(graph.topNodes[entry.first]))
+      expectedCommitSources.insert(entry.first);
     for (const GroupPropagationTarget &target : entry.second) {
       if (!packedActivationGroups.contains(target.groupNodeId) ||
+          !canPublishActivity(*this, entry.first, target.groupNodeId,
+                              combPosition, evalPosition) ||
           target.valueIds.empty() ||
           target.usedBits.size() != target.valueIds.size() ||
           target.vectorLanes.size() != target.valueIds.size() ||
@@ -814,6 +921,79 @@ LogicalResult SimulationPlan::verify() const {
     }
   }
   if (expectedPropagation != actualPropagation)
+    return failure();
+  if (expectedCommitSources != commitPropagationNodes)
+    return failure();
+  if (activityPublications.size() != groupPropagations.size())
+    return failure();
+  for (const auto &[source, targets] : groupPropagations) {
+    auto found = activityPublications.find(source);
+    if (found == activityPublications.end())
+      return failure();
+    llvm::DenseSet<unsigned> covered;
+    for (const ActivityPublication &pub : found->second) {
+      if (pub.stores.empty() || pub.branchless != (pub.stores.size() <= 3))
+        return failure();
+      std::map<unsigned, uint64_t> expected;
+      for (const GroupPropagationTarget &target : targets)
+        if (sameActivityPredicate(pub.predicate, target)) {
+          if (!covered.insert(target.groupNodeId).second)
+            return failure();
+          unsigned group = groupByNode.lookup(target.groupNodeId);
+          expected[group / 64u] |= uint64_t{1} << (group % 64u);
+        }
+      if (pub.stores.size() != expected.size())
+        return failure();
+      for (const ActivityWordMask &store : pub.stores) {
+        auto mask = expected.find(store.word);
+        if (mask == expected.end() || store.mask != mask->second)
+          return failure();
+        expected.erase(mask);
+      }
+    }
+    if (covered.size() != targets.size())
+      return failure();
+  }
+  auto validBatches = [&](llvm::ArrayRef<ActivityBatch> batches,
+                          llvm::ArrayRef<unsigned> expected) {
+    unsigned cursor = 0;
+    for (const ActivityBatch &batch : batches) {
+      if (batch.nodeIds.empty() || (!batch.mask && batch.nodeIds.size() != 1))
+        return false;
+      uint64_t mask = 0;
+      unsigned byte = ~0u;
+      for (unsigned node : batch.nodeIds) {
+        if (cursor >= expected.size() || node != expected[cursor++])
+          return false;
+        if (batch.mask) {
+          if (!packedActivationGroups.contains(node))
+            return false;
+          unsigned group = groupByNode.lookup(node);
+          if (group / 64u != batch.word || (byte != ~0u && group / 8u != byte))
+            return false;
+          byte = group / 8u;
+          mask |= uint64_t{1} << (group % 64u);
+        } else if (packedActivationGroups.contains(node)) {
+          return false;
+        }
+      }
+      if (mask != batch.mask)
+        return false;
+    }
+    return cursor == expected.size();
+  };
+  if (!validBatches(combActivityBatches, combNodeOrder))
+    return failure();
+  unsigned evalCursor = 0;
+  for (const auto &chunk : evalActivityChunks) {
+    if (chunk.empty() || evalCursor >= evalNodeOrder.size())
+      return failure();
+    unsigned size = std::min<unsigned>(evalChunkNodes, evalNodeOrder.size() - evalCursor);
+    if (!validBatches(chunk, llvm::ArrayRef(evalNodeOrder).slice(evalCursor, size)))
+      return failure();
+    evalCursor += size;
+  }
+  if (evalCursor != evalNodeOrder.size())
     return failure();
   llvm::DenseSet<unsigned> batchedRegs;
   for (const ResetGroupPlan &group : resetGroups) {
@@ -1051,13 +1231,19 @@ FailureOr<SimulationPlan> buildSimulationPlan(SimGraph graph,
         plan.combNodeOrder.push_back(static_cast<unsigned>(id));
       }
   }
-  planPackedGroupActivation(plan);
-
   DependencyGraph full;
   if (buildDependencies(plan.graph, names, true, full)) {
     plan.evalTopological = topoOrder(full, plan.evalNodeOrder);
     if (!plan.evalTopological)
       buildSccOrder(full, plan);
+  }
+  planPackedGroupActivation(plan);
+  planActivityPublications(plan);
+  plan.combActivityBatches = planActivityBatches(plan, plan.combNodeOrder);
+  for (unsigned begin = 0; begin < plan.evalNodeOrder.size(); begin += plan.evalChunkNodes) {
+    unsigned size = std::min<unsigned>(plan.evalChunkNodes, plan.evalNodeOrder.size() - begin);
+    plan.evalActivityChunks.push_back(planActivityBatches(
+        plan, llvm::ArrayRef(plan.evalNodeOrder).slice(begin, size)));
   }
   if (failed(plan.verify())) {
     function.emitError("simulation plan is incomplete");

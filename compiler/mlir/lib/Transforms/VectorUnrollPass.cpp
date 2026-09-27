@@ -331,6 +331,17 @@ struct VectorUnrollPass : public PassWrapper<VectorUnrollPass, OperationPass<fun
 
     std::function<void(Operation &)> collect;
     collect = [&](Operation &op) {
+      // Unrolling must not discard a live observation's name or duplicate an
+      // aggregate name on every scalar lane. Both backends support these
+      // retained vector operations. Keep matching wire assignments intact too.
+      if (op.hasAttr("pyc.name") || op.hasAttr("pyc.debug_keep"))
+        return;
+      if (auto assign = dyn_cast<pyc::AssignOp>(op)) {
+        Operation *wire = assign.getDst().getDefiningOp();
+        if (wire && (wire->hasAttr("pyc.name") ||
+                     wire->hasAttr("pyc.debug_keep")))
+          return;
+      }
       if (isVectorReduceOp(op))
         reduceOps.push_back(&op);
       else if (isa<pyc::VGetOp>(op) && isa<VectorType>(op.getOperand(0).getType()))

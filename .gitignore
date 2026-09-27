@@ -1,6 +1,8 @@
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
+# Handwritten PYC IR fixtures are source, not Python bytecode.
+!tests/newcircuit/*.pyc
 *$py.class
 
 # macOS

@@ -494,6 +494,137 @@ static LogicalResult emitCombMethod(const SimGraph &graph,
   return success();
 }
 
+static std::string oldOutputName(unsigned id) {
+  return "_pyc_old_group_value_" + std::to_string(id);
+}
+
+static void emitActivitySnapshots(const SimulationPlan &plan, unsigned nodeId,
+                                  llvm::raw_ostream &os, NameTable &nt,
+                                  llvm::StringRef indent) {
+  std::set<unsigned> values;
+  if (auto it = plan.groupPropagations.find(nodeId);
+      it != plan.groupPropagations.end())
+    for (const GroupPropagationTarget &target : it->second)
+      values.insert(target.valueIds.begin(), target.valueIds.end());
+  for (unsigned value : values)
+    os << indent << "auto " << oldOutputName(value) << " = "
+       << nt.get(value) << ";\n";
+}
+
+static void emitActivityPropagation(const SimulationPlan &plan, unsigned nodeId,
+                                    llvm::raw_ostream &os, NameTable &nt,
+                                    llvm::StringRef indent) {
+  const SimGraph &graph = plan.graph;
+  auto it = plan.activityPublications.find(nodeId);
+  if (it == plan.activityPublications.end())
+    return;
+  for (auto [ordinal, publication] : llvm::enumerate(it->second)) {
+    const GroupPropagationTarget &target = publication.predicate;
+    std::string changed = "_pyc_activity_changed_" + std::to_string(nodeId) +
+                          "_" + std::to_string(ordinal);
+    if (publication.branchless)
+      os << indent << "const bool " << changed << " = (";
+    else
+      os << indent << "if (";
+    for (auto [i, value] : llvm::enumerate(target.valueIds)) {
+      if (i)
+        os << " || ";
+      const SimType &type = graph.values[value].type;
+      if (type.shape.size() == 2 &&
+          !target.vectorElements[i].isAllOnes()) {
+        const llvm::APInt &elements = target.vectorElements[i];
+        unsigned columns = static_cast<unsigned>(type.shape[1]);
+        os << "(";
+        bool firstElement = true;
+        for (unsigned element = 0; element < elements.getBitWidth(); ++element) {
+          if (!elements[element])
+            continue;
+          if (!firstElement)
+            os << " || ";
+          firstElement = false;
+          unsigned row = element / columns, col = element % columns;
+          os << nt.get(value) << "[" << row << "][" << col << "] != "
+             << oldOutputName(value) << "[" << row << "][" << col << "]";
+        }
+        if (firstElement)
+          os << "false";
+        os << ")";
+        continue;
+      }
+      if (!type.shape.empty() &&
+          !target.vectorLanes[i].isAllOnes()) {
+        const llvm::APInt &lanes = target.vectorLanes[i];
+        os << "(";
+        bool firstLane = true;
+        for (unsigned lane = 0; lane < lanes.getBitWidth(); ++lane) {
+          if (!lanes[lane])
+            continue;
+          if (!firstLane)
+            os << " || ";
+          firstLane = false;
+          os << nt.get(value) << "[" << lane << "] != "
+             << oldOutputName(value) << "[" << lane << "]";
+        }
+        if (firstLane)
+          os << "false";
+        os << ")";
+        continue;
+      }
+      const llvm::APInt &mask = target.usedBits[i];
+      auto emitMaskedValue = [&](llvm::StringRef name) {
+        if (mask.isAllOnes()) {
+          os << name;
+          return;
+        }
+        unsigned width = graph.values[value].type.width;
+        os << "(" << name << " & pyc::cpp::Wire<" << width << ">({";
+        for (unsigned word = 0; word < (width + 63u) / 64u; ++word) {
+          if (word)
+            os << ", ";
+          os << mask.extractBitsAsZExtValue(
+                    std::min(64u, width - word * 64u), word * 64u)
+             << "ull";
+        }
+        os << "}))";
+      };
+      emitMaskedValue(nt.get(value));
+      os << " != ";
+      emitMaskedValue(oldOutputName(value));
+    }
+    os << (publication.branchless ? ");\n" : ") {\n");
+    for (const ActivityWordMask &store : publication.stores) {
+      os << indent << (publication.branchless ? "" : "  ")
+         << "_pyc_group_active_flags[" << store.word << "] |= ";
+      if (publication.branchless)
+        os << "(0ull - static_cast<std::uint64_t>(" << changed << ")) & ";
+      os << store.mask << "ull;\n";
+    }
+    if (!publication.branchless)
+      os << indent << "}\n";
+  }
+}
+
+template <typename EmitNode>
+static LogicalResult emitActivityBatches(llvm::ArrayRef<ActivityBatch> batches,
+                                         llvm::raw_ostream &os,
+                                         EmitNode &&emitNode) {
+  for (const ActivityBatch &batch : batches) {
+    bool packed = batch.mask && batch.nodeIds.size() > 1;
+    if (packed)
+      os << "    if (_pyc_group_active_flags[" << batch.word << "] & "
+         << batch.mask << "ull) {\n";
+    for (unsigned node : batch.nodeIds)
+      if (failed(emitNode(node, packed ? "      " : "    ")))
+        return failure();
+    if (packed) {
+      os << "    } else if (_pyc_sim_stats_enable) {\n"
+         << "      _pyc_sim_stats.group_cache_skips += " << batch.nodeIds.size()
+         << "ull;\n    }\n";
+    }
+  }
+  return success();
+}
+
 static LogicalResult emitSimGroupMethod(const SimulationPlan &plan,
                                         unsigned groupNodeId,
                                         llvm::raw_ostream &os,
@@ -522,14 +653,18 @@ static LogicalResult emitSimGroupMethod(const SimulationPlan &plan,
       for (const PlannedMuxAssignment &assignment :
            statement.muxAssignments) {
         os << "      " << nt.get(assignment.resultId)
-           << " = " << nt.get(assignment.trueValueId)
+           << " = " << (inlineRhs.count(assignment.trueValueId)
+                              ? inlineRhs.lookup(assignment.trueValueId)
+                              : nt.get(assignment.trueValueId))
            << ";\n";
       }
       os << "    } else {\n";
       for (const PlannedMuxAssignment &assignment :
            statement.muxAssignments) {
         os << "      " << nt.get(assignment.resultId)
-           << " = " << nt.get(assignment.falseValueId)
+           << " = " << (inlineRhs.count(assignment.falseValueId)
+                              ? inlineRhs.lookup(assignment.falseValueId)
+                              : nt.get(assignment.falseValueId))
            << ";\n";
       }
       os << "    }\n";
@@ -625,95 +760,6 @@ static LogicalResult emitSimGroupMethod(const SimulationPlan &plan,
     os << "    " << prefix << "_valid = true;\n";
     os << "    if (_pyc_sim_stats_enable) _pyc_sim_stats.group_eval_calls++;\n";
   };
-  std::set<unsigned> trackedOutputs;
-  if (auto it = plan.groupPropagations.find(groupNodeId);
-      it != plan.groupPropagations.end())
-    for (const GroupPropagationTarget &target : it->second)
-      trackedOutputs.insert(target.valueIds.begin(), target.valueIds.end());
-  auto oldOutputName = [](unsigned id) {
-    return "_pyc_old_group_value_" + std::to_string(id);
-  };
-  auto emitOutputSnapshots = [&]() {
-    for (unsigned value : trackedOutputs)
-      os << "    auto " << oldOutputName(value) << " = "
-         << nt.get(value) << ";\n";
-  };
-  auto emitPropagation = [&]() {
-    auto it = plan.groupPropagations.find(groupNodeId);
-    if (it == plan.groupPropagations.end())
-      return;
-    for (const GroupPropagationTarget &target : it->second) {
-      unsigned targetIndex = plan.groupByNode.lookup(target.groupNodeId);
-      os << "    if (";
-      for (auto [i, value] : llvm::enumerate(target.valueIds)) {
-        if (i)
-          os << " || ";
-        const SimType &type = graph.values[value].type;
-        if (type.shape.size() == 2 &&
-            !target.vectorElements[i].isAllOnes()) {
-          const llvm::APInt &elements = target.vectorElements[i];
-          unsigned columns = static_cast<unsigned>(type.shape[1]);
-          os << "(";
-          bool firstElement = true;
-          for (unsigned element = 0; element < elements.getBitWidth(); ++element) {
-            if (!elements[element])
-              continue;
-            if (!firstElement)
-              os << " || ";
-            firstElement = false;
-            unsigned row = element / columns, col = element % columns;
-            os << nt.get(value) << "[" << row << "][" << col << "] != "
-               << oldOutputName(value) << "[" << row << "][" << col << "]";
-          }
-          if (firstElement)
-            os << "false";
-          os << ")";
-          continue;
-        }
-        if (!type.shape.empty() &&
-            !target.vectorLanes[i].isAllOnes()) {
-          const llvm::APInt &lanes = target.vectorLanes[i];
-          os << "(";
-          bool firstLane = true;
-          for (unsigned lane = 0; lane < lanes.getBitWidth(); ++lane) {
-            if (!lanes[lane])
-              continue;
-            if (!firstLane)
-              os << " || ";
-            firstLane = false;
-            os << nt.get(value) << "[" << lane << "] != "
-               << oldOutputName(value) << "[" << lane << "]";
-          }
-          if (firstLane)
-            os << "false";
-          os << ")";
-          continue;
-        }
-        const llvm::APInt &mask = target.usedBits[i];
-        auto emitMaskedValue = [&](llvm::StringRef name) {
-          if (mask.isAllOnes()) {
-            os << name;
-            return;
-          }
-          unsigned width = graph.values[value].type.width;
-          os << "(" << name << " & pyc::cpp::Wire<" << width << ">({";
-          for (unsigned word = 0; word < (width + 63u) / 64u; ++word) {
-            if (word)
-              os << ", ";
-            os << mask.extractBitsAsZExtValue(
-                      std::min(64u, width - word * 64u), word * 64u)
-               << "ull";
-          }
-          os << "}))";
-        };
-        emitMaskedValue(nt.get(value));
-        os << " != ";
-        emitMaskedValue(oldOutputName(value));
-      }
-      os << ") _pyc_group_active_flags[" << targetIndex / 64u
-         << "] |= (1ull << " << targetIndex % 64u << ");\n";
-    }
-  };
   if (statements.chunks.size() > 1) {
     for (size_t part = 0; part < statements.chunks.size(); ++part) {
       os << "  inline void " << method << "_part_" << part << "() {\n";
@@ -723,19 +769,19 @@ static LogicalResult emitSimGroupMethod(const SimulationPlan &plan,
     }
     os << "  inline void " << method << "() {\n";
     emitActivationCheck();
-    emitOutputSnapshots();
+    emitActivitySnapshots(plan, groupNodeId, os, nt, "    ");
     for (size_t part = 0; part < statements.chunks.size(); ++part)
       os << "    " << method << "_part_" << part << "();\n";
-    emitPropagation();
+    emitActivityPropagation(plan, groupNodeId, os, nt, "    ");
     os << "  }\n\n";
     return success();
   }
   os << "  inline void " << method << "() {\n";
   emitActivationCheck();
-  emitOutputSnapshots();
+  emitActivitySnapshots(plan, groupNodeId, os, nt, "    ");
   if (failed(emitStatementChunk(statements.chunks.front())))
     return failure();
-  emitPropagation();
+  emitActivityPropagation(plan, groupNodeId, os, nt, "    ");
   os << "  }\n\n";
   return success();
 }
@@ -1430,40 +1476,44 @@ static LogicalResult emitFunc(const SimulationPlan &plan, llvm::raw_ostream &os,
   // that defer wiring). To keep C++ simulation correct, eval() runs a small
   // fixed-point iteration that alternates comb evaluation and primitive eval.
   os << "  inline void eval_comb_pass() {\n";
-  const auto &ordered = plan.combNodeOrder;
-
-  for (unsigned nodeId : ordered) {
+  auto emitCombNode = [&](unsigned nodeId, llvm::StringRef indent) -> LogicalResult {
     const SimNode &node = plan.graph.topNodes[nodeId];
     const SimNodeAction &action = plan.nodeActions[nodeId];
     Operation *op = node.op;
     if (action.kind == SimNodeActionKind::Group) {
-      emitGroupCall(nodeId, "    ");
-      continue;
+      emitGroupCall(nodeId, indent);
+      return success();
     }
     if (action.kind == SimNodeActionKind::Assign) {
-      os << "    " << nt.get(action.targetId)
+      emitActivitySnapshots(plan, nodeId, os, nt, indent);
+      os << indent << "" << nt.get(action.targetId)
          << " = " << nt.get(action.sourceId)
          << ";\n";
-      continue;
+      emitActivityPropagation(plan, nodeId, os, nt, indent);
+      return success();
     }
     if (action.kind == SimNodeActionKind::CombRegion) {
-      os << "    eval_comb_" << combIndex.lookup(nodeId) << "();\n";
-      continue;
+      emitActivitySnapshots(plan, nodeId, os, nt, indent);
+      os << indent << "eval_comb_" << combIndex.lookup(nodeId) << "();\n";
+      emitActivityPropagation(plan, nodeId, os, nt, indent);
+      return success();
     }
     if (action.kind == SimNodeActionKind::Assert) {
-      os << "    if (!"
+      os << indent << "if (!"
          << nt.get(action.conditionId)
          << ".toBool()) { std::cerr << "
          << cppStringLiteral(action.message)
          << " << \"\\n\"; std::abort(); }\n";
-      continue;
+      return success();
     }
     if (action.kind == SimNodeActionKind::Expression) {
+      emitActivitySnapshots(plan, nodeId, os, nt, indent);
       if (failed(emitGraphExpr(plan.graph,
                                plan.graph.expressions[action.expressionId],
                                os, nt)))
         return failure();
-      continue;
+      emitActivityPropagation(plan, nodeId, os, nt, indent);
+      return success();
     }
     if (action.kind == SimNodeActionKind::Fifo ||
         action.kind == SimNodeActionKind::AsyncFifo ||
@@ -1471,13 +1521,14 @@ static LogicalResult emitFunc(const SimulationPlan &plan, llvm::raw_ostream &os,
         action.kind == SimNodeActionKind::Instance ||
         action.kind == SimNodeActionKind::Skip) {
       // Primitives are evaluated in eval(), and regs only tick.
-      continue;
+      return success();
     }
     return op->emitError("unsupported op for C++ emission: ") << op->getName();
-  }
+  };
+  if (failed(emitActivityBatches(plan.combActivityBatches, os, emitCombNode)))
+    return failure();
   os << "  }\n\n";
 
-  const auto &fullOrdered = plan.evalNodeOrder;
   bool hasFullTopo = plan.evalTopological;
 
   llvm::SmallVector<std::string> instanceEvalHelperNames;
@@ -1812,16 +1863,20 @@ static LogicalResult emitFunc(const SimulationPlan &plan, llvm::raw_ostream &os,
       emitGroupCall(nodeId, indent);
       return success();
     }
+    emitActivitySnapshots(plan, nodeId, os, nt, indent);
     if (action.kind == SimNodeActionKind::Fifo) {
       emitFifoEvalWithCache(nodeId, indent, changedAnyVar);
+      emitActivityPropagation(plan, nodeId, os, nt, indent);
       return success();
     }
     if (action.kind == SimNodeActionKind::AsyncFifo) {
       emitAsyncFifoEvalWithCache(nodeId, indent, changedAnyVar);
+      emitActivityPropagation(plan, nodeId, os, nt, indent);
       return success();
     }
     if (action.kind == SimNodeActionKind::ByteMem) {
       emitByteMemEvalWithCache(nodeId, indent, changedAnyVar);
+      emitActivityPropagation(plan, nodeId, os, nt, indent);
       return success();
     }
     if (action.kind == SimNodeActionKind::Instance) {
@@ -1830,6 +1885,7 @@ static LogicalResult emitFunc(const SimulationPlan &plan, llvm::raw_ostream &os,
         return op->emitError("internal error: missing instance metadata");
       auto &ii = instInfos[it->second];
       emitInstanceEvalWithCache(ii, indent, changedAnyVar);
+      emitActivityPropagation(plan, nodeId, os, nt, indent);
       return success();
     }
     if (action.kind == SimNodeActionKind::Assert) {
@@ -1844,10 +1900,12 @@ static LogicalResult emitFunc(const SimulationPlan &plan, llvm::raw_ostream &os,
       os << indent << nt.get(action.targetId)
          << " = " << nt.get(action.sourceId)
          << ";\n";
+      emitActivityPropagation(plan, nodeId, os, nt, indent);
       return success();
     }
     if (action.kind == SimNodeActionKind::CombRegion) {
       os << indent << "eval_comb_" << combIndex.lookup(nodeId) << "();\n";
+      emitActivityPropagation(plan, nodeId, os, nt, indent);
       return success();
     }
     if (action.kind == SimNodeActionKind::Expression) {
@@ -1855,6 +1913,7 @@ static LogicalResult emitFunc(const SimulationPlan &plan, llvm::raw_ostream &os,
                                plan.graph.expressions[action.expressionId],
                                os, nt)))
         return failure();
+      emitActivityPropagation(plan, nodeId, os, nt, indent);
       return success();
     }
     return op->emitError("unsupported op for C++ emission: ") << op->getName();
@@ -1954,21 +2013,21 @@ static LogicalResult emitFunc(const SimulationPlan &plan, llvm::raw_ostream &os,
     }
   }
 
+  auto emitPlannedEvalBatches = [&](llvm::ArrayRef<ActivityBatch> batches) {
+    return emitActivityBatches(batches, os,
+        [&](unsigned node, llvm::StringRef indent) {
+          return emitEvalNode(node, indent);
+        });
+  };
   std::vector<std::string> topoEvalMethods;
-  if (hasFullTopo && !fullOrdered.empty()) {
-    unsigned evalTopoChunkNodes = plan.evalChunkNodes;
-    if (fullOrdered.size() > evalTopoChunkNodes) {
-      topoEvalMethods.reserve((fullOrdered.size() + evalTopoChunkNodes - 1) / evalTopoChunkNodes);
-      for (unsigned begin = 0, chunkIdx = 0; begin < fullOrdered.size(); begin += evalTopoChunkNodes, ++chunkIdx) {
-        unsigned end = std::min<unsigned>(static_cast<unsigned>(fullOrdered.size()), begin + evalTopoChunkNodes);
-        std::string methodName = "eval_topo_part_" + std::to_string(chunkIdx);
-        topoEvalMethods.push_back(methodName);
-        os << "  inline void " << methodName << "() {\n";
-        for (unsigned i = begin; i < end; ++i)
-          if (failed(emitEvalNode(fullOrdered[i], "    ")))
-            return failure();
-        os << "  }\n\n";
-      }
+  if (hasFullTopo && plan.evalActivityChunks.size() > 1) {
+    for (auto [index, chunk] : llvm::enumerate(plan.evalActivityChunks)) {
+      std::string methodName = "eval_topo_part_" + std::to_string(index);
+      topoEvalMethods.push_back(methodName);
+      os << "  inline void " << methodName << "() {\n";
+      if (failed(emitPlannedEvalBatches(chunk)))
+        return failure();
+      os << "  }\n\n";
     }
   }
 
@@ -1978,8 +2037,8 @@ static LogicalResult emitFunc(const SimulationPlan &plan, llvm::raw_ostream &os,
       for (const std::string &methodName : topoEvalMethods)
         os << "    " << methodName << "();\n";
     } else {
-      for (unsigned nodeId : fullOrdered)
-        if (failed(emitEvalNode(nodeId, "    ")))
+      for (const auto &chunk : plan.evalActivityChunks)
+        if (failed(emitPlannedEvalBatches(chunk)))
           return failure();
     }
   } else {
@@ -2042,6 +2101,19 @@ static LogicalResult emitFunc(const SimulationPlan &plan, llvm::raw_ostream &os,
   for (auto [part, chunk] : llvm::enumerate(plan.instanceTickChunks))
     emitTickCommitPart(chunk, static_cast<unsigned>(part));
 
+  auto regInstanceName = [&](unsigned id) {
+    const SimNode &reg = plan.graph.topNodes[id];
+    return nt.get(reg.outputIds.front()) + "_inst";
+  };
+  // Keep the uncommon reset override out of the normal data-update body.
+  // It computes pending state only; publication still occurs at commit.
+  for (auto [id, group] : llvm::enumerate(plan.resetGroups)) {
+    os << "  inline void reset_group_compute_" << id << "() {\n";
+    for (unsigned regId : group.regNodeIds)
+      os << "    " << regInstanceName(regId) << "->posedge_reset_compute();\n";
+    os << "  }\n\n";
+  }
+
   os << "  void tick_compute() {\n";
   if (!instInfos.empty()) {
     os << "    // Sub-modules.\n";
@@ -2049,10 +2121,6 @@ static LogicalResult emitFunc(const SimulationPlan &plan, llvm::raw_ostream &os,
       os << "    tick_compute_part_" << i << "();\n";
   }
   os << "    // Local sequential primitives.\n";
-  auto regInstanceName = [&](unsigned id) {
-    const SimNode &reg = plan.graph.topNodes[id];
-    return nt.get(reg.outputIds.front()) + "_inst";
-  };
   for (const SimTickAction &action : plan.localTickComputeActions) {
     unsigned id = action.id;
     switch (action.kind) {
@@ -2066,9 +2134,9 @@ static LogicalResult emitFunc(const SimulationPlan &plan, llvm::raw_ostream &os,
       os << "    bool " << edge << " = !" << previous << " && " << now << ";\n";
       os << "    " << previous << " = " << now << ";\n";
       os << "    if (" << edge << ") {\n";
-      os << "      if (" << nt.get(group.resetValueId) << ".toBool()) {\n";
-      for (unsigned regId : group.regNodeIds)
-        os << "        " << regInstanceName(regId) << "->posedge_reset_compute();\n";
+      os << "      if (__builtin_expect(" << nt.get(group.resetValueId)
+         << ".toBool(), false)) {\n";
+      os << "        reset_group_compute_" << id << "();\n";
       os << "      } else {\n";
       for (unsigned regId : group.regNodeIds)
         os << "        " << regInstanceName(regId) << "->posedge_data_compute();\n";
@@ -2113,6 +2181,8 @@ static LogicalResult emitFunc(const SimulationPlan &plan, llvm::raw_ostream &os,
   os << "    // Local sequential primitives.\n";
   for (const SimTickAction &action : plan.localTickCommitActions) {
     unsigned id = action.id;
+    if (plan.commitPropagationNodes.contains(id))
+      emitActivitySnapshots(plan, id, os, nt, "    ");
     switch (action.kind) {
     case SimTickActionKind::ResetGroup:
       llvm_unreachable("reset groups cannot commit as one action");
@@ -2135,6 +2205,8 @@ static LogicalResult emitFunc(const SimulationPlan &plan, llvm::raw_ostream &os,
          << "_inst.tick_commit();\n";
       break;
     }
+    if (plan.commitPropagationNodes.contains(id))
+      emitActivityPropagation(plan, id, os, nt, "    ");
   }
   if (!instInfos.empty()) {
     os << "    // Force re-eval on next eval() only for stateful sub-modules.\n";

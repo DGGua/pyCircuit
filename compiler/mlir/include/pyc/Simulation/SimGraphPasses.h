@@ -10,6 +10,9 @@ struct SimGraphPassOptions {
   bool enableUsedBitActivation = true;
   bool enableExpressionInlining = true;
   bool enableReplication = true;
+  // Default GSIM partitioning keeps coarsened supernodes indivisible. The
+  // legacy strict bound remains available for targeted partition experiments.
+  bool strictSupernodeBound = false;
   unsigned supernodeMaxSize = 35;
 };
 

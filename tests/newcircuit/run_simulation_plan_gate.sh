@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+trap 'echo "FAIL simulation plan gate at line ${LINENO}: ${BASH_COMMAND}" >&2' ERR
 
 repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 source "${repo_root}/flows/scripts/lib.sh"
@@ -15,6 +16,20 @@ fi
 
 gate_dir="$(mktemp -d)"
 trap 'rm -rf -- "${gate_dir}"' EXIT
+
+# These fixtures deliberately force partitions down to one or two operations
+# to isolate activation and replication behavior. GSIM's default soft bound
+# keeps coarse units indivisible; run_partition_gate.sh verifies that policy.
+# Keep replication disabled while measuring activation of these partitions;
+# the replication section below and run_replication_gate.sh enable it explicitly.
+export PYC_GATE_PYCC_REAL="${PYCC}"
+cat > "${gate_dir}/pycc" <<'SH'
+#!/usr/bin/env bash
+exec "${PYC_GATE_PYCC_REAL}" --sim-supernode-strict-bound=true \
+  --sim-replication="${PYC_GATE_REPLICATION:-false}" "$@"
+SH
+chmod +x "${gate_dir}/pycc"
+PYCC="${gate_dir}/pycc"
 
 PYTHONPATH="$(pyc_pythonpath)" PYTHONDONTWRITEBYTECODE=1 \
   PYCC="${PYCC}" PYC_TOOLCHAIN_ROOT="${PYC_TOOLCHAIN_ROOT}" \
@@ -763,6 +778,17 @@ PYC_SIM_STATS=1 "${gate_dir}/wide_dynamic_shift_demand_harness"
   --emit=cpp -o "${gate_dir}/comb_bit_demand.cpp"
 rg -F -q '_pyc_group_0_in_0 == (a & pyc::cpp::Wire<16>({1ull}))' \
   "${gate_dir}/comb_bit_demand.cpp"
+rg -F -q '_pyc_group_0_in_1 == (b & pyc::cpp::Wire<16>({1ull}))' \
+  "${gate_dir}/comb_bit_demand.cpp"
+rg -F -q '_pyc_group_0_in_2 == (c & pyc::cpp::Wire<16>({1ull}))' \
+  "${gate_dir}/comb_bit_demand.cpp"
+# Demand now crosses both comb yields: add/xor and both interfaces become
+# one bit. The final extract disappears, leaving one cached arithmetic group
+# instead of a second group after the comb. All three inputs still need bit 0.
+[[ "$(rg -c 'inline void eval_sim_group_[0-9]+\(' "${gate_dir}/comb_bit_demand.cpp")" == 1 ]]
+[[ "$(rg -c 'pyc::cpp::Wire<1> pyc_comb_[0-9]+\{' "${gate_dir}/comb_bit_demand.cpp")" == 2 ]]
+rg -q 'pyc::cpp::Wire<1> pyc_add_[0-9]+\{' "${gate_dir}/comb_bit_demand.cpp"
+rg -q 'pyc::cpp::Wire<1> pyc_xor_[0-9]+\{' "${gate_dir}/comb_bit_demand.cpp"
 cat > "${gate_dir}/comb_bit_demand_harness.cpp" <<'CPP'
 #include <sstream>
 #include <string>
@@ -782,8 +808,20 @@ int main() {
   if (sim.bit.value() != 1) return 3;
   std::ostringstream stats;
   sim.dump_sim_stats(stats);
-  if (stats.str().find("group_eval_calls=4\n") == std::string::npos) return 4;
-  if (stats.str().find("group_cache_skips=2\n") == std::string::npos) return 5;
+  // Exactly one group executes initially and when bit 0 changes; changing
+  // only bit 1 skips it. Nested comb passthroughs are not cached groups.
+  if (stats.str().find("group_eval_calls=2\n") == std::string::npos) return 4;
+  if (stats.str().find("group_cache_skips=1\n") == std::string::npos) return 5;
+  for (unsigned step = 0; step < 256; ++step) {
+    const unsigned a = (step * 257u + 11u) & 65535u;
+    const unsigned b = (step * 103u + 2u) & 65535u;
+    const unsigned c = (step * 71u + (step >> 2)) & 65535u;
+    sim.a = pyc::cpp::Wire<16>(a);
+    sim.b = pyc::cpp::Wire<16>(b);
+    sim.c = pyc::cpp::Wire<16>(c);
+    sim.eval();
+    if (sim.bit.value() != (((a + b) ^ c) & 1u)) return 6;
+  }
   return 0;
 }
 CPP
@@ -957,7 +995,7 @@ fi
 # does not replace the intended cross-group graph test.
 "${PYCC}" "${repo_root}/tests/newcircuit/cross_group_used_bits.pyc" \
   --emit=cpp --sim-supernode-max-size=2 -o "${gate_dir}/cross_group_bits.cpp"
-rg -q 'pyc_shli_2 & pyc::cpp::Wire<8>({4ull})' \
+rg -q 'pyc_shli_3 & pyc::cpp::Wire<8>({8ull})' \
   "${gate_dir}/cross_group_bits.cpp" -F
 rg -q 'a & pyc::cpp::Wire<8>({1ull})' \
   "${gate_dir}/cross_group_bits.cpp" -F
@@ -979,8 +1017,10 @@ int main() {
   if (sim.y.value() != 1) return 3;
   std::ostringstream stats;
   sim.dump_sim_stats(stats);
-  if (stats.str().find("group_eval_calls=6\n") == std::string::npos) return 4;
-  if (stats.str().find("group_cache_skips=3\n") == std::string::npos) return 5;
+  // The retained extract observation adds one graph alias; four bounded
+  // groups run on the first and relevant third inputs and skip the second.
+  if (stats.str().find("group_eval_calls=8\n") == std::string::npos) return 4;
+  if (stats.str().find("group_cache_skips=4\n") == std::string::npos) return 5;
   return 0;
 }
 CPP
@@ -1387,6 +1427,7 @@ PY
 # GSIM-style replication removes a cheap singleton evaluation and copies its
 # expression into two separate consumer supernodes. Compare enabled/disabled
 # generated simulations over several input changes.
+export PYC_GATE_REPLICATION=true
 "${PYCC}" "${repo_root}/tests/newcircuit/replicated_seed.pyc" \
   --emit=cpp --sim-supernode-max-size=0 -o "${gate_dir}/replicated_seed.cpp"
 "${PYCC}" "${repo_root}/tests/newcircuit/replicated_seed.pyc" \
@@ -1865,14 +1906,20 @@ if command -v iverilog >/dev/null 2>&1; then
   "${gate_dir}/multi_reader_arithmetic_tb"
 fi
 
-# Multiple slices of one mux result share a single narrowed selection.
+# Normalizing the low trunc into a slice exposes the disjoint demands to the
+# mux splitter. Keep exactly the low byte and bits 39:32 as two 8-bit muxes;
+# no selection is needed for the 24-bit gap between them.
 "${PYCC}" "${repo_root}/tests/newcircuit/multi_reader_mux.pyc" \
   --emit=cpp --dump-pass-ir="${gate_dir}/multi_reader_mux_ir" \
   --dump-pass-ir-filter=comb-canonicalize \
   -o "${gate_dir}/multi_reader_mux.cpp"
-rg -q 'pyc.mux .* : i1, i40, i40 -> i40' \
-  "${gate_dir}/multi_reader_mux_ir"/*after*.mlir
-! rg -q 'pyc.mux .* : i1, i128, i128 -> i128' \
+test "$(rg -c 'pyc.mux .* : i1, i8, i8 -> i8' \
+  "${gate_dir}/multi_reader_mux_ir"/*after*.mlir)" = 2
+test "$(rg -c 'pyc.extract .*lsb = 0 : i64.* : i128 -> i8' \
+  "${gate_dir}/multi_reader_mux_ir"/*after*.mlir)" = 2
+test "$(rg -c 'pyc.extract .*lsb = 32 : i64.* : i128 -> i8' \
+  "${gate_dir}/multi_reader_mux_ir"/*after*.mlir)" = 2
+! rg -q 'pyc.mux .* : i1, i(40|128), i(40|128) -> i(40|128)' \
   "${gate_dir}/multi_reader_mux_ir"/*after*.mlir
 "${CXX:-c++}" -std=c++17 -I "${PYC_TOOLCHAIN_ROOT}/include" \
   -I "${gate_dir}" "${repo_root}/tests/newcircuit/multi_reader_mux_harness.cpp" \

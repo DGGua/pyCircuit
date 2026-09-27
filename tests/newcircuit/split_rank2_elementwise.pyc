@@ -1,0 +1,10 @@
+module attributes {pyc.top = @top, pyc.frontend.contract = "pycircuit"} {
+  func.func @top(%a: vector<2x3xi8>, %b: vector<2x3xi8>) -> (i8, i8) attributes {arg_names = ["a", "b"], result_names = ["lane01", "lane12"], pyc.kind = "module", pyc.inline = "false", pyc.params = "{}", pyc.base = "top", pyc.struct.metrics = "{\"source_loc\":0,\"ast_node_count\":0,\"hardware_call_count\":0,\"loop_count\":0,\"module_call_count\":0,\"state_call_count\":0,\"estimated_inline_cost\":0,\"instance_count\":0,\"state_alloc_count\":0,\"collection_count\":0,\"collection_instance_count\":0,\"module_family_collection_count\":0,\"repeated_body_clusters\":[]}", pyc.struct.collections = "[]"} {
+    %sum = pyc.add %a, %b : vector<2x3xi8>, vector<2x3xi8> -> vector<2x3xi8>
+    %row0 = pyc.v_get %sum[0] : vector<2x3xi8> -> vector<3xi8>
+    %row1 = pyc.v_get %sum[1] : vector<2x3xi8> -> vector<3xi8>
+    %lane01 = pyc.v_get %row0[1] : vector<3xi8> -> i8
+    %lane12 = pyc.v_get %row1[2] : vector<3xi8> -> i8
+    return %lane01, %lane12 : i8, i8
+  }
+}

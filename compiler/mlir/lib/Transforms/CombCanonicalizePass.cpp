@@ -427,6 +427,148 @@ struct ExtractOneHotShift : public OpRewritePattern<pyc::ExtractOp> {
   }
 };
 
+// Truncation is the same low-bit observation as extract. Normalize readers
+// of supported scalar producers so the slice rewrites can propagate demand
+// through casts, muxes and state as well as shared bitwise DAGs. Restrict this
+// to producers with slice rewrites; in particular a dynamic right shift still
+// needs its original high input bits.
+struct TruncScalarDemandToExtract : public OpRewritePattern<pyc::TruncOp> {
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(pyc::TruncOp op,
+                                PatternRewriter &rewriter) const override {
+    auto inputType = dyn_cast<IntegerType>(op.getIn().getType());
+    auto resultType = dyn_cast<IntegerType>(op.getResult().getType());
+    Operation *producer = op.getIn().getDefiningOp();
+    if (!inputType || !resultType || !producer ||
+        resultType.getWidth() >= inputType.getWidth() ||
+        !isa<pyc::NotOp, pyc::AndOp, pyc::OrOp, pyc::XorOp,
+             pyc::TruncOp, pyc::ZextOp, pyc::SextOp, pyc::ConcatOp,
+             pyc::MuxOp, pyc::ShliOp, pyc::LshriOp, pyc::AshriOp,
+             pyc::RegOp, arith::SelectOp>(producer) ||
+        op->hasAttr("pyc.name") || op->hasAttr("pyc.debug_keep") ||
+        producer->hasAttr("pyc.name") || producer->hasAttr("pyc.debug_keep"))
+      return failure();
+    rewriter.replaceOpWithNewOp<pyc::ExtractOp>(
+        op, resultType, op.getIn(), 0, IntegerAttr{});
+    return success();
+  }
+};
+
+// Scalar arith.select and pyc.mux have the same hardware value semantics.
+// Canonicalize selects with only partial scalar readers so the existing mux
+// demand and segmentation patterns apply. Full-width and observed selects,
+// and vector selectors/values, retain their original representation.
+struct ScalarSelectDemandToMux : public OpRewritePattern<arith::SelectOp> {
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(arith::SelectOp op,
+                                PatternRewriter &rewriter) const override {
+    auto type = dyn_cast<IntegerType>(op.getType());
+    if (!type || !op.getCondition().getType().isInteger(1) ||
+        op->hasAttr("pyc.name") || op->hasAttr("pyc.debug_keep") ||
+        op.getResult().use_empty())
+      return failure();
+    for (Operation *user : op.getResult().getUsers()) {
+      if (user->hasAttr("pyc.name") || user->hasAttr("pyc.debug_keep"))
+        return failure();
+      Type resultType;
+      if (auto extract = dyn_cast<pyc::ExtractOp>(user))
+        resultType = extract.getResult().getType();
+      else if (auto trunc = dyn_cast<pyc::TruncOp>(user))
+        resultType = trunc.getResult().getType();
+      else
+        return failure();
+      auto readerType = dyn_cast<IntegerType>(resultType);
+      if (!readerType || readerType.getWidth() >= type.getWidth())
+        return failure();
+    }
+    rewriter.replaceOpWithNewOp<pyc::MuxOp>(
+        op, type, op.getCondition(), op.getTrueValue(), op.getFalseValue());
+    return success();
+  }
+};
+
+// Only explicit partial readers justify changing a region interface. A probe,
+// a complete reader or an unknown operation retains the original width.
+static std::optional<unsigned> partialScalarPrefix(Value value) {
+  auto type = dyn_cast<IntegerType>(value.getType());
+  if (!type || value.use_empty())
+    return std::nullopt;
+  uint64_t width = 0;
+  for (Operation *user : value.getUsers()) {
+    if (user->hasAttr("pyc.name") || user->hasAttr("pyc.debug_keep"))
+      return std::nullopt;
+    uint64_t begin = 0;
+    Type resultType;
+    if (auto extract = dyn_cast<pyc::ExtractOp>(user)) {
+      begin = extract.getLsb();
+      resultType = extract.getResult().getType();
+    } else if (auto trunc = dyn_cast<pyc::TruncOp>(user)) {
+      resultType = trunc.getResult().getType();
+    } else {
+      return std::nullopt;
+    }
+    auto readerType = dyn_cast<IntegerType>(resultType);
+    if (!readerType)
+      return std::nullopt;
+    width = std::max<uint64_t>(width, begin + readerType.getWidth());
+  }
+  if (!width || width >= type.getWidth())
+    return std::nullopt;
+  return static_cast<unsigned>(width);
+}
+
+// Keep explicit comb regions, but pass scalar prefix demand through their
+// yields and block arguments. The greedy driver applies existing slice rules
+// inside each region and revisits its interface, including nested combs.
+struct NarrowCombScalarInterfaces : public OpRewritePattern<pyc::CombOp> {
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(pyc::CombOp op,
+                                PatternRewriter &rewriter) const override {
+    if (op->hasAttr("pyc.name") || op->hasAttr("pyc.debug_keep"))
+      return failure();
+    Block &body = op.getBody().front();
+    auto yield = cast<pyc::YieldOp>(body.getTerminator());
+    bool changed = false;
+    for (auto [index, result] : llvm::enumerate(op.getResults())) {
+      auto width = partialScalarPrefix(result);
+      if (!width)
+        continue;
+      Type type = IntegerType::get(op.getContext(), *width);
+      rewriter.setInsertionPoint(yield);
+      Value narrowed = rewriter.create<pyc::ExtractOp>(
+          op.getLoc(), type, yield.getOperand(index), 0, IntegerAttr{});
+      rewriter.modifyOpInPlace(yield, [&]() {
+        yield->setOperand(index, narrowed);
+      });
+      rewriter.modifyOpInPlace(op, [&]() { result.setType(type); });
+      // A changed operand type can make a reader an identity cast/extract.
+      for (Operation *user : result.getUsers())
+        rewriter.modifyOpInPlace(user, []() {});
+      changed = true;
+    }
+    for (auto [index, argument] : llvm::enumerate(body.getArguments())) {
+      auto width = partialScalarPrefix(argument);
+      if (!width)
+        continue;
+      Type type = IntegerType::get(op.getContext(), *width);
+      rewriter.setInsertionPoint(op);
+      Value narrowed = rewriter.create<pyc::ExtractOp>(
+          op.getLoc(), type, op.getInputs()[index], 0, IntegerAttr{});
+      rewriter.modifyOpInPlace(op, [&]() {
+        op->setOperand(index, narrowed);
+        argument.setType(type);
+      });
+      for (Operation *user : argument.getUsers())
+        rewriter.modifyOpInPlace(user, []() {});
+      changed = true;
+    }
+    return success(changed);
+  }
+};
+
 // Push a demanded bit range through a concatenation when it lies wholly in
 // one field. This creates the hardware-side slice used by bit-level simulation
 // activity analysis without changing the value observed by either backend.
@@ -643,11 +785,13 @@ struct SplitRegisterBySlices : public OpRewritePattern<pyc::RegOp> {
       cuts.push_back(end);
       slices.push_back(slice);
     }
-    if (slices.size() < 2)
+    if (slices.empty())
       return failure();
     llvm::sort(cuts);
     cuts.erase(std::unique(cuts.begin(), cuts.end()), cuts.end());
-    if (cuts.size() < 3)
+    if (cuts.size() < 2 ||
+        (cuts.size() == 2 && cuts.front() == 0 &&
+         cuts.back() == originalTy.getWidth()))
       return failure();
     std::sort(slices.begin(), slices.end(), [](pyc::ExtractOp a,
                                                pyc::ExtractOp b) {
@@ -717,6 +861,27 @@ struct SplitRegisterBySlices : public OpRewritePattern<pyc::RegOp> {
   }
 };
 
+static bool hasObservationAttrs(Operation *op) {
+  return op->hasAttr("pyc.name") || op->hasAttr("pyc.debug_keep");
+}
+
+// A lane's name belongs to its observed value, not to the aggregate storage.
+// Keep a distinct alias for every observed reader even when readers share a
+// scalar computation or state lane. Do not copy the v_get index onto the alias.
+static void replaceObservedLane(pyc::VGetOp get, Value lane,
+                                PatternRewriter &rewriter) {
+  if (hasObservationAttrs(get)) {
+    OpBuilder::InsertionGuard guard(rewriter);
+    rewriter.setInsertionPoint(get);
+    auto alias = rewriter.create<pyc::AliasOp>(get.getLoc(), lane.getType(), lane);
+    for (NamedAttribute attr : get->getAttrs())
+      if (attr.getName() != "index")
+        alias->setAttr(attr.getName(), attr.getValue());
+    lane = alias.getResult();
+  }
+  rewriter.replaceOp(get, lane);
+}
+
 // A vector register with only constant-index outer-lane readers can keep just
 // the observed sub-vectors. Repeating this rewrite on nested readers reaches
 // scalar leaves without changing the clock/reset semantics.
@@ -734,8 +899,7 @@ struct SplitVectorRegisterLanes : public OpRewritePattern<pyc::RegOp> {
     std::map<uint64_t, SmallVector<pyc::VGetOp>> readers;
     for (OpOperand &use : op.getQ().getUses()) {
       auto get = dyn_cast<pyc::VGetOp>(use.getOwner());
-      if (!get || get.getVec() != op.getQ() ||
-          get->hasAttr("pyc.name") || get->hasAttr("pyc.debug_keep"))
+      if (!get || get.getVec() != op.getQ())
         return failure();
       uint64_t index = get.getIndex();
       if (index >= static_cast<uint64_t>(vectorTy.getDimSize(0)))
@@ -756,7 +920,7 @@ struct SplitVectorRegisterLanes : public OpRewritePattern<pyc::RegOp> {
           op.getLoc(), type, op.getClk(), op.getRst(), op.getEn(),
           next, init).getQ();
       for (pyc::VGetOp get : uses)
-        rewriter.replaceOp(get, q);
+        replaceObservedLane(get, q, rewriter);
     }
     rewriter.eraseOp(op);
     return success();
@@ -772,8 +936,6 @@ struct VGetThroughElementwise : public OpRewritePattern<pyc::VGetOp> {
 
   LogicalResult matchAndRewrite(pyc::VGetOp get,
                                 PatternRewriter &rewriter) const override {
-    if (get->hasAttr("pyc.name") || get->hasAttr("pyc.debug_keep"))
-      return failure();
     auto elementwise = get.getVec().getDefiningOp<ElementwiseOp>();
     auto vectorTy = dyn_cast<VectorType>(get.getVec().getType());
     if (!elementwise || !vectorTy || vectorTy.getRank() < 1 ||
@@ -784,8 +946,6 @@ struct VGetThroughElementwise : public OpRewritePattern<pyc::VGetOp> {
     for (OpOperand &use : elementwise.getResult().getUses()) {
       auto reader = dyn_cast<pyc::VGetOp>(use.getOwner());
       if (!reader || reader.getVec() != elementwise.getResult() ||
-          reader->hasAttr("pyc.name") ||
-          reader->hasAttr("pyc.debug_keep") ||
           reader.getIndex() >=
               static_cast<uint64_t>(vectorTy.getDimSize(0)))
         return failure();
@@ -821,7 +981,7 @@ struct VGetThroughElementwise : public OpRewritePattern<pyc::VGetOp> {
         state.addAttribute(attr.getName(), attr.getValue());
       Value lane = rewriter.create(state)->getResult(0);
       for (pyc::VGetOp reader : uses)
-        rewriter.replaceOp(reader, lane);
+        replaceObservedLane(reader, lane, rewriter);
     }
     rewriter.eraseOp(elementwise);
     return success();
@@ -865,7 +1025,8 @@ struct SplitBitwiseBySlices : public OpRewritePattern<BitwiseOp> {
       return failure();
     llvm::sort(cuts);
     cuts.erase(std::unique(cuts.begin(), cuts.end()), cuts.end());
-    if (cuts.size() < 3)
+    // Identical trunc/extract readers still share one narrowed segment.
+    if (cuts.size() < 2)
       return failure();
     std::map<uint64_t, int> coverageDeltas;
     for (pyc::ExtractOp slice : readers) {
@@ -1250,6 +1411,106 @@ struct ExtractThroughImmediateShift : public OpRewritePattern<pyc::ExtractOp> {
       }
     }
     rewriter.replaceOp(op, replacement);
+    return success();
+  }
+};
+
+// Shift amounts are unsigned hardware integers of arbitrary width. Bound
+// them in the shared hardware IR before host code converts them to unsigned;
+// discarding high amount bits would turn an overshift into a smaller shift.
+// Encode overflow in bit 31, above every legal MLIR integer element width.
+// Keeping an unknown comparison as an unknown amount bit also preserves
+// Verilog X/Z shift semantics; a saturating mux could merge equal arms and
+// incorrectly turn an unknown amount into a known overshift. This is
+// legalization, so retain and normalize observed operations as well.
+template <typename ShiftOp>
+struct NormalizeWideShiftAmount : public OpRewritePattern<ShiftOp> {
+  explicit NormalizeWideShiftAmount(MLIRContext *context)
+      : OpRewritePattern<ShiftOp>(context, /*benefit=*/3) {}
+
+  LogicalResult matchAndRewrite(ShiftOp op,
+                                PatternRewriter &rewriter) const override {
+    auto amountType = dyn_cast<IntegerType>(op.getAmount().getType());
+    Type element = op.getIn().getType();
+    if (auto vector = dyn_cast<VectorType>(element))
+      element = vector.getElementType();
+    auto elementType = dyn_cast<IntegerType>(element);
+    if (!amountType || amountType.getWidth() <= 32 || !elementType)
+      return failure();
+    unsigned width = elementType.getWidth();
+    Value limit = constInt(rewriter, op.getLoc(), amountType,
+                           llvm::APInt(amountType.getWidth(), width));
+    Value inRange = rewriter.create<pyc::UltOp>(
+        op.getLoc(), rewriter.getI1Type(), op.getAmount(), limit);
+    Value overflow = rewriter.create<pyc::NotOp>(
+        op.getLoc(), rewriter.getI1Type(), inRange);
+    Value low = rewriter.create<pyc::TruncOp>(
+        op.getLoc(), rewriter.getIntegerType(31), op.getAmount());
+    Value bounded = rewriter.create<pyc::ConcatOp>(
+        op.getLoc(), rewriter.getI32Type(), ValueRange{overflow, low});
+    rewriter.modifyOpInPlace(op, [&]() { op->setOperand(1, bounded); });
+    return success();
+  }
+};
+
+// A dynamic left shift is modular: its low K result bits depend only on the
+// low K input bits, including when amount >= K. Keep the complete amount,
+// share one narrowed shift across all partial readers, and leave right
+// shifts at their original input width because high bits can shift down.
+struct NarrowDynamicLeftShift : public OpRewritePattern<pyc::ShlOp> {
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(pyc::ShlOp op,
+                                PatternRewriter &rewriter) const override {
+    auto originalType = dyn_cast<IntegerType>(op.getResult().getType());
+    if (!originalType || op->hasAttr("pyc.name") || op->hasAttr("pyc.debug_keep"))
+      return failure();
+    SmallVector<pyc::ExtractOp> extracts;
+    SmallVector<pyc::TruncOp> truncs;
+    uint64_t width = 0;
+    for (OpOperand &use : op.getResult().getUses()) {
+      Operation *reader = use.getOwner();
+      if (reader->hasAttr("pyc.name") || reader->hasAttr("pyc.debug_keep"))
+        return failure();
+      if (auto extract = dyn_cast<pyc::ExtractOp>(reader)) {
+        auto resultType = dyn_cast<IntegerType>(extract.getResult().getType());
+        if (!resultType)
+          return failure();
+        width = std::max<uint64_t>(width, extract.getLsb() + resultType.getWidth());
+        extracts.push_back(extract);
+      } else if (auto trunc = dyn_cast<pyc::TruncOp>(reader)) {
+        auto resultType = dyn_cast<IntegerType>(trunc.getResult().getType());
+        if (!resultType)
+          return failure();
+        width = std::max<uint64_t>(width, resultType.getWidth());
+        truncs.push_back(trunc);
+      } else {
+        return failure();
+      }
+    }
+    if (!width || width >= originalType.getWidth())
+      return failure();
+    auto narrowedType = IntegerType::get(op.getContext(), width);
+    Value input = rewriter.create<pyc::TruncOp>(op.getLoc(), narrowedType, op.getIn());
+    Value shifted = rewriter.create<pyc::ShlOp>(op.getLoc(), narrowedType, input, op.getAmount());
+    for (pyc::ExtractOp extract : extracts) {
+      Type resultType = extract.getResult().getType();
+      Value result = resultType == narrowedType && extract.getLsb() == 0
+                         ? shifted
+                         : rewriter.create<pyc::ExtractOp>(
+                               extract.getLoc(), resultType, shifted,
+                               extract.getLsb(), extract.getMsbAttr()).getResult();
+      rewriter.replaceOp(extract, result);
+    }
+    for (pyc::TruncOp trunc : truncs) {
+      Type resultType = trunc.getResult().getType();
+      Value result = resultType == narrowedType
+                         ? shifted
+                         : rewriter.create<pyc::TruncOp>(
+                               trunc.getLoc(), resultType, shifted).getResult();
+      rewriter.replaceOp(trunc, result);
+    }
+    rewriter.eraseOp(op);
     return success();
   }
 };
@@ -1701,12 +1962,13 @@ struct VGetOfVCreate : public OpRewritePattern<pyc::VGetOp> {
 
   LogicalResult matchAndRewrite(pyc::VGetOp op, PatternRewriter &rewriter) const override {
     auto create = op.getVec().getDefiningOp<pyc::VCreateOp>();
-    if (!create)
+    if (!create || hasObservationAttrs(create))
       return failure();
     std::uint64_t idx = op.getIndex();
     if (idx >= create.getElements().size())
       return failure();
-    rewriter.replaceOp(op, *std::next(create.getElements().begin(), static_cast<long>(idx)));
+    replaceObservedLane(op, *std::next(create.getElements().begin(),
+                                      static_cast<long>(idx)), rewriter);
     return success();
   }
 };
@@ -1716,9 +1978,9 @@ struct VGetOfVBroadcast : public OpRewritePattern<pyc::VGetOp> {
 
   LogicalResult matchAndRewrite(pyc::VGetOp op, PatternRewriter &rewriter) const override {
     auto broadcast = op.getVec().getDefiningOp<pyc::VBroadcastOp>();
-    if (!broadcast)
+    if (!broadcast || hasObservationAttrs(broadcast))
       return failure();
-    rewriter.replaceOp(op, broadcast.getScalar());
+    replaceObservedLane(op, broadcast.getScalar(), rewriter);
     return success();
   }
 };
@@ -1729,10 +1991,7 @@ struct VGetOfVBroadcastDim : public OpRewritePattern<pyc::VGetOp> {
   LogicalResult matchAndRewrite(pyc::VGetOp get,
                                 PatternRewriter &rewriter) const override {
     auto broadcast = get.getVec().getDefiningOp<pyc::VBroadcastDimOp>();
-    if (!broadcast || get->hasAttr("pyc.name") ||
-        get->hasAttr("pyc.debug_keep") ||
-        broadcast->hasAttr("pyc.name") ||
-        broadcast->hasAttr("pyc.debug_keep"))
+    if (!broadcast || hasObservationAttrs(broadcast))
       return failure();
     auto sourceType = dyn_cast<VectorType>(broadcast.getVec().getType());
     auto broadcastType = dyn_cast<VectorType>(get.getVec().getType());
@@ -1743,7 +2002,7 @@ struct VGetOfVBroadcastDim : public OpRewritePattern<pyc::VGetOp> {
     if (dim == 0) {
       if (get.getResult().getType() != broadcast.getVec().getType())
         return failure();
-      rewriter.replaceOp(get, broadcast.getVec());
+      replaceObservedLane(get, broadcast.getVec(), rewriter);
       return success();
     }
     Type laneType = vectorLaneType(sourceType);
@@ -1751,15 +2010,16 @@ struct VGetOfVBroadcastDim : public OpRewritePattern<pyc::VGetOp> {
         get.getLoc(), laneType, broadcast.getVec(), get.getIndexAttr());
     Type resultType = get.getResult().getType();
     if (sourceType.getRank() == 1) {
-      rewriter.replaceOpWithNewOp<pyc::VBroadcastOp>(
-          get, resultType, lane, broadcast.getSize());
+      Value result = rewriter.create<pyc::VBroadcastOp>(
+          get.getLoc(), resultType, lane, broadcast.getSize());
+      replaceObservedLane(get, result, rewriter);
     } else {
       OperationState state(get.getLoc(), broadcast->getName());
       state.addOperands(lane);
       state.addTypes(resultType);
       state.addAttribute("size", broadcast.getSizeAttr());
       state.addAttribute("dim", rewriter.getI64IntegerAttr(dim - 1));
-      rewriter.replaceOp(get, rewriter.create(state)->getResult(0));
+      replaceObservedLane(get, rewriter.create(state)->getResult(0), rewriter);
     }
     return success();
   }
@@ -1788,8 +2048,6 @@ struct VGetOfRank2Reduce : public OpRewritePattern<pyc::VGetOp> {
     for (OpOperand &use : reduce.getResult().getUses()) {
       auto reader = dyn_cast<pyc::VGetOp>(use.getOwner());
       if (!reader || reader.getVec() != reduce.getResult() ||
-          reader->hasAttr("pyc.name") ||
-          reader->hasAttr("pyc.debug_keep") ||
           reader.getIndex() >=
               static_cast<uint64_t>(resultType.getDimSize(0)))
         return failure();
@@ -1833,7 +2091,7 @@ struct VGetOfRank2Reduce : public OpRewritePattern<pyc::VGetOp> {
       state.addAttribute("mode", reduce.getModeAttr());
       Value lane = rewriter.create(state)->getResult(0);
       for (pyc::VGetOp reader : uses)
-        rewriter.replaceOp(reader, lane);
+        replaceObservedLane(reader, lane, rewriter);
     }
     rewriter.eraseOp(reduce);
     return success();
@@ -1845,7 +2103,7 @@ struct VGetOfVectorMux : public OpRewritePattern<pyc::VGetOp> {
 
   LogicalResult matchAndRewrite(pyc::VGetOp op, PatternRewriter &rewriter) const override {
     auto mux = op.getVec().getDefiningOp<pyc::MuxOp>();
-    if (!mux || !mux.getResult().hasOneUse())
+    if (!mux || !mux.getResult().hasOneUse() || hasObservationAttrs(mux))
       return failure();
     auto muxVT = dyn_cast<VectorType>(mux.getResult().getType());
     if (!muxVT)
@@ -1869,7 +2127,8 @@ struct VGetOfVectorMux : public OpRewritePattern<pyc::VGetOp> {
     Type laneTy = op.getResult().getType();
     Value a = rewriter.create<pyc::VGetOp>(op.getLoc(), laneTy, mux.getA(), idx);
     Value b = rewriter.create<pyc::VGetOp>(op.getLoc(), laneTy, mux.getB(), idx);
-    rewriter.replaceOpWithNewOp<pyc::MuxOp>(op, laneTy, sel, a, b);
+    Value lane = rewriter.create<pyc::MuxOp>(op.getLoc(), laneTy, sel, a, b);
+    replaceObservedLane(op, lane, rewriter);
     return success();
   }
 };
@@ -1878,7 +2137,7 @@ struct VCreateOfConsecutiveVGets : public OpRewritePattern<pyc::VCreateOp> {
   using OpRewritePattern::OpRewritePattern;
 
   LogicalResult matchAndRewrite(pyc::VCreateOp op, PatternRewriter &rewriter) const override {
-    if (op.getElements().empty())
+    if (op.getElements().empty() || hasObservationAttrs(op))
       return failure();
 
     Value src;
@@ -1983,12 +2242,19 @@ struct CombCanonicalizePass : public PassWrapper<CombCanonicalizePass, Operation
                  EqConcatConstantSplit,
                  EqShiftedOrConstantSplit,
                  ExtractOneHotShift,
+                 TruncScalarDemandToExtract,
+                 ScalarSelectDemandToMux,
+                 NarrowCombScalarInterfaces,
                  ExtractThroughConcat,
                  ExtractThroughNot,
                  ExtractThroughWidthCast,
                  ExtractThroughImmediateShift<pyc::ShliOp>,
                  ExtractThroughImmediateShift<pyc::LshriOp>,
                  ExtractThroughImmediateShift<pyc::AshriOp>,
+                 NormalizeWideShiftAmount<pyc::ShlOp>,
+                 NormalizeWideShiftAmount<pyc::LshrOp>,
+                 NormalizeWideShiftAmount<pyc::AshrOp>,
+                 NarrowDynamicLeftShift,
                  ConstantDynamicShift<pyc::ShlOp, pyc::ShliOp>,
                  ConstantDynamicShift<pyc::LshrOp, pyc::LshriOp>,
                  ConstantDynamicShift<pyc::AshrOp, pyc::AshriOp>,

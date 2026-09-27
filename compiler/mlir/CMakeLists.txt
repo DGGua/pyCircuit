@@ -78,6 +78,7 @@ add_library(pyc_transforms
   lib/Transforms/CheckCombCyclesPass.cpp
   lib/Transforms/CheckClockDomainsPass.cpp
   lib/Transforms/CombCanonicalizePass.cpp
+  lib/Transforms/PreserveObservationsPass.cpp
   lib/Transforms/CollectCompileStatsPass.cpp
   lib/Transforms/EliminateDeadInstancesPass.cpp
   lib/Transforms/EliminateDeadStatePass.cpp

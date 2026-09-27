@@ -264,7 +264,8 @@ def PYC_ConcatOp : PYC_Op<"concat", [Pure]> {
   let hasFolder = 1;
 }
 
-def PYC_AliasOp : PYC_Op<"alias", [Pure, SameOperandsAndResultType]> {
+def PYC_AliasOp : PYC_Op<"alias", [AlwaysSpeculatable,
+    DeclareOpInterfaceMethods<MemoryEffectsOpInterface>, SameOperandsAndResultType]> {
   let summary = "Alias a value (for naming / debug)";
   let arguments = (ins AnyType:$in);
   let results = (outs AnyType:$result);
@@ -492,7 +493,8 @@ def PYC_VAddReduceOp : PYC_Op<"v_add_reduce", [Pure]> {
 // This is intended as a codegen-friendly wrapper that allows backends to emit
 // a single flattened combinational block (Verilog assigns / inlined C++ function)
 // instead of instantiating lots of tiny primitives.
-def PYC_CombOp : PYC_Op<"comb", [Pure, IsolatedFromAbove]> {
+def PYC_CombOp : PYC_Op<"comb", [AlwaysSpeculatable,
+    DeclareOpInterfaceMethods<MemoryEffectsOpInterface>, IsolatedFromAbove]> {
   let summary = "Fused combinational region";
   let arguments = (ins Variadic<AnyType>:$inputs);
   let results = (outs Variadic<AnyType>:$outputs);
