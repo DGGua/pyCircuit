@@ -166,13 +166,12 @@ static ArrayAttr integerArrayAttr(MLIRContext *context,
   return builder.getArrayAttr(attrs);
 }
 
-struct PlanChangeDrivenSchedulePass
-    : public PassWrapper<PlanChangeDrivenSchedulePass,
-                         OperationPass<ModuleOp>> {
-  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(PlanChangeDrivenSchedulePass)
+struct ChangeDrivenSchedulePass
+    : public PassWrapper<ChangeDrivenSchedulePass, OperationPass<ModuleOp>> {
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(ChangeDrivenSchedulePass)
 
   StringRef getArgument() const override {
-    return "pyc-plan-change-driven-schedule";
+    return "pyc-change-driven-schedule";
   }
   StringRef getDescription() const override {
     return "Attach deterministic change-driven schedule metadata";
@@ -251,10 +250,10 @@ struct PlanChangeDrivenSchedulePass
 
 } // namespace
 
-std::unique_ptr<::mlir::Pass> createPlanChangeDrivenSchedulePass() {
-  return std::make_unique<PlanChangeDrivenSchedulePass>();
+std::unique_ptr<::mlir::Pass> createChangeDrivenSchedulePass() {
+  return std::make_unique<ChangeDrivenSchedulePass>();
 }
 
-static PassRegistration<PlanChangeDrivenSchedulePass> planPass;
+static PassRegistration<ChangeDrivenSchedulePass> schedulePass;
 
 } // namespace pyc

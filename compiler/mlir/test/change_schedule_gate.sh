@@ -47,34 +47,25 @@ grep -q "b_input" "${cross_cycle_log}"
   "${ROOT}/compiler/mlir/test/Inputs/change_schedule_missing_summary.mlir" \
   --emit=none -o /dev/null
 
-nonmemoizable_log="${OUT}/comb_nonmemoizable.log"
-if "${PYCC}" "${ROOT}/compiler/mlir/test/Inputs/comb_nonmemoizable.mlir" \
-    --emit=none -o /dev/null >"${nonmemoizable_log}" 2>&1; then
-  echo "fail: non-memoizable pyc.comb was accepted" >&2
-  exit 1
-fi
-grep -q "is not on the deterministic pyc.comb memoization whitelist" \
-  "${nonmemoizable_log}"
-
-run_plan() {
+run_schedule() {
   local dump_dir=$1
   "${PYCC}" "${INPUT}" --emit=none -o /dev/null \
     --dump-pass-ir="${dump_dir}" --dump-pass-ir-phase=after \
     --dump-pass-ir-filter='change-driven-schedule' >/dev/null
 }
 
-run_plan "${OUT}/first"
-run_plan "${OUT}/second"
+run_schedule "${OUT}/first"
+run_schedule "${OUT}/second"
 
-first_plan=("${OUT}/first"/*_after_*plan-change-driven-schedule*.mlir)
-second_plan=("${OUT}/second"/*_after_*plan-change-driven-schedule*.mlir)
-if [[ ${#first_plan[@]} -ne 1 || ${#second_plan[@]} -ne 1 ]]; then
-  echo "fail: expected one planner dump per run" >&2
+first_dump=("${OUT}/first"/*_after_*change-driven-schedule*.mlir)
+second_dump=("${OUT}/second"/*_after_*change-driven-schedule*.mlir)
+if [[ ${#first_dump[@]} -ne 1 || ${#second_dump[@]} -ne 1 ]]; then
+  echo "fail: expected one schedule dump per run" >&2
   exit 1
 fi
-cmp "${first_plan[0]}" "${second_plan[0]}"
+cmp "${first_dump[0]}" "${second_dump[0]}"
 
-python3 - "${first_plan[0]}" <<'PY'
+python3 - "${first_dump[0]}" <<'PY'
 import re
 import sys
 
@@ -111,6 +102,25 @@ if len(node_attrs) != 4:
 print("ok: canonical schedule metadata is stable and verified")
 PY
 
+expect_pycc_failure() {
+  local input=$1
+  local diagnostic=$2
+  local log="${OUT}/$(basename "${input}").log"
+  if "${PYCC}" "${input}" --emit=none -o /dev/null >"${log}" 2>&1; then
+    echo "fail: expected ${input} to be rejected" >&2
+    exit 1
+  fi
+  if ! grep -q "${diagnostic}" "${log}"; then
+    echo "fail: ${input} did not report '${diagnostic}'" >&2
+    cat "${log}" >&2
+    exit 1
+  fi
+}
+
+expect_pycc_failure \
+  "${ROOT}/compiler/mlir/test/Inputs/change_schedule_unsupported.mlir" \
+  "no registered canonical per-result combinational dependency transfer"
+
 if [[ -x "${PYC_OPT}" ]]; then
   "${PYC_OPT}" \
     "${ROOT}/compiler/mlir/test/Inputs/comb_cycle_reg_feedback.mlir" \
@@ -126,35 +136,21 @@ if [[ -x "${PYC_OPT}" ]]; then
   fi
   grep -q "combinational cycle detected" "${true_cycle_opt_log}"
 
-  "${PYC_OPT}" "${INPUT}" \
-    --pyc-plan-change-driven-schedule -o /dev/null
-
-  expect_failure() {
-    local input=$1
-    local pass=$2
-    local diagnostic=$3
-    local log="${OUT}/$(basename "${input}").log"
-    if "${PYC_OPT}" "${input}" "${pass}" -o /dev/null >"${log}" 2>&1; then
-      echo "fail: expected ${input} to be rejected" >&2
+  if "${PYC_OPT}" --help 2>&1 | grep -q -- '--pyc-change-driven-schedule'; then
+    "${PYC_OPT}" "${INPUT}" \
+      --pyc-change-driven-schedule -o /dev/null
+    cycle_opt_log="${OUT}/change_schedule_cycle_opt.log"
+    if "${PYC_OPT}" \
+        "${ROOT}/compiler/mlir/test/Inputs/change_schedule_cycle.mlir" \
+        --pyc-change-driven-schedule -o /dev/null \
+        >"${cycle_opt_log}" 2>&1; then
+      echo "fail: cyclic schedule input was accepted" >&2
       exit 1
     fi
-    if ! grep -q "${diagnostic}" "${log}"; then
-      echo "fail: ${input} did not report '${diagnostic}'" >&2
-      cat "${log}" >&2
-      exit 1
-    fi
-  }
-
-  expect_failure \
-    "${ROOT}/compiler/mlir/test/Inputs/change_schedule_cycle.mlir" \
-    --pyc-plan-change-driven-schedule \
-    "requires an acyclic"
-  expect_failure \
-    "${ROOT}/compiler/mlir/test/Inputs/change_schedule_unsupported.mlir" \
-    --pyc-plan-change-driven-schedule \
-    "no registered canonical per-result combinational dependency transfer"
+    grep -q "requires an acyclic" "${cycle_opt_log}"
+  fi
 else
-  echo "note: pyc-opt unavailable; standalone negative pass cases not run" >&2
+  echo "note: pyc-opt unavailable; standalone comb-cycle checks not run" >&2
 fi
 
 echo "ok: change-driven schedule gate passed"

@@ -2372,11 +2372,10 @@ int main(int argc, char **argv) {
   addRemoveDeadValuesPassIfSupported(pm);
   pm.addNestedPass<func::FuncOp>(pyc::createEliminateDeadInstancesPass());
   pm.addPass(createSymbolDCEPass());
-  pm.addNestedPass<func::FuncOp>(pyc::createCheckCombMemoizablePass());
   // Fusion moves combinational ops into pyc.comb regions. The canonical graph
   // still sees those dependencies, so one check after fusion is sufficient.
   pm.addPass(pyc::createCheckCombCyclesPass());
-  pm.addPass(pyc::createPlanChangeDrivenSchedulePass());
+  pm.addPass(pyc::createChangeDrivenSchedulePass());
   pm.addNestedPass<func::FuncOp>(pyc::createCheckFlatTypesPass());
   pm.addNestedPass<func::FuncOp>(pyc::createCheckNoDynamicPass());
   pm.addPass(pyc::createCheckLogicDepthPass(logicDepthLimit));

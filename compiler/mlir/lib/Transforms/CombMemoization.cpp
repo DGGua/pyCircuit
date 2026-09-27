@@ -1,10 +1,8 @@
 #include "pyc/Transforms/CombMemoization.h"
 
 #include "pyc/Dialect/PYC/PYCOps.h"
-#include "pyc/Dialect/PYC/PYCTypes.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
-#include "mlir/IR/BuiltinTypes.h"
 
 using namespace mlir;
 
@@ -20,17 +18,6 @@ bool isMemoizableCombOperation(Operation *op) {
              pyc::AshrOp, pyc::VGetOp, pyc::VCreateOp, pyc::VBroadcastOp,
              pyc::VBroadcastDimOp, pyc::VOrReduceOp, pyc::VAndReduceOp,
              pyc::VAddReduceOp, arith::SelectOp>(op);
-}
-
-bool isMemoizableCombType(Type type) {
-  if (isa<pyc::ClockType, pyc::ResetType>(type))
-    return true;
-  if (auto integer = dyn_cast<IntegerType>(type))
-    return integer.getWidth() != 0;
-  if (auto vector = dyn_cast<VectorType>(type))
-    return vector.getRank() != 0 && vector.hasStaticShape() &&
-           isa<IntegerType>(vector.getElementType());
-  return false;
 }
 
 } // namespace pyc
