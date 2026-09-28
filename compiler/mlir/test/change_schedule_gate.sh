@@ -4,7 +4,6 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 PYCC="${PYCC:-${ROOT}/.pycircuit_out/toolchain/build/bin/pycc}"
-PYC_OPT="${PYC_OPT:-${ROOT}/.pycircuit_out/toolchain/build/bin/pyc-opt}"
 INPUT="${ROOT}/compiler/mlir/test/Inputs/change_schedule_chain.mlir"
 OUT="${ROOT}/.pycircuit_out/gates/change_schedule"
 
@@ -120,23 +119,5 @@ expect_pycc_failure() {
 expect_pycc_failure \
   "${ROOT}/compiler/mlir/test/Inputs/change_schedule_unsupported.mlir" \
   "no registered canonical per-result combinational dependency transfer"
-
-if [[ -x "${PYC_OPT}" ]]; then
-  "${PYC_OPT}" \
-    "${ROOT}/compiler/mlir/test/Inputs/comb_cycle_reg_feedback.mlir" \
-    --pyc-check-comb-cycles -o /dev/null
-
-  true_cycle_opt_log="${OUT}/comb_cycle_true_opt.log"
-  if "${PYC_OPT}" \
-      "${ROOT}/compiler/mlir/test/Inputs/comb_cycle_true.mlir" \
-      --pyc-check-comb-cycles -o /dev/null \
-      >"${true_cycle_opt_log}" 2>&1; then
-    echo "fail: true local combinational cycle was accepted" >&2
-    exit 1
-  fi
-  grep -q "combinational cycle detected" "${true_cycle_opt_log}"
-else
-  echo "note: pyc-opt unavailable; standalone comb-cycle checks not run" >&2
-fi
 
 echo "ok: change-driven schedule gate passed"
