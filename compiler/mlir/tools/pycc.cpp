@@ -1700,6 +1700,8 @@ static std::optional<SplitMethodDef> convertMethodChunk(llvm::StringRef chunk, l
   declSig = trimCopy(declSig);
 
   std::string defSig = signature;
+  // Keep PYC_NOINLINE on both declaration and definition. The macro has no
+  // parentheses here, so the first '(' still begins the method parameters.
   if (startsWithWord(defSig, "inline"))
     defSig = trimCopy(llvm::StringRef(defSig).drop_front(strlen("inline")));
   if (startsWithWord(defSig, "static"))
@@ -1753,7 +1755,8 @@ static bool isMethodStartLine(llvm::StringRef line, llvm::StringRef structName) 
     return false;
   if (t.size() >= 2 && t[0] == '/' && t[1] == '/')
     return false;
-  if (!(startsWithWord(t, "inline") || startsWithWord(t, "void") || startsWithWord(t, "static") ||
+  if (!(startsWithWord(t, "inline") || startsWithWord(t, "PYC_NOINLINE") ||
+        startsWithWord(t, "void") || startsWithWord(t, "static") ||
         startsWithWord(t, "bool") || startsWithWord(t, structName) || startsWithWord(t, "~" + structName.str()))) {
     return false;
   }
@@ -2478,6 +2481,30 @@ int main(int argc, char **argv) {
     return writeCompileStatsJson(statsPath, compileStats);
   };
 
+  // Aggregate the verified per-function plans after graph scheduling. Placement
+  // belongs to SimulationPlan rather than the old MLIR-only C++ emitter.
+  pyc::CppPlacementSummary placementTotals;
+  auto recordPlacement = [&](const pyc::SimulationPlan &plan) {
+    const auto &summary = plan.cppPlacementSummary;
+    placementTotals.structMembers += summary.structMembers;
+    placementTotals.localInMethod += summary.localInMethod;
+    placementTotals.probePinnedStruct += summary.probePinnedStruct;
+    placementTotals.crossPartPromoted += summary.crossPartPromoted;
+    placementTotals.scheduledCrossMethod += summary.scheduledCrossMethod;
+    placementTotals.scheduledCutWeight += summary.scheduledCutWeight;
+    placementTotals.omittedValues += summary.omittedValues;
+  };
+  auto buildPlacementSummary = [&]() -> llvm::json::Object {
+    llvm::json::Object placement;
+    placement["struct_members"] = static_cast<int64_t>(placementTotals.structMembers);
+    placement["local_in_method"] = static_cast<int64_t>(placementTotals.localInMethod);
+    placement["probe_pinned_struct"] = static_cast<int64_t>(placementTotals.probePinnedStruct);
+    placement["cross_part_promoted"] = static_cast<int64_t>(placementTotals.crossPartPromoted);
+    placement["scheduled_cross_method"] = static_cast<int64_t>(placementTotals.scheduledCrossMethod);
+    placement["scheduled_cut_weight"] = static_cast<int64_t>(placementTotals.scheduledCutWeight);
+    placement["omitted_values"] = static_cast<int64_t>(placementTotals.omittedValues);
+    return placement;
+  };
   auto buildProfileSummary = [&]() -> llvm::json::Object {
     llvm::json::Object obj;
     obj["build_profile"] = buildProfileNorm;
@@ -2494,6 +2521,8 @@ int main(int argc, char **argv) {
     obj["cpp_shard_threshold_lines"] = static_cast<int64_t>(cppShardThresholdLines);
     obj["cpp_shard_threshold_bytes"] = static_cast<int64_t>(cppShardThresholdBytes);
     obj["cpp_shard_max_ast_nodes"] = static_cast<int64_t>(cppShardMaxAstNodes);
+    obj["cpp_pch"] = cppPch.getValue();
+    obj["cpp_placement"] = buildPlacementSummary();
     obj["profile_pass_timing"] = collectPassTiming;
     return obj;
   };
@@ -2547,6 +2576,11 @@ int main(int argc, char **argv) {
     stats["tns"] = compileStats.tns;
     stats["fuse_comb_enabled"] = compileStats.fuseCombEnabled;
     root["compile_stats"] = std::move(stats);
+
+    if (emitKind == "cpp") {
+      root["cpp_pch"] = cppPch.getValue();
+      root["cpp_placement"] = buildPlacementSummary();
+    }
 
     if (passTimingCollector)
       root["passes"] = passTimingCollector->toJson();
@@ -2700,6 +2734,12 @@ int main(int argc, char **argv) {
         os << "#include <memory>\n";
         os << "#include <string>\n";
         os << "#include <cpp/pyc_sim.hpp>\n";
+        os << "#ifndef PYC_NOINLINE\n";
+        os << "#if defined(__GNUC__) || defined(__clang__)\n";
+        os << "#define PYC_NOINLINE __attribute__((noinline))\n";
+        os << "#elif defined(_MSC_VER)\n";
+        os << "#define PYC_NOINLINE __declspec(noinline)\n";
+        os << "#else\n#define PYC_NOINLINE\n#endif\n#endif\n";
       };
 
       auto writeSourcePreamble = [&](llvm::raw_ostream &os, llvm::StringRef headerName) {
@@ -2725,6 +2765,7 @@ int main(int argc, char **argv) {
           auto plan = buildCppSimulationPlan(f, enableFuseComb, planningOpts);
           if (failed(plan) || failed(pyc::emitCppFunc(*plan, emitOs, cppEmitOpts)))
             return 1;
+          recordPlacement(*plan);
           emitOs.flush();
         }
 
@@ -2821,10 +2862,6 @@ int main(int argc, char **argv) {
               return 1;
           } else {
             bool wroteAny = false;
-            if (failed(writeSourceFile(moduleName + "__core.cpp", "core", "core", coreMethods)))
-              return 1;
-            if (!coreMethods.empty())
-              wroteAny = true;
             auto shardPredictedCost = [&](size_t lines, size_t bytes, llvm::StringRef kind) -> double {
               return computePredictedCompileCost(
                   computeComplexityScore(static_cast<uint64_t>(lines), static_cast<uint64_t>(bytes), kind), kind);
@@ -2898,6 +2935,11 @@ int main(int argc, char **argv) {
               return flushShard();
             };
 
+            // Constructor, validation and probe helpers must retain the same
+            // translation-unit bounds as eval/tick helpers.
+            if (failed(writeMaybeShardedMethods("core", "core", coreMethods, /*allowSharding=*/true)))
+              return 1;
+
             // tick methods can be enormous for large top-level modules (e.g. JanusBccBackendCompat).
             // Allow sharding to avoid compiler instability/timeouts on a single huge TU.
             if (failed(writeMaybeShardedMethods("tick", "tick", tickMethods, /*allowSharding=*/true)))
@@ -2920,12 +2962,7 @@ int main(int argc, char **argv) {
             llvm::errs() << "error: cannot open " << headerPath << ": " << fe.message() << "\n";
             return 1;
           }
-          hos << "// pyCircuit C++ emission (prototype)\n";
-          hos << "#pragma once\n";
-          hos << "#include <cstdlib>\n";
-          hos << "#include <iostream>\n";
-          hos << "#include <memory>\n";
-          hos << "#include <cpp/pyc_sim.hpp>\n";
+          writeHeaderPreamble(hos, moduleName);
           for (const std::string &dep : deps[f.getSymName()])
             hos << "#include \"" << dep << ".hpp\"\n";
           hos << "\nnamespace pyc::gen {\n\n";
@@ -3026,6 +3063,7 @@ int main(int argc, char **argv) {
       auto functionPlan = buildCppSimulationPlan(f, enableFuseComb, planningOpts);
       if (failed(functionPlan))
         return 1;
+      recordPlacement(*functionPlan);
       functions.push_back(std::move(*functionPlan));
     }
     auto plan = pyc::buildModuleSimulationPlan(*module, std::move(functions));

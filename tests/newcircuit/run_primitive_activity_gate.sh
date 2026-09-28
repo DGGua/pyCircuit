@@ -14,13 +14,8 @@ for fixture in fifo async_fifo sync_mem_dp cdc; do
       rg -q '_pyc_group_active_flags' "${gate_dir}/activity.cpp"
       rg -q '_pyc_old_group_value_' "${gate_dir}/activity.cpp"
       if [[ "${fixture}" != fifo ]]; then
-        python3 - "${gate_dir}/activity.cpp" <<'PY'
-from pathlib import Path
-import sys
-source = Path(sys.argv[1]).read_text()
-commit = source.split('  void tick_commit() {', 1)[1].split('  void comb()', 1)[0]
-assert '_pyc_old_group_value_' in commit, 'primitive output commit lacks activity publication'
-PY
+        python3 "${repo_root}/tests/newcircuit/check_commit_activity.py" \
+          "${gate_dir}/activity.cpp"
       fi
     elif rg -q '_pyc_group_active_flags' "${gate_dir}/activity.cpp"; then
       echo 'disabled primitive activity emitted flags' >&2

@@ -18,14 +18,8 @@ for fixture in state instance memory; do
       rg -q '_pyc_old_group_value_' "${gate_dir}/activity.cpp"
       if [[ "$fixture" == state ]]; then
         # State notifications must be published at commit, not tick-compute.
-        python3 - "${gate_dir}/activity.cpp" <<'PY'
-from pathlib import Path
-import sys
-source = Path(sys.argv[1]).read_text()
-compute, commit = source.split('  void tick_compute() {', 1)[1].split('  void tick_commit() {', 1)
-assert '_pyc_old_group_value_' not in compute
-assert '_pyc_old_group_value_' in commit.split('  void comb()', 1)[0]
-PY
+        python3 "${repo_root}/tests/newcircuit/check_commit_activity.py" \
+          "${gate_dir}/activity.cpp"
       fi
     elif rg -q '_pyc_group_active_flags' "${gate_dir}/activity.cpp"; then
       echo 'disabled activation unexpectedly emitted activity flags' >&2
@@ -48,12 +42,13 @@ for count in 8 260; do
     --sim-supernode-strict-bound=true --sim-supernode-max-size=1 \
     --logic-depth=512 \
     -o "${gate_dir}/activity.cpp"
-  python3 - "${gate_dir}/activity.cpp" "$count" <<'PY'
-from pathlib import Path
+  python3 - "${gate_dir}/activity.cpp" "$count" \
+    "${repo_root}/tests/newcircuit/check_commit_activity.py" <<'PY'
 import re
+import runpy
 import sys
-source = Path(sys.argv[1]).read_text()
-commit = source.split('  void tick_commit() {', 1)[1].split('  void comb()', 1)[0]
+checked = runpy.run_path(sys.argv[3])
+source, commit = checked['source'], checked['commit']
 if int(sys.argv[2]) == 8:
     assert '0ull - static_cast<std::uint64_t>' in commit
 else:

@@ -75,7 +75,7 @@ def main(argv: list[str] | None = None) -> int:
         if bundled_python.is_dir():
             shutil.rmtree(bundled_python)
         tools_dir = package_dir / "_tools"
-        for tool_name in ("gen_cmake_from_manifest.py", "pyc_module_graph.py"):
+        for tool_name in ("gen_cmake_from_manifest.py", "cpp_pch_headers.py", "pyc_module_graph.py"):
             _copy_file(repo_root / "flows" / "tools" / tool_name, tools_dir / tool_name)
         _copy_file(repo_root / "LICENSE", stage / "LICENSE")
         _copy_file(repo_root / "README.md", stage / "README.md")

@@ -10,6 +10,22 @@ int main() {
     if (CASE_MODEL == 1) expected = sel ? expected : a;
     if (CASE_MODEL == 2) expected <<= 3;
     if (CASE_MODEL == 3) expected = sel ? expected + a : expected * b;
+    if (CASE_MODEL == 4) expected = a + 64u * b;
+    if (CASE_MODEL == 5) {
+      expected = a;
+      for (unsigned bit = 0; bit < 64; ++bit)
+        expected = ((b >> bit) & 1u) ? expected : b;
+    }
+    if (CASE_MODEL == 6) {
+      expected = a;
+      for (unsigned layer = 0; layer < 64; ++layer) {
+        if (layer % 4 == 0) expected *= b;
+        if (layer % 4 == 1) expected = ~expected;
+        if (layer % 4 == 2) expected ^= b;
+        // A 128-bit concatenation followed by its low 64 bits is identity.
+      }
+      expected <<= 1;
+    }
     if (STATE_CASE) expected = q;
     sim.eval();
     if (sim.y.value() != (expected & 255u) ||
@@ -24,6 +40,7 @@ int main() {
     uint64_t b = step * UINT64_C(0xd6e8feb86659fd93) + UINT64_MAX;
     if ((step & 15) == 0) a = b = 0;
     if ((step & 15) == 1) a = b = UINT64_MAX;
+    if ((step & 15) == 2) b = UINT64_MAX; // Keep a through every deep mux.
     const bool reset = step % 31 == 0, enable = step % 4 != 0, sel = step % 3 != 0;
     sim.clk = pyc::cpp::Wire<1>(0);
     sim.tick_compute();

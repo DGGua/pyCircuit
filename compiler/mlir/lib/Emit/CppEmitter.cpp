@@ -90,6 +90,41 @@ static void emitWireProbes(llvm::raw_ostream &os, const SimType &type,
   os << "    reg.addWire<" << type.width << ">(reg_path(" << cppStringLiteral(fieldPath) << "), &" << cppExpr << ");\n";
 }
 
+// Keep ordered runtime actions small enough for the host compiler to optimize.
+// Explicit noinline boundaries prevent -O3 from rebuilding the original large
+// method, including when every method is emitted into one translation unit.
+static void emitBoundedVoidMethod(llvm::raw_ostream &os, llvm::StringRef name,
+                                  llvm::ArrayRef<std::string> actions,
+                                  unsigned chunkActions,
+                                  llvm::StringRef parameters = "",
+                                  llvm::StringRef arguments = "",
+                                  llvm::StringRef prologue = "",
+                                  llvm::StringRef qualifiers = "") {
+  const unsigned limit = std::max(1u, chunkActions);
+  if (actions.size() <= limit) {
+    os << "  void " << name << "(" << parameters << ")" << qualifiers << " {\n";
+    os << prologue;
+    for (const std::string &action : actions)
+      os << action;
+    os << "  }\n\n";
+    return;
+  }
+  unsigned parts = 0;
+  for (size_t begin = 0; begin < actions.size(); begin += limit, ++parts) {
+    os << "  void PYC_NOINLINE " << name << "_part_" << parts << "("
+       << parameters << ")" << qualifiers << " {\n";
+    os << prologue;
+    for (const std::string &action : actions.slice(
+             begin, std::min<size_t>(limit, actions.size() - begin)))
+      os << action;
+    os << "  }\n\n";
+  }
+  os << "  void " << name << "(" << parameters << ")" << qualifiers << " {\n";
+  for (unsigned part = 0; part < parts; ++part)
+    os << "    " << name << "_part_" << part << "(" << arguments << ");\n";
+  os << "  }\n\n";
+}
+
 struct NameTable {
   const SimGraph &graph;
   llvm::DenseMap<unsigned, std::string> names;
@@ -411,7 +446,18 @@ static LogicalResult emitGraphExpr(const SimGraph &graph, const SimExpr &expr,
   return success();
 }
 
-static LogicalResult emitCombMethod(const SimGraph &graph,
+static void emitMethodLocals(const SimulationPlan &plan, llvm::StringRef method,
+                             llvm::raw_ostream &os, NameTable &nt) {
+  auto found = plan.cppMethodLocals.find(method.str());
+  if (found == plan.cppMethodLocals.end())
+    return;
+  for (unsigned value : found->second)
+    os << "    " << cppType(plan.graph.values[value].type) << " "
+       << nt.get(value) << "{};\n";
+}
+
+static LogicalResult emitCombMethod(const SimulationPlan &plan,
+                                    const SimGraph &graph,
                                     const SimCombRegion &region,
                                     const CombRegionStatementPlan &statements,
                                     const llvm::DenseMap<unsigned,
@@ -470,6 +516,7 @@ static LogicalResult emitCombMethod(const SimGraph &graph,
       std::string partName = "eval_comb_" + std::to_string(idx) + "_part_" + std::to_string(partIdx);
       partMethods.push_back(partName);
       os << "  inline void " << partName << "() {\n";
+      emitMethodLocals(plan, partName, os, nt);
       for (const SimCombStep &step : chunk)
         if (failed(emitStep(step)))
           return failure();
@@ -486,6 +533,7 @@ static LogicalResult emitCombMethod(const SimGraph &graph,
   }
 
   os << "  inline void eval_comb_" << idx << "() {\n";
+  emitMethodLocals(plan, "eval_comb_" + std::to_string(idx), os, nt);
   for (const SimCombStep &step : statements.chunks.front())
     if (failed(emitStep(step)))
       return failure();
@@ -763,6 +811,7 @@ static LogicalResult emitSimGroupMethod(const SimulationPlan &plan,
   if (statements.chunks.size() > 1) {
     for (size_t part = 0; part < statements.chunks.size(); ++part) {
       os << "  inline void " << method << "_part_" << part << "() {\n";
+      emitMethodLocals(plan, method + "_part_" + std::to_string(part), os, nt);
       if (failed(emitStatementChunk(statements.chunks[part])))
         return failure();
       os << "  }\n\n";
@@ -778,6 +827,7 @@ static LogicalResult emitSimGroupMethod(const SimulationPlan &plan,
   }
   os << "  inline void " << method << "() {\n";
   emitActivationCheck();
+  emitMethodLocals(plan, method, os, nt);
   emitActivitySnapshots(plan, groupNodeId, os, nt, "    ");
   if (failed(emitStatementChunk(statements.chunks.front())))
     return failure();
@@ -830,7 +880,11 @@ static LogicalResult emitFunc(const SimulationPlan &plan, llvm::raw_ostream &os,
   decls.reserve(plan.graph.declarationValueIds.size());
   for (unsigned id : plan.graph.declarationValueIds) {
     const SimValue &value = plan.graph.values[id];
-    decls.push_back(Decl{nt.get(id), value.type});
+    // Allocate every source name in the original order even when its storage
+    // moves into a method or its expression is fully substituted.
+    std::string name = nt.get(id);
+    if (plan.cppValueStorage[id] == CppValueStorage::Struct)
+      decls.push_back(Decl{std::move(name), value.type});
   }
   std::sort(decls.begin(), decls.end(), [](const Decl &a, const Decl &b) { return a.name < b.name; });
   for (const Decl &d : decls)
@@ -991,16 +1045,36 @@ static LogicalResult emitFunc(const SimulationPlan &plan, llvm::raw_ostream &os,
   }
 	  os << "  }\n\n";
 
-	  // ProbeRegistry registration (Decisions 0004, 0018-0021).
-	  os << "  void pyc_register_probes(pyc::cpp::ProbeRegistry &reg, const std::string &prefix) {\n";
-	  os << "    std::string inst = pyc::cpp::shortenInstancePath(prefix);\n";
-	  os << "    auto reg_path = [&](const char *leaf) {\n";
-	  os << "      std::string p = inst;\n";
+  // ProbeRegistry registration (Decisions 0004, 0018-0021).
+  std::string probePrologue;
+  llvm::raw_string_ostream probeHeader(probePrologue);
+	  probeHeader << "    std::string inst = pyc::cpp::shortenInstancePath(prefix);\n";
+	  probeHeader << "    auto reg_path = [&](const char *leaf) {\n";
+	  probeHeader << "      std::string p = inst;\n";
 	  // Decision 0023: canonical_path uses <instance_path>:<field_path>.
-	  os << "      p += \":\";\n";
-	  os << "      p += leaf;\n";
-	  os << "      return p;\n";
-	  os << "    };\n";
+	  probeHeader << "      p += \":\";\n";
+	  probeHeader << "      p += leaf;\n";
+	  probeHeader << "      return p;\n";
+	  probeHeader << "    };\n";
+
+	  if (!instInfos.empty()) {
+	    probeHeader << "    auto reg_child = [&](auto &child, const char *seg) {\n";
+	    probeHeader << "      std::string p = prefix;\n";
+	    probeHeader << "      p += \".\";\n";
+	    probeHeader << "      p += seg;\n";
+	    probeHeader << "      if (child) child->pyc_register_probes(reg, p);\n";
+	    probeHeader << "    };\n";
+	  }
+  std::vector<std::string> probeActions;
+  std::string probeAction;
+  llvm::raw_string_ostream probeOs(probeAction);
+  auto beginProbeAction = [&]() {
+    probeOs.flush();
+    if (!probeAction.empty()) {
+      probeActions.push_back(std::move(probeAction));
+      probeAction.clear();
+    }
+  };
 
     struct NamedProbeInfo {
       std::string fieldPath;
@@ -1053,69 +1127,75 @@ static LogicalResult emitFunc(const SimulationPlan &plan, llvm::raw_ostream &os,
     }
 
 		  for (auto [i, valueId] : llvm::enumerate(plan.graph.inputValueIds)) {
+    beginProbeAction();
         const SimType &type = plan.graph.values[valueId].type;
 		    unsigned w = type.width;
 		    if (w == 0)
 		      return f.emitError("invalid input port width for ProbeRegistry: ") << inCanon[i];
-		    emitWireProbes(os, type, inCanon[static_cast<unsigned>(i)], inNames[static_cast<unsigned>(i)]);
+		    emitWireProbes(probeOs, type, inCanon[static_cast<unsigned>(i)], inNames[static_cast<unsigned>(i)]);
 		  }
 		  for (unsigned i = 0; i < plan.graph.outputValueIds.size(); ++i) {
+    beginProbeAction();
         const SimType &type = plan.graph.values[plan.graph.outputValueIds[i]].type;
 		    unsigned w = type.width;
 		    if (w == 0)
 		      return f.emitError("invalid output port width for ProbeRegistry: ") << outCanon[i];
 		    if (outIsReg[i] && type.shape.empty()) {
-		      os << "    reg.addReg<" << w << ">(reg_path(" << cppStringLiteral(outCanon[i]) << "), &" << outNames[i]
+		      probeOs << "    reg.addReg<" << w << ">(reg_path(" << cppStringLiteral(outCanon[i]) << "), &" << outNames[i]
 		         << ", &" << nt.get(outRegQ[i]) << "_inst->pending, &" << nt.get(outRegQ[i]) << "_inst->qNext);\n";
 		    } else {
-		      emitWireProbes(os, type, outCanon[i], outNames[i]);
+		      emitWireProbes(probeOs, type, outCanon[i], outNames[i]);
 		    }
 		  }
       for (const auto &named : namedProbes) {
+    beginProbeAction();
         if (named.isReg && named.type.shape.empty()) {
-          os << "    reg.addReg<" << named.width << ">(reg_path(" << cppStringLiteral(named.fieldPath) << "), &"
+          probeOs << "    reg.addReg<" << named.width << ">(reg_path(" << cppStringLiteral(named.fieldPath) << "), &"
              << named.cppValue << ", &" << named.cppRegInst << "->pending, &" << named.cppRegInst << "->qNext);\n";
         } else {
-          emitWireProbes(os, named.type, named.fieldPath, named.cppValue);
+          emitWireProbes(probeOs, named.type, named.fieldPath, named.cppValue);
         }
       }
 		  for (unsigned id : byteMems) {
+    beginProbeAction();
 		    std::string instName = memoryInstanceName(id);
-	    os << "    reg.addMem(reg_path(\"" << instName << "\"), &" << instName << ", &" << instName
+	    probeOs << "    reg.addMem(reg_path(\"" << instName << "\"), &" << instName << ", &" << instName
 	       << ".pendingWrite, &" << instName << ".latchedAddr, &" << instName << ".latchedData, &" << instName
 	       << ".latchedStrb);\n";
 	  }
 	  for (unsigned id : syncMems) {
+    beginProbeAction();
 	    std::string instName = memoryInstanceName(id);
-	    os << "    if (" << instName << ") reg.addMem(reg_path(\"" << instName << "\"), " << instName << ", &" << instName
+	    probeOs << "    if (" << instName << ") reg.addMem(reg_path(\"" << instName << "\"), " << instName << ", &" << instName
 	       << "->pendingWrite, &" << instName << "->latchedWaddr, &" << instName << "->latchedWdata, &" << instName
 	       << "->latchedWstrb);\n";
 	  }
 	  for (unsigned id : syncMemDPs) {
+    beginProbeAction();
 	    std::string instName = memoryInstanceName(id);
-	    os << "    if (" << instName << ") reg.addMem(reg_path(\"" << instName << "\"), " << instName << ", &" << instName
+	    probeOs << "    if (" << instName << ") reg.addMem(reg_path(\"" << instName << "\"), " << instName << ", &" << instName
 	       << "->pendingWrite, &" << instName << "->latchedWaddr, &" << instName << "->latchedWdata, &" << instName
 	       << "->latchedWstrb);\n";
 	  }
-	  if (!instInfos.empty()) {
-	    os << "    auto reg_child = [&](auto &child, const char *seg) {\n";
-	    os << "      std::string p = prefix;\n";
-	    os << "      p += \".\";\n";
-	    os << "      p += seg;\n";
-	    os << "      if (child) child->pyc_register_probes(reg, p);\n";
-	    os << "    };\n";
-	    for (const auto &ii : instInfos)
-	      os << "    reg_child(" << ii.member << ", \"" << ii.seg << "\");\n";
-	  }
+  for (const auto &ii : instInfos) {
+    beginProbeAction();
+	      probeOs << "    reg_child(" << ii.member << ", \"" << ii.seg << "\");\n";
+  }
       auto probeAliases = loadProbeAliasesForTop(opts.probePlanPath,
                                                 plan.graph.functionName);
       if (!probeAliases.empty()) {
         for (const auto &alias : probeAliases) {
-          os << "    if (const auto *src = reg.findByPath(" << cppStringLiteral(alias.sourcePath) << "))\n";
-          os << "      reg.addAlias(" << cppStringLiteral(alias.canonicalPath) << ", *src);\n";
+    beginProbeAction();
+          probeOs << "    if (const auto *src = reg.findByPath(" << cppStringLiteral(alias.sourcePath) << "))\n";
+          probeOs << "      reg.addAlias(" << cppStringLiteral(alias.canonicalPath) << ", *src);\n";
         }
       }
-	  os << "  }\n\n";
+  beginProbeAction();
+  probeHeader.flush();
+  emitBoundedVoidMethod(os, "pyc_register_probes", probeActions,
+                        plan.tickChunkNodes,
+                        "pyc::cpp::ProbeRegistry &reg, const std::string &prefix",
+                        "reg, prefix", probePrologue);
 
   for (unsigned id : regs) {
     const SimNode &reg = plan.graph.topNodes[id];
@@ -1308,32 +1388,48 @@ static LogicalResult emitFunc(const SimulationPlan &plan, llvm::raw_ostream &os,
   os << "    dump_sim_stats(ofs);\n";
   os << "  }\n\n";
 
-  os << "  void _pyc_validate_primitive_bindings() const {\n";
+  std::vector<std::string> bindingActions;
+  std::string bindingAction;
+  llvm::raw_string_ostream bindingOs(bindingAction);
+  auto beginBindingAction = [&]() {
+    bindingOs.flush();
+    if (!bindingAction.empty()) {
+      bindingActions.push_back(std::move(bindingAction));
+      bindingAction.clear();
+    }
+  };
   for (unsigned id : regs) {
+    beginBindingAction();
     const SimNode &reg = plan.graph.topNodes[id];
     std::string qName = nt.get(reg.outputIds.front());
-    os << "    if (!" << qName << "_inst) { std::cerr << \"pyc null reg binding: " << qName
+    bindingOs << "    if (!" << qName << "_inst) { std::cerr << \"pyc null reg binding: " << qName
        << "_inst\" << \"\\n\"; std::abort(); }\n";
   }
   for (unsigned id : syncMems) {
+    beginBindingAction();
     std::string instName = memoryInstanceName(id);
-    os << "    if (!" << instName << ") { std::cerr << \"pyc null sync_mem binding: " << instName
+    bindingOs << "    if (!" << instName << ") { std::cerr << \"pyc null sync_mem binding: " << instName
        << "\" << \"\\n\"; std::abort(); }\n";
   }
   for (unsigned id : syncMemDPs) {
+    beginBindingAction();
     std::string instName = memoryInstanceName(id);
-    os << "    if (!" << instName << ") { std::cerr << \"pyc null sync_mem_dp binding: " << instName
+    bindingOs << "    if (!" << instName << ") { std::cerr << \"pyc null sync_mem_dp binding: " << instName
        << "\" << \"\\n\"; std::abort(); }\n";
   }
-  os << "  }\n\n";
+  beginBindingAction();
+  emitBoundedVoidMethod(os, "_pyc_validate_primitive_bindings", bindingActions,
+                        plan.tickChunkNodes, "", "", "", " const");
 
-  // Constructor (wire members default-initialize to 0).
-  os << "  " << structName << "()";
+  // Preserve the initializer list and its original construction order.
+  std::string ctorSignature;
+  llvm::raw_string_ostream ctorOs(ctorSignature);
+  ctorOs << "  " << structName << "()";
   bool firstInit = true;
   for (unsigned id : fifos) {
-    os << (firstInit ? " :\n" : ",\n");
+    ctorOs << (firstInit ? " :\n" : ",\n");
     firstInit = false;
-    os << "      " << fifoInstanceName(id) << "(" << fifoInputName(id, 0)
+    ctorOs << "      " << fifoInstanceName(id) << "(" << fifoInputName(id, 0)
        << ", " << fifoInputName(id, 1) << ", " << fifoInputName(id, 2)
        << ", " << fifoOutputName(id, 0) << ", " << fifoInputName(id, 3)
        << ", " << fifoOutputName(id, 1) << ", " << fifoInputName(id, 4)
@@ -1341,21 +1437,21 @@ static LogicalResult emitFunc(const SimulationPlan &plan, llvm::raw_ostream &os,
   }
   for (unsigned id : byteMems) {
     const SimNode &mem = plan.graph.topNodes[id];
-    os << (firstInit ? " :\n" : ",\n");
+    ctorOs << (firstInit ? " :\n" : ",\n");
     firstInit = false;
-    os << "      " << memoryInstanceName(id) << "("
+    ctorOs << "      " << memoryInstanceName(id) << "("
        << graphValueName(mem.inputIds[0]) << ", "
        << graphValueName(mem.inputIds[1]) << ", "
        << graphValueName(mem.inputIds[2]) << ", "
        << graphValueName(mem.outputIds.front());
     for (unsigned i = 3; i < mem.inputIds.size(); ++i)
-      os << ", " << graphValueName(mem.inputIds[i]);
-    os << ")";
+      ctorOs << ", " << graphValueName(mem.inputIds[i]);
+    ctorOs << ")";
   }
   for (unsigned id : asyncFifos) {
-    os << (firstInit ? " :\n" : ",\n");
+    ctorOs << (firstInit ? " :\n" : ",\n");
     firstInit = false;
-    os << "      " << fifoInstanceName(id) << "(" << fifoInputName(id, 0)
+    ctorOs << "      " << fifoInstanceName(id) << "(" << fifoInputName(id, 0)
        << ", " << fifoInputName(id, 1) << ", " << fifoInputName(id, 4)
        << ", " << fifoOutputName(id, 0) << ", " << fifoInputName(id, 5)
        << ", " << fifoInputName(id, 2) << ", " << fifoInputName(id, 3)
@@ -1364,16 +1460,27 @@ static LogicalResult emitFunc(const SimulationPlan &plan, llvm::raw_ostream &os,
   }
   for (unsigned id : cdcSyncs) {
     const SimNode &cdc = plan.graph.topNodes[id];
-    os << (firstInit ? " :\n" : ",\n");
+    ctorOs << (firstInit ? " :\n" : ",\n");
     firstInit = false;
-    os << "      " << nt.get(cdc.outputIds.front())
+    ctorOs << "      " << nt.get(cdc.outputIds.front())
        << "_inst(";
     for (unsigned inputId : cdc.inputIds)
-      os << nt.get(inputId) << ", ";
-    os << nt.get(cdc.outputIds.front()) << ")";
+      ctorOs << nt.get(inputId) << ", ";
+    ctorOs << nt.get(cdc.outputIds.front()) << ")";
   }
-  os << " {\n";
+  ctorOs << " {\n";
+  std::vector<std::string> initActions;
+  std::string initAction;
+  llvm::raw_string_ostream initOs(initAction);
+  auto beginInitAction = [&]() {
+    initOs.flush();
+    if (!initAction.empty()) {
+      initActions.push_back(std::move(initAction));
+      initAction.clear();
+    }
+  };
   for (unsigned id : regs) {
+    beginInitAction();
     const SimNode &reg = plan.graph.topNodes[id];
     const SimValue &q = plan.graph.values[reg.outputIds.front()];
     unsigned w = q.type.width;
@@ -1381,45 +1488,53 @@ static LogicalResult emitFunc(const SimulationPlan &plan, llvm::raw_ostream &os,
       return reg.op->emitError("invalid reg width");
     std::string qName = nt.get(reg.outputIds.front());
     if (!q.type.shape.empty())
-      os << "    " << qName << "_inst = new pyc::cpp::pyc_vec_reg<"
+      initOs << "    " << qName << "_inst = new pyc::cpp::pyc_vec_reg<"
          << cppType(q.type) << ">(";
     else
-      os << "    " << qName << "_inst = new pyc::cpp::pyc_reg<" << w << ">(";
+      initOs << "    " << qName << "_inst = new pyc::cpp::pyc_reg<" << w << ">(";
     for (unsigned inputId : reg.inputIds)
-      os << nt.get(inputId) << ", ";
-    os << qName << ");\n";
+      initOs << nt.get(inputId) << ", ";
+    initOs << qName << ");\n";
   }
   for (unsigned id : syncMems) {
+    beginInitAction();
     const SimNode &mem = plan.graph.topNodes[id];
     unsigned addrW = plan.graph.values[mem.inputIds[3]].type.width;
     unsigned dataW = plan.graph.values[mem.outputIds.front()].type.width;
     std::string instName = memoryInstanceName(id);
-    os << "    " << instName << " = new pyc::cpp::pyc_sync_mem<" << addrW
+    initOs << "    " << instName << " = new pyc::cpp::pyc_sync_mem<" << addrW
        << ", " << dataW << ", " << mem.primitiveDepth << ">(";
     for (unsigned i = 0; i < 4; ++i)
-      os << graphValueName(mem.inputIds[i]) << ", ";
-    os << graphValueName(mem.outputIds.front());
+      initOs << graphValueName(mem.inputIds[i]) << ", ";
+    initOs << graphValueName(mem.outputIds.front());
     for (unsigned i = 4; i < mem.inputIds.size(); ++i)
-      os << ", " << graphValueName(mem.inputIds[i]);
-    os << ");\n";
+      initOs << ", " << graphValueName(mem.inputIds[i]);
+    initOs << ");\n";
   }
   for (unsigned id : syncMemDPs) {
+    beginInitAction();
     const SimNode &mem = plan.graph.topNodes[id];
     unsigned addrW = plan.graph.values[mem.inputIds[3]].type.width;
     unsigned dataW = plan.graph.values[mem.outputIds.front()].type.width;
     std::string instName = memoryInstanceName(id);
-    os << "    " << instName << " = new pyc::cpp::pyc_sync_mem_dp<"
+    initOs << "    " << instName << " = new pyc::cpp::pyc_sync_mem_dp<"
        << addrW << ", " << dataW << ", " << mem.primitiveDepth << ">(";
     for (unsigned i = 0; i < 4; ++i)
-      os << graphValueName(mem.inputIds[i]) << ", ";
-    os << graphValueName(mem.outputIds[0]) << ", "
+      initOs << graphValueName(mem.inputIds[i]) << ", ";
+    initOs << graphValueName(mem.outputIds[0]) << ", "
        << graphValueName(mem.inputIds[4]) << ", "
        << graphValueName(mem.inputIds[5]) << ", "
        << graphValueName(mem.outputIds[1]);
     for (unsigned i = 6; i < mem.inputIds.size(); ++i)
-      os << ", " << graphValueName(mem.inputIds[i]);
-    os << ");\n";
+      initOs << ", " << graphValueName(mem.inputIds[i]);
+    initOs << ");\n";
   }
+  beginInitAction();
+  emitBoundedVoidMethod(os, "_pyc_init_primitives", initActions,
+                        plan.tickChunkNodes);
+  ctorOs.flush();
+  os << ctorSignature;
+  os << "    _pyc_init_primitives();\n";
   os << "    _pyc_validate_primitive_bindings();\n";
   os << "    _pyc_init_runtime_controls();\n";
   os << "    #ifdef PYC_ENABLE_CTOR_EVAL\n";
@@ -1435,7 +1550,7 @@ static LogicalResult emitFunc(const SimulationPlan &plan, llvm::raw_ostream &os,
     auto statements = plan.combRegionStatements.find(regionId);
     if (statements == plan.combRegionStatements.end())
       return plan.graph.topNodes[nodeId].op->emitError("missing planned comb statements");
-    if (failed(emitCombMethod(plan.graph, plan.graph.combRegions[regionId],
+    if (failed(emitCombMethod(plan, plan.graph, plan.graph.combRegions[regionId],
                               statements->second, plan.combRegionStatements,
                               os, nt,
                               static_cast<unsigned>(i))))
@@ -2067,14 +2182,14 @@ static LogicalResult emitFunc(const SimulationPlan &plan, llvm::raw_ostream &os,
   os << "  }\n\n";
 
   // tick_compute/tick_commit: two-phase sequential update (hierarchy-aware).
-  //
-  // Large designs can produce enormous tick bodies (notably JanusBccBackendCompat), which
-  // makes a single translation unit fragile and slow to compile. Split tick into helper
-  // parts so --cpp-split=module can shard tick across multiple .cpp files.
-  auto emitTickComputePart = [&](const llvm::SmallVector<unsigned> &chunk,
-                                 unsigned partIdx) {
-    os << "  inline void tick_compute_part_" << partIdx << "() {\n";
-    // Sub-modules (inputs + tick_compute).
+  // The plan bounds both instance and local state work. Keep the helper
+  // boundaries through C++ optimization so large designs remain shardable.
+  auto tickHelperSignature = [](bool needsBoundary) {
+    return needsBoundary ? "  void PYC_NOINLINE " : "  inline void ";
+  };
+  for (auto [part, chunk] : llvm::enumerate(plan.instanceTickChunks)) {
+    os << tickHelperSignature(plan.instanceTickChunks.size() > 1)
+       << "tick_compute_part_" << part << "() {\n";
     for (unsigned nodeId : chunk) {
       const auto &ii = instInfos[instIndex.lookup(nodeId)];
       const SimNode &inst = plan.graph.topNodes[ii.nodeId];
@@ -2083,131 +2198,132 @@ static LogicalResult emitFunc(const SimulationPlan &plan, llvm::raw_ostream &os,
       os << "    " << ii.member << "->tick_compute();\n";
     }
     os << "  }\n\n";
-  };
-
-  auto emitTickCommitPart = [&](const llvm::SmallVector<unsigned> &chunk,
-                                unsigned partIdx) {
-    os << "  inline void tick_commit_part_" << partIdx << "() {\n";
-    // Sub-modules.
+  }
+  for (auto [part, chunk] : llvm::enumerate(plan.instanceTickChunks)) {
+    os << tickHelperSignature(plan.instanceTickChunks.size() > 1)
+       << "tick_commit_part_" << part << "() {\n";
     for (unsigned nodeId : chunk)
       os << "    " << instInfos[instIndex.lookup(nodeId)].member << "->tick_commit();\n";
     os << "  }\n\n";
-  };
-
-  // Emit chunked submodule tick helpers.
-  unsigned subParts = plan.instanceTickChunks.size();
-  for (auto [part, chunk] : llvm::enumerate(plan.instanceTickChunks))
-    emitTickComputePart(chunk, static_cast<unsigned>(part));
-  for (auto [part, chunk] : llvm::enumerate(plan.instanceTickChunks))
-    emitTickCommitPart(chunk, static_cast<unsigned>(part));
+  }
 
   auto regInstanceName = [&](unsigned id) {
     const SimNode &reg = plan.graph.topNodes[id];
     return nt.get(reg.outputIds.front()) + "_inst";
   };
-  // Keep the uncommon reset override out of the normal data-update body.
-  // It computes pending state only; publication still occurs at commit.
+  // Every group samples its clock and reset once. Only the selected path
+  // invokes the ordered register chunks; none of these helpers publishes q.
   for (auto [id, group] : llvm::enumerate(plan.resetGroups)) {
-    os << "  inline void reset_group_compute_" << id << "() {\n";
-    for (unsigned regId : group.regNodeIds)
-      os << "    " << regInstanceName(regId) << "->posedge_reset_compute();\n";
+    auto emitRegParts = [&](llvm::StringRef path, llvm::StringRef method) {
+      for (auto [part, chunk] : llvm::enumerate(group.regChunks)) {
+        os << tickHelperSignature(group.regChunks.size() > 1)
+           << "tick_reset_group_" << id << "_" << path
+           << "_part_" << part << "() {\n";
+        for (unsigned regId : chunk)
+          os << "    " << regInstanceName(regId) << "->" << method << "();\n";
+        os << "  }\n\n";
+      }
+    };
+    emitRegParts("reset", "posedge_reset_compute");
+    emitRegParts("data", "posedge_data_compute");
+    emitRegParts("noedge", "noedge_update");
+    emitRegParts("negedge", "negedge_update");
+    auto emitRegPartCalls = [&](llvm::StringRef path,
+                                llvm::StringRef indent) {
+      for (unsigned part = 0; part < group.regChunks.size(); ++part)
+        os << indent << "tick_reset_group_" << id << "_" << path
+           << "_part_" << part << "();\n";
+    };
+    // Many small reset groups also need a boundary: inlining every group
+    // would otherwise reconstruct an oversized local compute method.
+    os << tickHelperSignature(group.regChunks.size() > 1 ||
+                              plan.localTickCommitChunks.size() > 1)
+       << "tick_reset_group_" << id << "_compute() {\n";
+    std::string suffix = std::to_string(id);
+    std::string now = "_pyc_reset_group_clk_now_" + suffix;
+    std::string edge = "_pyc_reset_group_edge_" + suffix;
+    std::string previous = "_pyc_reset_group_clk_prev_" + suffix;
+    os << "    bool " << now << " = " << nt.get(group.clockValueId) << ".toBool();\n";
+    os << "    bool " << edge << " = !" << previous << " && " << now << ";\n";
+    os << "    " << previous << " = " << now << ";\n";
+    os << "    if (" << edge << ") {\n";
+    os << "      if (__builtin_expect(" << nt.get(group.resetValueId)
+       << ".toBool(), false)) {\n";
+    emitRegPartCalls("reset", "        ");
+    os << "      } else {\n";
+    emitRegPartCalls("data", "        ");
+    os << "      }\n";
+    os << "    } else if (" << now << ") {\n";
+    emitRegPartCalls("noedge", "      ");
+    os << "    } else {\n";
+    emitRegPartCalls("negedge", "      ");
+    os << "    }\n";
     os << "  }\n\n";
   }
 
-  os << "  void tick_compute() {\n";
-  if (!instInfos.empty()) {
-    os << "    // Sub-modules.\n";
-    for (unsigned i = 0; i < subParts; ++i)
-      os << "    tick_compute_part_" << i << "();\n";
-  }
-  os << "    // Local sequential primitives.\n";
-  for (const SimTickAction &action : plan.localTickComputeActions) {
+  auto emitLocalTickCall = [&](const SimTickAction &action,
+                                llvm::StringRef method) {
     unsigned id = action.id;
     switch (action.kind) {
-    case SimTickActionKind::ResetGroup: {
-      const ResetGroupPlan &group = plan.resetGroups[id];
-      std::string suffix = std::to_string(id);
-      std::string now = "_pyc_reset_group_clk_now_" + suffix;
-      std::string edge = "_pyc_reset_group_edge_" + suffix;
-      std::string previous = "_pyc_reset_group_clk_prev_" + suffix;
-      os << "    bool " << now << " = " << nt.get(group.clockValueId) << ".toBool();\n";
-      os << "    bool " << edge << " = !" << previous << " && " << now << ";\n";
-      os << "    " << previous << " = " << now << ";\n";
-      os << "    if (" << edge << ") {\n";
-      os << "      if (__builtin_expect(" << nt.get(group.resetValueId)
-         << ".toBool(), false)) {\n";
-      os << "        reset_group_compute_" << id << "();\n";
-      os << "      } else {\n";
-      for (unsigned regId : group.regNodeIds)
-        os << "        " << regInstanceName(regId) << "->posedge_data_compute();\n";
-      os << "      }\n";
-      os << "    } else if (" << now << ") {\n";
-      for (unsigned regId : group.regNodeIds)
-        os << "      " << regInstanceName(regId) << "->noedge_update();\n";
-      os << "    } else {\n";
-      for (unsigned regId : group.regNodeIds)
-        os << "      " << regInstanceName(regId) << "->negedge_update();\n";
-      os << "    }\n";
-      break;
-    }
+    case SimTickActionKind::ResetGroup:
+      llvm_unreachable("reset groups use a shared compute dispatcher");
     case SimTickActionKind::Reg:
-      os << "    " << regInstanceName(id) << "->tick_compute();\n";
+      os << "    " << regInstanceName(id) << "->" << method << "();\n";
       break;
     case SimTickActionKind::Fifo:
     case SimTickActionKind::AsyncFifo:
-      os << "    " << fifoInstanceName(id) << ".tick_compute();\n";
+      os << "    " << fifoInstanceName(id) << "." << method << "();\n";
       break;
     case SimTickActionKind::ByteMem:
-      os << "    " << memoryInstanceName(id) << ".tick_compute();\n";
+      os << "    " << memoryInstanceName(id) << "." << method << "();\n";
       break;
     case SimTickActionKind::SyncMem:
     case SimTickActionKind::SyncMemDP:
-      os << "    " << memoryInstanceName(id) << "->tick_compute();\n";
+      os << "    " << memoryInstanceName(id) << "->" << method << "();\n";
       break;
     case SimTickActionKind::CdcSync:
       os << "    " << nt.get(plan.graph.topNodes[id].outputIds.front())
-         << "_inst.tick_compute();\n";
+         << "_inst." << method << "();\n";
       break;
     }
+  };
+  for (auto [part, chunk] : llvm::enumerate(plan.localTickComputeChunks)) {
+    os << tickHelperSignature(plan.localTickComputeChunks.size() > 1)
+       << "tick_local_compute_part_" << part << "() {\n";
+    for (const SimTickAction &action : chunk) {
+      if (action.kind == SimTickActionKind::ResetGroup)
+        os << "    tick_reset_group_" << action.id << "_compute();\n";
+      else
+        emitLocalTickCall(action, "tick_compute");
+    }
+    os << "  }\n\n";
   }
+  for (auto [part, chunk] : llvm::enumerate(plan.localTickCommitChunks)) {
+    os << tickHelperSignature(plan.localTickCommitChunks.size() > 1)
+       << "tick_local_commit_part_" << part << "() {\n";
+    for (const SimTickAction &action : chunk) {
+      unsigned id = action.id;
+      // A publication stays adjacent to the state transition it observes.
+      if (plan.commitPropagationNodes.contains(id))
+        emitActivitySnapshots(plan, id, os, nt, "    ");
+      emitLocalTickCall(action, "tick_commit");
+      if (plan.commitPropagationNodes.contains(id))
+        emitActivityPropagation(plan, id, os, nt, "    ");
+    }
+    os << "  }\n\n";
+  }
+  os << "  void tick_compute() {\n";
+  for (unsigned part = 0; part < plan.instanceTickChunks.size(); ++part)
+    os << "    tick_compute_part_" << part << "();\n";
+  for (unsigned part = 0; part < plan.localTickComputeChunks.size(); ++part)
+    os << "    tick_local_compute_part_" << part << "();\n";
   os << "  }\n\n";
 
   os << "  void tick_commit() {\n";
-  if (!instInfos.empty()) {
-    os << "    // Sub-modules.\n";
-    for (unsigned i = 0; i < subParts; ++i)
-      os << "    tick_commit_part_" << i << "();\n";
-  }
-  os << "    // Local sequential primitives.\n";
-  for (const SimTickAction &action : plan.localTickCommitActions) {
-    unsigned id = action.id;
-    if (plan.commitPropagationNodes.contains(id))
-      emitActivitySnapshots(plan, id, os, nt, "    ");
-    switch (action.kind) {
-    case SimTickActionKind::ResetGroup:
-      llvm_unreachable("reset groups cannot commit as one action");
-    case SimTickActionKind::Reg:
-      os << "    " << regInstanceName(id) << "->tick_commit();\n";
-      break;
-    case SimTickActionKind::Fifo:
-    case SimTickActionKind::AsyncFifo:
-      os << "    " << fifoInstanceName(id) << ".tick_commit();\n";
-      break;
-    case SimTickActionKind::ByteMem:
-      os << "    " << memoryInstanceName(id) << ".tick_commit();\n";
-      break;
-    case SimTickActionKind::SyncMem:
-    case SimTickActionKind::SyncMemDP:
-      os << "    " << memoryInstanceName(id) << "->tick_commit();\n";
-      break;
-    case SimTickActionKind::CdcSync:
-      os << "    " << nt.get(plan.graph.topNodes[id].outputIds.front())
-         << "_inst.tick_commit();\n";
-      break;
-    }
-    if (plan.commitPropagationNodes.contains(id))
-      emitActivityPropagation(plan, id, os, nt, "    ");
-  }
+  for (unsigned part = 0; part < plan.instanceTickChunks.size(); ++part)
+    os << "    tick_commit_part_" << part << "();\n";
+  for (unsigned part = 0; part < plan.localTickCommitChunks.size(); ++part)
+    os << "    tick_local_commit_part_" << part << "();\n";
   if (!instInfos.empty()) {
     os << "    // Force re-eval on next eval() only for stateful sub-modules.\n";
     for (unsigned i = 0; i < instInfos.size(); ++i) {
@@ -2258,6 +2374,12 @@ LogicalResult emitCpp(const ModuleSimulationPlan &plan, llvm::raw_ostream &os, c
   os << "#include <memory>\n";
   os << "#include <string>\n";
   os << "#include <cpp/pyc_sim.hpp>\n\n";
+  os << "#ifndef PYC_NOINLINE\n";
+  os << "#if defined(__GNUC__) || defined(__clang__)\n";
+  os << "#define PYC_NOINLINE __attribute__((noinline))\n";
+  os << "#elif defined(_MSC_VER)\n";
+  os << "#define PYC_NOINLINE __declspec(noinline)\n";
+  os << "#else\n#define PYC_NOINLINE\n#endif\n#endif\n\n";
   os << "namespace pyc::gen {\n\n";
 
   for (const SimulationPlan &function : plan.functions) {

@@ -39,6 +39,45 @@ Wide dynamic shift amounts also normalize in shared MLIR before conversion to a
 host `unsigned`, preserving overshift behavior and unknown amount propagation.
 This prevents a 64/128-bit amount such as `1 << 32` from becoming zero in C++.
 
+Scalar slice rewrites erase unused original producers immediately. Leaving a
+dead wide producer attached to its operands prevented the next slice rewrite
+from seeing a single reader, advancing demand only one edge per greedy
+iteration. Deep legal chains could therefore exhaust the default ten iterations.
+The fix retains the iteration limit and observation guards; 64-layer arithmetic,
+mux and mixed chains exercise convergence and independent backend value oracles.
+
+Hierarchical instance cache plans count every vector element, including all
+dimensions and the final partial word of each element. Scalar fingerprints are
+restricted to scalar values of at most 64 bits; vectors use aggregate comparison
+or packed words. The plan verifier checks cache capacity and mode against port
+shapes before C++ emission, preserving the existing runtime cache semantics.
+
+## Compilation cost and integration of `feat/cpp-localize-pch`
+
+The compilation optimizations from `6e07126`, `9f21eb9` and the review fixes in
+`05093c2` are adapted to NewCircuit's current graph/plan architecture. The older
+MLIR-only placement pass and emitter are not restored. Decisions
+0001/0004/0121/0141/0147 govern the integration.
+
+SimulationPlan now owns temporary storage placement and method lifetimes.
+Pure expression scheduling and weighted chunk cuts reduce values crossing
+method boundaries without changing GSIM group boundaries or activity semantics.
+Ports, state, observations, probes, caches and change-detection snapshots retain
+persistent storage. A bounded cut search prevents large chunk limits from
+creating unbounded planning work. See [C++ member placement](../cpp_member_placement.md).
+
+Large reset, compute/commit, constructor and probe-registration paths use
+bounded helpers. The plan verifies state-action coverage and order; commit
+snapshots, writes and activity publication stay adjacent. Core translation
+units use the same whole-method sharding machinery as eval/tick units.
+
+The CLI, manifests, CMake generator and wheel now carry device-header PCH
+configuration. Its cache key is specific to the C++ backend, so toggling PCH
+preserves unchanged JIT and Verilog artifacts. `--cpp-compile-budget` remains
+opt-in. Current modules' compile manifests select the active source/header
+files, preventing obsolete shards left by an in-place rebuild from entering
+the next build. See [device PCH](../cpp_device_pch.md).
+
 Source `graphRefine`, `mergeRegister` and `constructRegs` are disabled and are
 not implementation requirements. FIRRTL width/clock inference and invalid-value
 rules cannot replace PYC's explicit types, enables, CDC and observation phases.
@@ -56,10 +95,19 @@ CCACHE_DISABLE=1 PYC_SIM_JOBS=2 \
 
 The umbrella runs `simulation_plan`, `partition`, `replication`,
 `shared_condition`, `array_split`, `scalar_demand`, `scalar_fixedpoint`, `activity`,
-`primitive_activity`, and the repository's semantic regressions. Dedicated
+`primitive_activity`, `member_placement`, `large_state_probe`, and the
+repository's semantic regressions. Dedicated
 checks require both structural evidence and an independent value oracle;
 execution rewrites compare enabled/disabled variants. Hardware rewrites are
 checked in C++ and Verilog, including reset, observations and X/Z boundaries.
+
+PCH build and cache integration has a separate entry point:
+
+```sh
+PYCC=.pycircuit_out/toolchain/build/bin/pycc PYC_GATE_SKIP_BUILD=1 \
+  PYC_GATE_RUN_ID=newcircuit-pch-port-20260928 \
+  bash flows/scripts/run_cpp_device_pch_gate.sh
+```
 
 `benchmark_gsim_pipeline.py` measures compile time, emitted size and evaluation
 throughput with an independently checked checksum. It is a synthetic 260-stage
@@ -73,6 +121,31 @@ The older evidence below records earlier stages of implementation. Its group
 counts, policy descriptions and byte-identical comparisons describe those
 revisions; the current gate explicitly requests strict bounds where a fixture
 needs one-operation partitions. Default-policy behavior has a separate gate.
+
+## Gate evidence (2026-09-28)
+
+The integrated compiler passed all twelve umbrella suites in one uninterrupted
+run, including member placement, large state/probe compilation and the existing
+semantic regressions. The compiler and wrapper hashes were unchanged during
+the run. Commands, logs and the compiler SHA256 are recorded under
+[`newcircuit-integrated-20260928`](../gates/logs/newcircuit-integrated-20260928/gsim_reproduction_summary.json).
+
+- Scalar fixed-point coverage now includes 22 shapes, with 4,096 C++ and
+  Verilog checks per shape, including deep chains at canonicalize budget one.
+- Rank-two instance-cache tests mutate each vector lane/packed word and compare
+  cached, uncached and split/PCH execution against an independent oracle.
+- Member placement passes 2,048 cases in each of four emission modes, with
+  identical probe values/IDs and activity skips. A separate interleaved-chain
+  fixture reduces cross-method values from 12 to zero and anonymous persistent
+  fields from 16 to four, retaining an independent arithmetic oracle.
+- The 1,024-register fixture passes 98,304 checks in direct C++, split/PCH C++
+  and Verilog. Fresh host compilation took 190.16 s and 158.62 s for the two
+  C++ forms; the 258-register header-only boundary took 28.52 s. These runs
+  occurred under concurrent load and do not establish a general speedup.
+- PCH smoke and the final seven-test integration run pass, including four
+  off/on/on/off counter executions, unchanged JIT/Verilog artifacts and ignored
+  obsolete shards in the same output directory. The pre-fix stale-shard failure
+  is retained as negative evidence in the `pch/` subdirectory.
 
 ## Gate evidence (2026-09-26–27)
 

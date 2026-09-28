@@ -13,7 +13,9 @@
 #include <algorithm>
 #include <functional>
 #include <iterator>
+#include <limits>
 #include <map>
+#include <queue>
 #include <set>
 #include <string>
 #include <tuple>
@@ -47,6 +49,32 @@ static InstanceInterfacePlan planInstanceInterface(const SimNode &node) {
   for (const std::string &path : node.instanceOutputPortPaths)
     result.outputPorts.push_back(unique(sanitizeId(path)));
   return result;
+}
+
+static bool supportsScalarFingerprint(const SimType &type) {
+  return type.shape.empty() && type.width <= 64;
+}
+
+// appendPackedWireWords visits every vector element recursively and writes
+// ceil(element width / 64) words for each one, including partial words.
+static FailureOr<unsigned> instanceCacheWordCount(const SimGraph &graph,
+                                                 const SimNode &node) {
+  uint64_t total = 0;
+  constexpr uint64_t limit = std::numeric_limits<unsigned>::max();
+  for (unsigned inputId : node.inputIds) {
+    const SimType &type = graph.values[inputId].type;
+    uint64_t words = std::max<uint64_t>(
+        1, (static_cast<uint64_t>(type.width) + 63) / 64);
+    for (int64_t dimension : type.shape) {
+      if (dimension <= 0 || static_cast<uint64_t>(dimension) > limit / words)
+        return failure();
+      words *= static_cast<uint64_t>(dimension);
+    }
+    if (words > limit - total)
+      return failure();
+    total += words;
+  }
+  return static_cast<unsigned>(total);
 }
 
 // Match the emitter's existing deterministic node-key allocation. This is
@@ -502,15 +530,212 @@ planActivityBatches(const SimulationPlan &plan, llvm::ArrayRef<unsigned> nodes) 
   return batches;
 }
 
+// Adapt the donor's locality schedule and weighted cuts to graph expression
+// IDs. This only changes a pure method's internal order; SimGraph groups and
+// their activation/topological schedule remain intact. Existing mux batches
+// and nested comb steps retain their original schedules.
+struct PureMethodSchedule {
+  llvm::SmallVector<unsigned> expressions;
+  llvm::SmallVector<unsigned> ends;
+};
+
+static PureMethodSchedule planPureMethods(const SimGraph &graph,
+                                           llvm::ArrayRef<unsigned> original,
+                                           unsigned limit) {
+  PureMethodSchedule fixed;
+  fixed.expressions.assign(original.begin(), original.end());
+  for (unsigned begin = 0; begin < original.size(); begin += limit)
+    fixed.ends.push_back(std::min<unsigned>(original.size(), begin + limit));
+  if (original.size() <= limit)
+    return fixed;
+  const unsigned n = original.size();
+  llvm::DenseMap<unsigned, unsigned> producer;
+  for (auto [index, id] : llvm::enumerate(original))
+    producer.try_emplace(graph.expressions[id].result, index);
+  llvm::SmallVector<llvm::SmallVector<unsigned>> successors(n);
+  llvm::SmallVector<unsigned> indegree(n, 0), remainingUses(n, 0);
+  llvm::SmallVector<uint64_t> weight(n, 0), work(n, 1);
+  llvm::SmallVector<unsigned> depth(n, 1);
+  constexpr uint64_t inf = std::numeric_limits<uint64_t>::max() / 4;
+  for (auto [index, id] : llvm::enumerate(original)) {
+    llvm::SmallSet<unsigned, 4> dependencies;
+    for (unsigned input : graph.expressions[id].operands)
+      if (auto found = producer.find(input); found != producer.end()) {
+        dependencies.insert(found->second);
+        ++remainingUses[found->second];
+      }
+    indegree[index] = dependencies.size();
+    for (unsigned dependency : dependencies)
+      successors[dependency].push_back(index);
+  }
+  for (unsigned i = 0; i < n; ++i) {
+    const SimExpr &expr = graph.expressions[original[i]];
+    const SimValue &value = graph.values[expr.result];
+    // External/observable wires cannot benefit from method-local storage.
+    if (value.observable || value.sourceNameIsExplicit || expr.inlineIntoConsumer ||
+        expr.omitOriginalEvaluation || value.sourceUseCount != remainingUses[i])
+      continue;
+    uint64_t w = 1 + (static_cast<uint64_t>(value.type.width) + 63) / 64;
+    for (int64_t d : value.type.shape)
+      w = d > 0 && static_cast<uint64_t>(d) <= inf / w ? w * d : inf;
+    weight[i] = w;
+  }
+  for (unsigned i = n; i-- > 0;)
+    for (unsigned next : successors[i]) {
+      work[i] = std::min(inf, work[i] + work[next]);
+      depth[i] = std::max(depth[i], depth[next] + 1);
+    }
+  struct Ready {
+    uint64_t work;
+    unsigned depth;
+    int64_t delta;
+    uint64_t closed;
+    unsigned index;
+  };
+  auto worse = [](const Ready &a, const Ready &b) {
+    return std::tie(a.work, a.depth, a.delta) != std::tie(b.work, b.depth, b.delta)
+               ? std::tie(a.work, a.depth, a.delta) > std::tie(b.work, b.depth, b.delta)
+               : a.closed != b.closed ? a.closed < b.closed : a.index > b.index;
+  };
+  std::priority_queue<Ready, std::vector<Ready>, decltype(worse)> ready(worse);
+  auto enqueue = [&](unsigned index) {
+    uint64_t closed = 0;
+    llvm::DenseMap<unsigned, unsigned> consumed;
+    for (unsigned input : graph.expressions[original[index]].operands)
+      if (auto found = producer.find(input); found != producer.end())
+        ++consumed[found->second];
+    for (const auto &entry : consumed)
+      if (remainingUses[entry.first] == entry.second)
+        closed = std::min(inf, closed + weight[entry.first]);
+    ready.push({work[index], depth[index],
+                static_cast<int64_t>(weight[index]) - static_cast<int64_t>(closed),
+                closed, index});
+  };
+  for (unsigned i = 0; i < n; ++i)
+    if (indegree[i] == 0)
+      enqueue(i);
+  PureMethodSchedule scheduled;
+  while (!ready.empty()) {
+    unsigned selected = ready.top().index;
+    ready.pop();
+    scheduled.expressions.push_back(original[selected]);
+    for (unsigned input : graph.expressions[original[selected]].operands)
+      if (auto found = producer.find(input); found != producer.end())
+        --remainingUses[found->second];
+    for (unsigned next : successors[selected])
+      if (--indegree[next] == 0)
+        enqueue(next);
+  }
+  if (scheduled.expressions.size() != n)
+    return fixed;
+  auto cutData = [&](llvm::ArrayRef<unsigned> order) {
+    llvm::DenseMap<unsigned, unsigned> position;
+    for (auto [i, id] : llvm::enumerate(order))
+      position.try_emplace(graph.expressions[id].result, i);
+    llvm::SmallVector<unsigned> last(n);
+    for (unsigned i = 0; i < n; ++i)
+      last[i] = i;
+    for (auto [i, id] : llvm::enumerate(order))
+      for (unsigned input : graph.expressions[id].operands)
+        if (auto found = position.find(input); found != position.end())
+          last[found->second] = std::max<unsigned>(last[found->second], i);
+    return last;
+  };
+  auto last = cutData(scheduled.expressions);
+  const unsigned parts = fixed.ends.size(), slack = parts * limit - n;
+  // The donor's full deficit DP is quadratic in a large CLI chunk limit.
+  // Keep exact states for small cuts and deterministic endpoint-preserving
+  // sampling otherwise; bound work before allocating the predecessor table.
+  constexpr uint64_t maxWork = 4000000;
+  const uint64_t perStateWork = static_cast<uint64_t>(parts) *
+                                (static_cast<uint64_t>(limit) + 65);
+  unsigned states = static_cast<unsigned>(std::min<uint64_t>(
+      std::min<uint64_t>(64, static_cast<uint64_t>(slack) + 1),
+      maxWork / std::max<uint64_t>(1, perStateWork)));
+  if (states == 0 || (slack && states < 2))
+    return fixed;
+  std::vector<unsigned> deficits;
+  for (unsigned i = 0; i < states; ++i)
+    deficits.push_back(states == 1 ? 0 :
+        static_cast<uint64_t>(i) * slack / (states - 1));
+  std::vector<uint64_t> previous(states, inf), current(states, inf);
+  std::vector<std::vector<unsigned>> pred(parts + 1,
+      std::vector<unsigned>(states, ~0u));
+  previous[0] = 0;
+  for (unsigned part = 1; part <= parts; ++part) {
+    std::fill(current.begin(), current.end(), inf);
+    for (unsigned state = 0; state < states; ++state) {
+      unsigned deficit = deficits[state];
+      unsigned end = part * limit - deficit;
+      if (end == 0 || end > n)
+        continue;
+      unsigned maxLength = std::min(limit, end);
+      std::vector<uint64_t> cost(maxLength + 1, 0);
+      for (unsigned length = 1; length <= maxLength; ++length) {
+        unsigned pos = end - length;
+        unsigned value = graph.expressions[scheduled.expressions[pos]].result;
+        cost[length] = cost[length - 1];
+        if (last[pos] >= end)
+          cost[length] = std::min(inf, cost[length] + weight[producer.lookup(value)]);
+      }
+      for (unsigned prior = 0; prior <= state; ++prior) {
+        unsigned priorDeficit = deficits[prior];
+        if (previous[prior] == inf || (part - 1) * limit < priorDeficit)
+          continue;
+        unsigned begin = (part - 1) * limit - priorDeficit, length = end - begin;
+        if (length == 0 || length > maxLength)
+          continue;
+        uint64_t candidate = std::min(inf, previous[prior] + cost[length]);
+        if (candidate < current[state]) {
+          current[state] = candidate;
+          pred[part][state] = prior;
+        }
+      }
+    }
+    previous.swap(current);
+  }
+  if (previous.back() == inf)
+    return fixed;
+  unsigned state = states - 1;
+  for (unsigned part = parts; part > 0; --part) {
+    scheduled.ends.push_back(part * limit - deficits[state]);
+    state = pred[part][state];
+  }
+  std::reverse(scheduled.ends.begin(), scheduled.ends.end());
+  auto score = [&](const PureMethodSchedule &schedule) {
+    auto lastUse = cutData(schedule.expressions);
+    uint64_t cost = 0;
+    unsigned begin = 0, crosses = 0;
+    for (unsigned end : schedule.ends) {
+      for (unsigned i = begin; i < end; ++i)
+        if (lastUse[i] >= end) {
+          unsigned value = graph.expressions[schedule.expressions[i]].result;
+          uint64_t w = weight[producer.lookup(value)];
+          cost = std::min(inf, cost + w);
+          crosses += w != 0;
+        }
+      begin = end;
+    }
+    return std::make_pair(cost, crosses);
+  };
+  return score(scheduled) <= score(fixed) ? scheduled : fixed;
+}
+
 static void planGroupStatements(SimulationPlan &plan) {
   for (unsigned nodeId : plan.graph.groupedNodes) {
     const SimNode &group = plan.graph.topNodes[nodeId];
     GroupStatementPlan statements;
     statements.replicatedExpressionIds = group.replicatedExpressionIds;
-    for (unsigned begin = 0; begin < group.expressionIds.size();) {
-      unsigned end = begin + std::min<unsigned>(
-                                 plan.combChunkNodes,
-                                 group.expressionIds.size() - begin);
+    PureMethodSchedule schedule;
+    if (group.muxConditionBatches.empty())
+      schedule = planPureMethods(plan.graph, group.expressionIds, plan.combChunkNodes);
+    else {
+      schedule.expressions = group.expressionIds;
+      for (unsigned begin = 0; begin < group.expressionIds.size(); begin += plan.combChunkNodes)
+        schedule.ends.push_back(std::min<unsigned>(group.expressionIds.size(), begin + plan.combChunkNodes));
+    }
+    unsigned begin = 0;
+    for (unsigned end : schedule.ends) {
       llvm::SmallVector<SimStatement> chunk;
       for (unsigned index = begin; index < end;) {
         const MuxConditionBatch *batch = nullptr;
@@ -521,7 +746,7 @@ static void planGroupStatements(SimulationPlan &plan) {
           }
         SimStatement statement;
         if (!batch) {
-          statement.expressionId = group.expressionIds[index++];
+          statement.expressionId = schedule.expressions[index++];
         } else {
           statement.kind = SimStatementKind::MuxCondition;
           statement.selectorId = batch->selectorId;
@@ -547,13 +772,29 @@ static void planCombRegionStatements(SimulationPlan &plan) {
     CombRegionStatementPlan statements;
     if (region.steps.empty())
       statements.chunks.emplace_back();
-    for (unsigned begin = 0; begin < region.steps.size();) {
-      unsigned end = begin + std::min<unsigned>(
-                                 plan.combChunkNodes,
-                                 region.steps.size() - begin);
-      statements.chunks.emplace_back(region.steps.begin() + begin,
-                                      region.steps.begin() + end);
-      begin = end;
+    bool pureExpressions = llvm::all_of(region.steps, [](const SimCombStep &step) {
+      return step.expressionId != ~0u;
+    });
+    if (pureExpressions && !region.steps.empty()) {
+      llvm::SmallVector<unsigned> ids;
+      for (const SimCombStep &step : region.steps)
+        ids.push_back(step.expressionId);
+      auto schedule = planPureMethods(plan.graph, ids, plan.combChunkNodes);
+      unsigned begin = 0;
+      for (unsigned end : schedule.ends) {
+        auto &chunk = statements.chunks.emplace_back();
+        for (; begin < end; ++begin)
+          chunk.push_back({schedule.expressions[begin], ~0u});
+      }
+    } else {
+      for (unsigned begin = 0; begin < region.steps.size();) {
+        unsigned end = begin + std::min<unsigned>(
+                                   plan.combChunkNodes,
+                                   region.steps.size() - begin);
+        statements.chunks.emplace_back(region.steps.begin() + begin,
+                                        region.steps.begin() + end);
+        begin = end;
+      }
     }
     plan.combRegionStatements.try_emplace(
         static_cast<unsigned>(regionId), std::move(statements));
@@ -651,6 +892,216 @@ planPrimitiveEvalChunks(const SimulationPlan &plan) {
   return chunks;
 }
 
+static uint64_t cppPlacementWeight(const SimType &type) {
+  uint64_t weight = 1 + (static_cast<uint64_t>(type.width) + 63) / 64;
+  for (int64_t dimension : type.shape) {
+    if (dimension <= 0 || static_cast<uint64_t>(dimension) >
+                              std::numeric_limits<uint64_t>::max() / weight)
+      return std::numeric_limits<uint64_t>::max() / 4;
+    weight *= static_cast<uint64_t>(dimension);
+  }
+  return weight;
+}
+
+struct PlannedCppStorage {
+  llvm::SmallVector<CppValueStorage> storage;
+  std::vector<std::string> owners;
+  std::map<std::string, llvm::SmallVector<unsigned>> locals;
+  CppPlacementSummary summary;
+};
+
+// A method-local value must be defined on every execution before all of its
+// reads in that same method. Persistent references are a separate, explicit
+// root set; in particular caches and old-output snapshots are not SSA uses.
+static PlannedCppStorage planCppStorage(const SimulationPlan &plan) {
+  const SimGraph &graph = plan.graph;
+  const unsigned count = graph.values.size();
+  PlannedCppStorage result;
+  result.storage.assign(count, CppValueStorage::Struct);
+  result.owners.resize(count);
+  std::vector<std::set<std::string>> reads(count), writes(count);
+  llvm::DenseSet<unsigned> pinned, candidates;
+  llvm::DenseMap<unsigned, unsigned> bindings;
+  for (const SimCombRegion &region : graph.combRegions)
+    for (auto [arg, input] : llvm::zip(region.argumentIds, region.inputIds))
+      bindings.try_emplace(arg, input);
+  auto canonical = [&](unsigned value) {
+    // Nested comb block arguments are C++ aliases, not separate storage.
+    for (unsigned depth = 0; depth < count; ++depth) {
+      auto next = bindings.find(value);
+      if (next == bindings.end())
+        break;
+      value = next->second;
+    }
+    return value;
+  };
+  auto pin = [&](unsigned value) { pinned.insert(canonical(value)); };
+  auto pinAll = [&](const auto &values) {
+    for (unsigned value : values)
+      pin(value);
+  };
+  pinAll(graph.inputValueIds);
+  pinAll(graph.outputValueIds);
+  pinAll(graph.namedProbeValueIds);
+  for (unsigned value = 0; value < count; ++value)
+    if (graph.values[value].observable ||
+        graph.values[value].sourceNameIsExplicit)
+      pin(value);
+  for (const SimEdge &edge : graph.edges)
+    pin(edge.valueId);
+  for (auto [id, node] : llvm::enumerate(graph.topNodes)) {
+    if (plan.groupByNode.count(static_cast<unsigned>(id)))
+      continue;
+    // Includes ports, state/primitive reference bindings, ordinary eval
+    // expressions, assigns and the external interface of explicit combs.
+    pinAll(node.inputIds);
+    pinAll(node.outputIds);
+    if (node.assignedValueId != ~0u)
+      pin(node.assignedValueId);
+    if (node.assignedFromId != ~0u)
+      pin(node.assignedFromId);
+  }
+  for (const auto &entry : plan.groupActivations)
+    pinAll(entry.second.inputIds);
+  for (const auto &entry : plan.groupPropagations)
+    for (const GroupPropagationTarget &target : entry.second)
+      pinAll(target.valueIds);
+  pinAll(plan.fingerprintInputs);
+  for (const auto &entry : plan.registerProbeTargets) {
+    pin(entry.first);
+    pin(entry.second);
+  }
+
+  using InlineExpressions = llvm::DenseMap<unsigned, unsigned>;
+  std::function<void(unsigned, const std::string &, const InlineExpressions &)> read;
+  read = [&](unsigned value, const std::string &owner,
+             const InlineExpressions &inlined) {
+    auto expression = inlined.find(value);
+    if (expression != inlined.end()) {
+      for (unsigned operand : graph.expressions[expression->second].operands)
+        read(operand, owner, inlined);
+      return;
+    }
+    reads[canonical(value)].insert(owner);
+  };
+  auto expression = [&](unsigned id, const std::string &owner,
+                         InlineExpressions *inlined) {
+    const SimExpr &expr = graph.expressions[id];
+    candidates.insert(expr.result);
+    if (expr.omitOriginalEvaluation)
+      return;
+    if (inlined && expr.inlineIntoConsumer) {
+      inlined->try_emplace(expr.result, id);
+      return;
+    }
+    writes[canonical(expr.result)].insert(owner);
+    const InlineExpressions empty;
+    for (unsigned operand : expr.operands)
+      read(operand, owner, inlined ? *inlined : empty);
+  };
+  for (unsigned nodeId : graph.groupedNodes) {
+    const auto &statements = plan.groupStatements.find(nodeId)->second;
+    const std::string method = "eval_sim_group_" +
+                              std::to_string(plan.groupByNode.lookup(nodeId));
+    InlineExpressions inlined;
+    for (unsigned id : statements.replicatedExpressionIds)
+      expression(id, method, &inlined);
+    for (auto [part, chunk] : llvm::enumerate(statements.chunks)) {
+      const std::string owner = statements.chunks.size() > 1
+                                   ? method + "_part_" + std::to_string(part)
+                                   : method;
+      for (const SimStatement &statement : chunk) {
+        if (statement.kind == SimStatementKind::Expression) {
+          expression(statement.expressionId, owner, &inlined);
+        } else {
+          read(statement.selectorId, owner, inlined);
+          for (const PlannedMuxAssignment &assignment : statement.muxAssignments) {
+            candidates.insert(assignment.resultId);
+            writes[canonical(assignment.resultId)].insert(owner);
+            read(assignment.trueValueId, owner, inlined);
+            read(assignment.falseValueId, owner, inlined);
+          }
+        }
+      }
+    }
+  }
+  const InlineExpressions empty;
+  std::function<void(unsigned, const std::string &)> nested;
+  auto yields = [&](const SimCombRegion &region, const std::string &owner) {
+    for (auto [value, yielded] : llvm::zip(region.resultIds, region.yieldIds)) {
+      candidates.insert(value);
+      writes[canonical(value)].insert(owner);
+      read(yielded, owner, empty);
+    }
+  };
+  nested = [&](unsigned id, const std::string &owner) {
+    for (const auto &chunk : plan.combRegionStatements.find(id)->second.chunks)
+      for (const SimCombStep &step : chunk) {
+        if (step.expressionId != ~0u)
+          expression(step.expressionId, owner, nullptr);
+        else
+          nested(step.nestedRegionId, owner);
+      }
+    yields(graph.combRegions[id], owner);
+  };
+  for (auto [index, nodeId] : llvm::enumerate(plan.operationOrder.combs)) {
+    const unsigned regionId = graph.topNodes[nodeId].combRegionId;
+    const auto &statements = plan.combRegionStatements.find(regionId)->second;
+    const std::string method = "eval_comb_" + std::to_string(index);
+    for (auto [part, chunk] : llvm::enumerate(statements.chunks)) {
+      const std::string owner = statements.chunks.size() > 1
+                                   ? method + "_part_" + std::to_string(part)
+                                   : method;
+      for (const SimCombStep &step : chunk) {
+        if (step.expressionId != ~0u)
+          expression(step.expressionId, owner, nullptr);
+        else
+          nested(step.nestedRegionId, owner);
+      }
+    }
+    yields(graph.combRegions[regionId], method);
+  }
+  for (unsigned value : graph.declarationValueIds) {
+    const SimValue &signal = graph.values[value];
+    if (!pinned.contains(value) && candidates.contains(value)) {
+      if (reads[value].empty() && writes[value].empty()) {
+        result.storage[value] = CppValueStorage::Omitted;
+        ++result.summary.omittedValues;
+        continue;
+      }
+      if (writes[value].size() == 1 &&
+          (reads[value].empty() || reads[value] == writes[value])) {
+        result.storage[value] = CppValueStorage::Local;
+        result.owners[value] = *writes[value].begin();
+        result.locals[result.owners[value]].push_back(value);
+        ++result.summary.localInMethod;
+        continue;
+      }
+      if (!writes[value].empty()) {
+        ++result.summary.crossPartPromoted;
+        ++result.summary.scheduledCrossMethod;
+        result.summary.scheduledCutWeight += cppPlacementWeight(signal.type);
+      }
+    }
+    ++result.summary.structMembers;
+    if (signal.observable || signal.sourceNameIsExplicit)
+      ++result.summary.probePinnedStruct;
+  }
+  return result;
+}
+
+template <typename T>
+static llvm::SmallVector<llvm::SmallVector<T>>
+planTickChunks(llvm::ArrayRef<T> actions, unsigned limit) {
+  llvm::SmallVector<llvm::SmallVector<T>> chunks;
+  for (const T &action : actions) {
+    if (chunks.empty() || chunks.back().size() == limit)
+      chunks.emplace_back();
+    chunks.back().push_back(action);
+  }
+  return chunks;
+}
+
 static void planLocalTickActions(
     const SimulationPlan &plan, llvm::SmallVector<SimTickAction> &compute,
     llvm::SmallVector<SimTickAction> &commit) {
@@ -736,19 +1187,34 @@ LogicalResult SimulationPlan::verify() const {
     if (found == combRegionStatements.end())
       return failure();
     const auto &chunks = found->second.chunks;
-    unsigned expectedChunks = region.steps.empty()
-                                  ? 1
-                                  : 1 + (region.steps.size() - 1) / combChunkNodes;
-    if (chunks.size() != expectedChunks)
+    llvm::SmallVector<SimCombStep> expectedSteps = region.steps;
+    llvm::SmallVector<unsigned> ends;
+    bool pureExpressions = llvm::all_of(region.steps, [](const SimCombStep &step) {
+      return step.expressionId != ~0u;
+    });
+    if (pureExpressions && !region.steps.empty()) {
+      llvm::SmallVector<unsigned> ids;
+      for (const SimCombStep &step : region.steps)
+        ids.push_back(step.expressionId);
+      auto schedule = planPureMethods(graph, ids, combChunkNodes);
+      ends = std::move(schedule.ends);
+      for (auto [i, expression] : llvm::enumerate(schedule.expressions))
+        expectedSteps[i].expressionId = expression;
+    } else {
+      if (region.steps.empty())
+        ends.push_back(0);
+      for (unsigned begin = 0; begin < region.steps.size(); begin += combChunkNodes)
+        ends.push_back(std::min<unsigned>(region.steps.size(), begin + combChunkNodes));
+    }
+    if (chunks.size() != ends.size())
       return failure();
     unsigned cursor = 0;
-    for (const auto &chunk : chunks) {
-      unsigned expectedSize = std::min<unsigned>(
-          combChunkNodes, region.steps.size() - cursor);
-      if (chunk.size() != expectedSize)
+    for (auto [part, chunk] : llvm::enumerate(chunks)) {
+      unsigned expectedSize = ends[part] - cursor;
+      if (chunk.size() != expectedSize || chunk.size() > combChunkNodes)
         return failure();
       for (const SimCombStep &step : chunk) {
-        const SimCombStep &expected = region.steps[cursor++];
+        const SimCombStep &expected = expectedSteps[cursor++];
         if (step.expressionId != expected.expressionId ||
             step.nestedRegionId != expected.nestedRegionId)
           return failure();
@@ -789,20 +1255,26 @@ LogicalResult SimulationPlan::verify() const {
             group.replicatedExpressionIds)
       return failure();
     const GroupStatementPlan &statements = found->second;
-    unsigned expectedChunks =
-        1 + (group.expressionIds.size() - 1) / combChunkNodes;
-    if (statements.chunks.size() != expectedChunks)
+    PureMethodSchedule schedule;
+    if (group.muxConditionBatches.empty())
+      schedule = planPureMethods(graph, group.expressionIds, combChunkNodes);
+    else {
+      schedule.expressions = group.expressionIds;
+      for (unsigned begin = 0; begin < group.expressionIds.size(); begin += combChunkNodes)
+        schedule.ends.push_back(std::min<unsigned>(group.expressionIds.size(), begin + combChunkNodes));
+    }
+    if (statements.chunks.size() != schedule.ends.size())
       return failure();
     unsigned cursor = 0;
-    for (const auto &chunk : statements.chunks) {
-      unsigned chunkEnd = cursor + std::min<unsigned>(
-                                       combChunkNodes,
-                                       group.expressionIds.size() - cursor);
+    for (auto [part, chunk] : llvm::enumerate(statements.chunks)) {
+      unsigned chunkEnd = schedule.ends[part];
+      if (chunkEnd <= cursor || chunkEnd - cursor > combChunkNodes)
+        return failure();
       for (const SimStatement &statement : chunk) {
         if (cursor >= chunkEnd)
           return failure();
         if (statement.kind == SimStatementKind::Expression) {
-          if (statement.expressionId != group.expressionIds[cursor] ||
+          if (statement.expressionId != schedule.expressions[cursor] ||
               statement.selectorId != ~0u ||
               !statement.muxAssignments.empty())
             return failure();
@@ -1001,6 +1473,14 @@ LogicalResult SimulationPlan::verify() const {
         group.clockValueId >= graph.values.size() ||
         group.resetValueId >= graph.values.size())
       return failure();
+    llvm::SmallVector<unsigned> chunkRegs;
+    for (const auto &chunk : group.regChunks) {
+      if (chunk.empty() || chunk.size() > tickChunkNodes)
+        return failure();
+      chunkRegs.append(chunk.begin(), chunk.end());
+    }
+    if (chunkRegs != group.regNodeIds)
+      return failure();
     for (unsigned id : group.regNodeIds) {
       if (id >= graph.topNodes.size() || !batchedRegs.insert(id).second)
         return failure();
@@ -1013,13 +1493,22 @@ LogicalResult SimulationPlan::verify() const {
     }
   }
   for (unsigned id : fingerprintInputs)
-    if (id >= graph.values.size() || !graph.values[id].type.shape.empty() ||
-        graph.values[id].type.width > 64)
-      return failure();
-  for (const auto &entry : instanceCaches)
+    if (id >= graph.values.size() ||
+        !supportsScalarFingerprint(graph.values[id].type))
+      return graph.function->emitError(
+          "simulation plan input fingerprint requires a scalar of at most 64 bits");
+  for (const auto &entry : instanceCaches) {
     if (entry.first >= graph.topNodes.size() ||
         graph.topNodes[entry.first].kind != SimNodeKind::Instance)
       return failure();
+    const SimNode &instance = graph.topNodes[entry.first];
+    auto expectedWords = instanceCacheWordCount(graph, instance);
+    if (failed(expectedWords) || entry.second.packedWords != *expectedWords ||
+        entry.second.usePackedWords !=
+            (instance.inputIds.size() >= 12 || *expectedWords >= 16))
+      return instance.op->emitError(
+          "simulation instance input cache does not match its port shapes");
+  }
   for (const auto &entry : instanceInterfaces)
     if (entry.first >= graph.topNodes.size() ||
         graph.topNodes[entry.first].kind != SimNodeKind::Instance ||
@@ -1086,6 +1575,18 @@ LogicalResult SimulationPlan::verify() const {
   if (!sameActions(localTickComputeActions, expectedCompute) ||
       !sameActions(localTickCommitActions, expectedCommit))
     return failure();
+  auto validTickChunks = [&](const auto &chunks, const auto &actions) {
+    llvm::SmallVector<SimTickAction> flat;
+    for (const auto &chunk : chunks) {
+      if (chunk.empty() || chunk.size() > tickChunkNodes)
+        return false;
+      flat.append(chunk.begin(), chunk.end());
+    }
+    return sameActions(flat, actions);
+  };
+  if (!validTickChunks(localTickComputeChunks, localTickComputeActions) ||
+      !validTickChunks(localTickCommitChunks, localTickCommitActions))
+    return failure();
   for (const ScheduledComponent &component : sccOrder)
     if (!validOrder(component.nodeIds))
       return failure();
@@ -1110,6 +1611,18 @@ LogicalResult SimulationPlan::verify() const {
     if (evalNodeOrder.size() != expected)
       return failure();
   }
+  auto placement = planCppStorage(*this);
+  const auto &a = cppPlacementSummary;
+  const auto &b = placement.summary;
+  if (cppValueStorage != placement.storage ||
+      cppValueOwners != placement.owners || cppMethodLocals != placement.locals ||
+      std::tie(a.structMembers, a.localInMethod, a.probePinnedStruct,
+               a.crossPartPromoted, a.scheduledCrossMethod,
+               a.scheduledCutWeight, a.omittedValues) !=
+      std::tie(b.structMembers, b.localInMethod, b.probePinnedStruct,
+               b.crossPartPromoted, b.scheduledCrossMethod,
+               b.scheduledCutWeight, b.omittedValues))
+    return graph.function->emitError("simulation C++ value placement is incomplete");
   return success();
 }
 
@@ -1148,10 +1661,14 @@ FailureOr<SimulationPlan> buildSimulationPlan(SimGraph graph,
       ++plan.primitiveCount;
     if (node.kind == SimNodeKind::Instance) {
       InstanceCachePlan cache;
+      auto packedWords = instanceCacheWordCount(plan.graph, node);
+      if (failed(packedWords)) {
+        node.op->emitError("simulation instance input cache exceeds supported word count");
+        return failure();
+      }
+      cache.packedWords = *packedWords;
       for (unsigned inputId : node.inputIds) {
-        unsigned width = plan.graph.values[inputId].type.width;
-        cache.packedWords += std::max(1u, (width + 63u) / 64u);
-        if (width <= 64)
+        if (supportsScalarFingerprint(plan.graph.values[inputId].type))
           plan.fingerprintInputs.insert(inputId);
       }
       cache.usePackedWords = node.inputIds.size() >= 12 ||
@@ -1174,20 +1691,20 @@ FailureOr<SimulationPlan> buildSimulationPlan(SimGraph graph,
     }
     if (node.kind == SimNodeKind::Fifo) {
       unsigned dataId = node.inputIds[3];
-      if (plan.graph.values[dataId].type.width <= 64)
+      if (supportsScalarFingerprint(plan.graph.values[dataId].type))
         plan.fingerprintInputs.insert(dataId);
       plan.invalidateCachesOnCommit.insert(nodeId);
     }
     if (node.kind == SimNodeKind::AsyncFifo) {
       unsigned dataId = node.inputIds[5];
-      if (plan.graph.values[dataId].type.width <= 64)
+      if (supportsScalarFingerprint(plan.graph.values[dataId].type))
         plan.fingerprintInputs.insert(dataId);
       plan.invalidateCachesOnCommit.insert(nodeId);
     }
     if (node.kind == SimNodeKind::ByteMem) {
       for (unsigned index : {2u, 4u, 5u}) {
         unsigned valueId = node.inputIds[index];
-        if (plan.graph.values[valueId].type.width <= 64)
+        if (supportsScalarFingerprint(plan.graph.values[valueId].type))
           plan.fingerprintInputs.insert(valueId);
       }
       plan.invalidateCachesOnCommit.insert(nodeId);
@@ -1217,11 +1734,18 @@ FailureOr<SimulationPlan> buildSimulationPlan(SimGraph graph,
     resetGroups[{reg.inputIds[0], reg.inputIds[1]}].push_back(id);
   }
   for (auto &[key, regs] : resetGroups)
-    if (regs.size() >= 2)
+    if (regs.size() >= 2) {
+      auto chunks = planTickChunks<unsigned>(regs, plan.tickChunkNodes);
       plan.resetGroups.push_back(ResetGroupPlan{key.first, key.second,
-                                                std::move(regs)});
+                                                std::move(regs),
+                                                std::move(chunks)});
+    }
   planLocalTickActions(plan, plan.localTickComputeActions,
                        plan.localTickCommitActions);
+  plan.localTickComputeChunks = planTickChunks<SimTickAction>(
+      plan.localTickComputeActions, plan.tickChunkNodes);
+  plan.localTickCommitChunks = planTickChunks<SimTickAction>(
+      plan.localTickCommitActions, plan.tickChunkNodes);
   DependencyGraph comb;
   if (buildDependencies(plan.graph, names, false, comb))
     plan.combTopological = topoOrder(comb, plan.combNodeOrder);
@@ -1245,6 +1769,11 @@ FailureOr<SimulationPlan> buildSimulationPlan(SimGraph graph,
     plan.evalActivityChunks.push_back(planActivityBatches(
         plan, llvm::ArrayRef(plan.evalNodeOrder).slice(begin, size)));
   }
+  auto placement = planCppStorage(plan);
+  plan.cppValueStorage = std::move(placement.storage);
+  plan.cppValueOwners = std::move(placement.owners);
+  plan.cppMethodLocals = std::move(placement.locals);
+  plan.cppPlacementSummary = placement.summary;
   if (failed(plan.verify())) {
     function.emitError("simulation plan is incomplete");
     return failure();

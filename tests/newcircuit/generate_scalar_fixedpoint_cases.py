@@ -39,6 +39,42 @@ def add(name, body, *, model=0, state=False, full=False, keep=False,
 extract = '    %y = pyc.extract %n {lsb = 0 : i64, msb = 7 : i64} : i64 -> i8\n'
 trunc = '    %y = pyc.trunc %n : i64 -> i8\n'
 sum_op = '    %sum = pyc.add %a, %b : i64, i64 -> i64\n'
+
+# Demand must reach a fixed point beyond the greedy driver's default ten
+# iterations. These generic chains are independent of any external model.
+for kind, model in (('add', 4), ('mux', 5)):
+    lines = []
+    previous = '%a'
+    for index in range(64):
+        result = f'%chain{index}'
+        if kind == 'add':
+            lines.append(f'    {result} = pyc.add {previous}, %b : i64, i64 -> i64')
+        else:
+            lines.append(f'    %condition{index} = pyc.extract %b {{lsb = {index} : i64}} : i64 -> i1')
+            lines.append(f'    {result} = pyc.mux %condition{index}, {previous}, %b : i1, i64, i64 -> i64')
+        previous = result
+    lines.append(f'    %y = pyc.trunc {previous} : i64 -> i8')
+    add(f'deep_{kind}', '\n'.join(lines) + '\n', model=model,
+        add_width=8 if kind == 'add' else 0)
+
+lines = []
+previous = '%a'
+for index in range(64):
+    result = f'%mixed{index}'
+    if index % 4 == 0:
+        lines.append(f'    {result} = pyc.mul {previous}, %b : i64, i64 -> i64')
+    elif index % 4 == 1:
+        lines.append(f'    {result} = pyc.not {previous} : i64')
+    elif index % 4 == 2:
+        lines.append(f'    {result} = pyc.xor {previous}, %b : i64, i64 -> i64')
+    else:
+        lines.append(f'    %joined{index} = pyc.concat (%b, {previous}) : (i64, i64) -> i128')
+        lines.append(f'    {result} = pyc.trunc %joined{index} : i128 -> i64')
+    previous = result
+lines += [f'    %shifted = pyc.shli {previous} {{amount = 1 : i64}} : i64',
+          '    %y = pyc.trunc %shifted : i64 -> i8']
+add('deep_mixed', '\n'.join(lines) + '\n', model=6, add_width=0)
+
 for reader in ('extract', 'trunc', 'fullwidth', 'kept'):
     keep = reader == 'kept'
     full = reader == 'fullwidth'

@@ -1,0 +1,23 @@
+{
+  "expression_count": 16,
+  "chunk_cap": 4,
+  "cross_method_values": 12,
+  "cut_weight": 27,
+  "cut_bit_sum": 648,
+  "persistent_expression_fields": 16,
+  "cross_values": [
+    "pyc_add_1",
+    "pyc_add_10",
+    "pyc_add_11",
+    "pyc_add_12",
+    "pyc_add_2",
+    "pyc_add_3",
+    "pyc_add_4",
+    "pyc_add_9",
+    "pyc_xor_5",
+    "pyc_xor_6",
+    "pyc_xor_7",
+    "pyc_xor_8"
+  ],
+  "compiler_sha256": "12955eeead33e7fb48fa9f6a939e8d8999885d7fe0e667efea3991f09d88af78"
+}

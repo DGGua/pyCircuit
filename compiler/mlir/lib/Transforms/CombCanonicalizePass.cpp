@@ -613,10 +613,14 @@ struct ExtractThroughConcat : public OpRewritePattern<pyc::ExtractOp> {
       return failure();
     if (lowParts.size() == 1) {
       rewriter.replaceOp(op, lowParts.front());
+      if (concat.getResult().use_empty())
+        rewriter.eraseOp(concat);
       return success();
     }
     std::reverse(lowParts.begin(), lowParts.end());
     rewriter.replaceOpWithNewOp<pyc::ConcatOp>(op, resultType, lowParts);
+    if (concat.getResult().use_empty())
+      rewriter.eraseOp(concat);
     return success();
   }
 };
@@ -635,6 +639,7 @@ struct ExtractThroughNot : public OpRewritePattern<pyc::ExtractOp> {
         op.getLoc(), op.getResult().getType(), invert.getIn(), op.getLsb(),
         op.getMsbAttr());
     rewriter.replaceOpWithNewOp<pyc::NotOp>(op, part);
+    rewriter.eraseOp(invert);
     return success();
   }
 };
@@ -1118,6 +1123,8 @@ struct ExtractThroughBitwise : public OpRewritePattern<pyc::ExtractOp> {
         op.getLsb(), op.getMsbAttr());
     rewriter.replaceOpWithNewOp<BitwiseOp>(
         op, op.getResult().getType(), lhs, rhs);
+    if (bitwise.getResult().use_empty())
+      rewriter.eraseOp(bitwise);
     return success();
   }
 };
@@ -1249,6 +1256,7 @@ struct ExtractThroughMux : public OpRewritePattern<pyc::ExtractOp> {
         op.getLsb(), op.getMsbAttr());
     rewriter.replaceOpWithNewOp<pyc::MuxOp>(
         op, op.getResult().getType(), mux.getSel(), a, b);
+    rewriter.eraseOp(mux);
     return success();
   }
 };
@@ -1411,6 +1419,7 @@ struct ExtractThroughImmediateShift : public OpRewritePattern<pyc::ExtractOp> {
       }
     }
     rewriter.replaceOp(op, replacement);
+    rewriter.eraseOp(shift);
     return success();
   }
 };
@@ -1763,6 +1772,7 @@ struct ExtractThroughArithmetic : public OpRewritePattern<pyc::ExtractOp> {
     else
       rewriter.replaceOpWithNewOp<pyc::ExtractOp>(
           op, resultTy, narrowed, op.getLsb(), op.getMsbAttr());
+    rewriter.eraseOp(arithmetic);
     return success();
   }
 };
@@ -1793,6 +1803,10 @@ struct TruncThroughArithmetic : public OpRewritePattern<pyc::TruncOp> {
     Value rhs = rewriter.create<pyc::TruncOp>(
         op.getLoc(), resultTy, arithmetic.getRhs());
     rewriter.replaceOpWithNewOp<ArithmeticOp>(op, resultTy, lhs, rhs);
+    // Release the old producer's operand uses before the new truncations are
+    // visited. Otherwise they see both the dead wide operation and the narrow
+    // reader, and demand advances only one edge per whole-region iteration.
+    rewriter.eraseOp(arithmetic);
     return success();
   }
 };
@@ -2343,8 +2357,10 @@ struct CombCanonicalizePass : public PassWrapper<CombCanonicalizePass, Operation
                  VReduceSingleLaneDim<pyc::VAddReduceOp>>(f.getContext());
 
     GreedyRewriteConfig cfg;
-    if (failed(applyPatternsAndFoldGreedily(f, std::move(patterns), cfg)))
+    if (failed(applyPatternsAndFoldGreedily(f, std::move(patterns), cfg))) {
+      f.emitError("comb-canonicalize did not converge");
       signalPassFailure();
+    }
   }
 };
 

@@ -1,0 +1,21 @@
+clang version 10.0.0-4ubuntu1
+Direct/header flags: -O3; split Release: -O3 -DNDEBUG; per-build wall budget=300s; build parallelism=1
+Generated public synthetic model: 1024 independently observed 16-bit registers
+stats: regs=1024 (16384 bits), mems=0 (0 bits), max_depth=2/32, WNS=30, TNS=0, fuse_comb=on
+{"max_method_lines": 2249, "public_method_lines": {"_pyc_validate_primitive_bindings": 5, "pyc_register_probes": 6, "tick_commit": 5, "tick_compute": 2, "top": 7}}
+Large state/probe bounded helper structure PASS (256 actions, noinline, ordered complete coverage)
+compile_wall_seconds=190.16 peak_rss_kib=290360
+Large state/probe oracle PASS: 98304 checks; digest=0c67ae2a323f6f83
+stats: regs=1024 (16384 bits), mems=0 (0 bits), max_depth=2/32, WNS=30, TNS=0, fuse_comb=on
+{"max_method_lines": 2249, "public_method_lines": {"_pyc_validate_primitive_bindings": 5, "pyc_register_probes": 6, "tick_commit": 5, "tick_compute": 2, "top": 7}}
+Large state/probe bounded helper structure PASS (256 actions, noinline, ordered complete coverage)
+compile_wall_seconds=158.62 peak_rss_kib=179912
+Large state/probe oracle PASS: 98304 checks; digest=0c67ae2a323f6f83
+Generated public synthetic model: 258 independently observed 16-bit registers
+stats: regs=258 (4128 bits), mems=0 (0 bits), max_depth=2/32, WNS=30, TNS=0, fuse_comb=on
+Mixed small-reset/large-commit inlining boundary PASS
+compile_wall_seconds=28.52 peak_rss_kib=178144
+Large state/probe oracle PASS: 24768 checks; digest=7a4aa2253d3896b5
+stats: regs=1024 (16384 bits), mems=0 (0 bits), max_depth=2/32, WNS=30, TNS=0, fuse_comb=on
+Large state/probe oracle PASS: 98304 checks; digest=0c67ae2a323f6f83
+NewCircuit large state/probe chunk gate passed (direct/split+PCH/header-none/Verilog)

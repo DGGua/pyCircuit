@@ -1,0 +1,22 @@
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=2/64, WNS=62, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=2/64, WNS=62, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=2/64, WNS=62, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=2/64, WNS=62, TNS=0, fuse_comb=off
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=3/64, WNS=61, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=3/64, WNS=61, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=3/64, WNS=61, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=3/64, WNS=61, TNS=0, fuse_comb=off
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=2/64, WNS=62, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=2/64, WNS=62, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=2/64, WNS=62, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=2/64, WNS=62, TNS=0, fuse_comb=off
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=12/64, WNS=52, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=12/64, WNS=52, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=12/64, WNS=52, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=12/64, WNS=52, TNS=0, fuse_comb=off
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=3/64, WNS=61, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=3/64, WNS=61, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=3/64, WNS=61, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=3/64, WNS=61, TNS=0, fuse_comb=off
+shared-condition oracle: late-ready, inline trees, select, dependency and effects passed
+shared-condition functional oracle: default, bounded, strict and preserve-ops passed

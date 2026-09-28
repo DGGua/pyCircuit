@@ -9,6 +9,7 @@
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallVector.h"
 
+#include <map>
 #include <vector>
 
 namespace pyc {
@@ -109,6 +110,8 @@ struct ResetGroupPlan {
   unsigned clockValueId = 0;
   unsigned resetValueId = 0;
   llvm::SmallVector<unsigned> regNodeIds;
+  // Every path applies the same ordered register chunks after one group check.
+  llvm::SmallVector<llvm::SmallVector<unsigned>> regChunks;
 };
 
 enum class SimTickActionKind : unsigned char {
@@ -133,10 +136,27 @@ struct OperationOrder {
   llvm::SmallVector<unsigned> combs;
 };
 
+enum class CppValueStorage : unsigned char { Struct, Local, Omitted };
+
+struct CppPlacementSummary {
+  unsigned structMembers = 0;
+  unsigned localInMethod = 0;
+  unsigned probePinnedStruct = 0;
+  unsigned crossPartPromoted = 0;
+  unsigned scheduledCrossMethod = 0;
+  uint64_t scheduledCutWeight = 0;
+  unsigned omittedValues = 0;
+};
+
 enum class SimulationPhase { Comb, TickCompute, TickCommit };
 
 struct SimulationPlan {
   SimGraph graph;
+  // Storage is derived from actual emitted method reads/writes after scheduling.
+  llvm::SmallVector<CppValueStorage> cppValueStorage;
+  std::vector<std::string> cppValueOwners;
+  std::map<std::string, llvm::SmallVector<unsigned>> cppMethodLocals;
+  CppPlacementSummary cppPlacementSummary;
   OperationOrder operationOrder;
   llvm::SmallVector<llvm::SmallVector<unsigned>> instanceTickChunks;
   llvm::SmallVector<llvm::SmallVector<unsigned>> primitiveEvalChunks;
@@ -177,6 +197,8 @@ struct SimulationPlan {
   llvm::SmallVector<ResetGroupPlan> resetGroups;
   llvm::SmallVector<SimTickAction> localTickComputeActions;
   llvm::SmallVector<SimTickAction> localTickCommitActions;
+  llvm::SmallVector<llvm::SmallVector<SimTickAction>> localTickComputeChunks;
+  llvm::SmallVector<llvm::SmallVector<SimTickAction>> localTickCommitChunks;
   // Observable graph values that are aliases or comb passthroughs of a local
   // register output retain register probe semantics.
   llvm::DenseMap<unsigned, unsigned> registerProbeTargets;

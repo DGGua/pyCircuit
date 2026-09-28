@@ -1,0 +1,12 @@
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=8/20000, WNS=19992, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=8/20000, WNS=19992, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=4/20000, WNS=19996, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=2/20000, WNS=19998, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=2/20000, WNS=19998, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=30/20000, WNS=19970, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=7001/20000, WNS=12999, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=7002/20000, WNS=12998, TNS=0, fuse_comb=on
+GSIM partition oracle: atomic units, optimal cuts and recipient bounds passed
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=8/20000, WNS=19992, TNS=0, fuse_comb=off
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=4/20000, WNS=19996, TNS=0, fuse_comb=off
+GSIM partition functional oracle: default, strict and preserve-ops passed

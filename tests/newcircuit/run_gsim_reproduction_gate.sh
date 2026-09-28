@@ -10,7 +10,7 @@ log_dir="${repo_root}/docs/gates/logs/${run_id}"
 mkdir -p "$log_dir"
 rm -f "${log_dir}/gsim_reproduction_summary.json"
 gates=(simulation_plan partition replication shared_condition array_split
-       scalar_demand scalar_fixedpoint activity primitive_activity)
+       scalar_demand scalar_fixedpoint activity primitive_activity member_placement large_state_probe)
 for gate in "${gates[@]}"; do
   log="${log_dir}/${gate}.log"
   if ! bash "${repo_root}/tests/newcircuit/run_${gate}_gate.sh" >"$log" 2>&1; then

@@ -7,7 +7,7 @@ module tb;
   wire [7:0] y;
   wire [63:0] wide;
   reg [63:0] q = 0, expected;
-  integer step;
+  integer step, bit_index;
   top dut(.*);
   task check;
     begin
@@ -15,6 +15,21 @@ module tb;
       if (CASE_MODEL == 1) expected = sel ? expected : a;
       if (CASE_MODEL == 2) expected = expected << 3;
       if (CASE_MODEL == 3) expected = sel ? expected + a : expected * b;
+      if (CASE_MODEL == 4) expected = a + 64 * b;
+      if (CASE_MODEL == 5) begin
+        expected = a;
+        for (bit_index = 0; bit_index < 64; bit_index = bit_index + 1)
+          expected = b[bit_index] ? expected : b;
+      end
+      if (CASE_MODEL == 6) begin
+        expected = a;
+        for (bit_index = 0; bit_index < 64; bit_index = bit_index + 1) begin
+          if (bit_index % 4 == 0) expected = expected * b;
+          if (bit_index % 4 == 1) expected = ~expected;
+          if (bit_index % 4 == 2) expected = expected ^ b;
+        end
+        expected = expected << 1;
+      end
       if (STATE_CASE) expected = q;
       if (y !== expected[7:0] || wide !== (FULL_RESULT ? expected : 64'b0))
         $fatal(1, "scalar fixedpoint Verilog mismatch at %0d", step);
@@ -27,6 +42,7 @@ module tb;
       b = step * 64'hd6e8feb86659fd93 + 64'hffffffffffffffff;
       if ((step & 15) == 0) begin a = 0; b = 0; end
       if ((step & 15) == 1) begin a = '1; b = '1; end
+      if ((step & 15) == 2) b = '1; // Keep a through every deep mux.
       rst = step % 31 == 0;
       en = step % 4 != 0;
       sel = step % 3 != 0;

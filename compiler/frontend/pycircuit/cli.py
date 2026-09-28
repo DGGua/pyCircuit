@@ -1994,20 +1994,60 @@ def _emit_testbench_pyc_file(
     return tb_pyc_path
 
 
-def _gather_cpp_sources(cpp_root: Path) -> list[Path]:
-    out: list[Path] = []
-    for p in sorted(cpp_root.rglob("*.cpp")):
-        if p.is_file():
-            out.append(p)
-    return out
+def _cpp_compile_manifests(
+    cpp_root: Path, *, module_names: list[str] | None = None
+) -> list[tuple[Path, dict[str, Any]]]:
+    paths = (sorted(cpp_root.rglob("cpp_compile_manifest.json")) if module_names is None else
+             [cpp_root / name / "cpp_compile_manifest.json" for name in sorted(module_names)])
+    manifests: list[tuple[Path, dict[str, Any]]] = []
+    for path in paths:
+        if not path.is_file():
+            raise SystemExit(f"missing C++ compile manifest: {path}")
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise SystemExit(f"invalid C++ compile manifest {path}: {exc}") from exc
+        if not isinstance(data, dict):
+            raise SystemExit(f"invalid C++ compile manifest {path}: expected object")
+        manifests.append((path, data))
+    return manifests
 
 
-def _gather_cpp_headers(cpp_root: Path) -> list[Path]:
-    out: list[Path] = []
-    for p in sorted(cpp_root.rglob("*.hpp")):
-        if p.is_file():
-            out.append(p)
-    return out
+def _cpp_manifest_file(manifest: Path, raw: object, kind: str) -> Path:
+    if not isinstance(raw, str) or not raw:
+        raise SystemExit(f"invalid C++ compile manifest {manifest}: missing {kind} path")
+    path = Path(raw)
+    if not path.is_absolute():
+        path = manifest.parent / path
+    path = path.resolve()
+    if not path.is_file():
+        raise SystemExit(f"missing C++ {kind} from compile manifest {manifest}: {path}")
+    return path
+
+
+def _gather_cpp_sources(cpp_root: Path, *, module_names: list[str] | None = None) -> list[Path]:
+    manifests = _cpp_compile_manifests(cpp_root, module_names=module_names)
+    if not manifests and module_names is None:
+        return sorted(p for p in cpp_root.rglob("*.cpp") if p.is_file())
+    # An in-place regeneration can leave obsolete unsplit or numbered shards.
+    # Only the current manifests identify the translation units to compile.
+    out: set[Path] = set()
+    for manifest, data in manifests:
+        sources = data.get("sources")
+        if not isinstance(sources, list) or not sources:
+            raise SystemExit(f"invalid C++ compile manifest {manifest}: expected nonempty sources list")
+        for source in sources:
+            raw = source.get("path") if isinstance(source, dict) else None
+            out.add(_cpp_manifest_file(manifest, raw, "source"))
+    return sorted(out)
+
+
+def _gather_cpp_headers(cpp_root: Path, *, module_names: list[str] | None = None) -> list[Path]:
+    manifests = _cpp_compile_manifests(cpp_root, module_names=module_names)
+    if not manifests and module_names is None:
+        return sorted(p for p in cpp_root.rglob("*.hpp") if p.is_file())
+    return sorted({_cpp_manifest_file(manifest, data.get("top_header"), "header")
+                   for manifest, data in manifests})
 
 
 def _module_hash(path: Path) -> str:
@@ -2033,6 +2073,13 @@ def _deps_hash(entry: Path, *, project_root: Path) -> str:
 def _canonical_hash(payload: dict[str, Any]) -> str:
     blob = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
     return hashlib.sha256(blob).hexdigest()
+
+
+def _backend_build_flag_hashes(build_flags: dict[str, Any], *, cpp_pch: bool) -> tuple[str, str]:
+    """Return shared-backend and C++-specific cache keys."""
+    shared_hash = _canonical_hash(build_flags)
+    cpp_hash = _canonical_hash({**build_flags, "cpp_pch": bool(cpp_pch)})
+    return shared_hash, cpp_hash
 
 
 def _load_json(path: Path) -> dict[str, Any]:
@@ -2275,8 +2322,12 @@ def _cmd_build(args: argparse.Namespace) -> int:
         "tb_schedule_mode": str(args.tb_schedule_mode),
         "frontend_contract": FRONTEND_CONTRACT,
     }
-    build_flags_hash = _canonical_hash(build_flags)
+    cpp_build_flags = {**build_flags, "cpp_pch": bool(args.cpp_pch)}
+    build_flags_hash, cpp_build_flags_hash = _backend_build_flag_hashes(
+        build_flags, cpp_pch=bool(args.cpp_pch)
+    )
     same_flags = str(cache.get("build_flags_hash", "")) == build_flags_hash
+    cpp_same_flags = str(cache.get("cpp_build_flags_hash", "")) == cpp_build_flags_hash
 
     design_key = "__design_pyc"
     old_hashes = dict(cache.get("module_hashes", {}))
@@ -2362,26 +2413,35 @@ def _cmd_build(args: argparse.Namespace) -> int:
         h = _module_hash(mp)
         module_hashes[sym] = h
         unchanged = same_flags and old_hashes.get(sym) == h
+        cpp_unchanged = cpp_same_flags and old_hashes.get(sym) == h
 
         cpp_out_dir = device_cpp_root / sym
-        cpp_ready = cpp_out_dir.is_dir() and any(cpp_out_dir.glob("*.cpp")) and any(cpp_out_dir.glob("*.hpp"))
-        if do_cpp and not (unchanged and cpp_ready):
+        cpp_ready = (
+            cpp_out_dir.is_dir()
+            and any(cpp_out_dir.glob("*.cpp"))
+            and any(cpp_out_dir.glob("*.hpp"))
+            and (cpp_out_dir / "cpp_compile_manifest.json").is_file()
+        )
+        if do_cpp and not (cpp_unchanged and cpp_ready):
             cpp_out_dir.mkdir(parents=True, exist_ok=True)
+            cpp_args = [
+                str(pycc),
+                str(mp),
+                "--emit=cpp",
+                *pycc_hard_hierarchy_flags,
+                "--out-dir",
+                str(cpp_out_dir),
+                "--cpp-split=module",
+                "--probe-plan",
+                str(probe_plan_path),
+                f"--logic-depth={logic_depth}",
+            ]
+            if args.cpp_pch:
+                cpp_args.append("--cpp-pch")
             pycc_jobs.append(
                 (
                     f"cpp:{sym}",
-                    [
-                        str(pycc),
-                        str(mp),
-                        "--emit=cpp",
-                        *pycc_hard_hierarchy_flags,
-                        "--out-dir",
-                        str(cpp_out_dir),
-                        "--cpp-split=module",
-                        "--probe-plan",
-                        str(probe_plan_path),
-                        f"--logic-depth={logic_depth}",
-                    ],
+                    cpp_args,
                 )
             )
 
@@ -2436,12 +2496,13 @@ def _cmd_build(args: argparse.Namespace) -> int:
                 _ = fut.result()
 
     if do_cpp:
-        cpp_sources = _gather_cpp_sources(device_cpp_root)
+        cpp_module_names = sorted(module_paths)
+        cpp_sources = _gather_cpp_sources(device_cpp_root, module_names=cpp_module_names)
         if not cpp_sources:
             raise SystemExit("build(cpp): no generated C++ sources found")
         if not tb_cpp_out.is_file():
             raise SystemExit(f"build(cpp): missing generated TB C++ source: {tb_cpp_out}")
-        cpp_headers = _gather_cpp_headers(device_cpp_root)
+        cpp_headers = _gather_cpp_headers(device_cpp_root, module_names=cpp_module_names)
         include_dirs: list[str] = []
         include_dirs.append(str(device_cpp_root))
         runtime_source_include = Path(__file__).resolve().parents[3] / "runtime"
@@ -2465,6 +2526,26 @@ def _cmd_build(args: argparse.Namespace) -> int:
             "cxx_standard": "c++17",
             "profile": str(args.profile),
         }
+        if args.cpp_pch:
+            # Collect device hpp headers flagged for PCH across all module manifests.
+            seen: set[str] = set()
+            pch_headers: list[str] = []
+            for _, data in _cpp_compile_manifests(device_cpp_root, module_names=cpp_module_names):
+                profile = data.get("profile_summary") or {}
+                if not profile.get("cpp_pch"):
+                    continue
+                for header in data.get("precompile_headers") or []:
+                    if header not in seen:
+                        seen.add(header)
+                        pch_headers.append(header)
+            pch_headers.sort()
+            if not pch_headers:
+                pch_script = _tool_script("cpp_pch_headers.py")
+                pch_mod = _load_py_file(pch_script)
+                pch_headers = pch_mod.select_device_hpp_headers(build_manifest["headers"])
+            if pch_headers:
+                build_manifest["precompile_headers"] = pch_headers
+                build_manifest["precompile_headers_mode"] = "device_hpp"
         cpp_manifest = out_dir / "cpp_project_manifest.json"
         _save_json(cpp_manifest, build_manifest)
 
@@ -2600,6 +2681,8 @@ def _cmd_build(args: argparse.Namespace) -> int:
             "pycc": str(pycc),
             "build_flags": build_flags,
             "build_flags_hash": build_flags_hash,
+            "cpp_build_flags": cpp_build_flags,
+            "cpp_build_flags_hash": cpp_build_flags_hash,
             "jit_cache_key": jit_key,
             "jit_cache_inputs": jit_inputs,
             "last_pycc_jobs": int(len(pycc_jobs)),
@@ -2721,6 +2804,11 @@ def main(argv: list[str] | None = None) -> int:
         help="Backend targets to generate/build",
     )
     build.add_argument("--logic-depth", type=int, default=32, help="Max combinational logic depth for pycc")
+    build.add_argument(
+        "--cpp-pch",
+        action="store_true",
+        help="Precompile device module hpp headers in generated CMake build",
+    )
     build.add_argument(
         "--trace-config",
         default=None,

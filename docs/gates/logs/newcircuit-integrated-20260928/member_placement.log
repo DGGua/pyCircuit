@@ -1,0 +1,17 @@
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=6/32, WNS=26, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=6/32, WNS=26, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=6/32, WNS=26, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=6/32, WNS=26, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=6/32, WNS=26, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=6/32, WNS=26, TNS=0, fuse_comb=on
+Member placement structure PASS: method locals, pinned probes/cache interfaces, cross-chunk weighted cuts
+Member placement oracle PASS: 2048 cases; digest=d83780b64c6057a2; probes=6dcb4591733b2428
+Member placement oracle PASS: 2048 cases; digest=d83780b64c6057a2; probes=6dcb4591733b2428
+Member placement oracle PASS: 2048 cases; digest=d83780b64c6057a2; probes=6dcb4591733b2428
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=6/32, WNS=26, TNS=0, fuse_comb=on
+Member placement oracle PASS: 2048 cases; digest=d83780b64c6057a2; probes=6dcb4591733b2428
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=4/32, WNS=28, TNS=0, fuse_comb=on
+Strict locality improvement PASS: independent generated-method edge/weight/member counts all decrease
+{"chunk_cap": 4, "cross_method_values": 0, "cross_values": [], "cut_bit_sum": 0, "cut_weight": 0, "expression_count": 16, "persistent_expression_fields": 4}
+Weighted locality oracle PASS: 2048 cases; digest=cdc040cbd71552f5
+NewCircuit member placement gate passed (locals/chunks/nested/probes/activity/direct/split+PCH)

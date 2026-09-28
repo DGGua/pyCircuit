@@ -2681,8 +2681,8 @@ with pathlib.Path(sys.argv[2]).open("w") as out:
 PY
 "${PYCC}" "${gate_dir}/instance_chunks.pyc" --emit=cpp --logic-depth=256 \
   -o "${gate_dir}/instance_chunks.cpp"
-rg -q 'inline void tick_compute_part_1\(\)' "${gate_dir}/instance_chunks.cpp"
-rg -q 'inline void tick_commit_part_1\(\)' "${gate_dir}/instance_chunks.cpp"
+rg -q 'void PYC_NOINLINE tick_compute_part_1\(\)' "${gate_dir}/instance_chunks.cpp"
+rg -q 'void PYC_NOINLINE tick_commit_part_1\(\)' "${gate_dir}/instance_chunks.cpp"
 test "$(rg -c -- 'u[0-9]+->tick_compute\(\);' "${gate_dir}/instance_chunks.cpp")" = 257
 test "$(rg -c -- 'u[0-9]+->tick_commit\(\);' "${gate_dir}/instance_chunks.cpp")" = 257
 "${CXX:-c++}" -std=c++17 -I "${PYC_TOOLCHAIN_ROOT}/include" \
@@ -3258,5 +3258,9 @@ CPP
 "${CXX:-c++}" -std=c++17 -I "${PYC_TOOLCHAIN_ROOT}/include" -I "${gate_dir}" \
   "${gate_dir}/packed_multiword_harness.cpp" -o "${gate_dir}/packed_multiword_harness"
 "${gate_dir}/packed_multiword_harness"
+
+# Hierarchical aggregate ports exercise both nonpacked value comparison and
+# packed multiword instance caches, including split modules with device PCH.
+PYCC="${PYCC}" bash "${repo_root}/tests/newcircuit/run_vector_instance_cache_gate.sh"
 
 echo 'NewCircuit simulation plan gate passed'

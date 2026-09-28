@@ -54,6 +54,14 @@ Coexists with `--profile-pass-timing` / `--profile-json`.
 
 See [mlir_pass_ir_dump.md](mlir_pass_ir_dump.md) for full details.
 
+### Optional C++ device hpp PCH
+
+`--cpp-pch` records device module headers for CMake
+`target_precompile_headers`. It does not change emitted hardware behavior and
+requires `--cpp-split=module` for `pycc`.
+
+See [cpp_device_pch.md](cpp_device_pch.md).
+
 ## CLI entrypoints
 
 Emit a single `.pyc`:
