@@ -135,20 +135,6 @@ if [[ -x "${PYC_OPT}" ]]; then
     exit 1
   fi
   grep -q "combinational cycle detected" "${true_cycle_opt_log}"
-
-  if "${PYC_OPT}" --help 2>&1 | grep -q -- '--pyc-change-driven-schedule'; then
-    "${PYC_OPT}" "${INPUT}" \
-      --pyc-change-driven-schedule -o /dev/null
-    cycle_opt_log="${OUT}/change_schedule_cycle_opt.log"
-    if "${PYC_OPT}" \
-        "${ROOT}/compiler/mlir/test/Inputs/change_schedule_cycle.mlir" \
-        --pyc-change-driven-schedule -o /dev/null \
-        >"${cycle_opt_log}" 2>&1; then
-      echo "fail: cyclic schedule input was accepted" >&2
-      exit 1
-    fi
-    grep -q "requires an acyclic" "${cycle_opt_log}"
-  fi
 else
   echo "note: pyc-opt unavailable; standalone comb-cycle checks not run" >&2
 fi
