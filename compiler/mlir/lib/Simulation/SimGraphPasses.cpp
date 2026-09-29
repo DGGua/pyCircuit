@@ -1131,10 +1131,13 @@ static unsigned scalarWidth(const SimGraph &graph, unsigned value) {
 
 template <typename Demand, typename DemandFull>
 static void propagateUsedBits(const SimGraph &graph, const SimExpr &expr,
-                              const llvm::APInt &bits,
+                              llvm::APInt bits,
                               const llvm::DenseMap<unsigned, llvm::APInt> &constants,
                               Demand demand,
                               DemandFull demandFull) {
+  // `bits` is taken by value. Callers hand over a mask stored in a DenseMap,
+  // and demand() may insert into that map and rehash it before this function
+  // reads the mask again.
   if (expr.kind == SimExprKind::Extract) {
     unsigned width = scalarWidth(graph, expr.operands[0]);
     if (width && expr.immediate >= 0 &&
