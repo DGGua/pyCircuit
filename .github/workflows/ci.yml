@@ -229,6 +229,7 @@ jobs:
           PYCC="$PYC_TOOLCHAIN_ROOT/bin/pycc" \
             bash compiler/mlir/test/instance_vector_cache_smoke.sh
           bash tests/runtime/run_change_scheduler.sh
+          bash tests/runtime/run_delay_line_commit.sh
           python -m pytest -q tests/vec/test_vec_ops.py \
             -k 'slt_vv or slt_vs or slt_sv'
 

@@ -183,9 +183,11 @@ public:
     return depth == 1 ? sampledInput : tap(depth - 1);
   }
 
-  inline void tick_commit() {
+  // Applies a pending edge and reports whether the visible delay output changed.
+  inline bool tick_commit() {
     if (__builtin_expect(!pending, 1))
-      return;
+      return false;
+    const bool changed = q != qNext;
     if (pendingReset) {
       stages.fill(init);
       head = 0;
@@ -195,6 +197,7 @@ public:
     }
     q = qNext;
     pending = false;
+    return changed;
   }
 
 private:
@@ -326,9 +329,11 @@ public:
     pending = false;
   }
 
-  inline void tick_commit() {
+  // Applies a pending edge and reports whether the visible vector output changed.
+  inline bool tick_commit() {
     if (__builtin_expect(!pending, 1))
-      return;
+      return false;
+    const bool changed = q != qNext;
     if (pendingReset) {
       stages.fill(init);
       head = 0;
@@ -338,6 +343,7 @@ public:
     }
     q = qNext;
     pending = false;
+    return changed;
   }
 
   inline T tap(unsigned depth) const {
