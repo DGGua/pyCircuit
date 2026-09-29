@@ -1,0 +1,104 @@
+#pragma once
+
+#include <array>
+#include <cassert>
+#include <cstddef>
+#include <cstdint>
+
+namespace pyc::cpp {
+
+// Fixed-capacity dirty set keyed by precomputed topological rank. Marking an
+// already-dirty rank coalesces the duplicate, and takeNext always removes the
+// smallest rank. All storage is inline; no operation allocates.
+template <std::size_t Capacity>
+class DirtyBitset {
+  static_assert(Capacity > 0, "DirtyBitset requires non-zero capacity");
+
+public:
+  static constexpr std::size_t kCapacity = Capacity;
+  static constexpr std::size_t kWordBits = 64;
+  static constexpr std::size_t kWords =
+      (kCapacity + kWordBits - 1) / kWordBits;
+
+  // Returns true only when rank transitions from clean to dirty.
+  bool mark(std::size_t rank) noexcept {
+    assert(rank < kCapacity && "dirty rank exceeds fixed capacity");
+    if (rank >= kCapacity)
+      return false;
+    const std::size_t word = rank / kWordBits;
+    const std::uint64_t mask = std::uint64_t{1} << (rank % kWordBits);
+    const bool inserted = (words_[word] & mask) == 0;
+    words_[word] |= mask;
+    return inserted;
+  }
+
+  bool test(std::size_t rank) const noexcept {
+    assert(rank < kCapacity && "dirty rank exceeds fixed capacity");
+    if (rank >= kCapacity)
+      return false;
+    const std::size_t word = rank / kWordBits;
+    const std::uint64_t mask = std::uint64_t{1} << (rank % kWordBits);
+    return (words_[word] & mask) != 0;
+  }
+
+  // Removes one known rank. Returns true only if it was dirty.
+  bool take(std::size_t rank) noexcept {
+    assert(rank < kCapacity && "dirty rank exceeds fixed capacity");
+    if (rank >= kCapacity)
+      return false;
+    const std::size_t word = rank / kWordBits;
+    const std::uint64_t mask = std::uint64_t{1} << (rank % kWordBits);
+    const bool present = (words_[word] & mask) != 0;
+    words_[word] &= ~mask;
+    return present;
+  }
+
+  // Removes the minimum topological rank. Returns false when the set is empty.
+  bool takeNext(std::size_t &rank) noexcept {
+    for (std::size_t word = 0; word < kWords; ++word) {
+      if (words_[word] == 0)
+        continue;
+      const unsigned bit = lowestSetBit(words_[word]);
+      words_[word] &= ~(std::uint64_t{1} << bit);
+      rank = word * kWordBits + bit;
+      return true;
+    }
+    return false;
+  }
+
+  bool empty() const noexcept {
+    for (std::uint64_t word : words_) {
+      if (word != 0)
+        return false;
+    }
+    return true;
+  }
+
+  std::size_t count() const noexcept {
+    std::size_t total = 0;
+    for (std::uint64_t word : words_) {
+      while (word != 0) {
+        word &= word - 1;
+        ++total;
+      }
+    }
+    return total;
+  }
+
+  void clear() noexcept { words_.fill(0); }
+
+private:
+  static unsigned lowestSetBit(std::uint64_t word) noexcept {
+    assert(word != 0);
+    unsigned bit = 0;
+    while ((word & std::uint64_t{1}) == 0) {
+      word >>= 1;
+      ++bit;
+    }
+    return bit;
+  }
+
+  std::array<std::uint64_t, kWords> words_{};
+};
+
+} // namespace pyc::cpp
