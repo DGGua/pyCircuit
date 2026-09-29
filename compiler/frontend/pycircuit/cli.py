@@ -2419,13 +2419,18 @@ def _cmd_build(args: argparse.Namespace) -> int:
 
     tb_cpp_out = out_dir / "tb" / f"{tb_name}.cpp"
     tb_sv_out = out_dir / "tb" / f"{tb_name}.sv"
+    probe_plan_hash = hashlib.sha256(probe_plan_path.read_bytes()).hexdigest()
     for sym in sorted(module_paths.keys()):
         mp = module_paths[sym]
         h = _module_hash(mp)
         trace_fields = list(trace_codegen_plan["modules"].get(sym, []))
         cpp_key = f"cpp:{sym}"
         cpp_hash = _canonical_hash(
-            {"module_hash": h, "trace_fields": trace_fields}
+            {
+                "module_hash": h,
+                "trace_fields": trace_fields,
+                "probe_plan_hash": probe_plan_hash,
+            }
         )
         verilog_key = f"verilog:{sym}"
         module_hashes[cpp_key] = cpp_hash
