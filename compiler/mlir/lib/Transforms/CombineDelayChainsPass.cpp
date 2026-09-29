@@ -118,6 +118,7 @@ static void mergeEquivalentStates(func::FuncOp function, CombineStats &stats) {
     }
 
     OpBuilder builder(survivor);
+    builder.setInsertionPointAfter(survivor);
     remapStateOpIdentity(builder, reg.getOperation(), survivor.getQ());
     reg.getQ().replaceAllUsesWith(survivor.getQ());
     const int64_t survivorCount =
@@ -354,6 +355,7 @@ static void shareEquivalentDelayLines(func::FuncOp function,
       setI64Attr(survivor, kSharedChainCountAttr, lhsChains + rhsChains);
 
     OpBuilder builder(survivor);
+    builder.setInsertionPointAfter(survivor);
     remapStateOpIdentity(builder, delay.getOperation(), survivor.getQ());
     delay.getQ().replaceAllUsesWith(survivor.getQ());
     delay.erase();
