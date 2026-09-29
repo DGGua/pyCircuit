@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify read-only delay taps against default C++ and Verilog models."""
+"""Verify C++ delay taps against unoptimized Verilog."""
 
 from __future__ import annotations
 
@@ -70,12 +70,23 @@ def main() -> None:
         cpp = temp / "tap.hpp"
         verilog = temp / "tap.v"
         observed: dict[str, tuple[int, int]] = {}
-        for kind, output in (("cpp", cpp), ("verilog", verilog)):
-            stats = emit(args.pycc, source, output, kind)
-            if stats.get("delay_chain_taps_created") != 1:
-                raise AssertionError(f"{kind}: unexpected tap stats: {stats}")
-            if stats.get("reg_count") != 4 or stats.get("reg_bits") != 32:
-                raise AssertionError(f"{kind}: logical state changed: {stats}")
+        cpp_stats = emit(args.pycc, source, cpp, "cpp")
+        verilog_stats = emit(args.pycc, source, verilog, "verilog")
+        if cpp_stats.get("delay_chain_taps_created") != 1:
+            raise AssertionError(f"cpp: unexpected tap stats: {cpp_stats}")
+        if cpp_stats.get("reg_count") != 4 or cpp_stats.get("reg_bits") != 32:
+            raise AssertionError(f"cpp: logical state changed: {cpp_stats}")
+        if verilog_stats.get("delay_chain_taps_created"):
+            raise AssertionError(
+                f"verilog: tap rewrite ran unexpectedly: {verilog_stats}"
+            )
+        if (verilog_stats.get("reg_count") != 4 or
+                verilog_stats.get("reg_bits") != 32):
+            raise AssertionError(
+                f"verilog: unoptimized state changed: {verilog_stats}"
+            )
+        if verilog_stats.get("state_opt_policy") != "off":
+            raise AssertionError(f"verilog: policy is not off: {verilog_stats}")
 
         compile_cpp(args.cxx, cpp, temp / "cpp_bin")
         observed["cpp"] = result([str(temp / "cpp_bin")])
@@ -85,7 +96,8 @@ def main() -> None:
         cycles, checksum = next(iter(observed.values()))
         print(
             "delay tap equivalence verified: 4-reg chain -> one depth-4 history "
-            f"with depth-2 tap; C++ and Verilog match for {cycles} cycles "
+            f"with depth-2 tap; optimized C++ matches unoptimized Verilog for "
+            f"{cycles} cycles "
             f"(checksum={checksum})"
         )
 

@@ -37,7 +37,7 @@ trap 'rm -rf "${TMP_DIR}"' EXIT
   --input-file="${TMP_DIR}/generated.mlir"
 
 "${PYC_OPT}" "${INPUT}" \
-  --pass-pipeline='builtin.module(func.func(pyc-combine-delay-chains{mode=structural preserve-observability=true}))' \
+  --pass-pipeline='builtin.module(func.func(pyc-combine-delay-chains{mode=structural}))' \
   -o "${TMP_DIR}/structural.mlir"
 "${FILECHECK_BIN}" "${INPUT}" --check-prefix=STRUCTURAL \
   --input-file="${TMP_DIR}/structural.mlir"
@@ -49,10 +49,10 @@ trap 'rm -rf "${TMP_DIR}"' EXIT
   --input-file="${TMP_DIR}/aggressive.mlir"
 
 "${PYC_OPT}" "${OBSERVABILITY_INPUT}" \
-  --pass-pipeline='builtin.module(func.func(pyc-strip-state-observability,pyc-eliminate-dead-state))' \
-  -o "${TMP_DIR}/stripped-observability.mlir"
-"${FILECHECK_BIN}" "${OBSERVABILITY_INPUT}" --check-prefix=STRIP \
-  --input-file="${TMP_DIR}/stripped-observability.mlir"
+  --pass-pipeline='builtin.module(func.func(pyc-eliminate-dead-state))' \
+  -o "${TMP_DIR}/kept-observability.mlir"
+"${FILECHECK_BIN}" "${OBSERVABILITY_INPUT}" --check-prefix=KEEP \
+  --input-file="${TMP_DIR}/kept-observability.mlir"
 
 set +e
 "${PYC_OPT}" "${INPUT}" \
@@ -85,12 +85,6 @@ fi
   --input-file="${TMP_DIR}/packed.mlir"
 
 "${PYC_OPT}" "${STAGE15_STAGE2_INPUT}" \
-  --pass-pipeline='builtin.module(func.func(pyc-pack-state-lanes{max-width=256 preserve-observability=true}))' \
-  -o "${TMP_DIR}/packed-preserve.mlir"
-"${FILECHECK_BIN}" "${STAGE15_STAGE2_INPUT}" --check-prefix=PRESERVE \
-  --input-file="${TMP_DIR}/packed-preserve.mlir"
-
-"${PYC_OPT}" "${STAGE15_STAGE2_INPUT}" \
   --pass-pipeline='builtin.module(func.func(pyc-pack-state-lanes{max-width=12}))' \
   -o "${TMP_DIR}/packed-cap12.mlir"
 "${FILECHECK_BIN}" "${STAGE15_STAGE2_INPUT}" --check-prefix=CAP \
@@ -106,21 +100,12 @@ fi
 "${PYCC}" "${PACK_PROBE_INPUT}" --emit=cpp \
   --probe-manifest="${TMP_DIR}/packed-probes.json" \
   -o "${TMP_DIR}/packed-probes.hpp" 2>"${TMP_DIR}/packed-probes.stderr"
-if [[ $(grep -c 'addRegSlice<8, 16>' "${TMP_DIR}/packed-probes.hpp") -ne 2 ]]; then
-  echo "fail: packed state outputs are missing sliced ProbeRegistry entries" >&2
-  exit 1
-fi
-"${PYCC}" "${PACK_PROBE_INPUT}" --emit=cpp \
-  --state-opt-preserve-observability=true \
-  --probe-manifest="${TMP_DIR}/preserved-packed-probes.json" \
-  -o "${TMP_DIR}/preserved-packed-probes.hpp" \
-  2>"${TMP_DIR}/preserved-packed-probes.stderr"
-if [[ $(grep -c 'addRegSlice<8, 16>' "${TMP_DIR}/preserved-packed-probes.hpp") -ne 4 ]]; then
-  echo "fail: preservation mode lost packed state probe entries" >&2
+if [[ $(grep -c 'addRegSlice<8, 16>' "${TMP_DIR}/packed-probes.hpp") -lt 4 ]]; then
+  echo "fail: packed state outputs or named lanes are missing sliced ProbeRegistry entries" >&2
   exit 1
 fi
 "${CXX:-c++}" -std=c++17 -O2 -I"${ROOT}/runtime" \
-  -DMODEL_HEADER="\"${TMP_DIR}/preserved-packed-probes.hpp\"" \
+  -DMODEL_HEADER="\"${TMP_DIR}/packed-probes.hpp\"" \
   "${ROOT}/compiler/mlir/test/state_pack_probe_runtime.cpp" \
   -o "${TMP_DIR}/state-pack-probe-runtime"
 "${TMP_DIR}/state-pack-probe-runtime"
@@ -128,8 +113,7 @@ fi
 python3 - "${TMP_DIR}/default.hpp.stats.json" \
   "${TMP_DIR}/default.v.stats.json" \
   "${TMP_DIR}/default-probes.json" \
-  "${TMP_DIR}/packed-probes.json" \
-  "${TMP_DIR}/preserved-packed-probes.json" <<'PY'
+  "${TMP_DIR}/packed-probes.json" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -138,7 +122,6 @@ default = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
 default_verilog = json.loads(Path(sys.argv[2]).read_text(encoding="utf-8"))
 probe_manifest = json.loads(Path(sys.argv[3]).read_text(encoding="utf-8"))
 packed_probe_manifest = json.loads(Path(sys.argv[4]).read_text(encoding="utf-8"))
-preserved_probe_manifest = json.loads(Path(sys.argv[5]).read_text(encoding="utf-8"))
 keys = ("reg_count", "reg_bits", "state_opt_regs_merged",
         "state_opt_reg_bits_removed")
 default_view = {key: default.get(key) for key in keys}
@@ -156,16 +139,18 @@ if default.get("state_opt_policy") != "structural":
     raise AssertionError("default state optimization policy is not structural")
 if default.get("state_retime_policy") != "pipeline":
     raise AssertionError("default retiming policy is not pipeline")
-if default.get("state_opt_preserve_observability") is not False:
-    raise AssertionError("default state optimization unexpectedly preserves observability")
+if "state_opt_preserve_observability" in default:
+    raise AssertionError("removed preserve-observability flag leaked into stats")
 if default.get("state_opt_pack_width") != 192:
     raise AssertionError("default state pack width is not 192")
-if default_verilog.get("state_opt_policy") != "structural":
-    raise AssertionError("Verilog default policy is not structural")
-if default_verilog.get("state_retime_policy") != "pipeline":
-    raise AssertionError("Verilog default retiming policy is not pipeline")
-if default_verilog.get("reg_count") != default.get("reg_count"):
-    raise AssertionError("Verilog and C++ default structural counts differ")
+if default_verilog.get("state_opt_policy") != "off":
+    raise AssertionError("Verilog default policy is not off")
+if default_verilog.get("state_retime_policy") != "off":
+    raise AssertionError("Verilog default retiming policy is not off")
+if default_verilog.get("reg_count") != 2 or default_verilog.get("reg_bits") != 16:
+    raise AssertionError(
+        f"Verilog unexpectedly rewrote default state: {default_verilog}"
+    )
 output_probes = {
     probe["field_path"]: probe
     for probe in probe_manifest["probes"]
@@ -182,18 +167,9 @@ packed_outputs = {
 aggressive_entries = {
     probe["field_path"]: probe for probe in packed_probe_manifest["probes"]
 }
-for name in ("out0", "out1"):
+for name in ("out0", "out1", "lane0_state", "lane1_state"):
     if aggressive_entries[name].get("kind") != "state":
         raise AssertionError(f"packed lane {name} is not classified as state")
-for name in ("lane0_state", "lane1_state"):
-    if name in aggressive_entries:
-        raise AssertionError(f"performance mode retained explicit probe {name}")
-preserved_entries = {
-    probe["field_path"]: probe for probe in preserved_probe_manifest["probes"]
-}
-for name in ("out0", "out1", "lane0_state", "lane1_state"):
-    if preserved_entries[name].get("kind") != "state":
-        raise AssertionError(f"preservation mode lost state probe {name}")
 PY
 
 python3 "${ROOT}/compiler/mlir/test/check_state_delay_tap_models.py" \
@@ -204,12 +180,6 @@ python3 "${ROOT}/compiler/mlir/test/check_state_delay_tap_models.py" \
   -o "${TMP_DIR}/retimed.mlir"
 "${FILECHECK_BIN}" "${RETIME_INPUT}" --check-prefix=RETIME \
   --input-file="${TMP_DIR}/retimed.mlir"
-
-"${PYC_OPT}" "${RETIME_INPUT}" \
-  --pass-pipeline='builtin.module(func.func(pyc-retime-pipelines{preserve-observability=true}))' \
-  -o "${TMP_DIR}/retime-preserved.mlir"
-"${FILECHECK_BIN}" "${RETIME_INPUT}" --check-prefix=PRESERVE \
-  --input-file="${TMP_DIR}/retime-preserved.mlir"
 
 python3 "${ROOT}/compiler/mlir/test/check_state_retime_models.py" \
   --pycc "${PYCC}" --cxx "${CXX:-c++}"

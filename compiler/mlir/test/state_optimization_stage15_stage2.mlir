@@ -38,7 +38,8 @@
 // PACK-SAME: pyc.stats.state_opt_pack_groups = 1 : i64
 // PACK-COUNT-1: pyc.reg
 // PACK-SAME: pyc.state_pack_width = 16 : i64
-// PACK-NOT: pyc.name = "architectural_state"
+// PACK: pyc.alias
+// PACK-SAME: pyc.name = "architectural_state"
 // PACK-LABEL: func.func @keep_direct_state_outputs
 // PACK-SAME: pyc.stats.state_opt_pack_groups = 1 : i64
 // PACK-COUNT-1: pyc.reg
@@ -57,6 +58,8 @@
 // PACK-SAME: pyc.stats.state_opt_pack_groups = 1 : i64
 // PACK-COUNT-1: pyc.reg
 // PACK-SAME: pyc.state_pack_width = 16 : i64
+// PACK: pyc.alias
+// PACK-SAME: pyc.debug_keep = true
 // PACK-LABEL: func.func @pack_cross_bucket_alias_dependency
 // PACK-SAME: pyc.stats.state_opt_pack_groups = 2 : i64
 // PACK-COUNT-2: pyc.reg
@@ -65,17 +68,6 @@
 // PACK-SAME: pyc.stats.state_opt_pack_groups = 1 : i64
 // PACK-COUNT-1: pyc.reg
 // PACK-SAME: pyc.state_pack_width = 16 : i64
-
-// PRESERVE-LABEL: func.func @pack_named_state
-// PRESERVE-SAME: pyc.stats.state_opt_pack_groups = 1 : i64
-// PRESERVE-COUNT-1: pyc.reg
-// PRESERVE: pyc.alias
-// PRESERVE-SAME: pyc.name = "architectural_state"
-// PRESERVE-LABEL: func.func @keep_debug_state
-// PRESERVE-SAME: pyc.stats.state_opt_pack_groups = 0 : i64
-// PRESERVE-COUNT-2: pyc.reg
-// PRESERVE-NOT: pyc.concat
-// PRESERVE-LABEL: func.func @pack_cross_bucket_alias_dependency
 
 // CAP-LABEL: func.func @pack_integer_regs
 // CAP-SAME: pyc.stats.state_opt_pack_bits = 12 : i64

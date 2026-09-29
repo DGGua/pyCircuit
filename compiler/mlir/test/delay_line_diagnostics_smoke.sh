@@ -42,7 +42,8 @@ PROFILE_JSON="${TMP_DIR}/profile.json"
 "${FILECHECK_BIN}" "${PRECOMBINED_INPUT}" \
   --input-file="${PRECOMBINED_OPTIMIZED}"
 
-for flag in --combine-delay-chains --state-delay-opt --state-retime; do
+for flag in --combine-delay-chains --state-delay-opt --state-retime \
+           --state-opt-preserve-observability; do
   if "${PYCC}" --help 2>&1 | grep -E -- "${flag}(=|<|[[:space:]]|$)" >/dev/null; then
     echo "fail: deleted policy flag still advertised: ${flag}" >&2
     exit 1
@@ -106,7 +107,7 @@ for key, value in expected.items():
 stderr = stderr_path.read_text(encoding="utf-8")
 needle = (
     "stats: state_policy=structural, retime=pipeline, "
-    "preserve_observability=false, pack_width=192, regs=2 (16 bits), "
+    "pack_width=192, regs=2 (16 bits), "
     "delay_lines=1 (depth_total=2), merged=2, bits_removed=16, delay_chains=1"
 )
 if needle not in stderr:

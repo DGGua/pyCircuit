@@ -22,6 +22,13 @@
 // STRUCTURAL: %[[MERGED:.*]] = pyc.reg
 // STRUCTURAL-NOT: pyc.reg
 // STRUCTURAL: return %[[MERGED]], %[[MERGED]]
+// STRUCTURAL-LABEL: func.func @merge_named_pair
+// STRUCTURAL-SAME: pyc.stats.state_opt_regs_merged = 1 : i64
+// STRUCTURAL: %[[NAMED:.*]] = pyc.reg
+// STRUCTURAL-NOT: pyc.reg
+// STRUCTURAL: pyc.name = "copy_a"
+// STRUCTURAL: pyc.name = "copy_b"
+// STRUCTURAL: return
 // STRUCTURAL-LABEL: func.func @form_untagged_chain
 // STRUCTURAL-SAME: pyc.stats.state_opt_structural_chain_regs_combined = 3 : i64
 // STRUCTURAL-SAME: pyc.stats.state_opt_structural_chains_combined = 1 : i64
@@ -30,23 +37,25 @@
 // STRUCTURAL-SAME: pyc.optimized_by = "combine_delay_chains_structural"
 // STRUCTURAL-NOT: pyc.reg
 // STRUCTURAL-LABEL: func.func @keep_named_intermediate
-// STRUCTURAL: %[[NAMED_Q:.*]] = pyc.reg
-// STRUCTURAL: pyc.alias %[[NAMED_Q]]
+// STRUCTURAL: pyc.delay_line
+// STRUCTURAL-SAME: depth = 2 : i64
+// STRUCTURAL: pyc.delay_tap
+// STRUCTURAL: pyc.alias
 // STRUCTURAL-SAME: pyc.name = "architectural_tap"
-// STRUCTURAL: pyc.reg
-// STRUCTURAL-NOT: pyc.delay_line
+// STRUCTURAL-NOT: pyc.reg
 // STRUCTURAL-LABEL: func.func @keep_fanout
-// STRUCTURAL: pyc.reg
-// STRUCTURAL: pyc.reg
-// STRUCTURAL-NOT: pyc.delay_line
+// STRUCTURAL: pyc.delay_line
+// STRUCTURAL: pyc.delay_tap
+// STRUCTURAL-NOT: pyc.reg
 // STRUCTURAL-LABEL: func.func @keep_stateful_fanout
 // STRUCTURAL-COUNT-3: pyc.reg
 // STRUCTURAL-NOT: pyc.delay_line
 // STRUCTURAL-LABEL: func.func @keep_debug_state
-// STRUCTURAL: pyc.reg
+// STRUCTURAL: pyc.delay_line
+// STRUCTURAL-SAME: depth = 2 : i64
+// STRUCTURAL: pyc.alias
 // STRUCTURAL-SAME: pyc.debug_keep = true
-// STRUCTURAL: pyc.reg
-// STRUCTURAL-NOT: pyc.delay_line
+// STRUCTURAL-NOT: pyc.reg
 // STRUCTURAL-LABEL: func.func @keep_control_mismatch
 // STRUCTURAL: pyc.reg
 // STRUCTURAL: pyc.reg
@@ -60,6 +69,11 @@
 // AGGRESSIVE: %[[MERGED:.*]] = pyc.reg
 // AGGRESSIVE-NOT: pyc.reg
 // AGGRESSIVE: return %[[MERGED]], %[[MERGED]]
+// AGGRESSIVE-LABEL: func.func @merge_named_pair
+// AGGRESSIVE: %[[NAMED:.*]] = pyc.reg
+// AGGRESSIVE-NOT: pyc.reg
+// AGGRESSIVE: pyc.name = "copy_a"
+// AGGRESSIVE: pyc.name = "copy_b"
 // AGGRESSIVE-LABEL: func.func @form_untagged_chain
 // AGGRESSIVE: pyc.delay_line
 // AGGRESSIVE-SAME: depth = 3 : i64
@@ -67,7 +81,8 @@
 // AGGRESSIVE-LABEL: func.func @keep_named_intermediate
 // AGGRESSIVE: pyc.delay_line
 // AGGRESSIVE-SAME: depth = 2 : i64
-// AGGRESSIVE-NOT: pyc.alias
+// AGGRESSIVE: pyc.alias
+// AGGRESSIVE-SAME: pyc.name = "architectural_tap"
 // AGGRESSIVE-NOT: pyc.reg
 // AGGRESSIVE-LABEL: func.func @keep_fanout
 // AGGRESSIVE-SAME: pyc.stats.delay_chain_taps_created = 1 : i64
@@ -82,6 +97,8 @@
 // AGGRESSIVE-LABEL: func.func @keep_debug_state
 // AGGRESSIVE: pyc.delay_line
 // AGGRESSIVE-SAME: depth = 2 : i64
+// AGGRESSIVE: pyc.alias
+// AGGRESSIVE-SAME: pyc.debug_keep = true
 // AGGRESSIVE-NOT: pyc.reg
 // AGGRESSIVE-LABEL: func.func @keep_control_mismatch
 // AGGRESSIVE: pyc.reg
@@ -102,6 +119,16 @@ module {
     %q0 = pyc.reg %clk, %rst, %en, %in, %init : i8
     %q1 = pyc.reg %clk, %rst, %en, %in, %init : i8
     func.return %q0, %q1 : i8, i8
+  }
+
+  func.func @merge_named_pair(%clk: !pyc.clock, %rst: !pyc.reset, %in: i8) -> (i8, i8) {
+    %en = pyc.constant 1 : i1
+    %init = pyc.constant 0 : i8
+    %q0 = pyc.reg %clk, %rst, %en, %in, %init : i8
+    %a0 = pyc.alias %q0 {pyc.name = "copy_a"} : i8
+    %q1 = pyc.reg %clk, %rst, %en, %in, %init : i8
+    %a1 = pyc.alias %q1 {pyc.name = "copy_b"} : i8
+    func.return %a0, %a1 : i8, i8
   }
 
   func.func @form_untagged_chain(%clk: !pyc.clock, %rst: !pyc.reset, %in: i8) -> i8 {

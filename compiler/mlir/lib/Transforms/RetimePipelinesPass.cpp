@@ -97,19 +97,6 @@ static void setI64Attr(Operation *op, llvm::StringRef name, int64_t value,
   op->setAttr(name, builder.getI64IntegerAttr(value));
 }
 
-static bool hasObservationIdentity(Operation *op) {
-  if (!op)
-    return false;
-  for (NamedAttribute attr : op->getAttrs()) {
-    llvm::StringRef name = attr.getName().strref();
-    if (name == "pyc.name" || name == "pyc.debug_keep" ||
-        name == "pyc.observable" || name.starts_with("pyc.probe") ||
-        name.starts_with("pyc.trace"))
-      return true;
-  }
-  return false;
-}
-
 static bool isAllowedConeOp(Operation *op) {
   return isa<pyc::AliasOp, pyc::AddOp, pyc::SubOp, pyc::MulOp, pyc::AndOp,
              pyc::OrOp, pyc::XorOp, pyc::NotOp, pyc::MuxOp, pyc::EqOp,
@@ -223,8 +210,7 @@ struct ConeMatch {
   std::optional<PipelineLink> link;
 };
 
-static ConeMatch matchPipelineLink(pyc::RegOp consumer, pyc::RegOp keyReg,
-                                   bool preserveObservability) {
+static ConeMatch matchPipelineLink(pyc::RegOp consumer, pyc::RegOp keyReg) {
   PipelineLink link;
   link.consumer = consumer;
   link.root = consumer.getNext();
@@ -257,8 +243,7 @@ static ConeMatch matchPipelineLink(pyc::RegOp consumer, pyc::RegOp keyReg,
 
     Operation *def = value.getDefiningOp();
     if (!def || def->getBlock() != consumer->getBlock() ||
-        !isAllowedConeOp(def) ||
-        (preserveObservability && hasObservationIdentity(def))) {
+        !isAllowedConeOp(def)) {
       failed = true;
       visiting.erase(value);
       return;
@@ -284,10 +269,6 @@ static ConeMatch matchPipelineLink(pyc::RegOp consumer, pyc::RegOp keyReg,
       !equivalentStateValue(predecessor.getRst(), keyReg.getRst()) ||
       !equivalentStateValue(predecessor.getEn(), keyReg.getEn()))
     return {};
-  if (preserveObservability &&
-      (hasObservationIdentity(predecessor) || hasObservationIdentity(consumer)))
-    return {};
-
   llvm::DenseSet<Operation *> coneSet(link.coneOps.begin(), link.coneOps.end());
   for (Operation *op : link.coneOps) {
     for (Value result : op->getResults()) {
@@ -450,7 +431,7 @@ static bool hasOpaqueNextDependency(Value value, llvm::DenseSet<Value> &seen) {
 
 static std::optional<CommonDelayRegion>
 matchCommonDelayRegion(Operation *root, unsigned maxCombDepth,
-                       bool preserveObservability, RetimeStats &stats) {
+                       RetimeStats &stats) {
   if (!root || root->getNumResults() != 1 || root->getResult(0).use_empty() ||
       !isAllowedConeOp(root))
     return std::nullopt;
@@ -472,8 +453,7 @@ matchCommonDelayRegion(Operation *root, unsigned maxCombDepth,
       return;
     }
     if (auto source = stateSource(value)) {
-      if (source->op->getBlock() != root->getBlock() ||
-          (preserveObservability && hasObservationIdentity(source->op))) {
+      if (source->op->getBlock() != root->getBlock()) {
         failed = true;
       } else if (!sourceIndices.count(source->op)) {
         sourceIndices.try_emplace(source->op, region.sources.size());
@@ -488,8 +468,7 @@ matchCommonDelayRegion(Operation *root, unsigned maxCombDepth,
     }
 
     Operation *def = value.getDefiningOp();
-    if (!def || def->getBlock() != root->getBlock() || !isAllowedConeOp(def) ||
-        (preserveObservability && hasObservationIdentity(def))) {
+    if (!def || def->getBlock() != root->getBlock() || !isAllowedConeOp(def)) {
       failed = true;
       visiting.erase(value);
       return;
@@ -660,9 +639,14 @@ static void rewriteCommonDelayRegion(CommonDelayRegion &region,
     if (unused)
       op->erase();
   }
-  for (const StateSource &source : region.sources)
-    if (source.q.use_empty())
-      source.op->erase();
+  for (const StateSource &source : region.sources) {
+    // Named/probed sources stay as read-only histories so dut.read still
+    // sees the pre-sink values. Unobserved unused sources are deleted.
+    if (!source.q.use_empty() ||
+        stateHasExternalObservation(source.op, source.q))
+      continue;
+    source.op->erase();
+  }
 
   ++stats.commonDelaySinks;
   stats.commonDelaySourceStates += region.sources.size();
@@ -674,7 +658,6 @@ static void rewriteCommonDelayRegion(CommonDelayRegion &region,
 }
 
 static void runCommonDelaySinking(func::FuncOp function, bool rewrite,
-                                  bool preserveObservability,
                                   unsigned maxCombDepth, RetimeStats &stats) {
   llvm::SmallVector<Operation *> roots;
   function.walk([&](Operation *op) {
@@ -684,8 +667,7 @@ static void runCommonDelaySinking(func::FuncOp function, bool rewrite,
 
   llvm::SmallVector<CommonDelayRegion> candidates;
   for (Operation *root : llvm::reverse(roots)) {
-    auto region = matchCommonDelayRegion(root, maxCombDepth,
-                                         preserveObservability, stats);
+    auto region = matchCommonDelayRegion(root, maxCombDepth, stats);
     if (region)
       candidates.push_back(std::move(*region));
   }
@@ -744,8 +726,11 @@ static void runCommonDelaySinking(func::FuncOp function, bool rewrite,
 }
 
 static bool needsRebuiltView(PipelineRegion &region, unsigned index) {
-  Operation *regOp = region.regs[index].getOperation();
-  for (OpOperand &use : region.regs[index].getQ().getUses()) {
+  pyc::RegOp reg = region.regs[index];
+  if (stateHasExternalObservation(reg.getOperation(), reg.getQ()))
+    return true;
+  Operation *regOp = reg.getOperation();
+  for (OpOperand &use : reg.getQ().getUses()) {
     Operation *user = use.getOwner();
     if (region.coneSet.contains(user))
       continue;
@@ -839,8 +824,7 @@ static bool finalizeRegion(PipelineRegion &region, unsigned maxExtraCombOps,
 static std::optional<PipelineRegion>
 findRegionFromTail(pyc::RegOp tail, const llvm::DenseSet<Operation *> &claimed,
                    unsigned maxStages, unsigned maxExtraCombOps,
-                   unsigned maxCombDepth, bool preserveObservability,
-                   RetimeStats &stats) {
+                   unsigned maxCombDepth, RetimeStats &stats) {
   PipelineRegion region;
   llvm::SmallVector<pyc::RegOp> regsFromTail{tail};
   llvm::SmallVector<PipelineLink> linksFromTail;
@@ -849,7 +833,7 @@ findRegionFromTail(pyc::RegOp tail, const llvm::DenseSet<Operation *> &claimed,
   bool hasComb = false;
 
   while (maxStages == 0 || regsFromTail.size() < maxStages) {
-    ConeMatch match = matchPipelineLink(cursor, tail, preserveObservability);
+    ConeMatch match = matchPipelineLink(cursor, tail);
     if (!match.link)
       break;
     auto predecessorInit = constantValue(match.link->predecessor.getInit());
@@ -925,7 +909,10 @@ static void rewriteRegion(PipelineRegion &region, RetimeStats &stats) {
   }
 
   for (unsigned i = 0; i < region.regs.size(); ++i) {
-    if (externalUses[i].empty())
+    const bool needsObservation =
+        stateHasExternalObservation(region.regs[i].getOperation(),
+                                    region.regs[i].getQ());
+    if (externalUses[i].empty() && !needsObservation)
       continue;
     OpBuilder builder(region.regs[i]);
     const int64_t tapDepth = static_cast<int64_t>(i + 1);
@@ -939,6 +926,7 @@ static void rewriteRegion(PipelineRegion &region, RetimeStats &stats) {
       ++stats.tapsCreated;
     }
     Value rebuilt = clonePrefix(region, i, source, builder);
+    remapStateOpIdentity(builder, region.regs[i].getOperation(), rebuilt);
     for (OpOperand *use : externalUses[i])
       use->set(rebuilt);
   }
@@ -962,12 +950,10 @@ static void rewriteRegion(PipelineRegion &region, RetimeStats &stats) {
 }
 
 static RetimeStats runRetiming(func::FuncOp function, bool rewrite,
-                               bool preserveObservability, unsigned maxStages,
-                               unsigned maxExtraCombOps,
+                               unsigned maxStages, unsigned maxExtraCombOps,
                                unsigned maxCombDepth) {
   RetimeStats stats;
-  runCommonDelaySinking(function, rewrite, preserveObservability, maxCombDepth,
-                        stats);
+  runCommonDelaySinking(function, rewrite, maxCombDepth, stats);
   llvm::SmallVector<pyc::RegOp> regs;
   function.walk([&](pyc::RegOp reg) {
     regs.push_back(reg);
@@ -979,7 +965,7 @@ static RetimeStats runRetiming(func::FuncOp function, bool rewrite,
   for (pyc::RegOp tail : llvm::reverse(regs)) {
     auto region =
         findRegionFromTail(tail, noClaims, maxStages, maxExtraCombOps,
-                           maxCombDepth, preserveObservability, stats);
+                           maxCombDepth, stats);
     if (region)
       candidates.push_back(std::move(*region));
   }
@@ -1044,12 +1030,10 @@ struct RetimePipelinesPass
   RetimePipelinesPass() = default;
   RetimePipelinesPass(const RetimePipelinesPass &other) : PassWrapper(other) {}
   RetimePipelinesPass(unsigned maxStages, unsigned maxExtraCombOps,
-                      unsigned maxCombDepth, bool preserveObservability,
-                      bool accumulateStats) {
+                      unsigned maxCombDepth, bool accumulateStats) {
     maxStagesOption = maxStages;
     maxExtraCombOpsOption = maxExtraCombOps;
     maxCombDepthOption = maxCombDepth;
-    preserveObservabilityOption = preserveObservability;
     accumulateStatsOption = accumulateStats;
   }
 
@@ -1071,10 +1055,6 @@ struct RetimePipelinesPass
       *this, "max-comb-depth",
       llvm::cl::desc("Maximum rebuilt prefix operation depth"),
       llvm::cl::init(32)};
-  Option<bool> preserveObservabilityOption{
-      *this, "preserve-observability",
-      llvm::cl::desc("Do not retime named/debug/probe/trace state"),
-      llvm::cl::init(false)};
   Option<bool> accumulateStatsOption{
       *this, "accumulate-stats",
       llvm::cl::desc("Add rewrite statistics to an earlier retiming round"),
@@ -1082,8 +1062,8 @@ struct RetimePipelinesPass
 
   void runOnOperation() override {
     RetimeStats stats = runRetiming(
-        getOperation(), /*rewrite=*/true, preserveObservabilityOption,
-        maxStagesOption, maxExtraCombOpsOption, maxCombDepthOption);
+        getOperation(), /*rewrite=*/true, maxStagesOption,
+        maxExtraCombOpsOption, maxCombDepthOption);
     writeStats(getOperation(), stats, accumulateStatsOption);
   }
 };
@@ -1092,11 +1072,9 @@ struct RetimePipelinesPass
 
 std::unique_ptr<::mlir::Pass>
 createRetimePipelinesPass(unsigned maxStages, unsigned maxExtraCombOps,
-                          unsigned maxCombDepth, bool preserveObservability,
-                          bool accumulateStats) {
+                          unsigned maxCombDepth, bool accumulateStats) {
   return std::make_unique<RetimePipelinesPass>(
-      maxStages, maxExtraCombOps, maxCombDepth, preserveObservability,
-      accumulateStats);
+      maxStages, maxExtraCombOps, maxCombDepth, accumulateStats);
 }
 
 static PassRegistration<RetimePipelinesPass> retimePass;

@@ -264,7 +264,8 @@ def PYC_ConcatOp : PYC_Op<"concat", [Pure]> {
   let hasFolder = 1;
 }
 
-def PYC_AliasOp : PYC_Op<"alias", [Pure, SameOperandsAndResultType]> {
+def PYC_AliasOp : PYC_Op<"alias", [SameOperandsAndResultType,
+    DeclareOpInterfaceMethods<MemoryEffectsOpInterface>]> {
   let summary = "Alias a value (for naming / debug)";
   let arguments = (ins AnyType:$in);
   let results = (outs AnyType:$result);
@@ -313,7 +314,9 @@ def PYC_DelayLineOp : PYC_Op<"delay_line", [MemoryEffects<[MemRead, MemWrite]>, 
 // Read-only view of an internal stage of a fixed-depth delay line.  The
 // producer remains the owner of the storage; this op only exposes the value
 // that would be present after `depth` enabled edges.
-def PYC_DelayTapOp : PYC_Op<"delay_tap", [Pure, AllTypesMatch<["line", "tap"]>]> {
+def PYC_DelayTapOp : PYC_Op<"delay_tap",
+    [AllTypesMatch<["line", "tap"]>,
+     DeclareOpInterfaceMethods<MemoryEffectsOpInterface>]> {
   let summary = "Read-only fixed-depth delay-line tap";
   let arguments = (ins AnyIntegerOrV:$line);
   let results = (outs AnyIntegerOrV:$tap);

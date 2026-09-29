@@ -1,6 +1,4 @@
 // RUN: pyc-opt %s --pass-pipeline='builtin.module(func.func(pyc-retime-pipelines))' | FileCheck %s --check-prefix=RETIME
-// RUN: pyc-opt %s --pass-pipeline='builtin.module(func.func(pyc-retime-pipelines{preserve-observability=true}))' | FileCheck %s --check-prefix=PRESERVE
-
 // RETIME-LABEL: func.func @unary_pipeline
 // RETIME-SAME: pyc.stats.retime_regions_rewritten = 1 : i64
 // RETIME-SAME: pyc.stats.retime_regs_rewritten = 3 : i64
@@ -84,12 +82,15 @@
 // RETIME-COUNT-2: pyc.reg
 // RETIME-NOT: pyc.delay_line
 
-// PRESERVE-LABEL: func.func @preserve_named
-// PRESERVE-COUNT-2: pyc.reg
-// PRESERVE-NOT: pyc.delay_line
 // RETIME-LABEL: func.func @preserve_named
 // RETIME: pyc.delay_line
+// RETIME: pyc.alias
+// RETIME-SAME: pyc.name = "stage0"
 // RETIME-NOT: pyc.reg
+// RETIME-LABEL: func.func @named_common_sink
+// RETIME: pyc.name = "lhs_hist"
+// RETIME: pyc.name = "rhs_hist"
+// RETIME: pyc.optimized_by = "retime_common_delay_sink"
 
 module {
   func.func @unary_pipeline(
@@ -220,5 +221,16 @@ module {
     %inv = pyc.xor %q0, %ones : i8, i8 -> i8
     %q1 = pyc.reg %clk, %rst, %en, %inv, %ones : i8
     func.return %q1 : i8
+  }
+
+  func.func @named_common_sink(
+      %clk: !pyc.clock, %rst: !pyc.reset, %en: i1, %lhs: i8, %rhs: i8)
+      -> i1 {
+    %lhsInit = pyc.constant 3 : i8
+    %rhsInit = pyc.constant 9 : i8
+    %lq = pyc.reg %clk, %rst, %en, %lhs, %lhsInit {pyc.name = "lhs_hist"} : i8
+    %rq = pyc.reg %clk, %rst, %en, %rhs, %rhsInit {pyc.name = "rhs_hist"} : i8
+    %less = pyc.ult %lq, %rq : i8, i8 -> i1
+    func.return %less : i1
   }
 }

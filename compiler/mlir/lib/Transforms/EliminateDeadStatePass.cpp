@@ -1,4 +1,5 @@
 #include "pyc/Transforms/Passes.h"
+#include "pyc/Transforms/StateOptimization.h"
 
 #include "pyc/Dialect/PYC/PYCOps.h"
 
@@ -21,9 +22,11 @@ static bool allResultsUnused(OpT op) {
 }
 
 static bool shouldKeep(Operation *op) {
-  if (auto keep = op->getAttrOfType<BoolAttr>("pyc.debug_keep"))
-    return keep.getValue();
-  return false;
+  if (auto r = dyn_cast<pyc::RegOp>(op))
+    return stateHasExternalObservation(op, r.getQ());
+  if (auto delay = dyn_cast<pyc::DelayLineOp>(op))
+    return stateHasExternalObservation(op, delay.getQ());
+  return hasExternalObservationIdentity(op);
 }
 
 struct EliminateDeadStatePass : public PassWrapper<EliminateDeadStatePass, OperationPass<func::FuncOp>> {

@@ -217,12 +217,6 @@ static llvm::cl::opt<unsigned> statePackWidth(
         "Maximum packed state-lane width in structural mode (0 disables Stage 2)"),
     llvm::cl::init(192));
 
-static llvm::cl::opt<bool> stateOptPreserveObservability(
-    "state-opt-preserve-observability",
-    llvm::cl::desc(
-        "Preserve named/debug/probe/trace state identities (slower; default false)"),
-    llvm::cl::init(false));
-
 static llvm::cl::opt<bool> noInline(
     "noinline",
     llvm::cl::desc("Disable MLIR inliner to preserve module boundaries (prevents merge/flatten)"),
@@ -2036,7 +2030,6 @@ static LogicalResult writeCppCompileManifest(llvm::StringRef path,
 struct CompileStatsSummary {
   std::string stateOptimizationPolicy;
   std::string stateRetimePolicy;
-  bool stateOptPreserveObservability = false;
   int64_t stateOptPackWidth = 0;
   int64_t regCount = 0;
   int64_t regBits = 0;
@@ -2091,8 +2084,6 @@ struct CompileStatsSummary {
   int64_t stateOptPackedStateOps = 0;
   int64_t stateOptStatePrimitivesRemoved = 0;
   int64_t stateOptPackBits = 0;
-  int64_t stateOptObservabilityAttrsStripped = 0;
-  int64_t stateOptObservationAliasesRemoved = 0;
   int64_t memCount = 0;
   int64_t memBits = 0;
   int64_t maxLogicDepth = 0;
@@ -2271,12 +2262,6 @@ static CompileStatsSummary collectCompileStats(ModuleOp module, int64_t depthLim
     s.stateOptPackBits = satAdd(
         s.stateOptPackBits,
         getI64Attr(f, "pyc.stats.state_opt_pack_bits", 0));
-    s.stateOptObservabilityAttrsStripped = satAdd(
-        s.stateOptObservabilityAttrsStripped,
-        getI64Attr(f, "pyc.stats.state_opt_observability_attrs_stripped", 0));
-    s.stateOptObservationAliasesRemoved = satAdd(
-        s.stateOptObservationAliasesRemoved,
-        getI64Attr(f, "pyc.stats.state_opt_observation_aliases_removed", 0));
     s.memCount = satAdd(s.memCount, getI64Attr(f, "pyc.stats.mem_count", 0));
     s.memBits = satAdd(s.memBits, getI64Attr(f, "pyc.stats.mem_bits", 0));
 
@@ -2300,8 +2285,6 @@ static CompileStatsSummary collectCompileStats(ModuleOp module, int64_t depthLim
 static void printCompileStats(const CompileStatsSummary &s) {
   llvm::errs() << "stats: state_policy=" << s.stateOptimizationPolicy
                << ", retime=" << s.stateRetimePolicy
-               << ", preserve_observability="
-               << (s.stateOptPreserveObservability ? "true" : "false")
                << ", pack_width=" << s.stateOptPackWidth
                << ", regs=" << s.regCount << " (" << s.regBits << " bits)"
                << ", delay_lines=" << s.delayLineCount
@@ -2321,8 +2304,6 @@ static llvm::json::Object compileStatsToJson(const CompileStatsSummary &s) {
   llvm::json::Object obj;
   obj["state_opt_policy"] = s.stateOptimizationPolicy;
   obj["state_retime_policy"] = s.stateRetimePolicy;
-  obj["state_opt_preserve_observability"] =
-      s.stateOptPreserveObservability;
   obj["state_opt_pack_width"] = s.stateOptPackWidth;
   obj["reg_count"] = s.regCount;
   obj["reg_bits"] = s.regBits;
@@ -2383,10 +2364,6 @@ static llvm::json::Object compileStatsToJson(const CompileStatsSummary &s) {
   obj["state_opt_state_primitives_removed"] =
       s.stateOptStatePrimitivesRemoved;
   obj["state_opt_pack_bits"] = s.stateOptPackBits;
-  obj["state_opt_observability_attrs_stripped"] =
-      s.stateOptObservabilityAttrsStripped;
-  obj["state_opt_observation_aliases_removed"] =
-      s.stateOptObservationAliasesRemoved;
   obj["mem_count"] = s.memCount;
   obj["mem_bits"] = s.memBits;
   obj["logic_depth_limit"] = s.logicDepthLimit;
@@ -2720,59 +2697,48 @@ int main(int argc, char **argv) {
     pm.addNestedPass<func::FuncOp>(pyc::createVectorUnrollPass());
   pm.addNestedPass<func::FuncOp>(pyc::createEliminateWiresPass());
   pm.addNestedPass<func::FuncOp>(pyc::createEliminateDeadStatePass());
-  // pycc always runs structural state merge, pipeline retiming, and packing.
-  if (!stateOptPreserveObservability) {
-    // Performance mode intentionally drops explicit state identity.
+  // State merge, retiming, and packing stay on the C++ emit path only so
+  // Verilog keeps the pre-optimization netlist.
+  const bool enableStateDelayOptimization = (emitKind == "cpp");
+  if (enableStateDelayOptimization) {
     pm.addNestedPass<func::FuncOp>(
-        pyc::createStripStateObservabilityPass());
+        pyc::createCombineDelayChainsPass(
+            pyc::DelayChainMode::Structural, /*accumulateStats=*/false,
+            /*cascadeRound=*/false,
+            /*mergeOnly=*/true,
+            /*skipMerge=*/false));
+    // Stage 1.5: the first state merge can expose equivalent combinational
+    // cones. Canonicalize/CSE once, then run one bounded merge refinement.
+    pm.addPass(createCanonicalizerPass(canonicalizeCfg));
+    pm.addPass(createCSEPass());
+    pm.addNestedPass<func::FuncOp>(pyc::createCombineDelayChainsPass(
+        pyc::DelayChainMode::Structural, /*accumulateStats=*/true,
+        /*cascadeRound=*/true,
+        /*mergeOnly=*/true, /*skipMerge=*/false));
+    // Run retiming after the two low-risk merge-only rounds. This prevents
+    // a local retime from consuming a state that has a more profitable
+    // global equivalent-state or direct-chain rewrite.
+    const unsigned retimeCombDepth = std::min<unsigned>(
+        stateRetimeMaxCombDepth, logicDepthLimit);
+    pm.addNestedPass<func::FuncOp>(pyc::createRetimePipelinesPass(
+        stateRetimeMaxStages, stateRetimeMaxExtraCombOps,
+        retimeCombDepth, /*accumulateStats=*/false));
     pm.addNestedPass<func::FuncOp>(pyc::createEliminateDeadStatePass());
+    // Form ordinary direct chains only after retiming has selected the more
+    // general computed pipelines. Also share equivalent histories here.
+    pm.addNestedPass<func::FuncOp>(pyc::createCombineDelayChainsPass(
+        pyc::DelayChainMode::Structural, /*accumulateStats=*/true,
+        /*cascadeRound=*/false,
+        /*mergeOnly=*/false, /*skipMerge=*/true));
+    if (statePackWidth != 0)
+      pm.addNestedPass<func::FuncOp>(
+          pyc::createPackStateLanesPass(statePackWidth));
   }
-  pm.addNestedPass<func::FuncOp>(
-      pyc::createCombineDelayChainsPass(
-          pyc::DelayChainMode::Structural, /*accumulateStats=*/false,
-          /*cascadeRound=*/false,
-          /*preserveObservability=*/stateOptPreserveObservability,
-          /*mergeOnly=*/true,
-          /*skipMerge=*/false));
-  // Stage 1.5: the first state merge can expose equivalent combinational
-  // cones. Canonicalize/CSE once, then run one bounded merge refinement.
-  pm.addPass(createCanonicalizerPass(canonicalizeCfg));
-  pm.addPass(createCSEPass());
-  pm.addNestedPass<func::FuncOp>(pyc::createCombineDelayChainsPass(
-      pyc::DelayChainMode::Structural, /*accumulateStats=*/true,
-      /*cascadeRound=*/true,
-      /*preserveObservability=*/stateOptPreserveObservability,
-      /*mergeOnly=*/true, /*skipMerge=*/false));
-  // Run retiming after the two low-risk merge-only rounds. This prevents
-  // a local retime from consuming a state that has a more profitable
-  // global equivalent-state or direct-chain rewrite.
-  const unsigned retimeCombDepth = std::min<unsigned>(
-      stateRetimeMaxCombDepth, logicDepthLimit);
-  pm.addNestedPass<func::FuncOp>(pyc::createRetimePipelinesPass(
-      stateRetimeMaxStages, stateRetimeMaxExtraCombOps,
-      retimeCombDepth, stateOptPreserveObservability,
-      /*accumulateStats=*/false));
-  pm.addNestedPass<func::FuncOp>(pyc::createEliminateDeadStatePass());
-  // Form ordinary direct chains only after retiming has selected the more
-  // general computed pipelines. Also share equivalent histories here.
-  pm.addNestedPass<func::FuncOp>(pyc::createCombineDelayChainsPass(
-      pyc::DelayChainMode::Structural, /*accumulateStats=*/true,
-      /*cascadeRound=*/false,
-      /*preserveObservability=*/stateOptPreserveObservability,
-      /*mergeOnly=*/false, /*skipMerge=*/true));
-  if (statePackWidth != 0)
-    pm.addNestedPass<func::FuncOp>(
-        pyc::createPackStateLanesPass(
-            statePackWidth, stateOptPreserveObservability));
   if (!unrollVector)
     pm.addNestedPass<func::FuncOp>(pyc::createSLPPackWiresPass());
   pm.addNestedPass<func::FuncOp>(pyc::createCombCanonicalizePass());
   pm.addPass(pyc::createCheckClockDomainsPass());
-  // Performance mode lets the legacy run-based i1 packer collect lanes that
-  // the general dependency-aware packer leaves behind. The preservation mode
-  // skips it because that legacy pass does not retain observation metadata.
-  if (!stateOptPreserveObservability)
-    pm.addNestedPass<func::FuncOp>(pyc::createPackI1RegsPass());
+  pm.addNestedPass<func::FuncOp>(pyc::createPackI1RegsPass());
   const bool enableFuseComb = (!cppOnly) || !cppOnlyPreserveOps;
   if (enableFuseComb)
     pm.addNestedPass<func::FuncOp>(pyc::createFuseCombPass());
@@ -2826,10 +2792,12 @@ int main(int argc, char **argv) {
   }
 
   CompileStatsSummary compileStats = collectCompileStats(*module, static_cast<int64_t>(logicDepthLimit));
-  compileStats.stateOptimizationPolicy = "structural";
-  compileStats.stateRetimePolicy = "pipeline";
-  compileStats.stateOptPreserveObservability = stateOptPreserveObservability;
-  compileStats.stateOptPackWidth = static_cast<int64_t>(statePackWidth);
+  compileStats.stateOptimizationPolicy =
+      enableStateDelayOptimization ? "structural" : "off";
+  compileStats.stateRetimePolicy =
+      enableStateDelayOptimization ? "pipeline" : "off";
+  compileStats.stateOptPackWidth =
+      enableStateDelayOptimization ? static_cast<int64_t>(statePackWidth) : 0;
   compileStats.fuseCombEnabled = enableFuseComb;
   printCompileStats(compileStats);
 

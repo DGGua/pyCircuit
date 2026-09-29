@@ -31,20 +31,18 @@
 | 13 | `pyc-lower-scf-static` | function | 将静态 `scf.for`、`scf.if` 等控制流降低为静态硬件结构。 | 始终 |
 | 14 | `pyc-unroll-vector` | function | 将 Vector 计算、连接和状态展开为标量 lane 操作。 | `--unroll-vector` |
 | 15 | `pyc-eliminate-wires` | function | 消除可直接替换的 `pyc.wire` / `pyc.assign` 中间连接。 | 始终 |
-| 16 | `pyc-eliminate-dead-state` | function | 删除对可观察行为无影响的寄存器、存储等状态。 | 始终 |
-| 17 | `pyc-strip-state-observability` | function | 性能模式移除状态 debug/probe/trace/name 身份，保留功能数据流。 | 未开启 `--state-opt-preserve-observability` |
-| 17b | `pyc-eliminate-dead-state` | function | 清理观测身份移除后不再有功能用途的状态。 | 同上 |
-| 18 | `pyc-combine-delay-chains{merge-only=true}` | function | Stage 1：第一轮等价状态合并。 | 始终 |
-| 19 | `canonicalize` + `cse` | module | Stage 1.5：让第一轮状态合并暴露的组合锥共享一次。 | 始终 |
-| 20 | `pyc-combine-delay-chains{merge-only=true}` | function | Stage 1.5 第二轮有界 equivalent-state merge。 | 始终 |
-| 20a | `pyc-retime-pipelines` | function | 把合法 computed pipeline 集中为 history，或将同深度多 operand delay 下沉到组合结果；执行 init、反馈、状态位和组合深度证明。 | 始终 |
-| 20b | `pyc-combine-delay-chains{skip-merge=true}` | function | 在 retiming 之后形成普通直连 delay-line/tap，并共享等价 history。 | 始终 |
-| 21 | `pyc-pack-state-lanes` | function | Stage 2：将控制兼容的整数 reg/delay-line lanes 打包到上限宽度。 | `--state-pack-width != 0` |
+| 16 | `pyc-eliminate-dead-state` | function | 删除对可观察行为无影响的寄存器、存储等状态；带外部可读身份的状态视为活。 | 始终 |
+| 17 | `pyc-combine-delay-chains{merge-only=true}` | function | Stage 1：第一轮等价状态合并，并把被删状态的 name/debug/probe/trace 挂到 survivor 的只读 alias。 | `--emit=cpp` |
+| 17b | `canonicalize` + `cse` | module | Stage 1.5：让第一轮状态合并暴露的组合锥共享一次。 | `--emit=cpp` |
+| 18 | `pyc-combine-delay-chains{merge-only=true}` | function | Stage 1.5 第二轮有界 equivalent-state merge。 | `--emit=cpp` |
+| 19 | `pyc-retime-pipelines` | function | 把合法 computed pipeline 集中为 history，或将同深度多 operand delay 下沉到组合结果；具名中间级拉 tap/线，具名下沉源留下只读 history。 | `--emit=cpp` |
+| 20 | `pyc-combine-delay-chains{skip-merge=true}` | function | 在 retiming 之后形成普通直连 delay-line/tap，并共享等价 history；中间身份改挂 delay_tap。 | `--emit=cpp` |
+| 21 | `pyc-pack-state-lanes` | function | Stage 2：将控制兼容的整数 reg/delay-line lanes 打包到上限宽度，外部身份挂到 slice alias。 | `--emit=cpp` 且 `--state-pack-width != 0` |
 | 22 | `pyc-slp-pack-wires` | function | 将可识别的同构标量 lane 重新打包成 Vector 操作。 | 未启用 `--unroll-vector` |
 | 23 | `pyc-comb-canonicalize` | function | PYC 组合图结构化简（mux、wire、get/create 重建）并将结构化 Vec 拆成 lane 级运算，使 dialect folder 能折叠可知 lane。 | 始终 |
 | 24 | `pyc-check-comb-cycles` | module | 构建组合依赖图并拒绝组合环。 | 始终 |
 | 25 | `pyc-check-clock-domains` | module | 检查跨时钟域连接、时钟/复位使用和 CDC 合法性。 | 始终 |
-| 26 | `pyc-pack-i1-regs` | function | 收集通用 state pack 留下的可合并标量 `i1` 寄存器。 | 默认性能模式；structural 显式观测保留模式跳过 |
+| 26 | `pyc-pack-i1-regs` | function | 收集通用 state pack 留下的可合并标量 `i1` 寄存器，并把身份挂到 packed bit alias。 | 始终 |
 | 27 | `pyc-fuse-comb` | function | 将连续组合逻辑融合为 `pyc.comb` 区域，减少 emitter 调度开销；稳定命名/观测状态是 fusion barrier。 | 默认启用；仅当同时设置 `--sim-mode=cpp-only` 与 `--cpp-only-preserve-ops` 时跳过 |
 | 28 | `canonicalize` | module | 对前面 lowering/fusion 产生的新模式再次规范化。 | 始终 |
 | 29 | `cse` | module | 再次消除公共子表达式。 | 始终 |
@@ -63,8 +61,7 @@ C++ 路径在统计和 emit 之前还会跑第 36 项 `pyc-cpp-placement`。
 ## Vector 分支
 
 第 14–16、22 项是 Vector 处理相关步骤。`pyc-eliminate-wires`（15）与
-`pyc-eliminate-dead-state`（16）**始终执行**；默认性能模式还会在 17/17b
-再次清理已放弃观测身份的 dead state；互斥的只有 unroll（14）与 SLP（22）：
+`pyc-eliminate-dead-state`（16）**始终执行**；互斥的只有 unroll（14）与 SLP（22）：
 
 ```text
 --unroll-vector

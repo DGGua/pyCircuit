@@ -1,16 +1,13 @@
-// STRIP-LABEL: func.func @drop_observation_only_state
-// STRIP-SAME: pyc.stats.state_opt_observability_attrs_stripped = 4 : i64
-// STRIP-SAME: pyc.stats.state_opt_observation_aliases_removed = 1 : i64
-// STRIP-NOT: pyc.reg
-// STRIP-NOT: pyc.alias
-// STRIP: return
+// KEEP-LABEL: func.func @drop_observation_only_state
+// KEEP: pyc.reg
+// KEEP: pyc.alias
+// KEEP-SAME: pyc.name = "debug_tap"
+// KEEP: return
 
-// STRIP-LABEL: func.func @keep_functional_state
-// STRIP-SAME: pyc.stats.state_opt_observability_attrs_stripped = 2 : i64
-// STRIP: %[[Q:.*]] = pyc.reg
-// STRIP-NOT: pyc.debug_keep
-// STRIP-NOT: pyc.name
-// STRIP: return %[[Q]]
+// KEEP-LABEL: func.func @keep_functional_state
+// KEEP: %[[Q:.*]] = pyc.reg
+// KEEP-SAME: pyc.name = "functional_state"
+// KEEP: return %[[Q]]
 
 module {
   func.func @drop_observation_only_state(

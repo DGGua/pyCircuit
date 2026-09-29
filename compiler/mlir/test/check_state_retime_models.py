@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Cross-check default retimed C++ and Verilog models."""
+"""Cross-check retimed C++ against unoptimized Verilog."""
 
 from __future__ import annotations
 
@@ -69,20 +69,39 @@ def main() -> None:
         cpp = temp / "default.hpp"
         verilog = temp / "default.v"
         observed: dict[str, tuple[int, int]] = {}
-        for kind, output in (("cpp", cpp), ("verilog", verilog)):
-            stats = emit(args.pycc, output, kind)
-            if (stats.get("reg_count") != 5 or stats.get("reg_bits") != 33):
-                raise AssertionError(f"{kind}: logical state changed: {stats}")
-            if stats.get("retime_regions_rewritten") != 2:
-                raise AssertionError(f"{kind}: retiming stats mismatch: {stats}")
-            if stats.get("retime_state_bits_removed") != 15:
-                raise AssertionError(f"{kind}: retiming bit delta mismatch: {stats}")
-            if stats.get("delay_line_count") != 1:
-                raise AssertionError(f"{kind}: delay line mismatch: {stats}")
-            if stats.get("state_opt_policy") != "structural":
-                raise AssertionError(f"{kind}: policy is not structural: {stats}")
-            if stats.get("state_retime_policy") != "pipeline":
-                raise AssertionError(f"{kind}: retime policy is not pipeline: {stats}")
+        cpp_stats = emit(args.pycc, cpp, "cpp")
+        verilog_stats = emit(args.pycc, verilog, "verilog")
+        if (cpp_stats.get("reg_count") != 5 or cpp_stats.get("reg_bits") != 33):
+            raise AssertionError(f"cpp: logical state changed: {cpp_stats}")
+        if cpp_stats.get("retime_regions_rewritten") != 2:
+            raise AssertionError(f"cpp: retiming stats mismatch: {cpp_stats}")
+        if cpp_stats.get("retime_state_bits_removed") != 15:
+            raise AssertionError(f"cpp: retiming bit delta mismatch: {cpp_stats}")
+        if cpp_stats.get("delay_line_count") != 1:
+            raise AssertionError(f"cpp: delay line mismatch: {cpp_stats}")
+        if cpp_stats.get("state_opt_policy") != "structural":
+            raise AssertionError(f"cpp: policy is not structural: {cpp_stats}")
+        if cpp_stats.get("state_retime_policy") != "pipeline":
+            raise AssertionError(f"cpp: retime policy is not pipeline: {cpp_stats}")
+        if (verilog_stats.get("reg_count") != 6 or
+                verilog_stats.get("reg_bits") != 48):
+            raise AssertionError(
+                f"verilog: unoptimized state changed: {verilog_stats}"
+            )
+        if verilog_stats.get("retime_regions_rewritten"):
+            raise AssertionError(
+                f"verilog: retiming ran unexpectedly: {verilog_stats}"
+            )
+        if verilog_stats.get("delay_line_count"):
+            raise AssertionError(
+                f"verilog: delay line formed unexpectedly: {verilog_stats}"
+            )
+        if verilog_stats.get("state_opt_policy") != "off":
+            raise AssertionError(f"verilog: policy is not off: {verilog_stats}")
+        if verilog_stats.get("state_retime_policy") != "off":
+            raise AssertionError(
+                f"verilog: retime policy is not off: {verilog_stats}"
+            )
 
         compile_cpp(args.cxx, cpp, temp / "cpp_bin")
         observed["cpp"] = result([str(temp / "cpp_bin")])
@@ -93,7 +112,7 @@ def main() -> None:
         print(
             "retiming verified: a 3-register computed pipeline -> one depth-3 "
             "history and two delayed i8 operands -> one i1 result state; "
-            "default C++ and Verilog match for "
+            "optimized C++ matches unoptimized Verilog for "
             f"{cycles} cycles (checksum={checksum})"
         )
 

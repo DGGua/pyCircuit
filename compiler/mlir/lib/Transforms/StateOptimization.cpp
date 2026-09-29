@@ -1,8 +1,10 @@
 #include "pyc/Transforms/StateOptimization.h"
 
 #include "mlir/IR/BuiltinAttributes.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/Hashing.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/StringRef.h"
 
 using namespace mlir;
 
@@ -18,6 +20,12 @@ static bool hasObservationAttribute(Operation *op) {
       return true;
   }
   return false;
+}
+
+static bool isObservationAttrName(llvm::StringRef name) {
+  return name == "pyc.name" || name == "pyc.debug_keep" ||
+         name == "pyc.observable" || name.starts_with("pyc.probe") ||
+         name.starts_with("pyc.trace");
 }
 
 static std::size_t opaqueHash(const void *ptr) {
@@ -87,6 +95,73 @@ bool hasStableStateName(Operation *op) {
   return !isCycleBalanceGenerated(op);
 }
 
+bool hasExternalObservationIdentity(Operation *op) {
+  if (!op)
+    return false;
+  const bool skipCycleBalanceName = isCycleBalanceGenerated(op);
+  for (NamedAttribute attr : op->getAttrs()) {
+    llvm::StringRef name = attr.getName().strref();
+    if (!isObservationAttrName(name))
+      continue;
+    if (name == "pyc.name" && skipCycleBalanceName)
+      continue;
+    return true;
+  }
+  return false;
+}
+
+bool stateHasExternalObservation(Operation *state, Value q) {
+  if (hasExternalObservationIdentity(state))
+    return true;
+  llvm::SmallVector<Value> worklist{q};
+  llvm::DenseSet<Value> seen;
+  while (!worklist.empty()) {
+    Value value = worklist.pop_back_val();
+    if (!seen.insert(value).second)
+      continue;
+    for (Operation *user : value.getUsers()) {
+      auto alias = dyn_cast<pyc::AliasOp>(user);
+      if (!alias)
+        continue;
+      if (hasExternalObservationIdentity(alias))
+        return true;
+      worklist.push_back(alias.getResult());
+    }
+  }
+  return false;
+}
+
+void copyExternalObservationAttrs(Operation *from, Operation *to) {
+  if (!from || !to)
+    return;
+  const bool skipCycleBalanceName = isCycleBalanceGenerated(from);
+  for (NamedAttribute attr : from->getAttrs()) {
+    llvm::StringRef name = attr.getName().strref();
+    if (!isObservationAttrName(name))
+      continue;
+    if (name == "pyc.name" && skipCycleBalanceName)
+      continue;
+    to->setAttr(attr.getName(), attr.getValue());
+  }
+}
+
+pyc::AliasOp materializeObservationAlias(OpBuilder &builder, Location loc,
+                                         Value source,
+                                         Operation *attrSource) {
+  auto alias =
+      builder.create<pyc::AliasOp>(loc, source.getType(), source);
+  copyExternalObservationAttrs(attrSource, alias);
+  return alias;
+}
+
+void remapStateOpIdentity(OpBuilder &builder, Operation *oldState,
+                          Value newSource) {
+  if (!oldState || !newSource || !hasExternalObservationIdentity(oldState))
+    return;
+  materializeObservationAlias(builder, oldState->getLoc(), newSource,
+                              oldState);
+}
+
 StateObservabilityAnalysis::StateObservabilityAnalysis(func::FuncOp function,
                                                        bool analyze) {
   if (!analyze)
@@ -143,23 +218,16 @@ bool equivalentStateValue(Value lhs, Value rhs) {
   return lhsConstant->getAttr("value") == rhsConstant->getAttr("value");
 }
 
-bool isStateOptimizationCandidate(
-    pyc::RegOp reg, DelayChainMode mode,
-    const StateObservabilityAnalysis &observability,
-    bool preserveObservability) {
-  if (!reg ||
-      (preserveObservability && observability.isPinned(reg.getOperation())))
+bool isStateOptimizationCandidate(pyc::RegOp reg, DelayChainMode mode) {
+  if (!reg)
     return false;
   if (mode == DelayChainMode::Generated)
     return isCycleBalanceGenerated(reg);
   return true;
 }
 
-bool isTransparentChainAlias(pyc::AliasOp alias, DelayChainMode mode,
-                             bool preserveObservability) {
-  if (!alias ||
-      (preserveObservability &&
-       (shouldKeepStateOptimization(alias) || hasStableStateName(alias))))
+bool isTransparentChainAlias(pyc::AliasOp alias, DelayChainMode mode) {
+  if (!alias)
     return false;
   if (mode == DelayChainMode::Generated)
     return isCycleBalanceGenerated(alias);
@@ -168,23 +236,18 @@ bool isTransparentChainAlias(pyc::AliasOp alias, DelayChainMode mode,
 
 std::optional<StateChainLink>
 matchStateChainPredecessor(pyc::RegOp consumer, pyc::RegOp keyReg,
-                           DelayChainMode mode,
-                           const StateObservabilityAnalysis &observability,
-                           bool preserveObservability,
-                           bool allowReadOnlyFanout) {
+                           DelayChainMode mode, bool allowReadOnlyFanout) {
   Value value = consumer.getNext();
   StateChainLink link;
   while (auto alias = value.getDefiningOp<pyc::AliasOp>()) {
-    if (!isTransparentChainAlias(alias, mode, preserveObservability))
+    if (!isTransparentChainAlias(alias, mode))
       return std::nullopt;
     link.aliasesFromConsumerToProducer.push_back(alias);
     value = alias.getIn();
   }
 
   auto predecessor = value.getDefiningOp<pyc::RegOp>();
-  if (!predecessor ||
-      !isStateOptimizationCandidate(predecessor, mode, observability,
-                                    preserveObservability))
+  if (!predecessor || !isStateOptimizationCandidate(predecessor, mode))
     return std::nullopt;
   if (predecessor.getQ().getType() != keyReg.getQ().getType() ||
       !equivalentStateValue(predecessor.getClk(), keyReg.getClk()) ||

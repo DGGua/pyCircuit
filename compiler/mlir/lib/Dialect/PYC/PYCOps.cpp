@@ -14,6 +14,7 @@
 #include "mlir/Support/LogicalResult.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/StringRef.h"
 #include "llvm/Support/raw_ostream.h"
 
 #include <optional>
@@ -762,9 +763,36 @@ OpFoldResult VAddReduceOp::fold(FoldAdaptor adaptor) {
   return foldVectorReduce(*this, adaptor.getVec(), VectorReduceKind::Add);
 }
 
+static bool carriesExternalObservationIdentity(Operation *op) {
+  auto generated = op->getAttrOfType<StringAttr>("pyc.generated");
+  const bool skipCycleBalanceName =
+      generated && generated.getValue() == "cycle_balance";
+  for (NamedAttribute attr : op->getAttrs()) {
+    llvm::StringRef name = attr.getName().strref();
+    if (name == "pyc.name") {
+      if (!skipCycleBalanceName)
+        return true;
+      continue;
+    }
+    if (name == "pyc.debug_keep" || name == "pyc.observable" ||
+        name.starts_with("pyc.probe") || name.starts_with("pyc.trace"))
+      return true;
+  }
+  return false;
+}
+
+void AliasOp::getEffects(
+    SmallVectorImpl<SideEffects::EffectInstance<MemoryEffects::Effect>>
+        &effects) {
+  // Unused observation aliases must survive DCE so probe/VCD can still
+  // register the identity after a state rewrite.
+  if (carriesExternalObservationIdentity(*this))
+    effects.emplace_back(MemoryEffects::Write::get());
+}
+
 OpFoldResult AliasOp::fold(FoldAdaptor) {
-  // Preserve alias ops that carry a debug name (used for codegen name mangling).
-  if (auto nAttr = (*this)->getAttrOfType<StringAttr>("pyc.name"))
+  // Preserve aliases that carry external observation identity.
+  if (carriesExternalObservationIdentity(*this))
     return {};
   return getIn();
 }
@@ -1014,6 +1042,13 @@ LogicalResult DelayLineOp::verify() {
   if (depthAttr.getValue().getSExtValue() <= 1)
     return emitOpError("depth must be > 1");
   return success();
+}
+
+void DelayTapOp::getEffects(
+    SmallVectorImpl<SideEffects::EffectInstance<MemoryEffects::Effect>>
+        &effects) {
+  if (carriesExternalObservationIdentity(*this))
+    effects.emplace_back(MemoryEffects::Write::get());
 }
 
 LogicalResult DelayTapOp::verify() {

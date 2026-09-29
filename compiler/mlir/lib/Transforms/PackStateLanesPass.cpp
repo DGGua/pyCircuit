@@ -36,7 +36,6 @@ struct StateLane {
   unsigned position = 0;
   int64_t depth = 1;
   bool isDelay = false;
-  StringAttr stableName;
   llvm::SmallVector<pyc::AliasOp> aliases;
 };
 
@@ -264,11 +263,11 @@ static void packGroup(ArrayRef<StateLane> lanes, PackStats &stats) {
     extract->setAttr("pyc.state_pack_source_width",
                      builder.getI64IntegerAttr(packedWidth));
     Value replacement = extract.getResult();
-    if (lane.stableName) {
-      auto alias = builder.create<pyc::AliasOp>(lane.op->getLoc(), laneType,
-                                                replacement);
-      alias->setAttr("pyc.name", lane.stableName);
-      replacement = alias.getResult();
+    remapStateOpIdentity(builder, lane.op, replacement);
+    for (pyc::AliasOp alias : lane.aliases) {
+      if (hasExternalObservationIdentity(alias))
+        materializeObservationAlias(builder, alias.getLoc(), replacement,
+                                    alias);
     }
     replacements.push_back(replacement);
     lsb += lane.width;
@@ -295,10 +294,7 @@ public:
 
   PackStateLanesPass() = default;
   PackStateLanesPass(const PackStateLanesPass &other) : PassWrapper(other) {}
-  PackStateLanesPass(unsigned maxWidth, bool preserveObservability) {
-    maxWidthOption = maxWidth;
-    preserveObservabilityOption = preserveObservability;
-  }
+  PackStateLanesPass(unsigned maxWidth) { maxWidthOption = maxWidth; }
 
   StringRef getArgument() const override { return "pyc-pack-state-lanes"; }
   StringRef getDescription() const override {
@@ -309,19 +305,12 @@ public:
       *this, "max-width",
       llvm::cl::desc("Maximum packed integer width (0 disables packing)"),
       llvm::cl::init(192)};
-  Option<bool> preserveObservabilityOption{
-      *this, "preserve-observability",
-      llvm::cl::desc("Keep named/debug/probe/trace state identities"),
-      llvm::cl::init(false)};
-
   void runOnOperation() override {
     func::FuncOp function = getOperation();
     PackStats stats;
     if (maxWidthOption != 0) {
-      StateObservabilityAnalysis observability(
-          function, preserveObservabilityOption);
       for (Block &block : function.getBody())
-        packBlock(block, observability, stats);
+        packBlock(block, stats);
     }
 
     setI64Attr(function, "pyc.stats.state_opt_pack_groups", stats.groups);
@@ -337,9 +326,7 @@ public:
   }
 
 private:
-  void packBlock(Block &block,
-                 const StateObservabilityAnalysis &observability,
-                 PackStats &stats) {
+  void packBlock(Block &block, PackStats &stats) {
     llvm::DenseMap<Operation *, unsigned> positions;
     unsigned nextPosition = 0;
     for (Operation &op : block)
@@ -385,18 +372,6 @@ private:
       lane.position = positions.lookup(lane.op);
       llvm::DenseSet<Operation *> aliases;
       collectAliases(lane.q, lane.aliases, aliases);
-      if (preserveObservabilityOption && observability.isPinned(lane.op)) {
-        // A stable logical name can survive packing on a slice alias. Stronger
-        // observation/debug attributes and named aliases retain physical state.
-        if (!hasStableStateName(lane.op) ||
-            shouldKeepStateOptimization(lane.op) ||
-            llvm::any_of(lane.aliases, [](pyc::AliasOp alias) {
-              return hasStableStateName(alias) ||
-                     shouldKeepStateOptimization(alias);
-            }))
-          continue;
-        lane.stableName = lane.op->getAttrOfType<StringAttr>("pyc.name");
-      }
       auto &candidateIndexes = bucketIndexes[controlHash(lane)];
       auto match = llvm::find_if(candidateIndexes, [&](unsigned index) {
         return sameControlKey(exactBuckets[index].front(), lane);
@@ -443,9 +418,8 @@ private:
 } // namespace
 
 std::unique_ptr<::mlir::Pass>
-createPackStateLanesPass(unsigned maxWidth, bool preserveObservability) {
-  return std::make_unique<PackStateLanesPass>(maxWidth,
-                                               preserveObservability);
+createPackStateLanesPass(unsigned maxWidth) {
+  return std::make_unique<PackStateLanesPass>(maxWidth);
 }
 
 static PassRegistration<PackStateLanesPass> pass;

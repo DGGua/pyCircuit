@@ -1,7 +1,8 @@
 // Form compact delay-line state from proven serial register chains. The
 // generated mode preserves the original cycle-balance-only policy; structural
 // mode additionally merges equivalent state and admits untagged chains after
-// the same sequential proof. Explicit state identity is an opt-in boundary.
+// the same sequential proof. External observation identities are remapped onto
+// survivor / delay-line / delay-tap views instead of blocking the rewrite.
 
 #include "pyc/Transforms/Passes.h"
 #include "pyc/Transforms/StateOptimization.h"
@@ -77,42 +78,30 @@ static bool isStatefulTapConsumer(Operation *op) {
              pyc::AsyncFifoOp, pyc::CdcSyncOp, pyc::InstanceOp>(op);
 }
 
-static Value stripChainAliases(Value value, DelayChainMode mode,
-                               bool preserveObservability) {
+static Value stripChainAliases(Value value, DelayChainMode mode) {
   while (auto alias = value.getDefiningOp<pyc::AliasOp>()) {
-    if (!isTransparentChainAlias(alias, mode, preserveObservability))
+    if (!isTransparentChainAlias(alias, mode))
       break;
     value = alias.getIn();
   }
   return value;
 }
 
-static bool isDelayCandidate(
-    pyc::DelayLineOp delay, DelayChainMode mode,
-    const StateObservabilityAnalysis &observability,
-    bool preserveObservability) {
-  if (!delay ||
-      (preserveObservability &&
-       (shouldKeepStateOptimization(delay) || hasStableStateName(delay) ||
-        observability.isPinned(delay.getOperation()))))
+static bool isDelayCandidate(pyc::DelayLineOp delay, DelayChainMode mode) {
+  if (!delay)
     return false;
   if (mode == DelayChainMode::Generated)
     return isCycleBalanceGenerated(delay);
   return true;
 }
 
-static void mergeEquivalentStates(
-    func::FuncOp function, CombineStats &stats,
-    const StateObservabilityAnalysis &observability,
-    bool preserveObservability) {
+static void mergeEquivalentStates(func::FuncOp function, CombineStats &stats) {
   llvm::SmallVector<pyc::RegOp> regs;
   function.walk([&](pyc::RegOp reg) { regs.push_back(reg); });
 
   llvm::DenseMap<std::size_t, llvm::SmallVector<pyc::RegOp>> buckets;
   for (pyc::RegOp reg : regs) {
-    if (!isStateOptimizationCandidate(reg, DelayChainMode::Structural,
-                                      observability,
-                                      preserveObservability))
+    if (!isStateOptimizationCandidate(reg, DelayChainMode::Structural))
       continue;
 
     auto &bucket = buckets[registerStateHash(reg)];
@@ -128,6 +117,8 @@ static void mergeEquivalentStates(
       continue;
     }
 
+    OpBuilder builder(survivor);
+    remapStateOpIdentity(builder, reg.getOperation(), survivor.getQ());
     reg.getQ().replaceAllUsesWith(survivor.getQ());
     const int64_t survivorCount =
         getI64Attr(survivor, kStateMergedCountAttr, 1);
@@ -141,20 +132,16 @@ static void mergeEquivalentStates(
   }
 }
 
-static void combineStateChains(
-    func::FuncOp function, CombineStats &stats, DelayChainMode mode,
-    const StateObservabilityAnalysis &observability,
-    bool preserveObservability) {
+static void combineStateChains(func::FuncOp function, CombineStats &stats,
+                               DelayChainMode mode) {
   llvm::SmallVector<pyc::RegOp> regs;
   function.walk([&](pyc::RegOp reg) {
-    if (isStateOptimizationCandidate(reg, mode, observability,
-                                     preserveObservability))
+    if (isStateOptimizationCandidate(reg, mode))
       regs.push_back(reg);
   });
 
   llvm::DenseSet<Operation *> erased;
-  const bool allowReadOnlyFanout =
-      mode == DelayChainMode::Structural && !preserveObservability;
+  const bool allowReadOnlyFanout = mode == DelayChainMode::Structural;
   for (pyc::RegOp tail : llvm::reverse(regs)) {
     if (erased.contains(tail.getOperation()))
       continue;
@@ -163,8 +150,7 @@ static void combineStateChains(
     llvm::SmallVector<StateChainLink> linksFromTail;
     pyc::RegOp cursor = tail;
     while (auto link = matchStateChainPredecessor(
-               cursor, tail, mode, observability, preserveObservability,
-               allowReadOnlyFanout)) {
+               cursor, tail, mode, allowReadOnlyFanout)) {
       if (erased.contains(link->predecessor.getOperation()))
         break;
       linksFromTail.push_back(*link);
@@ -229,7 +215,7 @@ static void combineStateChains(
     auto delay = builder.create<pyc::DelayLineOp>(
         tail.getLoc(), tail.getQ().getType(), head.getClk(), head.getRst(),
         head.getEn(),
-        stripChainAliases(head.getNext(), mode, preserveObservability),
+        stripChainAliases(head.getNext(), mode),
         head.getInit());
     delay->setAttr("depth", builder.getI64IntegerAttr(depth));
     if (allGenerated)
@@ -247,8 +233,9 @@ static void combineStateChains(
 
     // A non-tail state may have read-only fanout. Replace each such direct
     // read with a fixed-depth view of the new history, while preserving the
-    // unique state-to-state edge that defines the chain. Alias bridges are
-    // only accepted when they remain one-use, so they can be erased safely.
+    // unique state-to-state edge that defines the chain. Observation
+    // identities on erased stages are remapped onto the same views.
+    remapStateOpIdentity(builder, tail.getOperation(), delay.getQ());
     for (unsigned i = 1; i < chainFromTail.size(); ++i) {
       pyc::RegOp reg = chainFromTail[i];
       llvm::SmallVector<OpOperand *, 8> sideUses;
@@ -278,7 +265,12 @@ static void combineStateChains(
           if (use.getOwner() != requiredUser)
             sideUses.push_back(&use);
       }
-      if (sideUses.empty())
+      const bool needsObservationView =
+          hasExternalObservationIdentity(reg.getOperation()) ||
+          llvm::any_of(link.aliasesFromConsumerToProducer, [](pyc::AliasOp a) {
+            return hasExternalObservationIdentity(a);
+          });
+      if (sideUses.empty() && !needsObservationView)
         continue;
       const int64_t tapDepth = static_cast<int64_t>(chainFromTail.size() - i);
       auto tap = builder.create<pyc::DelayTapOp>(
@@ -287,6 +279,12 @@ static void combineStateChains(
       tap->setAttr("pyc.optimized_by",
                    builder.getStringAttr("combine_delay_chain_tap"));
       ++stats.delayTapsCreated;
+      remapStateOpIdentity(builder, reg.getOperation(), tap.getTap());
+      for (pyc::AliasOp alias : link.aliasesFromConsumerToProducer) {
+        if (hasExternalObservationIdentity(alias))
+          materializeObservationAlias(builder, alias.getLoc(), tap.getTap(),
+                                      alias);
+      }
       for (OpOperand *use : sideUses) {
         use->set(tap.getTap());
         ++stats.delayTapUsesRewritten;
@@ -319,13 +317,12 @@ static void combineStateChains(
   }
 }
 
-static void shareEquivalentDelayLines(
-    func::FuncOp function, CombineStats &stats, DelayChainMode mode,
-    const StateObservabilityAnalysis &observability,
-    bool preserveObservability) {
+static void shareEquivalentDelayLines(func::FuncOp function,
+                                      CombineStats &stats,
+                                      DelayChainMode mode) {
   llvm::SmallVector<pyc::DelayLineOp> delays;
   function.walk([&](pyc::DelayLineOp delay) {
-    if (isDelayCandidate(delay, mode, observability, preserveObservability))
+    if (isDelayCandidate(delay, mode))
       delays.push_back(delay);
   });
 
@@ -356,6 +353,8 @@ static void shareEquivalentDelayLines(
     if (lhsChains || rhsChains)
       setI64Attr(survivor, kSharedChainCountAttr, lhsChains + rhsChains);
 
+    OpBuilder builder(survivor);
+    remapStateOpIdentity(builder, delay.getOperation(), survivor.getQ());
     delay.getQ().replaceAllUsesWith(survivor.getQ());
     delay.erase();
     ++stats.delayLinesMerged;
@@ -407,12 +406,10 @@ struct CombineDelayChainsPass
   CombineDelayChainsPass(const CombineDelayChainsPass &other)
       : PassWrapper(other) {}
   CombineDelayChainsPass(DelayChainMode mode, bool accumulateStats,
-                         bool cascadeRound, bool preserveObservability,
-                         bool mergeOnly, bool skipMerge) {
+                         bool cascadeRound, bool mergeOnly, bool skipMerge) {
     modeOption = stringifyDelayChainMode(mode).str();
     accumulateStatsOption = accumulateStats;
     cascadeRoundOption = cascadeRound;
-    preserveObservabilityOption = preserveObservability;
     mergeOnlyOption = mergeOnly;
     skipMergeOption = skipMerge;
   }
@@ -434,10 +431,6 @@ struct CombineDelayChainsPass
       *this, "cascade-round",
       llvm::cl::desc("Attribute equivalent-state merges to cascade refinement"),
       llvm::cl::init(false)};
-  Option<bool> preserveObservabilityOption{
-      *this, "preserve-observability",
-      llvm::cl::desc("Keep named/debug/probe/trace state identities"),
-      llvm::cl::init(false)};
   Option<bool> mergeOnlyOption{
       *this, "merge-only",
       llvm::cl::desc("Only merge equivalent registers; do not form histories"),
@@ -458,13 +451,6 @@ struct CombineDelayChainsPass
     }
 
     func::FuncOp function = getOperation();
-    // Generated mode is the compatibility policy and always retains its
-    // historical observability boundaries. Structural mode is performance-
-    // first unless preservation is explicitly requested.
-    const bool preserveObservability =
-        *mode == DelayChainMode::Generated || preserveObservabilityOption;
-    StateObservabilityAnalysis observability(function,
-                                              preserveObservability);
     CombineStats stats;
     if (mergeOnlyOption && skipMergeOption) {
       function.emitError()
@@ -473,13 +459,10 @@ struct CombineDelayChainsPass
       return;
     }
     if (*mode == DelayChainMode::Structural && !skipMergeOption)
-      mergeEquivalentStates(function, stats, observability,
-                            preserveObservability);
+      mergeEquivalentStates(function, stats);
     if (!mergeOnlyOption) {
-      combineStateChains(function, stats, *mode, observability,
-                         preserveObservability);
-      shareEquivalentDelayLines(function, stats, *mode, observability,
-                                preserveObservability);
+      combineStateChains(function, stats, *mode);
+      shareEquivalentDelayLines(function, stats, *mode);
     }
     writeCombineStats(function, stats, accumulateStatsOption,
                       cascadeRoundOption, *mode,
@@ -492,13 +475,10 @@ struct CombineDelayChainsPass
 
 std::unique_ptr<::mlir::Pass>
 createCombineDelayChainsPass(DelayChainMode mode, bool accumulateStats,
-                             bool cascadeRound,
-                             bool preserveObservability, bool mergeOnly,
+                             bool cascadeRound, bool mergeOnly,
                              bool skipMerge) {
-  return std::make_unique<CombineDelayChainsPass>(mode, accumulateStats,
-                                                   cascadeRound,
-                                                   preserveObservability,
-                                                   mergeOnly, skipMerge);
+  return std::make_unique<CombineDelayChainsPass>(
+      mode, accumulateStats, cascadeRound, mergeOnly, skipMerge);
 }
 
 static PassRegistration<CombineDelayChainsPass> pass;

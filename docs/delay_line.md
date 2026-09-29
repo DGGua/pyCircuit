@@ -38,16 +38,15 @@ b@4 ─────────────────────────�
 
 - `pyc.generated = "cycle_balance"` 说明状态来源；
 - 状态类型、clock/reset/enable/init、next-state、fanout 和依赖关系决定能否改写；
-- `pycc` 固定走 `structural` 证明，不要求 `pyc.generated` marker；
-- 默认性能模式允许丢弃内部 debug/probe/trace/name 的物理状态身份；
+- `pycc --emit=cpp` 固定走 `structural` 证明，不要求 `pyc.generated` marker；
+- C++ 路径优化时保留 debug/probe/trace/name，改挂到 survivor / delay_tap / slice alias；
 - 端口行为、周期数、reset/enable/init 和功能数据流仍必须等价。
 
-C++ 与 Verilog 都固定跑完整状态优化（structural 合并 + pipeline retiming）。
-仍可调的预算是：
+只有 `--emit=cpp`（或 `-cpp`）跑完整状态优化（structural 合并 + pipeline retiming）。
+`--emit=verilog` 与 `--emit=none` 保持优化前的寄存器网表。仍可调的预算是：
 
 ```text
 --state-pack-width=192
---state-opt-preserve-observability=false
 --state-retime-max-stages=0
 --state-retime-max-extra-comb-ops=32
 --state-retime-max-comb-depth=32
@@ -149,9 +148,6 @@ Stage 1.5 固定运行一次 canonicalize+CSE 和第二轮状态优化。这样�
 eliminate-wires
 eliminate-dead-state
         │
-        ├─ structural performance mode:
-        │    strip-state-observability
-        │    eliminate-dead-state
         ▼
 Stage 1/1.5: two bounded equivalent-state merge rounds with canonicalize/CSE
         │
@@ -168,7 +164,7 @@ Stage 2: pack compatible reg/delay-line lanes
 comb/clock/logic-depth gates → stats → C++ or Verilog emitter
 ```
 
-`pycc` 的状态优化预算开关（策略本身不可关）：
+`pycc` 在 C++ 路径上的状态优化预算开关（Verilog / `--emit=none` 不跑这组 pass）：
 
 ```text
 --state-retime-max-stages=0
@@ -186,8 +182,6 @@ comb/clock/logic-depth gates → stats → C++ or Verilog emitter
 --state-pack-width=0
     禁用 Stage 2，便于隔离 Stage 1/1.5 收益
 
---state-opt-preserve-observability=true
-    保留内部命名/debug/probe/trace 状态身份；性能较低
 ```
 
 编译统计 JSON 会记录：
@@ -196,7 +190,6 @@ comb/clock/logic-depth gates → stats → C++ or Verilog emitter
 {
   "state_opt_policy": "structural",
   "state_retime_policy": "pipeline",
-  "state_opt_preserve_observability": false,
   "state_opt_pack_width": 192
 }
 ```
@@ -215,42 +208,21 @@ comb/clock/logic-depth gates → stats → C++ or Verilog emitter
 - 稳定的非 cycle-balance `pyc.name`；
 - 状态 q 之后携带上述属性的 alias 链。
 
-改写 pass 用同一套观测分析决定能不能合并、收链或 retiming；不再单独提供只统计不改写的 analyze pass。
+改写 pass 不再把这些身份当成硬边界。合并、收链、retiming、packing 照做，并把身份改挂到 survivor、`pyc.delay_tap` 或 packed slice alias。`cycle_balance` 自动名不拉外部视图。共同 delay 下沉后，具名源 history 留下只读观测。
 
-## 6. 默认性能模式：显式观测身份清理
+## 6. 观测身份重映射
 
-默认 structural 模式运行
-[`StripStateObservabilityPass.cpp`](../compiler/mlir/lib/Transforms/StripStateObservabilityPass.cpp)。
-该 pass：
+`pyc-strip-state-observability` 和 `--state-opt-preserve-observability` 已删除。
+C++ 路径始终优化，并把外部可读身份改挂到只读视图：
 
-1. 从 reg、delay-line 及其状态 alias 删除 `pyc.name`、`pyc.debug_keep`、
-   `pyc.observable`、`pyc.probe*` 和 `pyc.trace*`；
-2. 删除已经没有 SSA 使用的状态 alias；
-3. 再运行 dead-state，删除仅因观测标记而存活、没有功能用途的状态。
+1. 等价合并：victim 上的身份挂到 survivor `q` 的 `pyc.alias`；
+2. 收链：中间级挂到对应深度的 `pyc.delay_tap`，末端挂到 `delay_line.q`；
+3. pipeline retiming：中间级挂到 tap 加重放前缀；
+4. 共同 delay 下沉：功能路径改为 `D^N(f(...))`，具名源 history 留下只读观测；
+5. packing：身份挂到 packed storage 的 slice alias，`ProbeRegistry` 用 `addRegSlice`。
 
-需要准确理解“放弃显式观测语义”的范围：
-
-- 允许内部状态失去原物理对象、名字和独立 current/next/pending probe 身份；
-- 允许仅用于 debug/probe 的状态和 alias 被删除；
-- 不允许改变 function result、instance 端口或其他功能消费者看到的值；
-- 不放宽 clock/reset/enable/init、类型、fanout 和状态依赖证明；
-- 不允许少一个周期或多一个周期。
-
-例如，只有 `debug_keep` 但没有功能使用的寄存器可被删除；直接返回到模块输出的
-寄存器不能因为去掉名字而被删除。
-
-需要调试物理状态时使用：
-
-```bash
-pycc input.mlir --state-opt-preserve-observability=true ...
-```
-
-该模式下 debug/probe/trace/observable 和具名 alias 继续作为硬边界。只有单纯带
-`pyc.name` 的逻辑状态可在安全时通过具名 slice alias 参与 packing；C++
-ProbeRegistry 使用 `addRegSlice<W, StorageW>` 将逻辑 q/pending/qNext 映射到
-packed storage。
-
-`generated` 兼容模式始终保留观测边界，不受默认 performance policy 影响。
+`cycle_balance` 的 `_v5_bal_*` 不拉外部视图。无使用的观测 alias/tap 带副作用，
+避免被 DCE 在 emit 前删掉。功能端口、周期和 clk/rst/en/init 证明不放宽。
 
 ## 7. Stage 1：等价状态、结构化链和共享
 
@@ -556,7 +528,7 @@ history。中间值被模块输出、assert、组合 consumer，甚至另一寄�
 - 被删除状态的 next 不反馈依赖候选内状态，也不通过未解析 wire 隐藏反馈；
 - 组合锥中间结果没有锥外 fanout；共同下沉的源状态没有其他使用；
 - 新 history bits 不增加，新增组合 op、重建前缀及其下游深度均在预算内；
-- `preserve-observability=true` 时，name/debug/probe/trace 身份仍是硬边界。
+- 外部可读身份改挂到 tap/线/留下的源 history，不改变可读值。
 
 `eq(0, 0)` 的新 init 会计算为 1，而不是机械沿用 0。动态 shift、截位和有符号比较也
 使用 `APInt` 按结果位宽求值。局部深度预算取
@@ -673,25 +645,23 @@ packing。state bits 的主要下降来自等价状态合并，不是 lane packi
 
 ## 13. 可观测性和正确性边界
 
-默认 performance policy 有意改变内部物理观测身份，因此团队对齐时应使用以下口径：
+C++ 默认路径优化物理对象，但外部可读名字/probe 必须仍能读到同一周期的值：
 
-| 行为 | 默认性能模式 |
+| 行为 | C++ 默认路径 |
 |---|---|
 | 模块输入/输出值和周期 | 必须保持 |
 | reset/enable/init 语义 | 必须保持 |
 | function/instance 功能数据流 | 必须保持 |
-| 中间只读 SSA fanout/tap | structural 性能模式改写为 `pyc.delay_tap`；state dependency/写回仍禁止 |
-| 内部 reg 的原物理对象和名字 | 不保证 |
-| debug/probe/trace/observable-only state | 可删除 |
-| state current/next/pending 的独立物理身份 | 不保证 |
+| 中间只读 SSA fanout/tap | 改写为 `pyc.delay_tap`；state dependency/写回仍禁止 |
+| 内部 reg 的原物理对象 | 不保证，身份改挂到 survivor / tap / slice |
+| debug/probe/trace/name 的可读值 | 必须保持；`cycle_balance` 自动名除外 |
+| 共同下沉的具名源 history | 留下只读观测，不把名字改挂到 `f` 的结果 |
 
 因此：
 
-- 功能回归和性能自动化使用默认模式；
-- 需要波形逐状态对齐、内部 probe identity 或调试特定寄存器时使用
-  `--state-opt-preserve-observability=true`；
+- 功能回归、内部 `dut.read` 和 probe 清单都走默认 C++ 路径；
 - 需要拆开 generated 兼容改写时用 `pyc-opt` 指定 `pyc-combine-delay-chains`；
-  `pycc` 不再提供 off / generated / retime-off 开关。
+  `pycc` 不再提供 off / generated / retime-off / preserve-observability 开关。
 
 ## 14. 统计和诊断
 
@@ -710,9 +680,8 @@ packing。state bits 的主要下降来自等价状态合并，不是 lane packi
 
 | JSON 字段 | 含义 |
 |---|---|
-| `state_opt_policy` | 固定为 `structural` |
-| `state_retime_policy` | 固定为 `pipeline` |
-| `state_opt_preserve_observability` | 是否保留显式状态身份 |
+| `state_opt_policy` | `--emit=cpp` 为 `structural`，其它 emit 为 `off` |
+| `state_retime_policy` | `--emit=cpp` 为 `pipeline`，其它 emit 为 `off` |
 | `state_opt_pack_width` | 实际 Stage 2 width 上限 |
 | `state_opt_regs_merged` | 两轮实际合并的 reg 数 |
 | `state_opt_reg_bits_removed` | 等价状态合并移除的逻辑 bits |
@@ -725,8 +694,6 @@ packing。state bits 的主要下降来自等价状态合并，不是 lane packi
 | `state_opt_packed_state_ops` | 参与 packing 的原 state op 数 |
 | `state_opt_state_primitives_removed` | packing 净减少的 primitive 数 |
 | `state_opt_pack_bits` | 参与 packing 的逻辑 bit×depth 总量 |
-| `state_opt_observability_attrs_stripped` | 性能模式删除的观测属性数 |
-| `state_opt_observation_aliases_removed` | 删除的无用途状态 alias 数 |
 | `delay_chain_taps_created` | 由中间只读 fanout 形成的固定深度 tap 数 |
 | `delay_chain_tap_uses_rewritten` | 被 tap 替换的只读 SSA 使用数 |
 | `retime_regions/regs_rewritten` | 实际改写的 region 和源状态数 |
@@ -742,9 +709,9 @@ packing。state bits 的主要下降来自等价状态合并，不是 lane packi
 查看 pass 前后 IR：
 
 ```bash
-pycc input.mlir --emit=none \
+pycc input.mlir --emit=cpp \
   --dump-pass-ir=/tmp/state_ir \
-  --dump-pass-ir-filter='strip-state-observability|retime-pipelines|combine-delay-chains|pack-state-lanes' \
+  --dump-pass-ir-filter='retime-pipelines|combine-delay-chains|pack-state-lanes' \
   --dump-pass-ir-phase=both
 ```
 
@@ -760,7 +727,7 @@ python3 compiler/mlir/test/check_state_delay_tap_models.py
 python3 compiler/mlir/test/check_state_retime_models.py
 ```
 
-`state_delay_optimization_smoke.sh` 覆盖默认策略、显式保留、delay tap、lane packing
+`state_delay_optimization_smoke.sh` 覆盖默认策略、观测重映射、delay tap、lane packing
 和 probe。两个 Python 检查分别核对 delay tap 与 retiming 的 C++ 结果。
 
 ## 16. 修改文件与职责
@@ -770,8 +737,7 @@ python3 compiler/mlir/test/check_state_retime_models.py
 | Frontend | [`v5.py`](../compiler/frontend/pycircuit/v5.py)、[`dsl.py`](../compiler/frontend/pycircuit/dsl.py)、[`hw.py`](../compiler/frontend/pycircuit/hw.py) | 生成并传播 cycle-balance provenance |
 | Dialect | [`PYCOps.td`](../compiler/mlir/include/pyc/Dialect/PYC/PYCOps.td)、[`PYCOps.cpp`](../compiler/mlir/lib/Dialect/PYC/PYCOps.cpp) | 定义和验证 `pyc.delay_line` |
 | Analysis | [`StateOptimization.cpp`](../compiler/mlir/lib/Transforms/StateOptimization.cpp) | 观测边界、状态值归一化和等价证明，供改写 pass 使用 |
-| Transform | [`StripStateObservabilityPass.cpp`](../compiler/mlir/lib/Transforms/StripStateObservabilityPass.cpp) | 性能模式清理显式状态身份 |
-| Transform | [`CombineDelayChainsPass.cpp`](../compiler/mlir/lib/Transforms/CombineDelayChainsPass.cpp) | 等价 state、串行 chain、delay sharing 和两轮统计 |
+| Transform | [`CombineDelayChainsPass.cpp`](../compiler/mlir/lib/Transforms/CombineDelayChainsPass.cpp) | 等价 state、串行 chain、delay sharing 和观测重映射 |
 | Transform | [`RetimePipelinesPass.cpp`](../compiler/mlir/lib/Transforms/RetimePipelinesPass.cpp) | computed pipeline history、共同 delay 下沉、init/depth/cost 证明 |
 | Transform | [`PackStateLanesPass.cpp`](../compiler/mlir/lib/Transforms/PackStateLanesPass.cpp) | reg/delay-line lane packing |
 | Pipeline | [`pycc.cpp`](../compiler/mlir/tools/pycc.cpp) | 默认策略、pass 顺序、CLI 和统计汇总 |
@@ -823,10 +789,9 @@ pyc4.0 value-model hardening。Yosys/目标综合器的 FF/LUT/memory 数据也�
 3. Stage 1 减少等价状态、形成严格串行历史并共享重复历史；
 4. Stage 1.5 用一次有界 canonicalize/CSE 捕获级联机会；
 5. Stage 2 将独立窄状态集中为较少的宽 storage，重点降低 C++ primitive 调度；
-6. 默认性能模式牺牲内部显式观测身份，但不牺牲端口和周期功能等价；
-7. 需要内部调试身份时有明确的 preserve 开关；
+6. C++ 默认路径优化物理对象，但 name/debug/probe/trace 仍通过只读视图保持同一周期可读；
+7. 已删除 strip 与 `--state-opt-preserve-observability`，不再提供剥身份或钉死身份两种模式；
 8. 受约束 computed-pipeline retiming 和共同 delay 下沉已默认开启；不同深度/反馈图的
    全局 retiming、多结果 tap 原语和综合反馈 cost model 仍是后续独立阶段。
 
-这套边界使自动化性能测试可以默认获得最大收益，同时保留一个可审计、可回退、
-跨 backend 有门禁的安全路径。
+这套边界使自动化性能测试可以默认获得最大收益，同时外部按原名读取仍有门禁。
