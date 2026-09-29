@@ -1,7 +1,6 @@
 // STRIP-LABEL: func.func @drop_observation_only_state
 // STRIP-SAME: pyc.stats.state_opt_observability_attrs_stripped = 4 : i64
 // STRIP-SAME: pyc.stats.state_opt_observation_aliases_removed = 1 : i64
-// STRIP-SAME: pyc.stats.state_opt_pinned_regs = 1 : i64
 // STRIP-NOT: pyc.reg
 // STRIP-NOT: pyc.alias
 // STRIP: return

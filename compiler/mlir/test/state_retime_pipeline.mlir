@@ -1,11 +1,5 @@
-// RUN: pyc-opt %s --pass-pipeline='builtin.module(func.func(pyc-analyze-retiming))' | FileCheck %s --check-prefix=ANALYZE
 // RUN: pyc-opt %s --pass-pipeline='builtin.module(func.func(pyc-retime-pipelines))' | FileCheck %s --check-prefix=RETIME
 // RUN: pyc-opt %s --pass-pipeline='builtin.module(func.func(pyc-retime-pipelines{preserve-observability=true}))' | FileCheck %s --check-prefix=PRESERVE
-
-// ANALYZE-LABEL: func.func @unary_pipeline
-// ANALYZE-SAME: pyc.stats.retime_candidate_comb_ops = 2 : i64
-// ANALYZE-SAME: pyc.stats.retime_candidate_regions = 1 : i64
-// ANALYZE-SAME: pyc.stats.retime_candidate_regs = 3 : i64
 
 // RETIME-LABEL: func.func @unary_pipeline
 // RETIME-SAME: pyc.stats.retime_regions_rewritten = 1 : i64
@@ -43,8 +37,6 @@
 // RETIME-SAME: %[[FTAP]]
 // RETIME: return %[[FADD]], %[[BRANCH]] : i8, i8
 
-// ANALYZE-LABEL: func.func @common_delay_sink
-// ANALYZE-SAME: pyc.stats.retime_common_delay_candidates = 1 : i64
 // RETIME-LABEL: func.func @common_delay_sink
 // RETIME-SAME: pyc.stats.retime_common_delay_sinks = 1 : i64
 // RETIME-SAME: pyc.stats.retime_state_bits_removed = 15 : i64

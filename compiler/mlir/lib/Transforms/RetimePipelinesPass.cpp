@@ -1012,23 +1012,7 @@ static RetimeStats runRetiming(func::FuncOp function, bool rewrite,
 }
 
 static void writeStats(func::FuncOp function, const RetimeStats &stats,
-                       bool analysis, bool accumulate = false) {
-  if (analysis) {
-    setI64Attr(function, "pyc.stats.retime_regs_seen", stats.regsSeen);
-    setI64Attr(function, "pyc.stats.retime_candidate_regions",
-               stats.candidateRegions);
-    setI64Attr(function, "pyc.stats.retime_candidate_regs",
-               stats.candidateRegs);
-    setI64Attr(function, "pyc.stats.retime_candidate_comb_ops",
-               stats.candidateCombOps);
-    setI64Attr(function, "pyc.stats.retime_analysis_blocked_init",
-               stats.blockedInit);
-    setI64Attr(function, "pyc.stats.retime_analysis_blocked_cost",
-               stats.blockedCost);
-    setI64Attr(function, "pyc.stats.retime_common_delay_candidates",
-               stats.commonDelayCandidates);
-    return;
-  }
+                       bool accumulate = false) {
   setI64Attr(function, "pyc.stats.retime_regions_rewritten",
              stats.regionsRetimed, accumulate);
   setI64Attr(function, "pyc.stats.retime_regs_rewritten", stats.regsRetimed,
@@ -1052,25 +1036,6 @@ static void writeStats(func::FuncOp function, const RetimeStats &stats,
   setI64Attr(function, "pyc.stats.retime_blocked_cost", stats.blockedCost,
              accumulate);
 }
-
-struct AnalyzeRetimingPass
-    : public PassWrapper<AnalyzeRetimingPass, OperationPass<func::FuncOp>> {
-  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(AnalyzeRetimingPass)
-
-  StringRef getArgument() const override { return "pyc-analyze-retiming"; }
-  StringRef getDescription() const override {
-    return "Report legal single-source pipeline retiming opportunities";
-  }
-
-  void runOnOperation() override {
-    RetimeStats stats = runRetiming(getOperation(), /*rewrite=*/false,
-                                    /*preserveObservability=*/true,
-                                    /*maxStages=*/0,
-                                    /*maxExtraCombOps=*/32,
-                                    /*maxCombDepth=*/32);
-    writeStats(getOperation(), stats, /*analysis=*/true);
-  }
-};
 
 struct RetimePipelinesPass
     : public PassWrapper<RetimePipelinesPass, OperationPass<func::FuncOp>> {
@@ -1119,16 +1084,11 @@ struct RetimePipelinesPass
     RetimeStats stats = runRetiming(
         getOperation(), /*rewrite=*/true, preserveObservabilityOption,
         maxStagesOption, maxExtraCombOpsOption, maxCombDepthOption);
-    writeStats(getOperation(), stats, /*analysis=*/false,
-               accumulateStatsOption);
+    writeStats(getOperation(), stats, accumulateStatsOption);
   }
 };
 
 } // namespace
-
-std::unique_ptr<::mlir::Pass> createAnalyzeRetimingPass() {
-  return std::make_unique<AnalyzeRetimingPass>();
-}
 
 std::unique_ptr<::mlir::Pass>
 createRetimePipelinesPass(unsigned maxStages, unsigned maxExtraCombOps,
@@ -1139,7 +1099,6 @@ createRetimePipelinesPass(unsigned maxStages, unsigned maxExtraCombOps,
       accumulateStats);
 }
 
-static PassRegistration<AnalyzeRetimingPass> analyzePass;
 static PassRegistration<RetimePipelinesPass> retimePass;
 
 } // namespace pyc

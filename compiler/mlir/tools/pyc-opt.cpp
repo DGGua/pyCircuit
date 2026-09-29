@@ -49,8 +49,6 @@ static void forceLinkPycPasses() {
   (void)pyc::createCombCanonicalizePass();
   (void)pyc::createFuseCombPass();
   (void)pyc::createEliminateWiresPass();
-  (void)pyc::createAnalyzeStateOptimizationPass();
-  (void)pyc::createAnalyzeRetimingPass();
   (void)pyc::createStripStateObservabilityPass();
   (void)pyc::createRetimePipelinesPass();
   (void)pyc::createCombineDelayChainsPass();

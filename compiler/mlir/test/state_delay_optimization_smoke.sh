@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Gate for Stage 0 analysis and Stage 1 structural state optimization.
+# Gate for structural state optimization, delay taps, packing, and retiming.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
@@ -31,12 +31,6 @@ TMP_DIR="$(mktemp -d /tmp/pyc-state-delay-opt.XXXXXX)"
 trap 'rm -rf "${TMP_DIR}"' EXIT
 
 "${PYC_OPT}" "${INPUT}" \
-  --pass-pipeline='builtin.module(func.func(pyc-analyze-state-optimization))' \
-  -o "${TMP_DIR}/analyze.mlir"
-"${FILECHECK_BIN}" "${INPUT}" --check-prefix=ANALYZE \
-  --input-file="${TMP_DIR}/analyze.mlir"
-
-"${PYC_OPT}" "${INPUT}" \
   --pass-pipeline='builtin.module(func.func(pyc-combine-delay-chains))' \
   -o "${TMP_DIR}/generated.mlir"
 "${FILECHECK_BIN}" "${INPUT}" --check-prefix=GENERATED \
@@ -55,7 +49,7 @@ trap 'rm -rf "${TMP_DIR}"' EXIT
   --input-file="${TMP_DIR}/aggressive.mlir"
 
 "${PYC_OPT}" "${OBSERVABILITY_INPUT}" \
-  --pass-pipeline='builtin.module(func.func(pyc-analyze-state-optimization,pyc-strip-state-observability,pyc-eliminate-dead-state))' \
+  --pass-pipeline='builtin.module(func.func(pyc-strip-state-observability,pyc-eliminate-dead-state))' \
   -o "${TMP_DIR}/stripped-observability.mlir"
 "${FILECHECK_BIN}" "${OBSERVABILITY_INPUT}" --check-prefix=STRIP \
   --input-file="${TMP_DIR}/stripped-observability.mlir"
@@ -204,12 +198,6 @@ PY
 
 python3 "${ROOT}/compiler/mlir/test/check_state_delay_tap_models.py" \
   --pycc "${PYCC}" --cxx "${CXX:-c++}"
-
-"${PYC_OPT}" "${RETIME_INPUT}" \
-  --pass-pipeline='builtin.module(func.func(pyc-analyze-retiming))' \
-  -o "${TMP_DIR}/retime-analyze.mlir"
-"${FILECHECK_BIN}" "${RETIME_INPUT}" --check-prefix=ANALYZE \
-  --input-file="${TMP_DIR}/retime-analyze.mlir"
 
 "${PYC_OPT}" "${RETIME_INPUT}" \
   --pass-pipeline='builtin.module(func.func(pyc-retime-pipelines))' \

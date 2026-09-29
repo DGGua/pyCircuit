@@ -1,21 +1,4 @@
-// Stage 0/1 regression fixture for provenance-independent state optimization.
-//
-// ANALYZE-LABEL: func.func @merge_untagged
-// ANALYZE-SAME: pyc.stats.state_opt_generated_regs = 0 : i64
-// ANALYZE-SAME: pyc.stats.state_opt_merge_candidates = 1 : i64
-// ANALYZE-SAME: pyc.stats.state_opt_pinned_regs = 0 : i64
-// ANALYZE-SAME: pyc.stats.state_opt_regs_seen = 2 : i64
-// ANALYZE-LABEL: func.func @form_untagged_chain
-// ANALYZE-SAME: pyc.stats.state_opt_structural_chain_regs = 3 : i64
-// ANALYZE-SAME: pyc.stats.state_opt_structural_chains = 1 : i64
-// ANALYZE-SAME: pyc.stats.state_opt_structural_only_chain_regs = 3 : i64
-// ANALYZE-SAME: pyc.stats.state_opt_structural_only_chains = 1 : i64
-// ANALYZE-LABEL: func.func @keep_named_intermediate
-// ANALYZE-SAME: pyc.stats.state_opt_pinned_regs = 1 : i64
-// ANALYZE-SAME: pyc.stats.state_opt_structural_chains = 0 : i64
-// ANALYZE-LABEL: func.func @form_generated_chain
-// ANALYZE-SAME: pyc.stats.state_opt_generated_chain_regs = 2 : i64
-// ANALYZE-SAME: pyc.stats.state_opt_generated_chains = 1 : i64
+// Stage 1 regression fixture for provenance-independent state optimization.
 //
 // GENERATED-LABEL: func.func @merge_untagged
 // GENERATED: %[[M0:.*]] = pyc.reg

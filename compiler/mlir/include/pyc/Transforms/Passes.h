@@ -16,8 +16,6 @@ std::unique_ptr<::mlir::Pass> createCombCanonicalizePass();
 std::unique_ptr<::mlir::Pass> createInlineFunctionsPass();
 std::unique_ptr<::mlir::Pass> createFuseCombPass();
 std::unique_ptr<::mlir::Pass> createEliminateWiresPass();
-std::unique_ptr<::mlir::Pass> createAnalyzeStateOptimizationPass();
-std::unique_ptr<::mlir::Pass> createAnalyzeRetimingPass();
 std::unique_ptr<::mlir::Pass> createStripStateObservabilityPass();
 std::unique_ptr<::mlir::Pass>
 createRetimePipelinesPass(unsigned maxStages = 0,

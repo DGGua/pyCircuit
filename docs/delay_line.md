@@ -215,8 +215,7 @@ comb/clock/logic-depth gates → stats → C++ or Verilog emitter
 - 稳定的非 cycle-balance `pyc.name`；
 - 状态 q 之后携带上述属性的 alias 链。
 
-`pyc-analyze-state-optimization` 和 `pyc-analyze-retiming` 只统计这些机会，不改 IR。
-`pycc` 默认不跑它们。需要这份机会账本时，用 `pyc-opt` 单独调用。
+改写 pass 用同一套观测分析决定能不能合并、收链或 retiming；不再单独提供只统计不改写的 analyze pass。
 
 ## 6. 默认性能模式：显式观测身份清理
 
@@ -691,8 +690,8 @@ packing。state bits 的主要下降来自等价状态合并，不是 lane packi
 - 功能回归和性能自动化使用默认模式；
 - 需要波形逐状态对齐、内部 probe identity 或调试特定寄存器时使用
   `--state-opt-preserve-observability=true`；
-- 需要拆开 generated / 分析-only 阶段时用 `pyc-opt` 指定 pass；`pycc` 不再提供
-  off / generated / retime-off 开关。
+- 需要拆开 generated 兼容改写时用 `pyc-opt` 指定 `pyc-combine-delay-chains`；
+  `pycc` 不再提供 off / generated / retime-off 开关。
 
 ## 14. 统计和诊断
 
@@ -715,8 +714,6 @@ packing。state bits 的主要下降来自等价状态合并，不是 lane packi
 | `state_retime_policy` | 固定为 `pipeline` |
 | `state_opt_preserve_observability` | 是否保留显式状态身份 |
 | `state_opt_pack_width` | 实际 Stage 2 width 上限 |
-| `state_opt_regs_seen/generated/pinned` | 仅 `pyc-analyze-state-optimization` 写入；默认 `pycc` 为 0 |
-| `state_opt_merge_candidates` | 同上，保守观测边界下的等价状态候选 |
 | `state_opt_regs_merged` | 两轮实际合并的 reg 数 |
 | `state_opt_reg_bits_removed` | 等价状态合并移除的逻辑 bits |
 | `state_opt_merge_rounds` | structural 合并轮数 |
@@ -732,7 +729,6 @@ packing。state bits 的主要下降来自等价状态合并，不是 lane packi
 | `state_opt_observation_aliases_removed` | 删除的无用途状态 alias 数 |
 | `delay_chain_taps_created` | 由中间只读 fanout 形成的固定深度 tap 数 |
 | `delay_chain_tap_uses_rewritten` | 被 tap 替换的只读 SSA 使用数 |
-| `retime_candidate_regions/regs/comb_ops` | analysis-only 的保守 retiming 候选规模 |
 | `retime_regions/regs_rewritten` | 实际改写的 region 和源状态数 |
 | `retime_state_primitives_removed` | retiming 净减少的 state primitive 数 |
 | `retime_common_delay_sinks` | 成功执行的共同 delay 下沉数 |
@@ -773,7 +769,7 @@ python3 compiler/mlir/test/check_state_retime_models.py
 |---|---|---|
 | Frontend | [`v5.py`](../compiler/frontend/pycircuit/v5.py)、[`dsl.py`](../compiler/frontend/pycircuit/dsl.py)、[`hw.py`](../compiler/frontend/pycircuit/hw.py) | 生成并传播 cycle-balance provenance |
 | Dialect | [`PYCOps.td`](../compiler/mlir/include/pyc/Dialect/PYC/PYCOps.td)、[`PYCOps.cpp`](../compiler/mlir/lib/Dialect/PYC/PYCOps.cpp) | 定义和验证 `pyc.delay_line` |
-| Analysis | [`StateOptimization.cpp`](../compiler/mlir/lib/Transforms/StateOptimization.cpp) | 观测边界、状态值归一化和等价证明。机会统计 pass 不在 `pycc` 默认管线中 |
+| Analysis | [`StateOptimization.cpp`](../compiler/mlir/lib/Transforms/StateOptimization.cpp) | 观测边界、状态值归一化和等价证明，供改写 pass 使用 |
 | Transform | [`StripStateObservabilityPass.cpp`](../compiler/mlir/lib/Transforms/StripStateObservabilityPass.cpp) | 性能模式清理显式状态身份 |
 | Transform | [`CombineDelayChainsPass.cpp`](../compiler/mlir/lib/Transforms/CombineDelayChainsPass.cpp) | 等价 state、串行 chain、delay sharing 和两轮统计 |
 | Transform | [`RetimePipelinesPass.cpp`](../compiler/mlir/lib/Transforms/RetimePipelinesPass.cpp) | computed pipeline history、共同 delay 下沉、init/depth/cost 证明 |

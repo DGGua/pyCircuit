@@ -95,8 +95,6 @@ PYC dialect folder 是常量语义的唯一来源：它折叠标量运算、全�
 | Pass | 基本功能 |
 | --- | --- |
 | `pyc-prune-ports` | 删除未使用的函数端口，并同步更新调用点。可由 `pyc-opt` 单独调用，但 `pycc` 默认管线不添加它。 |
-| `pyc-analyze-state-optimization` | 统计等价状态和寄存器链机会，不改 IR。 |
-| `pyc-analyze-retiming` | 统计可重定时的流水线机会，不改 IR。 |
 
 ## 相关源码
 

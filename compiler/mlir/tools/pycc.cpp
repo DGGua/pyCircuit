@@ -2720,8 +2720,6 @@ int main(int argc, char **argv) {
     pm.addNestedPass<func::FuncOp>(pyc::createVectorUnrollPass());
   pm.addNestedPass<func::FuncOp>(pyc::createEliminateWiresPass());
   pm.addNestedPass<func::FuncOp>(pyc::createEliminateDeadStatePass());
-  // Opportunity-only analyzers stay available through pyc-opt. They do not
-  // change the circuit, so pycc does not run them on the compile path.
   // pycc always runs structural state merge, pipeline retiming, and packing.
   if (!stateOptPreserveObservability) {
     // Performance mode intentionally drops explicit state identity.

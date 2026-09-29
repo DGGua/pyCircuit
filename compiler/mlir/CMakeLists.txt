@@ -69,7 +69,6 @@ target_link_libraries(pyc_dialect PUBLIC
 )
 
 add_library(pyc_transforms
-  lib/Transforms/AnalyzeStateOptimizationPass.cpp
   lib/Transforms/CombDepGraph.cpp
   lib/Transforms/CheckFrontendContractPass.cpp
   lib/Transforms/CheckHierarchyDisciplinePass.cpp
