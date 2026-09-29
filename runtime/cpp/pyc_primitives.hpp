@@ -183,9 +183,9 @@ public:
     return depth == 1 ? sampledInput : tap(depth - 1);
   }
 
-  inline void tick_commit() {
+  inline bool tick_commit() {
     if (__builtin_expect(!pending, 1))
-      return;
+      return false;
     if (pendingReset) {
       stages.fill(init);
       head = 0;
@@ -193,8 +193,10 @@ public:
       stages[head] = sampledInput;
       head = nextIndex(head);
     }
+    const bool changed = q != qNext;
     q = qNext;
     pending = false;
+    return changed;
   }
 
 private:
@@ -326,9 +328,9 @@ public:
     pending = false;
   }
 
-  inline void tick_commit() {
+  inline bool tick_commit() {
     if (__builtin_expect(!pending, 1))
-      return;
+      return false;
     if (pendingReset) {
       stages.fill(init);
       head = 0;
@@ -336,8 +338,10 @@ public:
       stages[head] = sampledInput;
       head = nextIndex(head);
     }
+    const bool changed = q != qNext;
     q = qNext;
     pending = false;
+    return changed;
   }
 
   inline T tap(unsigned depth) const {

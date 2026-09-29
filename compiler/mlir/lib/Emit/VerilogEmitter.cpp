@@ -485,10 +485,22 @@ static std::optional<LogicalResult> emitScalarOpAssign(Operation &op, raw_ostrea
       suffix = lineName.substr(baseName.size());
     const auto bit = (depth.getInt() - 1) * static_cast<int64_t>(*width);
     std::string history = baseName + "__history" + suffix;
-    emitConnectAssign(nt.get(tap.getTap()),
-                      history + "[" + std::to_string(bit + *width - 1) + ":" +
-                          std::to_string(bit) + "]",
-                      tap.getTap().getType(), os);
+    std::string bitSlice = "[" + std::to_string(bit + *width - 1) + ":" +
+                           std::to_string(bit) + "]";
+    std::string tapName = nt.get(tap.getTap());
+    if (auto vt = dyn_cast<VectorType>(tap.getTap().getType())) {
+      // Each leaf has its own pyc_delay_line and an unpacked lane in
+      // q__history, so slice the depth window per lane rather than treating
+      // history as a single packed vector.
+      SmallVector<int64_t> shape = vectorShape(vt);
+      walkVectorIndices(shape, [&](ArrayRef<int64_t> indices) {
+        std::string lane = indexSuffix(indices);
+        os << "assign " << tapName << lane << " = " << history << lane
+           << bitSlice << ";\n";
+      });
+    } else {
+      os << "assign " << tapName << " = " << history << bitSlice << ";\n";
+    }
     return success();
   }
   if (auto sh = dyn_cast<pyc::ShliOp>(op)) {
