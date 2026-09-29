@@ -196,25 +196,6 @@ static llvm::cl::opt<bool> unrollVector(
     llvm::cl::desc("Unroll vector operations to scalars at IR level before optimization passes"),
     llvm::cl::init(false));
 
-static llvm::cl::opt<bool> combineDelayChains(
-    "combine-delay-chains",
-    llvm::cl::desc(
-        "Legacy state/delay switch (explicit true selects generated; false forces off)"),
-    llvm::cl::init(true));
-
-static llvm::cl::opt<std::string> stateDelayOpt(
-    "state-delay-opt",
-    llvm::cl::desc(
-        "State/delay optimization policy: off|generated|structural "
-        "(default: structural for C++; off for --emit=verilog unless set explicitly)"),
-    llvm::cl::init("structural"));
-
-static llvm::cl::opt<std::string> stateRetimeOpt(
-    "state-retime",
-    llvm::cl::desc(
-        "Pipeline retiming policy: off|pipeline (default: pipeline in structural mode)"),
-    llvm::cl::init("pipeline"));
-
 static llvm::cl::opt<unsigned> stateRetimeMaxStages(
     "state-retime-max-stages",
     llvm::cl::desc("Maximum registers per retimed region (0 is unlimited)"),
@@ -2569,34 +2550,6 @@ int main(int argc, char **argv) {
     return 1;
   }
 
-  std::string stateDelayOptNorm = llvm::StringRef(stateDelayOpt).lower();
-  // Verilog keeps the pre-merge netlist. State merge, delay_line, retiming,
-  // and lane packing stay on for C++ unless the flag is set explicitly.
-  if (stateDelayOpt.getNumOccurrences() == 0 &&
-      combineDelayChains.getNumOccurrences() == 0 && emitKind == "verilog")
-    stateDelayOptNorm = "off";
-  else if (stateDelayOpt.getNumOccurrences() == 0 &&
-           combineDelayChains.getNumOccurrences() != 0 && combineDelayChains)
-    stateDelayOptNorm = "generated";
-  const bool enableStateDelayOptimization =
-      combineDelayChains && stateDelayOptNorm != "off";
-  std::string stateRetimeNorm = llvm::StringRef(stateRetimeOpt).lower();
-  if (stateRetimeNorm != "off" && stateRetimeNorm != "pipeline") {
-    llvm::errs() << "error: unknown --state-retime: " << stateRetimeOpt
-                 << " (expected: off|pipeline)\n";
-    return 1;
-  }
-  pyc::DelayChainMode stateDelayMode = pyc::DelayChainMode::Generated;
-  if (stateDelayOptNorm == "generated" || stateDelayOptNorm == "off") {
-    stateDelayMode = pyc::DelayChainMode::Generated;
-  } else if (stateDelayOptNorm == "structural") {
-    stateDelayMode = pyc::DelayChainMode::Structural;
-  } else {
-    llvm::errs() << "error: unknown --state-delay-opt: " << stateDelayOpt
-                 << " (expected: off|generated|structural)\n";
-    return 1;
-  }
-
   if (emitStructuralMode != "auto" && emitStructuralMode != "on" && emitStructuralMode != "off") {
     llvm::errs() << "error: unknown --emit-structural: " << emitStructuralMode << " (expected: auto|on|off)\n";
     return 1;
@@ -2769,63 +2722,50 @@ int main(int argc, char **argv) {
   pm.addNestedPass<func::FuncOp>(pyc::createEliminateDeadStatePass());
   // Opportunity-only analyzers stay available through pyc-opt. They do not
   // change the circuit, so pycc does not run them on the compile path.
-  if (enableStateDelayOptimization &&
-      stateDelayMode == pyc::DelayChainMode::Structural &&
-      !stateOptPreserveObservability) {
+  // pycc always runs structural state merge, pipeline retiming, and packing.
+  if (!stateOptPreserveObservability) {
     // Performance mode intentionally drops explicit state identity.
     pm.addNestedPass<func::FuncOp>(
         pyc::createStripStateObservabilityPass());
     pm.addNestedPass<func::FuncOp>(pyc::createEliminateDeadStatePass());
   }
-  // Structural mode gives exact equivalent-state merging priority over
-  // retiming and direct chain formation. Generated compatibility mode keeps
-  // the original all-in-one behavior.
-  if (enableStateDelayOptimization)
+  pm.addNestedPass<func::FuncOp>(
+      pyc::createCombineDelayChainsPass(
+          pyc::DelayChainMode::Structural, /*accumulateStats=*/false,
+          /*cascadeRound=*/false,
+          /*preserveObservability=*/stateOptPreserveObservability,
+          /*mergeOnly=*/true,
+          /*skipMerge=*/false));
+  // Stage 1.5: the first state merge can expose equivalent combinational
+  // cones. Canonicalize/CSE once, then run one bounded merge refinement.
+  pm.addPass(createCanonicalizerPass(canonicalizeCfg));
+  pm.addPass(createCSEPass());
+  pm.addNestedPass<func::FuncOp>(pyc::createCombineDelayChainsPass(
+      pyc::DelayChainMode::Structural, /*accumulateStats=*/true,
+      /*cascadeRound=*/true,
+      /*preserveObservability=*/stateOptPreserveObservability,
+      /*mergeOnly=*/true, /*skipMerge=*/false));
+  // Run retiming after the two low-risk merge-only rounds. This prevents
+  // a local retime from consuming a state that has a more profitable
+  // global equivalent-state or direct-chain rewrite.
+  const unsigned retimeCombDepth = std::min<unsigned>(
+      stateRetimeMaxCombDepth, logicDepthLimit);
+  pm.addNestedPass<func::FuncOp>(pyc::createRetimePipelinesPass(
+      stateRetimeMaxStages, stateRetimeMaxExtraCombOps,
+      retimeCombDepth, stateOptPreserveObservability,
+      /*accumulateStats=*/false));
+  pm.addNestedPass<func::FuncOp>(pyc::createEliminateDeadStatePass());
+  // Form ordinary direct chains only after retiming has selected the more
+  // general computed pipelines. Also share equivalent histories here.
+  pm.addNestedPass<func::FuncOp>(pyc::createCombineDelayChainsPass(
+      pyc::DelayChainMode::Structural, /*accumulateStats=*/true,
+      /*cascadeRound=*/false,
+      /*preserveObservability=*/stateOptPreserveObservability,
+      /*mergeOnly=*/false, /*skipMerge=*/true));
+  if (statePackWidth != 0)
     pm.addNestedPass<func::FuncOp>(
-        pyc::createCombineDelayChainsPass(
-            stateDelayMode, /*accumulateStats=*/false,
-            /*cascadeRound=*/false,
-            /*preserveObservability=*/
-                stateDelayMode == pyc::DelayChainMode::Generated ||
-                    stateOptPreserveObservability,
-            /*mergeOnly=*/
-                stateDelayMode == pyc::DelayChainMode::Structural,
-            /*skipMerge=*/false));
-  if (enableStateDelayOptimization &&
-      stateDelayMode == pyc::DelayChainMode::Structural) {
-    // Stage 1.5: the first state merge can expose equivalent combinational
-    // cones. Canonicalize/CSE once, then run one bounded merge refinement.
-    pm.addPass(createCanonicalizerPass(canonicalizeCfg));
-    pm.addPass(createCSEPass());
-    pm.addNestedPass<func::FuncOp>(pyc::createCombineDelayChainsPass(
-        stateDelayMode, /*accumulateStats=*/true,
-        /*cascadeRound=*/true,
-        /*preserveObservability=*/stateOptPreserveObservability,
-        /*mergeOnly=*/true, /*skipMerge=*/false));
-    if (stateRetimeNorm == "pipeline") {
-      // Run retiming after the two low-risk merge-only rounds. This prevents
-      // a local retime from consuming a state that has a more profitable
-      // global equivalent-state or direct-chain rewrite.
-      const unsigned retimeCombDepth = std::min<unsigned>(
-          stateRetimeMaxCombDepth, logicDepthLimit);
-      pm.addNestedPass<func::FuncOp>(pyc::createRetimePipelinesPass(
-          stateRetimeMaxStages, stateRetimeMaxExtraCombOps,
-          retimeCombDepth, stateOptPreserveObservability,
-          /*accumulateStats=*/false));
-      pm.addNestedPass<func::FuncOp>(pyc::createEliminateDeadStatePass());
-    }
-    // Form ordinary direct chains only after retiming has selected the more
-    // general computed pipelines. Also share equivalent histories here.
-    pm.addNestedPass<func::FuncOp>(pyc::createCombineDelayChainsPass(
-        stateDelayMode, /*accumulateStats=*/true,
-        /*cascadeRound=*/false,
-        /*preserveObservability=*/stateOptPreserveObservability,
-        /*mergeOnly=*/false, /*skipMerge=*/true));
-    if (statePackWidth != 0)
-      pm.addNestedPass<func::FuncOp>(
-          pyc::createPackStateLanesPass(
-              statePackWidth, stateOptPreserveObservability));
-  }
+        pyc::createPackStateLanesPass(
+            statePackWidth, stateOptPreserveObservability));
   if (!unrollVector)
     pm.addNestedPass<func::FuncOp>(pyc::createSLPPackWiresPass());
   pm.addNestedPass<func::FuncOp>(pyc::createCombCanonicalizePass());
@@ -2833,9 +2773,7 @@ int main(int argc, char **argv) {
   // Performance mode lets the legacy run-based i1 packer collect lanes that
   // the general dependency-aware packer leaves behind. The preservation mode
   // skips it because that legacy pass does not retain observation metadata.
-  if (!(enableStateDelayOptimization &&
-        stateDelayMode == pyc::DelayChainMode::Structural &&
-        stateOptPreserveObservability))
+  if (!stateOptPreserveObservability)
     pm.addNestedPass<func::FuncOp>(pyc::createPackI1RegsPass());
   const bool enableFuseComb = (!cppOnly) || !cppOnlyPreserveOps;
   if (enableFuseComb)
@@ -2890,26 +2828,10 @@ int main(int argc, char **argv) {
   }
 
   CompileStatsSummary compileStats = collectCompileStats(*module, static_cast<int64_t>(logicDepthLimit));
-  compileStats.stateOptimizationPolicy =
-      enableStateDelayOptimization
-          ? (stateDelayMode == pyc::DelayChainMode::Structural
-                 ? "structural"
-                 : "generated")
-          : "off";
-  compileStats.stateRetimePolicy =
-      enableStateDelayOptimization &&
-              stateDelayMode == pyc::DelayChainMode::Structural
-          ? stateRetimeNorm
-          : "off";
-  compileStats.stateOptPreserveObservability =
-      enableStateDelayOptimization &&
-      (stateDelayMode == pyc::DelayChainMode::Generated ||
-       stateOptPreserveObservability);
-  compileStats.stateOptPackWidth =
-      enableStateDelayOptimization &&
-              stateDelayMode == pyc::DelayChainMode::Structural
-          ? static_cast<int64_t>(statePackWidth)
-          : 0;
+  compileStats.stateOptimizationPolicy = "structural";
+  compileStats.stateRetimePolicy = "pipeline";
+  compileStats.stateOptPreserveObservability = stateOptPreserveObservability;
+  compileStats.stateOptPackWidth = static_cast<int64_t>(statePackWidth);
   compileStats.fuseCombEnabled = enableFuseComb;
   printCompileStats(compileStats);
 

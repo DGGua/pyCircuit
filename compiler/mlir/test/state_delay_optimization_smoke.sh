@@ -104,12 +104,8 @@ fi
 
 "${PYCC}" "${DEFAULT_INPUT}" --emit=cpp \
   -o "${TMP_DIR}/default.hpp" 2>"${TMP_DIR}/default.stderr"
-"${PYCC}" "${DEFAULT_INPUT}" --emit=cpp --state-delay-opt=structural \
-  -o "${TMP_DIR}/structural.hpp" 2>"${TMP_DIR}/structural.stderr"
-"${PYCC}" "${DEFAULT_INPUT}" --emit=cpp --state-delay-opt=generated \
-  -o "${TMP_DIR}/generated.hpp" 2>"${TMP_DIR}/generated.stderr"
-"${PYCC}" "${DEFAULT_INPUT}" --emit=cpp --combine-delay-chains=true \
-  -o "${TMP_DIR}/legacy-true.hpp" 2>"${TMP_DIR}/legacy-true.stderr"
+"${PYCC}" "${DEFAULT_INPUT}" --emit=verilog \
+  -o "${TMP_DIR}/default.v" 2>"${TMP_DIR}/default-verilog.stderr"
 "${PYCC}" "${DEFAULT_INPUT}" --emit=none \
   --probe-manifest="${TMP_DIR}/default-probes.json" \
   -o /dev/null 2>"${TMP_DIR}/default-probes.stderr"
@@ -136,9 +132,7 @@ fi
 "${TMP_DIR}/state-pack-probe-runtime"
 
 python3 - "${TMP_DIR}/default.hpp.stats.json" \
-  "${TMP_DIR}/structural.hpp.stats.json" \
-  "${TMP_DIR}/generated.hpp.stats.json" \
-  "${TMP_DIR}/legacy-true.hpp.stats.json" \
+  "${TMP_DIR}/default.v.stats.json" \
   "${TMP_DIR}/default-probes.json" \
   "${TMP_DIR}/packed-probes.json" \
   "${TMP_DIR}/preserved-packed-probes.json" <<'PY'
@@ -146,22 +140,14 @@ import json
 import sys
 from pathlib import Path
 
-default, structural, generated, legacy_true = (
-    json.loads(Path(path).read_text(encoding="utf-8")) for path in sys.argv[1:5]
-)
-probe_manifest = json.loads(Path(sys.argv[5]).read_text(encoding="utf-8"))
-packed_probe_manifest = json.loads(Path(sys.argv[6]).read_text(encoding="utf-8"))
-preserved_probe_manifest = json.loads(Path(sys.argv[7]).read_text(encoding="utf-8"))
+default = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+default_verilog = json.loads(Path(sys.argv[2]).read_text(encoding="utf-8"))
+probe_manifest = json.loads(Path(sys.argv[3]).read_text(encoding="utf-8"))
+packed_probe_manifest = json.loads(Path(sys.argv[4]).read_text(encoding="utf-8"))
+preserved_probe_manifest = json.loads(Path(sys.argv[5]).read_text(encoding="utf-8"))
 keys = ("reg_count", "reg_bits", "state_opt_regs_merged",
         "state_opt_reg_bits_removed")
 default_view = {key: default.get(key) for key in keys}
-structural_view = {key: structural.get(key) for key in keys}
-generated_view = {key: generated.get(key) for key in keys}
-legacy_true_view = {key: legacy_true.get(key) for key in keys}
-if default_view != structural_view:
-    raise AssertionError(
-        f"default policy is not structural: {default_view} != {structural_view}"
-    )
 expected_structural = {
     "reg_count": 1,
     "reg_bits": 8,
@@ -174,24 +160,18 @@ if default_view != expected_structural:
     )
 if default.get("state_opt_policy") != "structural":
     raise AssertionError("default state optimization policy is not structural")
+if default.get("state_retime_policy") != "pipeline":
+    raise AssertionError("default retiming policy is not pipeline")
 if default.get("state_opt_preserve_observability") is not False:
     raise AssertionError("default state optimization unexpectedly preserves observability")
 if default.get("state_opt_pack_width") != 192:
     raise AssertionError("default state pack width is not 192")
-expected_generated = {
-    "reg_count": 2,
-    "reg_bits": 16,
-    "state_opt_regs_merged": 0,
-    "state_opt_reg_bits_removed": 0,
-}
-if generated_view != expected_generated:
-    raise AssertionError(
-        f"generated fallback changed behavior: {generated_view}"
-    )
-if legacy_true_view != generated_view:
-    raise AssertionError(
-        f"legacy true is not generated: {legacy_true_view} != {generated_view}"
-    )
+if default_verilog.get("state_opt_policy") != "structural":
+    raise AssertionError("Verilog default policy is not structural")
+if default_verilog.get("state_retime_policy") != "pipeline":
+    raise AssertionError("Verilog default retiming policy is not pipeline")
+if default_verilog.get("reg_count") != default.get("reg_count"):
+    raise AssertionError("Verilog and C++ default structural counts differ")
 output_probes = {
     probe["field_path"]: probe
     for probe in probe_manifest["probes"]

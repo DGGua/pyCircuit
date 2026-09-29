@@ -38,23 +38,20 @@ b@4 ─────────────────────────�
 
 - `pyc.generated = "cycle_balance"` 说明状态来源；
 - 状态类型、clock/reset/enable/init、next-state、fanout 和依赖关系决定能否改写；
-- `generated` 模式只处理原有 marker，作为兼容回退；
-- 默认 `structural` 模式不要求 marker，依据 MLIR 结构证明执行优化；
+- `pycc` 固定走 `structural` 证明，不要求 `pyc.generated` marker；
 - 默认性能模式允许丢弃内部 debug/probe/trace/name 的物理状态身份；
 - 端口行为、周期数、reset/enable/init 和功能数据流仍必须等价。
 
-C++ 生成的默认配置为：
+C++ 与 Verilog 都固定跑完整状态优化（structural 合并 + pipeline retiming）。
+仍可调的预算是：
 
 ```text
---state-delay-opt=structural
---state-retime=pipeline
 --state-pack-width=192
 --state-opt-preserve-observability=false
+--state-retime-max-stages=0
+--state-retime-max-extra-comb-ops=32
+--state-retime-max-comb-depth=32
 ```
-
-`--emit=verilog` 在未显式传入 `--state-delay-opt` 时使用 `off`，不改写寄存器、
-`delay_line`、retiming 和 lane packing。需要优化后的 Verilog 时显式传入
-`--state-delay-opt=structural`。
 
 等价状态合并会减少逻辑位数。delay line 和 lane packing 减少 C++ 里的状态对象数量，
 不减少逻辑位数，也不等于综合后的触发器数量。
@@ -121,8 +118,8 @@ logical state bits     = N × W
 ### 3.2 Provenance 不是正确性证明
 
 早期实现把 `pyc.generated = "cycle_balance"` 当作候选资格，安全但覆盖有限。
-当前设计中 marker 仍用于来源统计和兼容模式，但 structural 模式的正确性来自完整
-状态转移条件，而不是来源名字。
+当前设计中 marker 仍用于来源统计；`pyc-opt` 的 generated 兼容模式仍会看它。
+`pycc` 固定走 structural，正确性来自完整状态转移条件，而不是来源名字。
 
 ### 3.3 区分四类指标
 
@@ -144,7 +141,7 @@ delay-line 能大幅减少每周期调度，但 Verilog 仍要保留真实 N 级
 Stage 1.5 固定运行一次 canonicalize+CSE 和第二轮状态优化。这样能捕获主要级联收益，
 同时保证编译时间、统计口径和 IR 结果可预测，不引入数据相关的无界迭代。
 
-## 4. 默认流水线和策略开关
+## 4. 默认流水线和预算开关
 
 状态优化在 wire/dead-state 清理之后、clock/comb/logic-depth legality gates 之前运行：
 
@@ -171,24 +168,9 @@ Stage 2: pack compatible reg/delay-line lanes
 comb/clock/logic-depth gates → stats → C++ or Verilog emitter
 ```
 
-`pycc` 的主要开关：
+`pycc` 的状态优化预算开关（策略本身不可关）：
 
 ```text
---state-delay-opt=off
-    不执行状态合并、delay line、retiming 或 packing
-
---state-delay-opt=generated
-    只处理 pyc.generated="cycle_balance"，保留原有观测边界
-
---state-delay-opt=structural
-    使用 provenance-independent 状态证明；当前默认
-
---state-retime=pipeline
-    启用受约束的组合逻辑跨状态重排；structural 模式下当前默认
-
---state-retime=off
-    保留等价合并、delay line 和 packing，只关闭 retiming
-
 --state-retime-max-stages=0
     单个 computed pipeline 的最大寄存器级数；0 表示不单独限制
 
@@ -207,10 +189,6 @@ comb/clock/logic-depth gates → stats → C++ or Verilog emitter
 --state-opt-preserve-observability=true
     保留内部命名/debug/probe/trace 状态身份；性能较低
 ```
-
-legacy `--combine-delay-chains=false` 强制 `off`。未显式设置
-`--state-delay-opt` 时，显式 legacy `--combine-delay-chains=true` 选择
-`generated` 兼容行为；新自动化应使用分级参数直接表达策略。
 
 编译统计 JSON 会记录：
 
@@ -713,8 +691,8 @@ packing。state bits 的主要下降来自等价状态合并，不是 lane packi
 - 功能回归和性能自动化使用默认模式；
 - 需要波形逐状态对齐、内部 probe identity 或调试特定寄存器时使用
   `--state-opt-preserve-observability=true`；
-- 需要复现最初 cycle-balance 行为时使用 `--state-delay-opt=generated`；
-- 需要无状态改写 baseline 时使用 `--state-delay-opt=off`。
+- 需要拆开 generated / 分析-only 阶段时用 `pyc-opt` 指定 pass；`pycc` 不再提供
+  off / generated / retime-off 开关。
 
 ## 14. 统计和诊断
 
@@ -733,8 +711,8 @@ packing。state bits 的主要下降来自等价状态合并，不是 lane packi
 
 | JSON 字段 | 含义 |
 |---|---|
-| `state_opt_policy` | off/generated/structural 实际策略 |
-| `state_retime_policy` | off/pipeline 实际 retiming 策略 |
+| `state_opt_policy` | 固定为 `structural` |
+| `state_retime_policy` | 固定为 `pipeline` |
 | `state_opt_preserve_observability` | 是否保留显式状态身份 |
 | `state_opt_pack_width` | 实际 Stage 2 width 上限 |
 | `state_opt_regs_seen/generated/pinned` | 仅 `pyc-analyze-state-optimization` 写入；默认 `pycc` 为 0 |

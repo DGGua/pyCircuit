@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Cross-check baseline, delay-only, and retimed pipeline models."""
+"""Cross-check default retimed C++ and Verilog models."""
 
 from __future__ import annotations
 
@@ -30,10 +30,10 @@ def result(command: list[str]) -> tuple[int, int]:
     return int(match.group(1)), int(match.group(2))
 
 
-def emit(pycc: Path, output: Path, kind: str, options: list[str]) -> dict[str, object]:
+def emit(pycc: Path, output: Path, kind: str) -> dict[str, object]:
     run([
         str(pycc), str(HERE / "state_retime_codegen.mlir"), f"--emit={kind}",
-        "--state-pack-width=0", *options, "-o", str(output),
+        "--state-pack-width=0", "-o", str(output),
     ])
     return json.loads(Path(f"{output}.stats.json").read_text(encoding="utf-8"))
 
@@ -64,50 +64,36 @@ def main() -> None:
     parser.add_argument("--cxx", default=os.environ.get("CXX", "c++"))
     args = parser.parse_args()
 
-    variants = {
-        "off": ["--state-delay-opt=off", "--state-retime=off"],
-        "delay_only": ["--state-delay-opt=structural", "--state-retime=off"],
-        "retimed": ["--state-delay-opt=structural", "--state-retime=pipeline"],
-        "default": ["--state-delay-opt=structural"],
-    }
     with tempfile.TemporaryDirectory(prefix="pyc-retime-", dir="/tmp") as path:
         temp = Path(path)
+        cpp = temp / "default.hpp"
+        verilog = temp / "default.v"
         observed: dict[str, tuple[int, int]] = {}
-        for variant, options in variants.items():
-            cpp = temp / f"{variant}.hpp"
-            verilog = temp / f"{variant}.v"
-            cpp_stats = emit(args.pycc, cpp, "cpp", options)
-            verilog_stats = emit(args.pycc, verilog, "verilog", options)
-            for stats in (cpp_stats, verilog_stats):
-                retime_enabled = variant in ("retimed", "default")
-                expected_regs = 5 if retime_enabled else 6
-                expected_bits = 33 if retime_enabled else 48
-                if (stats.get("reg_count") != expected_regs or
-                        stats.get("reg_bits") != expected_bits):
-                    raise AssertionError(f"{variant}: logical state changed: {stats}")
-                expected = 2 if retime_enabled else 0
-                if stats.get("retime_regions_rewritten") != expected:
-                    raise AssertionError(f"{variant}: retiming stats mismatch: {stats}")
-                expected_bits_removed = 15 if retime_enabled else 0
-                if stats.get("retime_state_bits_removed") != expected_bits_removed:
-                    raise AssertionError(f"{variant}: retiming bit delta mismatch: {stats}")
-                expected_lines = 0 if variant == "off" else 1
-                if stats.get("delay_line_count") != expected_lines:
-                    raise AssertionError(f"{variant}: delay line mismatch: {stats}")
+        for kind, output in (("cpp", cpp), ("verilog", verilog)):
+            stats = emit(args.pycc, output, kind)
+            if (stats.get("reg_count") != 5 or stats.get("reg_bits") != 33):
+                raise AssertionError(f"{kind}: logical state changed: {stats}")
+            if stats.get("retime_regions_rewritten") != 2:
+                raise AssertionError(f"{kind}: retiming stats mismatch: {stats}")
+            if stats.get("retime_state_bits_removed") != 15:
+                raise AssertionError(f"{kind}: retiming bit delta mismatch: {stats}")
+            if stats.get("delay_line_count") != 1:
+                raise AssertionError(f"{kind}: delay line mismatch: {stats}")
+            if stats.get("state_opt_policy") != "structural":
+                raise AssertionError(f"{kind}: policy is not structural: {stats}")
+            if stats.get("state_retime_policy") != "pipeline":
+                raise AssertionError(f"{kind}: retime policy is not pipeline: {stats}")
 
-            cpp_binary = temp / f"{variant}_cpp"
-            compile_cpp(args.cxx, cpp, cpp_binary)
-            observed[f"{variant}_cpp"] = result([str(cpp_binary)])
-            verilator_binary = compile_verilator(verilog, temp / f"obj_{variant}")
-            observed[f"{variant}_verilog"] = result([str(verilator_binary)])
-
+        compile_cpp(args.cxx, cpp, temp / "cpp_bin")
+        observed["cpp"] = result([str(temp / "cpp_bin")])
+        observed["verilog"] = result([str(compile_verilator(verilog, temp / "obj"))])
         if len(set(observed.values())) != 1:
             raise AssertionError(f"retiming model mismatch: {observed}")
         cycles, checksum = next(iter(observed.values()))
         print(
             "retiming verified: a 3-register computed pipeline -> one depth-3 "
             "history and two delayed i8 operands -> one i1 result state; "
-            "off/delay-only/retimed/default C++ and Verilog match for "
+            "default C++ and Verilog match for "
             f"{cycles} cycles (checksum={checksum})"
         )
 

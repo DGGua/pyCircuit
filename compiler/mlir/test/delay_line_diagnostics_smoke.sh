@@ -42,7 +42,23 @@ PROFILE_JSON="${TMP_DIR}/profile.json"
 "${FILECHECK_BIN}" "${PRECOMBINED_INPUT}" \
   --input-file="${PRECOMBINED_OPTIMIZED}"
 
-"${PYCC}" "${INPUT}" --emit=cpp --combine-delay-chains=true \
+for flag in --combine-delay-chains --state-delay-opt --state-retime; do
+  if "${PYCC}" --help 2>&1 | grep -E -- "${flag}(=|<|[[:space:]]|$)" >/dev/null; then
+    echo "fail: deleted policy flag still advertised: ${flag}" >&2
+    exit 1
+  fi
+  set +e
+  "${PYCC}" "${INPUT}" --emit=none "${flag}=off" -o /dev/null \
+    >"${TMP_DIR}/unknown.stdout" 2>"${TMP_DIR}/unknown.stderr"
+  UNKNOWN_RC=$?
+  set -e
+  if [[ ${UNKNOWN_RC} -eq 0 ]]; then
+    echo "fail: deleted policy flag was accepted: ${flag}" >&2
+    exit 1
+  fi
+done
+
+"${PYCC}" "${INPUT}" --emit=cpp \
   --profile-json="${PROFILE_JSON}" -o "${MODEL}" 2>"${STDERR_LOG}"
 
 python3 - "${MODEL}.stats.json" "${STDERR_LOG}" "${PROFILE_JSON}" <<'PY'
@@ -55,16 +71,24 @@ stderr_path = Path(sys.argv[2])
 profile_path = Path(sys.argv[3])
 stats = json.loads(stats_path.read_text(encoding="utf-8"))
 
+# pycc always merges equivalent chains first, then forms one shared delay-line.
 expected = {
-    "delay_chains_combined": 2,
-    "delay_chain_regs_combined": 4,
-    "delay_chain_aliases_removed": 2,
-    "delay_chain_delay_lines_created": 2,
-    "delay_chain_delay_lines_merged": 1,
-    "delay_chain_state_reads_before": 4,
+    "state_opt_policy": "structural",
+    "state_retime_policy": "pipeline",
+    "state_opt_regs_merged": 2,
+    "state_opt_reg_bits_removed": 16,
+    "delay_chains_combined": 1,
+    "delay_chain_regs_combined": 2,
+    "delay_chain_aliases_removed": 0,
+    "delay_chain_delay_lines_created": 1,
+    "delay_chain_delay_lines_merged": 0,
+    "delay_chain_state_reads_before": 2,
     "delay_chain_state_reads_after": 1,
-    "delay_chain_state_writes_before": 4,
+    "delay_chain_state_writes_before": 2,
     "delay_chain_state_writes_after": 1,
+    "delay_line_count": 1,
+    "reg_count": 2,
+    "reg_bits": 16,
 }
 for key, value in expected.items():
     actual = stats.get(key)
@@ -81,8 +105,9 @@ for key, value in expected.items():
 
 stderr = stderr_path.read_text(encoding="utf-8")
 needle = (
-    "delay_chain={chains:2, regs:4, aliases:2, created:2, merged:1, "
-    "reads:4->1, writes:4->1"
+    "stats: state_policy=structural, retime=pipeline, "
+    "preserve_observability=false, pack_width=192, regs=2 (16 bits), "
+    "delay_lines=1 (depth_total=2), merged=2, bits_removed=16, delay_chains=1"
 )
 if needle not in stderr:
     raise AssertionError(f"missing stderr summary: {needle}\nactual stderr:\n{stderr}")
