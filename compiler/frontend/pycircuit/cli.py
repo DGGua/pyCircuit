@@ -2459,6 +2459,8 @@ def _cmd_build(args: argparse.Namespace) -> int:
                 "--cpp-split=module",
                 "--probe-plan",
                 str(probe_plan_path),
+                "--observe-named",
+                "demand",
                 *trace_codegen_args,
                 f"--logic-depth={logic_depth}",
             ]

@@ -30,6 +30,12 @@ createCombineDelayChainsPass(DelayChainMode mode = DelayChainMode::Generated,
 std::unique_ptr<::mlir::Pass>
 createPackStateLanesPass(unsigned maxWidth = 192);
 std::unique_ptr<::mlir::Pass> createPackI1RegsPass();
+/// After C++ state opt remaps identities, drop pyc.name values that are not
+/// in the runtime observation demand set (@probe source, trace fields, or
+/// debug_keep/observable/probe*/trace*).
+std::unique_ptr<::mlir::Pass>
+createApplyObservationDemandPass(std::string probePlanPath = {},
+                                 std::string traceCodegenPlanPath = {});
 std::unique_ptr<::mlir::Pass> createLowerSCFToPYCStaticPass();
 std::unique_ptr<::mlir::Pass> createCheckFrontendContractPass();
 std::unique_ptr<::mlir::Pass> createCheckHierarchyDisciplinePass();

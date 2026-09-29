@@ -40,6 +40,7 @@ b@4 ─────────────────────────�
 - 状态类型、clock/reset/enable/init、next-state、fanout 和依赖关系决定能否改写；
 - `pycc --emit=cpp` 固定走 `structural` 证明，不要求 `pyc.generated` marker；
 - C++ 路径优化时保留 debug/probe/trace/name，改挂到 survivor / delay_tap / slice alias；
+- 优化完成后，`--observe-named=demand`（默认）按 `@probe` / trace / IR 观测属性丢掉无人读的 `pyc.name`，C++ 不再为裸作者名付观测税；
 - 端口行为、周期数、reset/enable/init 和功能数据流仍必须等价。
 
 只有 `--emit=cpp`（或 `-cpp`）跑完整状态优化（structural 合并 + pipeline retiming）。
@@ -221,8 +222,11 @@ C++ 路径始终优化，并把外部可读身份改挂到只读视图：
 4. 共同 delay 下沉：功能路径改为 `D^N(f(...))`，具名源 history 留下只读观测；
 5. packing：身份挂到 packed storage 的 slice alias，`ProbeRegistry` 用 `addRegSlice`。
 
-`cycle_balance` 的 `_v5_bal_*` 不拉外部视图。无使用的观测 alias/tap 带副作用，
-避免被 DCE 在 emit 前删掉。功能端口、周期和 clk/rst/en/init 证明不放宽。
+`cycle_balance` 的 `_v5_bal_*` 不拉外部视图。有运行时读取需求的观测 alias/tap
+带副作用，避免被 DCE 在 emit 前删掉。`--observe-named=demand` 会在 fuse-comb /
+placement 之前剥掉无人读的 `pyc.name`，这些视图随后可以 DCE。`--observe-named=all`
+恢复「每个非 cycle-balance 名字都当探针」。功能端口、周期和 clk/rst/en/init
+证明不放宽。
 
 ## 7. Stage 1：等价状态、结构化链和共享
 
@@ -457,8 +461,8 @@ Packing：
 - 不因自身减少 logical state bits；
 - 可能使内部物理状态名字变成 packed storage 的 slice。
 
-直接成为模块输出的 packed slice 仍被 probe manifest 分类为 state。在显式观测保留
-模式下，具名逻辑 state 可通过 slice alias 和 `addRegSlice` 保持逻辑 probe 映射。
+直接成为模块输出的 packed slice 仍被 probe manifest 分类为 state。有运行时读取需求
+的具名逻辑 state 可通过 slice alias 和 `addRegSlice` 保持逻辑 probe 映射。
 
 ### 9.4 为什么默认宽度是 192
 
@@ -682,6 +686,9 @@ C++ 默认路径优化物理对象，但外部可读名字/probe 必须仍能读
 |---|---|
 | `state_opt_policy` | `--emit=cpp` 为 `structural`，其它 emit 为 `off` |
 | `state_retime_policy` | `--emit=cpp` 为 `pipeline`，其它 emit 为 `off` |
+| `observe_named` | `--emit=cpp` 为 `demand`（默认）或 `all`；其它 emit 为 `off` |
+| `observe_named_names_stripped` | demand 模式下剥掉的 `pyc.name` 数 |
+| `observe_named_names_kept` | demand 模式下因 @probe/trace/IR 属性留下的 `pyc.name` 数 |
 | `state_opt_pack_width` | 实际 Stage 2 width 上限 |
 | `state_opt_regs_merged` | 两轮实际合并的 reg 数 |
 | `state_opt_reg_bits_removed` | 等价状态合并移除的逻辑 bits |

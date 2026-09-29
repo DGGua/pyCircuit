@@ -97,7 +97,27 @@ fi
 "${PYCC}" "${DEFAULT_INPUT}" --emit=none \
   --probe-manifest="${TMP_DIR}/default-probes.json" \
   -o /dev/null 2>"${TMP_DIR}/default-probes.stderr"
+"${PYC_OPT}" "${ROOT}/compiler/mlir/test/observation_demand.mlir" \
+  --pass-pipeline="builtin.module(pyc-apply-observation-demand{probe-plan=${ROOT}/compiler/mlir/test/observation_demand_probe_plan.json})" \
+  -o "${TMP_DIR}/observation-demand.mlir"
+"${FILECHECK_BIN}" "${ROOT}/compiler/mlir/test/observation_demand.mlir" \
+  --check-prefix=DEMAND \
+  --input-file="${TMP_DIR}/observation-demand.mlir"
+
 "${PYCC}" "${PACK_PROBE_INPUT}" --emit=cpp \
+  --observe-named=demand \
+  -o "${TMP_DIR}/packed-probes-demand.hpp" 2>"${TMP_DIR}/packed-probes-demand.stderr"
+if grep -q 'lane0_state\|lane1_state' "${TMP_DIR}/packed-probes-demand.hpp"; then
+  echo "fail: demand mode kept undemanded packed lane names" >&2
+  exit 1
+fi
+if [[ $(grep -c 'addRegSlice<8, 16>' "${TMP_DIR}/packed-probes-demand.hpp") -ge 4 ]]; then
+  echo "fail: demand mode still registered undemanded packed lane slices" >&2
+  exit 1
+fi
+
+"${PYCC}" "${PACK_PROBE_INPUT}" --emit=cpp \
+  --observe-named=all \
   --probe-manifest="${TMP_DIR}/packed-probes.json" \
   -o "${TMP_DIR}/packed-probes.hpp" 2>"${TMP_DIR}/packed-probes.stderr"
 if [[ $(grep -c 'addRegSlice<8, 16>' "${TMP_DIR}/packed-probes.hpp") -lt 4 ]]; then
@@ -143,6 +163,8 @@ if "state_opt_preserve_observability" in default:
     raise AssertionError("removed preserve-observability flag leaked into stats")
 if default.get("state_opt_pack_width") != 192:
     raise AssertionError("default state pack width is not 192")
+if default.get("observe_named") != "demand":
+    raise AssertionError("default C++ observe_named is not demand")
 if default_verilog.get("state_opt_policy") != "off":
     raise AssertionError("Verilog default policy is not off")
 if default_verilog.get("state_retime_policy") != "off":

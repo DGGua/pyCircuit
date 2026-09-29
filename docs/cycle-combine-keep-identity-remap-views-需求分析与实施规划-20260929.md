@@ -112,7 +112,7 @@ emitter / probe-manifest
 7. `_v5_bal_*` / `pyc.generated = "cycle_balance"` 仍不是外部探针，不强制为它们拉视图。
 8. `debug_keep` 与 name/probe 相同：只保证可读视图，不钉死物理 flop。与功能状态等价的观测副本可以合并，名字挂到 survivor。独一无二、不可重构的观测状态留下物理对象。
 9. 共同 delay 下沉必须同时满足：功能结果改为 `D^N(f(...))`；每个带外部可读身份的源仍能按原名读到下沉前同一周期的值（留下原 history，不把名字改挂到 `f` 的结果上）。
-10. 无使用的观测视图不得被 DCE / canonicalize 在 emit 前删掉。
+10. 无使用且**有运行时读取需求**的观测视图不得被 DCE / canonicalize 在 emit 前删掉。裸 `pyc.name` 在 `--observe-named=demand` 下会在优化后被剥掉，随后可以 DCE。详见 `docs/cycle-combine-observation-demand-views-需求分析与实施规划-20260929.md`。
 11. 现有 delay-line / retiming / packing smoke 按新契约改写后通过；`xz_value_model_smoke` 一类按名字 `dut.read` 的夹具在 `--emit=cpp` 优化后仍能解析到该名字。
 
 ## 方案设计
@@ -268,7 +268,7 @@ placement / emit / probe-manifest
 - `pycc --help` / `pyc-opt --help` 不再列出这两项；`pycc … --state-opt-preserve-observability` 按未知选项失败（rc=1）。
 - `--emit=cpp` 仍跑 merge / 收链 / retiming / packing；身份不再挡住候选。
 - `--emit=verilog` / `--emit=none` 仍不跑这组改写（`state_opt_policy=off`）。
-- 观测-only 状态由 `pyc-eliminate-dead-state` 留下；带观测身份的 `pyc.alias` / `pyc.delay_tap` 声明 Write effect，canonicalize 不再折掉。
+- 观测-only 状态由 `pyc-eliminate-dead-state` 留下；带观测身份的 `pyc.alias` / `pyc.delay_tap` 声明 Write effect，canonicalize 不再折掉。C++ 默认 `--observe-named=demand` 会在 fuse-comb 前剥掉无人读的 `pyc.name`，见 observation-demand 规划。
 
 ### 验证
 

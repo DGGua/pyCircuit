@@ -168,6 +168,13 @@ static llvm::cl::opt<std::string> traceCodegenPlanPath(
         "Resolved per-module internal trace fields used by C++ placement"),
     llvm::cl::init(""));
 
+static llvm::cl::opt<std::string> observeNamed(
+    "observe-named",
+    llvm::cl::desc(
+        "Which pyc.name values stay as C++ probes after state opt: "
+        "demand (default: @probe/trace/IR attrs only) or all"),
+    llvm::cl::init("demand"));
+
 static llvm::cl::opt<std::string> targetKind("target", llvm::cl::desc("Target: default|fpga"),
                                              llvm::cl::init("default"));
 
@@ -2091,6 +2098,9 @@ struct CompileStatsSummary {
   int64_t tns = 0;
   int64_t logicDepthLimit = 32;
   bool fuseCombEnabled = false;
+  std::string observeNamedPolicy;
+  int64_t observeNamedNamesStripped = 0;
+  int64_t observeNamedNamesKept = 0;
 };
 
 static int64_t getI64Attr(Operation *op, llvm::StringRef name, int64_t fallback = 0) {
@@ -2264,6 +2274,12 @@ static CompileStatsSummary collectCompileStats(ModuleOp module, int64_t depthLim
         getI64Attr(f, "pyc.stats.state_opt_pack_bits", 0));
     s.memCount = satAdd(s.memCount, getI64Attr(f, "pyc.stats.mem_count", 0));
     s.memBits = satAdd(s.memBits, getI64Attr(f, "pyc.stats.mem_bits", 0));
+    s.observeNamedNamesStripped = satAdd(
+        s.observeNamedNamesStripped,
+        getI64Attr(f, "pyc.stats.observe_named_names_stripped", 0));
+    s.observeNamedNamesKept = satAdd(
+        s.observeNamedNamesKept,
+        getI64Attr(f, "pyc.stats.observe_named_names_kept", 0));
 
     s.maxLogicDepth = std::max(s.maxLogicDepth, getI64Attr(f, "pyc.logic_depth.max", 0));
 
@@ -2297,7 +2313,8 @@ static void printCompileStats(const CompileStatsSummary &s) {
                << ", mems=" << s.memCount << " (" << s.memBits << " bits)"
                << ", max_depth=" << s.maxLogicDepth << "/" << s.logicDepthLimit
                << ", WNS=" << s.wns << ", TNS=" << s.tns
-               << ", fuse_comb=" << (s.fuseCombEnabled ? "on" : "off") << "\n";
+               << ", fuse_comb=" << (s.fuseCombEnabled ? "on" : "off")
+               << ", observe_named=" << s.observeNamedPolicy << "\n";
 }
 
 static llvm::json::Object compileStatsToJson(const CompileStatsSummary &s) {
@@ -2371,6 +2388,9 @@ static llvm::json::Object compileStatsToJson(const CompileStatsSummary &s) {
   obj["wns"] = s.wns;
   obj["tns"] = s.tns;
   obj["fuse_comb_enabled"] = s.fuseCombEnabled;
+  obj["observe_named"] = s.observeNamedPolicy;
+  obj["observe_named_names_stripped"] = s.observeNamedNamesStripped;
+  obj["observe_named_names_kept"] = s.observeNamedNamesKept;
   return obj;
 }
 
@@ -2438,6 +2458,12 @@ int main(int argc, char **argv) {
   }
   if (cppPch && cppSplitMode != "module") {
     llvm::errs() << "error: --cpp-pch requires --cpp-split=module\n";
+    return 1;
+  }
+  const llvm::StringRef observeNamedNorm = llvm::StringRef(observeNamed);
+  if (observeNamedNorm != "demand" && observeNamedNorm != "all") {
+    llvm::errs() << "error: unknown --observe-named: " << observeNamed
+                 << " (expected: demand|all)\n";
     return 1;
   }
 
@@ -2739,6 +2765,11 @@ int main(int argc, char **argv) {
   pm.addNestedPass<func::FuncOp>(pyc::createCombCanonicalizePass());
   pm.addPass(pyc::createCheckClockDomainsPass());
   pm.addNestedPass<func::FuncOp>(pyc::createPackI1RegsPass());
+  // Demand mode drops undemanded pyc.name after identities were remapped,
+  // before fuse-comb treats leftover names as barriers.
+  if (emitKind == "cpp" && llvm::StringRef(observeNamed) == "demand")
+    pm.addPass(pyc::createApplyObservationDemandPass(
+        probePlanPath, traceCodegenPlanPath));
   const bool enableFuseComb = (!cppOnly) || !cppOnlyPreserveOps;
   if (enableFuseComb)
     pm.addNestedPass<func::FuncOp>(pyc::createFuseCombPass());
@@ -2799,6 +2830,8 @@ int main(int argc, char **argv) {
   compileStats.stateOptPackWidth =
       enableStateDelayOptimization ? static_cast<int64_t>(statePackWidth) : 0;
   compileStats.fuseCombEnabled = enableFuseComb;
+  compileStats.observeNamedPolicy =
+      emitKind == "cpp" ? std::string(observeNamed) : std::string("off");
   printCompileStats(compileStats);
 
   if (!probeManifestPath.empty()) {

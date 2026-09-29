@@ -53,6 +53,7 @@ static void forceLinkPycPasses() {
   (void)pyc::createCombineDelayChainsPass();
   (void)pyc::createPackStateLanesPass();
   (void)pyc::createPackI1RegsPass();
+  (void)pyc::createApplyObservationDemandPass();
   (void)pyc::createLowerSCFToPYCStaticPass();
   (void)pyc::createCheckFlatTypesPass();
   (void)pyc::createPrunePortsPass();

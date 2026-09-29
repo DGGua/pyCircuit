@@ -43,7 +43,8 @@
 | 24 | `pyc-check-comb-cycles` | module | 构建组合依赖图并拒绝组合环。 | 始终 |
 | 25 | `pyc-check-clock-domains` | module | 检查跨时钟域连接、时钟/复位使用和 CDC 合法性。 | 始终 |
 | 26 | `pyc-pack-i1-regs` | function | 收集通用 state pack 留下的可合并标量 `i1` 寄存器，并把身份挂到 packed bit alias。 | 始终 |
-| 27 | `pyc-fuse-comb` | function | 将连续组合逻辑融合为 `pyc.comb` 区域，减少 emitter 调度开销；稳定命名/观测状态是 fusion barrier。 | 默认启用；仅当同时设置 `--sim-mode=cpp-only` 与 `--cpp-only-preserve-ops` 时跳过 |
+| 26b | `pyc-apply-observation-demand` | module | 状态优化重映射身份之后，剥掉不在运行时观测需求里的 `pyc.name`（需求来自 `@probe` source、`--trace-codegen-plan`、以及 `debug_keep` / `observable` / `probe*` / `trace*`）。无人读的观测-only alias 随后可被 DCE。 | `--emit=cpp` 且 `--observe-named=demand`（默认） |
+| 27 | `pyc-fuse-comb` | function | 将连续组合逻辑融合为 `pyc.comb` 区域，减少 emitter 调度开销；仍带稳定名字或观测属性的 op 是 fusion barrier。 | 默认启用；仅当同时设置 `--sim-mode=cpp-only` 与 `--cpp-only-preserve-ops` 时跳过 |
 | 28 | `canonicalize` | module | 对前面 lowering/fusion 产生的新模式再次规范化。 | 始终 |
 | 29 | `cse` | module | 再次消除公共子表达式。 | 始终 |
 | 30 | `remove-dead-values` | module | 清理二次优化后的无用 SSA value。 | LLVM < 19；LLVM 19+ 跳过 |
@@ -52,7 +53,7 @@
 | 33 | `pyc-check-flat-types` | function | 验证所有 operand/result 类型均可被目标 emitter 表示。 | 始终 |
 | 34 | `pyc-check-no-dynamic` | function | 拒绝残留的 `scf.*`、`index` 等动态结构。 | 始终 |
 | 35 | `pyc-check-logic-depth` | module | 计算组合逻辑深度并按 `--logic-depth` 限制拒绝超限设计。 | 始终 |
-| 36 | `pyc-cpp-placement` | module | 为 C++ emit 标注 comb 方法切分与 struct/local 存储；带 `pyc.name` 的值留在结构体上，供探针和 trace 取样。 | 仅 `--emit=cpp` |
+| 36 | `pyc-cpp-placement` | module | 为 C++ emit 标注 comb 方法切分与 struct/local 存储；此时仍带 `pyc.name` 的值留在结构体上，供探针和 trace 取样。 | 仅 `--emit=cpp` |
 | 37 | `pyc-collect-compile-stats` | function | 写入寄存器、存储和硬件位数等编译统计属性。 | 始终 |
 
 通过第 33–35 项 legality gate 后，`pycc` 才调用 C++ 或 Verilog emitter。
