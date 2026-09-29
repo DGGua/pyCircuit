@@ -20,6 +20,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <limits>
+#include <optional>
 #include <queue>
 #include <string>
 #include <vector>
@@ -486,8 +487,7 @@ static llvm::SmallVector<pyc::CombOp> collectTopLevelCombs(func::FuncOp f) {
   return combs;
 }
 
-/// Returns true for values that must remain struct members (cannot be
-/// localized).
+/// Returns true for values that must remain struct members (cannot be localized).
 static bool pinToStruct(Value v, const llvm::StringSet<> &traceSelectedFields) {
   Operation *def = v.getDefiningOp();
   if (!def)
@@ -572,8 +572,8 @@ runCppMemberPlacement(func::FuncOp f, unsigned combChunkNodes,
   llvm::DenseSet<Value> crossPartValues;
   llvm::SmallVector<pyc::CombOp> combs = collectTopLevelCombs(f);
   for (auto [i, comb] : llvm::enumerate(combs))
-    assignCombOpMethods(comb, static_cast<unsigned>(i), combChunkNodes,
-                        opToMethod, crossPartValues, summary);
+    assignCombOpMethods(comb, static_cast<unsigned>(i), combChunkNodes, opToMethod,
+                        crossPartValues, summary);
 
   llvm::SmallVector<Value> candidates;
   f.walk([&](Operation *op) {
@@ -594,7 +594,6 @@ runCppMemberPlacement(func::FuncOp f, unsigned combChunkNodes,
   // One additional demotion applies: a value that crosses part methods cannot
   // be a method-local Wire<> (it would be invisible to the other part), so it
   // is promoted to a struct member even though it passes the boundary test.
-  llvm::StringSet<> noTraceSelectedFields;
   for (Value v : candidates) {
     Operation *def = v.getDefiningOp();
 
@@ -609,13 +608,6 @@ runCppMemberPlacement(func::FuncOp f, unsigned combChunkNodes,
 
     // Pinned-to-struct values (block args, state ops, comb results, values
     // escaping their comb) always live on the struct.
-    bool tracePinned = false;
-    if (def) {
-      if (auto name = def->getAttrOfType<StringAttr>("pyc.name"))
-        tracePinned = traceSelectedFields.contains(name.getValue());
-    }
-    const bool tracePromoted =
-        tracePinned && !pinToStruct(v, noTraceSelectedFields);
     if (pinToStruct(v, traceSelectedFields)) {
       annotatePlacement(v, CppStorageKind::Struct, {});
       summary.structMembers++;

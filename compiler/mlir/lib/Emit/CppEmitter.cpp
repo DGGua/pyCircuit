@@ -1572,7 +1572,6 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
   std::sort(syncMems.begin(), syncMems.end(), [&](pyc::SyncMemOp a, pyc::SyncMemOp b) { return syncMemKey(a) < syncMemKey(b); });
   std::sort(syncMemDPs.begin(), syncMemDPs.end(), [&](pyc::SyncMemDPOp a, pyc::SyncMemDPOp b) { return syncMemDPKey(a) < syncMemDPKey(b); });
   std::sort(cdcSyncs.begin(), cdcSyncs.end(), [&](pyc::CdcSyncOp a, pyc::CdcSyncOp b) { return cdcKey(a) < cdcKey(b); });
-
   auto scheduleSlot = [&](Operation *op) -> uint64_t {
     if (!op || op->getNumResults() == 0)
       return std::numeric_limits<uint64_t>::max();
@@ -1599,8 +1598,8 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
         !combIndex.contains(node.operation))
       return node.operation->emitError(
           "C++ emitter cannot map schedule node to a comb execution unit");
-    if (!isa<pyc::CombOp, pyc::InstanceOp, pyc::RegOp, pyc::FifoOp,
-             pyc::ByteMemOp, pyc::SyncMemOp, pyc::SyncMemDPOp,
+    if (!isa<pyc::CombOp, pyc::InstanceOp, pyc::RegOp, pyc::DelayLineOp,
+             pyc::FifoOp, pyc::ByteMemOp, pyc::SyncMemOp, pyc::SyncMemDPOp,
              pyc::AsyncFifoOp, pyc::CdcSyncOp>(node.operation))
       return node.operation->emitError(
           "C++ emitter cannot map schedule node to a supported execution or state-source unit");
@@ -1769,103 +1768,6 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
     os << "\n";
   }
 
-  struct NamedProbeInfo {
-    std::string fieldPath;
-    std::string cppValue;
-    std::string cppRegInst;
-    unsigned width = 0;
-    bool isReg = false;
-    Type type;
-  };
-
-  // Decision 0003 / 0051-0052: infer probe kind for ports and named internal
-  // objects. Trace-selected comb locals have already been pinned to stable
-  // struct storage by pyc-cpp-placement.
-  std::vector<bool> outIsReg(f.getNumResults(), false);
-  std::vector<Value> outRegQ(f.getNumResults(), Value());
-  std::vector<NamedProbeInfo> namedProbes;
-  if (!f.isDeclaration()) {
-    auto ret =
-        dyn_cast_or_null<func::ReturnOp>(f.getBody().front().getTerminator());
-    if (!ret)
-      return f.emitError("missing return");
-    for (unsigned i = 0; i < f.getNumResults() && i < ret.getNumOperands(); ++i)
-      outRegQ[i] = findRegQFromValue(ret.getOperand(i));
-    for (unsigned i = 0; i < f.getNumResults(); ++i)
-      outIsReg[i] = static_cast<bool>(outRegQ[i]);
-
-    llvm::StringSet<> seenNamedFields;
-    f.walk([&](Operation *op) {
-      auto nameAttr = op->getAttrOfType<StringAttr>("pyc.name");
-      if (!nameAttr || op->getNumResults() != 1)
-        return;
-      Value value = op->getResult(0);
-      if (getValueCppStorage(value) == CppStorageKind::Local)
-        return;
-      unsigned width = bitWidth(value.getType());
-      if (width == 0)
-        return;
-      std::string fieldPath = nameAttr.getValue().str();
-      if (!seenNamedFields.insert(fieldPath).second)
-        return;
-      Value regQ = findRegQFromValue(value);
-      namedProbes.push_back(NamedProbeInfo{
-          fieldPath,
-          nt.get(value),
-          static_cast<bool>(regQ) ? (nt.get(regQ) + "_inst") : std::string(),
-          width,
-          static_cast<bool>(regQ),
-          value.getType(),
-      });
-    });
-    std::sort(namedProbes.begin(), namedProbes.end(),
-              [](const NamedProbeInfo &a, const NamedProbeInfo &b) {
-                return a.fieldPath < b.fieldPath;
-              });
-  }
-
-	  // DFX trace registration (Decision 0145).
-	  os << "  template <typename TbT, typename EnabledInstT, typename EnabledSigT>\n";
-	  os << "  void pyc_trace_vcd(TbT &tb, const std::string &prefix, EnabledInstT &&enabledInst, EnabledSigT &&enabledSig) {\n";
-	  os << "    std::string inst = pyc::cpp::shortenInstancePath(prefix);\n";
-	  os << "    auto trace_port = [&](auto &sig, const char *leaf) {\n";
-  os << "      std::string p = inst;\n";
-  // Decision 0023: canonical_path uses <instance_path>:<field_path>.
-  os << "      p += \":\";\n";
-  os << "      p += leaf;\n";
-		  os << "      if (enabledSig(p)) tb.vcdTrace(sig, p);\n";
-	  os << "    };\n";
-	  for (unsigned i = 0; i < inNames.size(); ++i)
-	    os << "    trace_port(" << inNames[i] << ", " << cppStringLiteral(inCanon[i]) << ");\n";
-	  for (unsigned i = 0; i < outNames.size(); ++i)
-	    os << "    trace_port(" << outNames[i] << ", " << cppStringLiteral(outCanon[i]) << ");\n";
-	  for (const auto &named : namedProbes)
-	    os << "    trace_port(" << named.cppValue << ", "
-	       << cppStringLiteral(named.fieldPath) << ");\n";
-	  if (!instInfos.empty()) {
-	    os << "    auto trace_child = [&](auto &child, const char *seg) {\n";
-	    os << "      std::string full = prefix;\n";
-	    os << "      full += \".\";\n";
-    os << "      full += seg;\n";
-    os << "      std::string inst_path = pyc::cpp::shortenInstancePath(full);\n";
-    os << "      if (enabledInst(inst_path) && child) child->pyc_trace_vcd(tb, full, enabledInst, enabledSig);\n";
-    os << "    };\n";
-    for (const auto &ii : instInfos)
-      os << "    trace_child(" << ii.member << ", \"" << ii.seg << "\");\n";
-  }
-	  os << "  }\n\n";
-
-	  // ProbeRegistry registration (Decisions 0004, 0018-0021).
-	  os << "  void pyc_register_probes(pyc::cpp::ProbeRegistry &reg, const std::string &prefix) {\n";
-	  os << "    std::string inst = pyc::cpp::shortenInstancePath(prefix);\n";
-	  os << "    auto reg_path = [&](const char *leaf) {\n";
-	  os << "      std::string p = inst;\n";
-	  // Decision 0023: canonical_path uses <instance_path>:<field_path>.
-	  os << "      p += \":\";\n";
-	  os << "      p += leaf;\n";
-	  os << "      return p;\n";
-	  os << "    };\n";
-
     struct NamedProbeInfo {
       std::string fieldPath;
       std::string cppValue;
@@ -1933,7 +1835,47 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
         return a.fieldPath < b.fieldPath;
       });
     }
+    // DFX trace registration (Decision 0145).
+	  os << "  template <typename TbT, typename EnabledInstT, typename EnabledSigT>\n";
+	  os << "  void pyc_trace_vcd(TbT &tb, const std::string &prefix, EnabledInstT &&enabledInst, EnabledSigT &&enabledSig) {\n";
+	  os << "    std::string inst = pyc::cpp::shortenInstancePath(prefix);\n";
+	  os << "    auto trace_port = [&](auto &sig, const char *leaf) {\n";
+    os << "      std::string p = inst;\n";
+    // Decision 0023: canonical_path uses <instance_path>:<field_path>.
+    os << "      p += \":\";\n";
+    os << "      p += leaf;\n";
+    os << "      if (enabledSig(p)) tb.vcdTrace(sig, p);\n";
+	  os << "    };\n";
+	  for (unsigned i = 0; i < inNames.size(); ++i)
+	    os << "    trace_port(" << inNames[i] << ", " << cppStringLiteral(inCanon[i]) << ");\n";
+	  for (unsigned i = 0; i < outNames.size(); ++i)
+	    os << "    trace_port(" << outNames[i] << ", " << cppStringLiteral(outCanon[i]) << ");\n";
+	  for (const auto &named : namedProbes)
+	    os << "    trace_port(" << named.cppValue << ", "
+	       << cppStringLiteral(named.fieldPath) << ");\n";
+	  if (!instInfos.empty()) {
+	    os << "    auto trace_child = [&](auto &child, const char *seg) {\n";
+	    os << "      std::string full = prefix;\n";
+	    os << "      full += \".\";\n";
+      os << "      full += seg;\n";
+      os << "      std::string inst_path = pyc::cpp::shortenInstancePath(full);\n";
+      os << "      if (enabledInst(inst_path) && child) child->pyc_trace_vcd(tb, full, enabledInst, enabledSig);\n";
+      os << "    };\n";
+      for (const auto &ii : instInfos)
+        os << "    trace_child(" << ii.member << ", \"" << ii.seg << "\");\n";
+    }
+	  os << "  }\n\n";
 
+	  // ProbeRegistry registration (Decisions 0004, 0018-0021).
+	  os << "  void pyc_register_probes(pyc::cpp::ProbeRegistry &reg, const std::string &prefix) {\n";
+	  os << "    std::string inst = pyc::cpp::shortenInstancePath(prefix);\n";
+	  os << "    auto reg_path = [&](const char *leaf) {\n";
+	  os << "      std::string p = inst;\n";
+	  // Decision 0023: canonical_path uses <instance_path>:<field_path>.
+	  os << "      p += \":\";\n";
+	  os << "      p += leaf;\n";
+	  os << "      return p;\n";
+	  os << "    };\n";
 		  for (auto [i, arg] : llvm::enumerate(f.getArguments())) {
 		    unsigned w = bitWidth(arg.getType());
 		    if (w == 0)
@@ -2708,6 +2650,8 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
       }
       os << "      " << ii.member << "->eval();\n";
       os << "      " << ii.member << "_eval_cache_words = _pyc_inputs;\n";
+      os << "    } else {\n";
+      emitClockOnlyAssigns("      ");
       os << "    }\n";
       os << "    _pyc_inst_changed = " << changedFlag << ";\n";
       os << "    " << ii.member << "_eval_cache_valid = true;\n";
@@ -2758,6 +2702,8 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
         os << "      " << ii.member << "->" << ii.inPorts[i] << " = " << cacheName << ";\n";
       }
       os << "      " << ii.member << "->eval();\n";
+      os << "    } else {\n";
+      emitClockOnlyAssigns("      ");
       os << "    }\n";
       os << "    #else\n";
       for (unsigned i = 0; i < inst.getNumOperands(); ++i) {
@@ -2779,6 +2725,8 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
       }
       emitClockOnlyAssigns("      ");
       os << "      " << ii.member << "->eval();\n";
+      os << "    } else {\n";
+      emitClockOnlyAssigns("      ");
       os << "    }\n";
       os << "    #endif\n";
       os << "    _pyc_inst_changed = " << changedFlag << ";\n";
@@ -3668,7 +3616,7 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
     std::string key = nt.get(sync.getOut()) + "_inst";
     emitStateTickCompute(key, sync->getOperands(), "    ",
                          [&](llvm::StringRef indent) {
-                           os << indent << key << ".tick_compute();\n";
+                           os << indent << key << "->tick_compute();\n";
                          });
   }
   os << "  }\n\n";
@@ -3765,7 +3713,7 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
     std::string key = nt.get(sync.getOut()) + "_inst";
     std::string changed = "_pyc_commit_changed_" + key;
     os << "    const bool " << changed << " = " << key
-       << ".tick_commit();\n";
+       << "->tick_commit();\n";
     emitCommitWake(changed, sync.getOut());
   }
   if (!instInfos.empty()) {

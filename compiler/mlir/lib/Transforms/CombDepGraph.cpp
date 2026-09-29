@@ -148,6 +148,17 @@ resolveResultTransfer(Operation *op, unsigned resultIndex, ModuleOp module,
     transfer.baseDepth = 0;
     return transfer;
   }
+  if (isa<pyc::DelayTapOp>(op)) {
+    // A tap reads a committed delay-line stage. Connect it to the line so
+    // change-driven fanout reaches tap consumers, without a same-tick path
+    // from the delay input.
+    transfer.baseDepth = 0;
+    transfer.operandDependencies.reserve(op->getNumOperands());
+    for (unsigned operandIndex = 0; operandIndex < op->getNumOperands();
+         ++operandIndex)
+      transfer.operandDependencies.push_back({operandIndex, 0});
+    return transfer;
+  }
   if (isa<pyc::ConstantOp, arith::ConstantOp>(op)) {
     transfer.baseDepth = 0;
     return transfer;
