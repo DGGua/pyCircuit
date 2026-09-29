@@ -785,7 +785,8 @@ void AliasOp::getEffects(
     SmallVectorImpl<SideEffects::EffectInstance<MemoryEffects::Effect>>
         &effects) {
   // Unused observation aliases must survive DCE so probe/VCD can still
-  // register the identity after a state rewrite.
+  // register the identity after a state rewrite. Comb treats AliasOp as
+  // identity anyway; this Write is liveness, not a real store.
   if (carriesExternalObservationIdentity(*this))
     effects.emplace_back(MemoryEffects::Write::get());
 }
@@ -1312,11 +1313,14 @@ LogicalResult CombOp::verify() {
   // A pyc.comb body is freely topologically reorderable by code-generation
   // placement passes. Keep that contract explicit instead of trusting the
   // producer that originally formed the region.
+  //
+  // Observation aliases report Write only so unused probe names survive DCE.
+  // They are still identity ops and stay safe to reorder.
   for (Operation &op : b.without_terminator()) {
     if (op.getNumRegions() != 0)
       return emitOpError("body operation ")
              << op.getName() << " must not contain nested regions";
-    if (!isMemoryEffectFree(&op))
+    if (!isMemoryEffectFree(&op) && !isa<AliasOp>(&op))
       return emitOpError("body operation ")
              << op.getName() << " must be memory-effect-free";
   }
