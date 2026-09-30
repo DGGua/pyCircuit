@@ -2369,6 +2369,7 @@ def _cmd_build(args: argparse.Namespace) -> int:
         )
     except ProbeError as e:
         raise SystemExit(f"probe resolution failed: {e}") from e
+    probe_plan_obj = _load_json(probe_plan_path)
     probe_manifest_path = out_dir / "probe_manifest.json"
     _save_json(probe_manifest_path, probe_manifest_obj)
     manifest["probe_manifest"] = str(probe_manifest_path.relative_to(out_dir))
@@ -2423,9 +2424,23 @@ def _cmd_build(args: argparse.Namespace) -> int:
         mp = module_paths[sym]
         h = _module_hash(mp)
         trace_fields = list(trace_codegen_plan["modules"].get(sym, []))
+        # Observation demand makes emitted C++ depend on the probe plan: a
+        # probe alias change keeps/strips eager storage even when the hardware
+        # is unchanged, so the alias paths must participate in the C++ cache
+        # key or stale headers silently break addAlias/dut.read.
+        sym_prefix = f"{sym}:"
+        probe_paths = sorted(
+            str(alias.get("source_path", ""))
+            for alias in probe_plan_obj["aliases"]
+            if str(alias.get("source_path", "")).startswith(sym_prefix)
+        )
         cpp_key = f"cpp:{sym}"
         cpp_hash = _canonical_hash(
-            {"module_hash": h, "trace_fields": trace_fields}
+            {
+                "module_hash": h,
+                "trace_fields": trace_fields,
+                "probe_paths": probe_paths,
+            }
         )
         verilog_key = f"verilog:{sym}"
         module_hashes[cpp_key] = cpp_hash
