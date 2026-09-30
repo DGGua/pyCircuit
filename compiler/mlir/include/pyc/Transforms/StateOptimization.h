@@ -19,6 +19,9 @@ llvm::StringRef stringifyDelayChainMode(DelayChainMode mode);
 
 bool isCycleBalanceGenerated(mlir::Operation *op);
 bool shouldKeepStateOptimization(mlir::Operation *op);
+/// True when `pyc.observe_lazy` marks an undeclared name as on-read lookup.
+bool isObserveLazy(mlir::Operation *op);
+/// True for a non-lazy, non-cycle-balance `pyc.name` that must stay an eager probe.
 bool hasStableStateName(mlir::Operation *op);
 
 /// True when `op` carries an identity that probe/VCD/`dut.read` may consume.

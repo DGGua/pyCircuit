@@ -251,9 +251,12 @@ struct NameTable {
       return it->second;
     if (Operation *def = v.getDefiningOp()) {
       if (auto nAttr = def->getAttrOfType<StringAttr>("pyc.name")) {
-        std::string cand = unique(sanitizeId(nAttr.getValue()));
-        names.try_emplace(v, cand);
-        return cand;
+        auto lazy = def->getAttrOfType<BoolAttr>("pyc.observe_lazy");
+        if (!lazy || !lazy.getValue()) {
+          std::string cand = unique(sanitizeId(nAttr.getValue()));
+          names.try_emplace(v, cand);
+          return cand;
+        }
       }
       // Fall back to op-based names for readability (instead of v1/v2/...).
       std::string base = sanitizeId(def->getName().getStringRef());
@@ -1803,6 +1806,9 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
         auto nameAttr = op->getAttrOfType<StringAttr>("pyc.name");
         if (!nameAttr || op->getNumResults() != 1)
           return;
+        if (auto lazy = op->getAttrOfType<BoolAttr>("pyc.observe_lazy");
+            lazy && lazy.getValue())
+          return;
         Value value = op->getResult(0);
         if (getValueCppStorage(value) == CppStorageKind::Local)
           return;
@@ -1926,6 +1932,69 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
           emitWireProbes(os, named.type, named.width, named.fieldPath, named.cppValue);
         }
       }
+      llvm::StringSet<> emittedNamed;
+      for (const auto &named : namedProbes)
+        emittedNamed.insert(named.fieldPath);
+      auto emitLazySlices = [&](Operation *storage, Value q) -> LogicalResult {
+        auto slices = storage->getAttrOfType<ArrayAttr>("pyc.lazy_probe_slices");
+        if (!slices)
+          return success();
+        const unsigned storageWidth = bitWidth(q.getType());
+        if (storageWidth == 0)
+          return storage->emitError("lazy probe storage has empty width");
+        const std::string inst = nt.get(q) + "_inst";
+        for (Attribute item : slices) {
+          auto dict = dyn_cast<DictionaryAttr>(item);
+          if (!dict)
+            return storage->emitError("invalid pyc.lazy_probe_slices entry");
+          auto name = dict.getAs<StringAttr>("name");
+          auto lsbAttr = dict.getAs<IntegerAttr>("lsb");
+          auto widthAttr = dict.getAs<IntegerAttr>("width");
+          auto tapAttr = dict.getAs<IntegerAttr>("tap_depth");
+          if (!name || name.getValue().empty() || !lsbAttr || !widthAttr)
+            return storage->emitError("lazy probe slice requires name/lsb/width");
+          const std::string field = name.getValue().str();
+          if (!emittedNamed.insert(field).second)
+            continue;
+          const unsigned width = static_cast<unsigned>(widthAttr.getInt());
+          const unsigned lsb = static_cast<unsigned>(lsbAttr.getInt());
+          const int64_t tapDepth = tapAttr ? tapAttr.getInt() : -1;
+          if (width == 0)
+            return storage->emitError("lazy probe slice has empty width: ")
+                   << field;
+          if (tapDepth >= 0) {
+            os << "    reg.addRegLazyTap<" << width << ">(reg_path("
+               << cppStringLiteral(field) << "), " << inst << ", " << tapDepth
+               << "u, &" << inst << "->pending, &" << inst << "->qNext);\n";
+            continue;
+          }
+          if (lsb == 0 && width == storageWidth) {
+            os << "    reg.addReg<" << width << ">(reg_path("
+               << cppStringLiteral(field) << "), &" << inst << "->q, &" << inst
+               << "->pending, &" << inst << "->qNext);\n";
+            continue;
+          }
+          os << "    reg.addRegLazySlice<" << width << ", " << storageWidth
+             << ">(reg_path(" << cppStringLiteral(field) << "), &" << inst
+             << "->q, " << lsb << "u, &" << inst << "->pending, &" << inst
+             << "->qNext);\n";
+        }
+        return success();
+      };
+      bool lazyFailed = false;
+      f.walk([&](Operation *op) {
+        if (lazyFailed)
+          return;
+        if (auto reg = dyn_cast<pyc::RegOp>(op)) {
+          if (failed(emitLazySlices(op, reg.getQ())))
+            lazyFailed = true;
+        } else if (auto delay = dyn_cast<pyc::DelayLineOp>(op)) {
+          if (failed(emitLazySlices(op, delay.getQ())))
+            lazyFailed = true;
+        }
+      });
+      if (lazyFailed)
+        return failure();
 		  for (auto mem : byteMems) {
 		    std::string instName = nt.get(mem.getRdata()) + "_inst";
 		    if (auto nameAttr = mem->getAttrOfType<StringAttr>("name"))

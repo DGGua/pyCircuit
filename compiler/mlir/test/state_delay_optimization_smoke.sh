@@ -107,12 +107,30 @@ fi
 "${PYCC}" "${PACK_PROBE_INPUT}" --emit=cpp \
   --observe-named=demand \
   -o "${TMP_DIR}/packed-probes-demand.hpp" 2>"${TMP_DIR}/packed-probes-demand.stderr"
-if grep -q 'lane0_state\|lane1_state' "${TMP_DIR}/packed-probes-demand.hpp"; then
-  echo "fail: demand mode kept undemanded packed lane names" >&2
+if grep -qE 'lane0_state[[:space:]]*=|lane1_state[[:space:]]*=' \
+  "${TMP_DIR}/packed-probes-demand.hpp"; then
+  echo "fail: demand mode still assigned undemanded packed lane names" >&2
+  exit 1
+fi
+if ! grep -q 'addRegLazySlice<8, 16>' "${TMP_DIR}/packed-probes-demand.hpp"; then
+  echo "fail: demand mode missing lazy packed lane lookups" >&2
+  exit 1
+fi
+if ! grep -q 'lane0_state' "${TMP_DIR}/packed-probes-demand.hpp" ||
+   ! grep -q 'lane1_state' "${TMP_DIR}/packed-probes-demand.hpp"; then
+  echo "fail: demand mode dropped packed lane lookup names" >&2
   exit 1
 fi
 if [[ $(grep -c 'addRegSlice<8, 16>' "${TMP_DIR}/packed-probes-demand.hpp") -ge 4 ]]; then
   echo "fail: demand mode still registered undemanded packed lane slices" >&2
+  exit 1
+fi
+"${CXX:-c++}" -std=c++17 -O2 -I"${ROOT}/runtime" \
+  -DMODEL_HEADER="\"${TMP_DIR}/packed-probes-demand.hpp\"" \
+  "${ROOT}/compiler/mlir/test/state_pack_probe_demand_runtime.cpp" \
+  -o "${TMP_DIR}/state-pack-probe-demand-runtime"
+if ! "${TMP_DIR}/state-pack-probe-demand-runtime"; then
+  echo "fail: demand lazy findByPath/readU64 did not match packed lane values" >&2
   exit 1
 fi
 

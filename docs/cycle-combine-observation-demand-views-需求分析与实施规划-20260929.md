@@ -317,8 +317,8 @@ demand 默认落地后，调试和旧夹具需要一条不写 `@probe` 也能把
 
 ### 契约
 
-- `pycc --emit=cpp` 默认 `--observe-named=demand`：优化并重映射身份之后，剥掉不在 `@probe` source / `--trace-codegen-plan` / IR 观测属性里的 `pyc.name`。
-- `--observe-named=all` 跳过该 pass，C++ 行为回到 keep-identity（每个非 cycle-balance 名字都注册）。
+- `pycc --emit=cpp` 默认 `--observe-named=demand`：优化并重映射身份之后，声明过的 `@probe` / `--trace-codegen-plan` / IR 观测属性仍急切；其余 `pyc.name` **不再剥掉**，改为懒查找（见 `docs/cycle-combine-lazy-named-lookup-需求分析与实施规划-20260930.md`）。
+- `--observe-named=all` 跳过该 pass，C++ 行为回到 keep-identity（每个非 cycle-balance 名字都急切注册）。
 - 不提供 `--observe-fields`。`cli build` 显式传 `--observe-named=demand` 和已有 `--probe-plan`。
 - `pyc-opt` 默认不跑该 pass；可手动 `--pyc-apply-observation-demand`。
 - `--emit=none` catalog 仍枚举全部作者名。
@@ -330,7 +330,7 @@ cmake --build .pycircuit_out/toolchain/build --target pycc pyc-opt
 PYCC=$PWD/.pycircuit_out/toolchain/build/bin/pycc \
 PYC_OPT=$PWD/.pycircuit_out/toolchain/build/bin/pyc-opt \
   bash compiler/mlir/test/state_delay_optimization_smoke.sh
-# PASS（含 observation_demand FileCheck、demand 下无 lane0_state、all 下 addRegSlice≥4）
+# PASS（含 observation_demand FileCheck、demand 下无 lane0_state= 赋值、all 下 addRegSlice≥4）
 
 PYCC=… PYC_OPT=… bash compiler/mlir/test/delay_line_diagnostics_smoke.sh
 # PASS

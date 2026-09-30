@@ -3,12 +3,16 @@
 
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/BuiltinOps.h"
+#include "mlir/IR/BuiltinTypes.h"
 #include "mlir/Pass/Pass.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringSet.h"
+#include "mlir/IR/BuiltinAttributes.h"
 #include "llvm/Support/JSON.h"
 #include "llvm/Support/MemoryBuffer.h"
 
+#include <optional>
 #include <string>
 
 using namespace mlir;
@@ -19,6 +23,112 @@ namespace {
 static void setI64Attr(Operation *op, StringRef name, int64_t value) {
   op->setAttr(name, IntegerAttr::get(IntegerType::get(op->getContext(), 64),
                                      value));
+}
+
+static constexpr StringRef kLazySlicesAttr = "pyc.lazy_probe_slices";
+
+struct StateProbeSource {
+  Operation *storage = nullptr;
+  unsigned lsb = 0;
+  int64_t tapDepth = -1;
+};
+
+static unsigned valueWidth(Value value) {
+  if (auto integer = dyn_cast<IntegerType>(value.getType()))
+    return integer.getWidth();
+  return 0;
+}
+
+static std::optional<StateProbeSource> findRegStorage(Value value) {
+  llvm::SmallVector<Value, 8> seen;
+  unsigned lsb = 0;
+  while (true) {
+    for (Value prev : seen) {
+      if (prev == value)
+        return std::nullopt;
+    }
+    seen.push_back(value);
+    while (auto alias = value.getDefiningOp<pyc::AliasOp>())
+      value = alias.getIn();
+    if (auto reg = value.getDefiningOp<pyc::RegOp>())
+      return StateProbeSource{reg.getOperation(), lsb};
+    if (auto delay = value.getDefiningOp<pyc::DelayLineOp>())
+      return StateProbeSource{delay.getOperation(), lsb};
+    if (auto tap = value.getDefiningOp<pyc::DelayTapOp>()) {
+      auto delay = tap.getLine().getDefiningOp<pyc::DelayLineOp>();
+      auto depth = tap->getAttrOfType<IntegerAttr>("depth");
+      if (!delay || !depth)
+        return std::nullopt;
+      return StateProbeSource{delay.getOperation(), lsb, depth.getInt()};
+    }
+    if (auto extract = value.getDefiningOp<pyc::ExtractOp>()) {
+      auto packedLsb =
+          extract->getAttrOfType<IntegerAttr>("pyc.state_pack_lsb");
+      const int64_t sliceLsb =
+          packedLsb ? packedLsb.getInt() : extract.getLsbAttr().getInt();
+      if (sliceLsb < 0)
+        return std::nullopt;
+      lsb += static_cast<unsigned>(sliceLsb);
+      value = extract.getIn();
+      continue;
+    }
+    auto comb = value.getDefiningOp<pyc::CombOp>();
+    if (!comb)
+      return std::nullopt;
+    auto res = dyn_cast<OpResult>(value);
+    if (!res)
+      return std::nullopt;
+    auto yield =
+        dyn_cast_or_null<pyc::YieldOp>(comb.getBody().front().getTerminator());
+    if (!yield || res.getResultNumber() >= yield.getNumOperands())
+      return std::nullopt;
+    Value y = yield.getOperand(res.getResultNumber());
+    while (auto alias = y.getDefiningOp<pyc::AliasOp>())
+      y = alias.getIn();
+    if (auto extract = y.getDefiningOp<pyc::ExtractOp>()) {
+      auto packedLsb =
+          extract->getAttrOfType<IntegerAttr>("pyc.state_pack_lsb");
+      const int64_t sliceLsb =
+          packedLsb ? packedLsb.getInt() : extract.getLsbAttr().getInt();
+      if (sliceLsb < 0)
+        return std::nullopt;
+      lsb += static_cast<unsigned>(sliceLsb);
+      y = extract.getIn();
+      while (auto alias = y.getDefiningOp<pyc::AliasOp>())
+        y = alias.getIn();
+    }
+    auto barg = dyn_cast<BlockArgument>(y);
+    if (!barg || barg.getOwner() != &comb.getBody().front() ||
+        barg.getArgNumber() >= comb.getNumOperands())
+      return std::nullopt;
+    value = comb.getOperand(barg.getArgNumber());
+  }
+}
+
+static LogicalResult appendLazySlice(Operation *storage, StringRef name,
+                                     unsigned lsb, unsigned width,
+                                     int64_t tapDepth) {
+  MLIRContext *ctx = storage->getContext();
+  SmallVector<Attribute> items;
+  if (auto existing = storage->getAttrOfType<ArrayAttr>(kLazySlicesAttr))
+    items.append(existing.begin(), existing.end());
+  for (Attribute item : items) {
+    auto dict = dyn_cast<DictionaryAttr>(item);
+    if (!dict)
+      continue;
+    if (auto prev = dict.getAs<StringAttr>("name");
+        prev && prev.getValue() == name)
+      return success();
+  }
+  NamedAttrList fields;
+  fields.set("name", StringAttr::get(ctx, name));
+  fields.set("lsb", IntegerAttr::get(IntegerType::get(ctx, 64), lsb));
+  fields.set("width", IntegerAttr::get(IntegerType::get(ctx, 64), width));
+  fields.set("tap_depth",
+             IntegerAttr::get(IntegerType::get(ctx, 64), tapDepth));
+  items.push_back(DictionaryAttr::get(ctx, fields));
+  storage->setAttr(kLazySlicesAttr, ArrayAttr::get(ctx, items));
+  return success();
 }
 
 static llvm::StringRef fieldPathFromProbePath(llvm::StringRef path) {
@@ -94,10 +204,10 @@ static LogicalResult loadTracePlanFields(ModuleOp module, StringRef path,
   return success();
 }
 
-// After merge/retime/pack have remapped every author identity, drop pyc.name
-// values that nobody asked to read. Decision 0091/0096: unselected probes
-// must not pay C++ struct/addReg/fuse-comb cost. IR attrs debug_keep /
-// observable / probe* / trace* still count as demand.
+// After merge/retime/pack remapped identities, mark undeclared pyc.name
+// values as lazy lookups. Decision 0091/0096: those names stay findable
+// but must not pay per-cycle extract/pin cost. IR attrs debug_keep /
+// observable / probe* / trace* still count as eager demand.
 struct ApplyObservationDemandPass
     : public PassWrapper<ApplyObservationDemandPass, OperationPass<ModuleOp>> {
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(ApplyObservationDemandPass)
@@ -115,8 +225,7 @@ struct ApplyObservationDemandPass
     return "pyc-apply-observation-demand";
   }
   StringRef getDescription() const override {
-    return "Strip undemanded pyc.name after state opt so C++ probes stay "
-           "selective";
+    return "Mark undeclared pyc.name as lazy lookups after state opt";
   }
 
   Option<std::string> probePlanOption{
@@ -170,21 +279,48 @@ struct ApplyObservationDemandPass
       }
     }
 
-    int64_t stripped = 0;
+    int64_t lazy = 0;
     int64_t kept = 0;
-    function.walk([&](Operation *op) {
+    auto mark = [&](Operation *op) -> LogicalResult {
       auto name = op->getAttrOfType<StringAttr>("pyc.name");
       if (!name)
-        return;
+        return success();
+      if (isCycleBalanceGenerated(op))
+        return success();
       const bool demanded = shouldKeepStateOptimization(op) ||
                             demand.contains(name.getValue());
       if (demanded) {
+        op->removeAttr("pyc.observe_lazy");
         ++kept;
-        return;
+        return success();
       }
-      op->removeAttr("pyc.name");
-      ++stripped;
+      if (op->getNumResults() != 1) {
+        ++kept;
+        return success();
+      }
+      auto source = findRegStorage(op->getResult(0));
+      const unsigned width = valueWidth(op->getResult(0));
+      // Combinational / unreconstructable names stay eager so findByPath
+      // still works; only scalar state slices become lazy lookups.
+      if (!source || width == 0) {
+        ++kept;
+        return success();
+      }
+      op->setAttr("pyc.observe_lazy", BoolAttr::get(op->getContext(), true));
+      if (failed(appendLazySlice(source->storage, name.getValue(), source->lsb,
+                                 width, source->tapDepth)))
+        return failure();
+      ++lazy;
+      return success();
+    };
+    LogicalResult status = success();
+    function.walk([&](Operation *op) {
+      if (failed(status))
+        return;
+      status = mark(op);
     });
+    if (failed(status))
+      return failure();
 
     llvm::StringSet<> presentAfter;
     function.walk([&](Operation *op) {
@@ -199,7 +335,8 @@ struct ApplyObservationDemandPass
                << field.getKey();
     }
 
-    setI64Attr(function, "pyc.stats.observe_named_names_stripped", stripped);
+    setI64Attr(function, "pyc.stats.observe_named_names_stripped", lazy);
+    setI64Attr(function, "pyc.stats.observe_named_names_lazy", lazy);
     setI64Attr(function, "pyc.stats.observe_named_names_kept", kept);
     return success();
   }

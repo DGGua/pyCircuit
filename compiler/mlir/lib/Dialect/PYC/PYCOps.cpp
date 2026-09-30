@@ -770,9 +770,12 @@ static bool carriesExternalObservationIdentity(Operation *op) {
   for (NamedAttribute attr : op->getAttrs()) {
     llvm::StringRef name = attr.getName().strref();
     if (name == "pyc.name") {
-      if (!skipCycleBalanceName)
-        return true;
-      continue;
+      if (skipCycleBalanceName)
+        continue;
+      if (auto lazy = op->getAttrOfType<BoolAttr>("pyc.observe_lazy");
+          lazy && lazy.getValue())
+        continue;
+      return true;
     }
     if (name == "pyc.debug_keep" || name == "pyc.observable" ||
         name.starts_with("pyc.probe") || name.starts_with("pyc.trace"))

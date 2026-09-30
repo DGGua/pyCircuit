@@ -1,7 +1,11 @@
 // DEMAND-LABEL: func.func @observation_demand
 // DEMAND: pyc.name = "keep_me"
-// DEMAND-NOT: pyc.name = "drop_me"
-// DEMAND: pyc.name = "debug_only"
+// DEMAND-NOT: pyc.observe_lazy
+// DEMAND: pyc.lazy_probe_slices
+// DEMAND-SAME: pyc.name = "drop_me"
+// DEMAND-SAME: pyc.observe_lazy
+// DEMAND: pyc.debug_keep
+// DEMAND-SAME: pyc.name = "debug_only"
 
 module {
   func.func @observation_demand(

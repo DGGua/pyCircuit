@@ -87,8 +87,18 @@ bool shouldKeepStateOptimization(Operation *op) {
   return hasObservationAttribute(op);
 }
 
+bool isObserveLazy(Operation *op) {
+  if (!op)
+    return false;
+  if (auto lazy = op->getAttrOfType<BoolAttr>("pyc.observe_lazy"))
+    return lazy.getValue();
+  return false;
+}
+
 bool hasStableStateName(Operation *op) {
   if (!op || !op->hasAttrOfType<StringAttr>("pyc.name"))
+    return false;
+  if (isObserveLazy(op))
     return false;
   // Frontend cycle-balance names are explicitly excluded from both probe
   // manifest generation and C++ ProbeRegistry registration.

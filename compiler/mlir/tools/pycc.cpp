@@ -171,8 +171,9 @@ static llvm::cl::opt<std::string> traceCodegenPlanPath(
 static llvm::cl::opt<std::string> observeNamed(
     "observe-named",
     llvm::cl::desc(
-        "Which pyc.name values stay as C++ probes after state opt: "
-        "demand (default: @probe/trace/IR attrs only) or all"),
+        "Which pyc.name values stay as eager C++ probes after state opt: "
+        "demand (default: @probe/trace/IR attrs eager, other names lazy "
+        "lookup) or all (every non-cycle-balance name eager)"),
     llvm::cl::init("demand"));
 
 static llvm::cl::opt<std::string> targetKind("target", llvm::cl::desc("Target: default|fpga"),
@@ -2100,6 +2101,7 @@ struct CompileStatsSummary {
   bool fuseCombEnabled = false;
   std::string observeNamedPolicy;
   int64_t observeNamedNamesStripped = 0;
+  int64_t observeNamedNamesLazy = 0;
   int64_t observeNamedNamesKept = 0;
 };
 
@@ -2277,6 +2279,9 @@ static CompileStatsSummary collectCompileStats(ModuleOp module, int64_t depthLim
     s.observeNamedNamesStripped = satAdd(
         s.observeNamedNamesStripped,
         getI64Attr(f, "pyc.stats.observe_named_names_stripped", 0));
+    s.observeNamedNamesLazy = satAdd(
+        s.observeNamedNamesLazy,
+        getI64Attr(f, "pyc.stats.observe_named_names_lazy", 0));
     s.observeNamedNamesKept = satAdd(
         s.observeNamedNamesKept,
         getI64Attr(f, "pyc.stats.observe_named_names_kept", 0));
@@ -2390,6 +2395,7 @@ static llvm::json::Object compileStatsToJson(const CompileStatsSummary &s) {
   obj["fuse_comb_enabled"] = s.fuseCombEnabled;
   obj["observe_named"] = s.observeNamedPolicy;
   obj["observe_named_names_stripped"] = s.observeNamedNamesStripped;
+  obj["observe_named_names_lazy"] = s.observeNamedNamesLazy;
   obj["observe_named_names_kept"] = s.observeNamedNamesKept;
   return obj;
 }

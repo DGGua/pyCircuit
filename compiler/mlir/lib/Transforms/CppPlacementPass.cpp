@@ -496,8 +496,14 @@ static bool pinToStruct(Value v, const llvm::StringSet<> &traceSelectedFields) {
   // Named values are registered as probes, and trace-selected fields are a
   // subset of those names. Their addresses must stay valid for the model.
   (void)traceSelectedFields;
-  if (def->hasAttr("pyc.name"))
-    return true;
+  if (def->hasAttr("pyc.name")) {
+    if (auto lazy = def->getAttrOfType<BoolAttr>("pyc.observe_lazy");
+        lazy && lazy.getValue()) {
+      // Undeclared names stay lookupable via lazy slices, not pinned Wires.
+    } else {
+      return true;
+    }
+  }
 
   // Top-level comb results and state-holding ops always live on the struct.
   if (isa<pyc::CombOp>(def))
