@@ -1963,9 +1963,31 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
             return storage->emitError("lazy probe slice has empty width: ")
                    << field;
           if (tapDepth >= 0) {
-            os << "    reg.addRegLazyTap<" << width << ">(reg_path("
-               << cppStringLiteral(field) << "), " << inst << ", " << tapDepth
-               << "u, &" << inst << "->pending, &" << inst << "->qNext);\n";
+            // Bind write-next to this stage's own qNext (emitTapUpdates writes
+            // per-tap _qNext wires); the delay line's inst->qNext is stage 0.
+            pyc::DelayTapOp matchingTap;
+            for (auto tap : delayTaps) {
+              if (tap.getLine() != q)
+                continue;
+              auto d = tap->getAttrOfType<IntegerAttr>("depth");
+              if (d && d.getInt() == tapDepth) {
+                matchingTap = tap;
+                break;
+              }
+            }
+            std::string tapWriteNext =
+                matchingTap ? (nt.get(matchingTap.getTap()) + "_qNext")
+                            : (inst + "->qNext");
+            if (lsb == 0 && width == storageWidth) {
+              os << "    reg.addRegLazyTap<" << width << ">(reg_path("
+                 << cppStringLiteral(field) << "), " << inst << ", " << tapDepth
+                 << "u, &" << inst << "->pending, &" << tapWriteNext << ");\n";
+            } else {
+              os << "    reg.addRegLazyTapSlice<" << width << ", "
+                 << storageWidth << ">(reg_path(" << cppStringLiteral(field)
+                 << "), " << inst << ", " << tapDepth << "u, " << lsb
+                 << "u, &" << inst << "->pending, &" << tapWriteNext << ");\n";
+            }
             continue;
           }
           if (lsb == 0 && width == storageWidth) {

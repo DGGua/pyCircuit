@@ -302,7 +302,9 @@ struct ApplyObservationDemandPass
       const unsigned width = valueWidth(op->getResult(0));
       // Combinational / unreconstructable names stay eager so findByPath
       // still works; only scalar state slices become lazy lookups.
-      if (!source || width == 0) {
+      // Wider-than-64b scalars also stay eager: the lazy read path exposes
+      // only Entry::readU64() (low 64 bits), which would silently truncate.
+      if (!source || width == 0 || width > 64) {
         ++kept;
         return success();
       }
