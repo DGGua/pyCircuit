@@ -403,12 +403,15 @@ class CycleAwareDomain:
             self._delay_serial += 1
             nm = f"_v5_bal_{self._delay_serial}"
             shape = w.ty.shape() if isinstance(w.ty, Vector) else []
+            # This ownership marker lets MLIR optimize compiler-inserted state
+            # without guessing from the private `_v5_bal_*` spelling.
             r = self._m.out(
                 self._m.scoped_name(nm),
                 domain=self._cd,
                 width=w.width if width is None else int(width),
                 shape=shape,
                 init=0,
+                generated="cycle_balance",
             )
             r.set(cur)
             cur = Wire(self._m, r.q.sig, signed=cur.signed)
@@ -2377,5 +2380,3 @@ def _pack_lanes(leaf_w: int, lanes: list[int]) -> int:
     for i, x in enumerate(lanes):
         v |= (int(x) & mask) << (i * leaf_w)
     return v
-
-
