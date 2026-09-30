@@ -254,3 +254,8 @@ designs/outerCube/
 .claude/settings.local.json
 # gate outputs
 docs/gates
+
+# Local experiment notes and harnesses.
+verification
+docs/superpowers
+reports
