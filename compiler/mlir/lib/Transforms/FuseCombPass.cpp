@@ -108,6 +108,7 @@ struct FuseCombPass : public PassWrapper<FuseCombPass, OperationPass<func::FuncO
 
     // Live-outs: results that are used by an op outside the run.
     llvm::SmallVector<Value> outputs;
+    llvm::DenseSet<Value> outputSet;
     for (Operation *op : run) {
       for (Value r : op->getResults()) {
         bool usedOutside = false;
@@ -117,10 +118,37 @@ struct FuseCombPass : public PassWrapper<FuseCombPass, OperationPass<func::FuncO
             break;
           }
         }
-        if (usedOutside)
+        if (usedOutside && outputSet.insert(r).second)
           outputs.push_back(r);
       }
     }
+
+    // Promote any pyc.lazy_probe_wires host in the run to a live-out so
+    // its wired result survives as a comb output. Observation demand
+    // hangs the attribute on the alias-stripped producer (see
+    // findWireHost in ApplyObservationDemandPass), so a named alias that
+    // is the live-out, or a mid-pipeline named op consumed only by other
+    // fused ops, would otherwise be cloned into the pyc.comb body and
+    // become invisible to the emitter (which skips ops inside pyc.comb).
+    for (Operation *op : run) {
+      auto wires = op->getAttrOfType<ArrayAttr>("pyc.lazy_probe_wires");
+      if (!wires)
+        continue;
+      for (Attribute item : wires) {
+        auto dict = dyn_cast<DictionaryAttr>(item);
+        if (!dict)
+          continue;
+        auto resultAttr = dict.getAs<IntegerAttr>("result");
+        const unsigned srcResult =
+            resultAttr ? static_cast<unsigned>(resultAttr.getInt()) : 0;
+        if (srcResult >= op->getNumResults())
+          continue;
+        Value r = op->getResult(srcResult);
+        if (outputSet.insert(r).second)
+          outputs.push_back(r);
+      }
+    }
+
     if (outputs.empty())
       return;
 
