@@ -258,7 +258,7 @@ packing 之后，未声明名字对应的位通常还在 packed `q` 里。`addRe
 
 - `demand`：声明过的探针 + 端口仍急切；其余标量状态 `pyc.name` 打 `pyc.observe_lazy`，在活存储上挂 `pyc.lazy_probe_slices`，C++ 用 `addRegLazySlice` / `addRegLazyTap`。热路径不再为这些名字生成 `名字 = extract`。
 - `findByPath("dut:name")` 对懒名字成功；调用方用 `Entry::readU64()`，不要把懒条目的 `ptr` 当成 lane `Wire*`。
-- 无法还原成 packed / survivor / tap 的组合名保持急切（仍可按名读，不让 `pycc` 失败）。
+- 无法还原成 packed / survivor / tap 的**标量组合名**改为懒 `addWire`：挂到已有成员（或 fuse 后的 `pyc.comb` 结果），不额外抄第二根命名 Wire。端口 / 向量 / 还原不出 host 的名字仍急切。
 - `--observe-named=all` 仍全部急切。`cycle_balance` 仍不进查找。
 - `hasExternalObservationIdentity` 对懒名字仍为真，死状态不会删掉唯一存储；`hasStableStateName` 对懒名字为假，不挡 fuse / 不钉 struct。
 
@@ -281,4 +281,27 @@ pycc --observe-named=maybe → unknown --observe-named（rc≠0）
 pyc-opt … probe-plan=/no/such/… → cannot read probe plan（rc≠0）
 ```
 
-未跑完整 Davinci / 性能测试墙钟。组合名若无法还原成状态切片，本轮保持急切，避免 `pycc` 失败。
+未跑完整 Davinci / 性能测试墙钟。
+
+## 后续：组合名也改懒注册（选项 B）
+
+2026-09-30 用户批准再试 **B**：未声明组合名不再急切钉第二根 Wire。
+
+### 做法
+
+1. `pyc-apply-observation-demand`：状态切片仍走 `pyc.lazy_probe_slices`；否则把名字挂到可取地址的 host（`pyc.and` / 已有 `pyc.comb` 结果 / instance 结果）为 `pyc.lazy_probe_wires`，并打 `pyc.observe_lazy`。
+2. `pyc-fuse-comb`：被融合 live-out 上的 `pyc.lazy_probe_wires` 改挂到新 `pyc.comb` 的对应 result，这样名字不挡融合，指针仍指向 struct 成员。
+3. `CppPlacementPass`：带 `pyc.lazy_probe_wires` 的值钉 struct，保证 `addWire` 指针活过 `eval`。
+4. `CppEmitter`：对这些名字只 `addWire`，不生成 `名字 = …`。`readU64()` 读那根已有成员。
+
+### 验收
+
+```text
+FILECHECK=/usr/lib64/llvm19/bin/FileCheck \
+PYCC=$PWD/.pycircuit_out/toolchain/build/bin/pycc \
+PYC_OPT=$PWD/.pycircuit_out/toolchain/build/bin/pyc-opt \
+  bash compiler/mlir/test/state_delay_optimization_smoke.sh
+# PASS（含 observation_demand_comb FileCheck、demand 无 ready_state=、
+# addWire ready_state/ready_alias、runtime AND 值一致；
+# pack-probe 懒切片回归仍过）
+```

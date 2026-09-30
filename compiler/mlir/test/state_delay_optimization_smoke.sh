@@ -103,6 +103,37 @@ fi
 "${FILECHECK_BIN}" "${ROOT}/compiler/mlir/test/observation_demand.mlir" \
   --check-prefix=DEMAND \
   --input-file="${TMP_DIR}/observation-demand.mlir"
+"${PYC_OPT}" "${ROOT}/compiler/mlir/test/observation_demand_comb.mlir" \
+  --pass-pipeline="builtin.module(pyc-apply-observation-demand)" \
+  -o "${TMP_DIR}/observation-demand-comb.mlir"
+"${FILECHECK_BIN}" "${ROOT}/compiler/mlir/test/observation_demand_comb.mlir" \
+  --check-prefix=COMB \
+  --input-file="${TMP_DIR}/observation-demand-comb.mlir"
+
+"${PYCC}" "${ROOT}/compiler/mlir/test/observation_demand_comb_module.mlir" \
+  --emit=cpp --observe-named=demand \
+  -o "${TMP_DIR}/observation-demand-comb.hpp" \
+  2>"${TMP_DIR}/observation-demand-comb.stderr"
+if grep -qE 'ready_state[[:space:]]*=|ready_alias[[:space:]]*=' \
+  "${TMP_DIR}/observation-demand-comb.hpp"; then
+  echo "fail: demand mode still assigned undeclared combinational names" >&2
+  exit 1
+fi
+if ! grep -q 'addWire<8>(reg_path("ready_state")' \
+  "${TMP_DIR}/observation-demand-comb.hpp" ||
+   ! grep -q 'addWire<8>(reg_path("ready_alias")' \
+  "${TMP_DIR}/observation-demand-comb.hpp"; then
+  echo "fail: demand mode missing lazy combinational addWire lookups" >&2
+  exit 1
+fi
+"${CXX:-c++}" -std=c++17 -O2 -I"${ROOT}/runtime" \
+  -DMODEL_HEADER="\"${TMP_DIR}/observation-demand-comb.hpp\"" \
+  "${ROOT}/compiler/mlir/test/observation_demand_comb_runtime.cpp" \
+  -o "${TMP_DIR}/observation-demand-comb-runtime"
+if ! "${TMP_DIR}/observation-demand-comb-runtime"; then
+  echo "fail: demand combinational findByPath/readU64 did not match AND" >&2
+  exit 1
+fi
 
 "${PYCC}" "${PACK_PROBE_INPUT}" --emit=cpp \
   --observe-named=demand \

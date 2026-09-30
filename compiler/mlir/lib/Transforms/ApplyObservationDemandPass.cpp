@@ -5,6 +5,7 @@
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/Pass/Pass.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringSet.h"
@@ -26,6 +27,12 @@ static void setI64Attr(Operation *op, StringRef name, int64_t value) {
 }
 
 static constexpr StringRef kLazySlicesAttr = "pyc.lazy_probe_slices";
+static constexpr StringRef kLazyWiresAttr = "pyc.lazy_probe_wires";
+
+struct WireProbeHost {
+  Operation *op = nullptr;
+  unsigned resultIndex = 0;
+};
 
 struct StateProbeSource {
   Operation *storage = nullptr;
@@ -129,6 +136,67 @@ static LogicalResult appendLazySlice(Operation *storage, StringRef name,
   items.push_back(DictionaryAttr::get(ctx, fields));
   storage->setAttr(kLazySlicesAttr, ArrayAttr::get(ctx, items));
   return success();
+}
+
+static LogicalResult appendLazyWire(Operation *host, StringRef name,
+                                    unsigned width, unsigned resultIndex) {
+  MLIRContext *ctx = host->getContext();
+  SmallVector<Attribute> items;
+  if (auto existing = host->getAttrOfType<ArrayAttr>(kLazyWiresAttr))
+    items.append(existing.begin(), existing.end());
+  for (Attribute item : items) {
+    auto dict = dyn_cast<DictionaryAttr>(item);
+    if (!dict)
+      continue;
+    if (auto prev = dict.getAs<StringAttr>("name");
+        prev && prev.getValue() == name)
+      return success();
+  }
+  NamedAttrList fields;
+  fields.set("name", StringAttr::get(ctx, name));
+  fields.set("width", IntegerAttr::get(IntegerType::get(ctx, 64), width));
+  fields.set("result",
+             IntegerAttr::get(IntegerType::get(ctx, 64), resultIndex));
+  items.push_back(DictionaryAttr::get(ctx, fields));
+  host->setAttr(kLazyWiresAttr, ArrayAttr::get(ctx, items));
+  return success();
+}
+
+// Point undeclared combinational names at an SSA that will be a C++ member
+// after fuse/placement, so lookup does not copy a second Wire.
+static std::optional<WireProbeHost> findWireHost(Value value) {
+  while (auto alias = value.getDefiningOp<pyc::AliasOp>())
+    value = alias.getIn();
+  if (auto comb = value.getDefiningOp<pyc::CombOp>()) {
+    auto res = dyn_cast<OpResult>(value);
+    if (!res)
+      return std::nullopt;
+    return WireProbeHost{comb.getOperation(), res.getResultNumber()};
+  }
+  Operation *def = value.getDefiningOp();
+  if (!def)
+    return std::nullopt;
+  if (isa<pyc::RegOp, pyc::DelayLineOp, pyc::DelayTapOp>(def))
+    return std::nullopt;
+  if (auto comb = def->getParentOfType<pyc::CombOp>()) {
+    auto yield =
+        dyn_cast_or_null<pyc::YieldOp>(comb.getBody().front().getTerminator());
+    if (!yield)
+      return std::nullopt;
+    for (auto [i, operand] : llvm::enumerate(yield.getOperands())) {
+      Value y = operand;
+      while (auto alias = y.getDefiningOp<pyc::AliasOp>())
+        y = alias.getIn();
+      if (y == value)
+        return WireProbeHost{comb.getOperation(),
+                             static_cast<unsigned>(i)};
+    }
+    return std::nullopt;
+  }
+  auto res = dyn_cast<OpResult>(value);
+  if (!res)
+    return std::nullopt;
+  return WireProbeHost{def, res.getResultNumber()};
 }
 
 static llvm::StringRef fieldPathFromProbePath(llvm::StringRef path) {
@@ -298,17 +366,27 @@ struct ApplyObservationDemandPass
         ++kept;
         return success();
       }
-      auto source = findRegStorage(op->getResult(0));
       const unsigned width = valueWidth(op->getResult(0));
-      // Combinational / unreconstructable names stay eager so findByPath
-      // still works; only scalar state slices become lazy lookups.
-      if (!source || width == 0) {
+      if (width == 0) {
+        ++kept;
+        return success();
+      }
+      if (auto source = findRegStorage(op->getResult(0))) {
+        op->setAttr("pyc.observe_lazy", BoolAttr::get(op->getContext(), true));
+        if (failed(appendLazySlice(source->storage, name.getValue(), source->lsb,
+                                   width, source->tapDepth)))
+          return failure();
+        ++lazy;
+        return success();
+      }
+      auto host = findWireHost(op->getResult(0));
+      if (!host) {
         ++kept;
         return success();
       }
       op->setAttr("pyc.observe_lazy", BoolAttr::get(op->getContext(), true));
-      if (failed(appendLazySlice(source->storage, name.getValue(), source->lsb,
-                                 width, source->tapDepth)))
+      if (failed(appendLazyWire(host->op, name.getValue(), width,
+                               host->resultIndex)))
         return failure();
       ++lazy;
       return success();

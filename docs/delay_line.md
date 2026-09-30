@@ -40,7 +40,7 @@ b@4 ─────────────────────────�
 - 状态类型、clock/reset/enable/init、next-state、fanout 和依赖关系决定能否改写；
 - `pycc --emit=cpp` 固定走 `structural` 证明，不要求 `pyc.generated` marker；
 - C++ 路径优化时保留 debug/probe/trace/name，改挂到 survivor / delay_tap / slice alias；
-- 优化完成后，`--observe-named=demand`（默认）按 `@probe` / trace / IR 观测属性只把声明过的名字做成急切探针；其余作者名保留为按名懒查找，C++ 热路径不再为它们每拍 `extract`；
+- 优化完成后，`--observe-named=demand`（默认）按 `@probe` / trace / IR 观测属性只把声明过的名字做成急切探针；其余作者名保留为按名懒查找（状态切片或已有组合成员上的 `addWire`），C++ 热路径不再为它们每拍抄第二根命名 Wire；
 - 端口行为、周期数、reset/enable/init 和功能数据流仍必须等价。
 
 只有 `--emit=cpp`（或 `-cpp`）跑完整状态优化（structural 合并 + pipeline retiming）。

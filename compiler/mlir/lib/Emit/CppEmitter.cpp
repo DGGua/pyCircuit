@@ -1995,6 +1995,49 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
       });
       if (lazyFailed)
         return failure();
+      bool lazyWireFailed = false;
+      f.walk([&](Operation *op) {
+        if (lazyWireFailed)
+          return;
+        if (op->getParentOfType<pyc::CombOp>())
+          return;
+        auto wires = op->getAttrOfType<ArrayAttr>("pyc.lazy_probe_wires");
+        if (!wires)
+          return;
+        for (Attribute item : wires) {
+          auto dict = dyn_cast<DictionaryAttr>(item);
+          if (!dict) {
+            op->emitError("invalid pyc.lazy_probe_wires entry");
+            lazyWireFailed = true;
+            return;
+          }
+          auto name = dict.getAs<StringAttr>("name");
+          auto widthAttr = dict.getAs<IntegerAttr>("width");
+          auto resultAttr = dict.getAs<IntegerAttr>("result");
+          if (!name || name.getValue().empty() || !widthAttr) {
+            op->emitError("lazy probe wire requires name/width");
+            lazyWireFailed = true;
+            return;
+          }
+          const std::string field = name.getValue().str();
+          if (!emittedNamed.insert(field).second)
+            continue;
+          const unsigned width = static_cast<unsigned>(widthAttr.getInt());
+          const unsigned resultIndex =
+              resultAttr ? static_cast<unsigned>(resultAttr.getInt()) : 0;
+          if (width == 0 || resultIndex >= op->getNumResults()) {
+            op->emitError("lazy probe wire has invalid width/result: ")
+                << field;
+            lazyWireFailed = true;
+            return;
+          }
+          os << "    reg.addWire<" << width << ">(reg_path("
+             << cppStringLiteral(field) << "), &"
+             << nt.get(op->getResult(resultIndex)) << ");\n";
+        }
+      });
+      if (lazyWireFailed)
+        return failure();
 		  for (auto mem : byteMems) {
 		    std::string instName = nt.get(mem.getRdata()) + "_inst";
 		    if (auto nameAttr = mem->getAttrOfType<StringAttr>("name"))

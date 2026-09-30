@@ -499,11 +499,14 @@ static bool pinToStruct(Value v, const llvm::StringSet<> &traceSelectedFields) {
   if (def->hasAttr("pyc.name")) {
     if (auto lazy = def->getAttrOfType<BoolAttr>("pyc.observe_lazy");
         lazy && lazy.getValue()) {
-      // Undeclared names stay lookupable via lazy slices, not pinned Wires.
+      // Undeclared names stay lookupable via lazy slices/wires, not a
+      // second named Wire. The host below may still be pinned.
     } else {
       return true;
     }
   }
+  if (def->hasAttr("pyc.lazy_probe_wires"))
+    return true;
 
   // Top-level comb results and state-holding ops always live on the struct.
   if (isa<pyc::CombOp>(def))
