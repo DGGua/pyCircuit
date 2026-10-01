@@ -481,6 +481,24 @@ createCombineDelayChainsPass(DelayChainMode mode, bool accumulateStats,
       mode, accumulateStats, cascadeRound, mergeOnly, skipMerge);
 }
 
+void runDelayChainMergeRound(func::FuncOp function, bool cascadeRound,
+                             bool accumulateStats) {
+  CombineStats stats;
+  mergeEquivalentStates(function, stats);
+  writeCombineStats(function, stats, accumulateStats, cascadeRound,
+                    DelayChainMode::Structural,
+                    /*performedMergeRound=*/true);
+}
+
+void runDelayChainFormAndShare(func::FuncOp function, bool accumulateStats) {
+  CombineStats stats;
+  combineStateChains(function, stats, DelayChainMode::Structural);
+  shareEquivalentDelayLines(function, stats, DelayChainMode::Structural);
+  writeCombineStats(function, stats, accumulateStats,
+                    /*cascadeRound=*/false, DelayChainMode::Structural,
+                    /*performedMergeRound=*/false);
+}
+
 static PassRegistration<CombineDelayChainsPass> pass;
 
 } // namespace pyc

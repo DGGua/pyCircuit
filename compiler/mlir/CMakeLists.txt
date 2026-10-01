@@ -96,6 +96,7 @@ add_library(pyc_transforms
   lib/Transforms/RetimePipelinesPass.cpp
   lib/Transforms/SLPPackWiresPass.cpp
   lib/Transforms/StateOptimization.cpp
+  lib/Transforms/StateOptimizePass.cpp
   lib/Support/PassIRDumper.cpp
   lib/Transforms/VectorUnrollPass.cpp
 )

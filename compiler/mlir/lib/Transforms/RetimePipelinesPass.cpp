@@ -1077,6 +1077,14 @@ createRetimePipelinesPass(unsigned maxStages, unsigned maxExtraCombOps,
       maxStages, maxExtraCombOps, maxCombDepth, accumulateStats);
 }
 
+void runRetimePipelines(func::FuncOp function, unsigned maxStages,
+                        unsigned maxExtraCombOps, unsigned maxCombDepth,
+                        bool accumulateStats) {
+  RetimeStats stats = runRetiming(function, /*rewrite=*/true, maxStages,
+                                  maxExtraCombOps, maxCombDepth);
+  writeStats(function, stats, accumulateStats);
+}
+
 static PassRegistration<RetimePipelinesPass> retimePass;
 
 } // namespace pyc

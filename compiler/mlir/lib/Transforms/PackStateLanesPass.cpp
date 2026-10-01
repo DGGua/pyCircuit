@@ -48,6 +48,8 @@ struct PackStats {
   int64_t packedBits = 0;
 };
 
+void packBlockImpl(Block &block, PackStats &stats, unsigned maxWidth);
+
 static void setI64Attr(Operation *op, llvm::StringRef name, int64_t value) {
   OpBuilder builder(op->getContext());
   op->setAttr(name, builder.getI64IntegerAttr(value));
@@ -327,6 +329,11 @@ public:
 
 private:
   void packBlock(Block &block, PackStats &stats) {
+    packBlockImpl(block, stats, maxWidthOption);
+  }
+};
+
+void packBlockImpl(Block &block, PackStats &stats, unsigned maxWidth) {
     llvm::DenseMap<Operation *, unsigned> positions;
     unsigned nextPosition = 0;
     for (Operation &op : block)
@@ -366,7 +373,7 @@ private:
       }
 
       auto type = dyn_cast<IntegerType>(lane.q.getType());
-      if (!type || type.getWidth() == 0 || type.getWidth() > maxWidthOption)
+      if (!type || type.getWidth() == 0 || type.getWidth() > maxWidth)
         continue;
       lane.width = type.getWidth();
       lane.position = positions.lookup(lane.op);
@@ -400,7 +407,7 @@ private:
       };
 
       for (const StateLane &lane : bucket) {
-        if (!group.empty() && groupWidth + lane.width > maxWidthOption)
+        if (!group.empty() && groupWidth + lane.width > maxWidth)
           flush();
         llvm::SmallVector<StateLane> prospective(group.begin(), group.end());
         prospective.push_back(lane);
@@ -412,14 +419,30 @@ private:
       }
       flush();
     }
-  }
-};
-
+}
 } // namespace
 
 std::unique_ptr<::mlir::Pass>
 createPackStateLanesPass(unsigned maxWidth) {
   return std::make_unique<PackStateLanesPass>(maxWidth);
+}
+
+void runPackStateLanes(func::FuncOp function, unsigned maxWidth) {
+  PackStats stats;
+  if (maxWidth != 0) {
+    for (Block &block : function.getBody())
+      packBlockImpl(block, stats, maxWidth);
+  }
+  setI64Attr(function, "pyc.stats.state_opt_pack_groups", stats.groups);
+  setI64Attr(function, "pyc.stats.state_opt_pack_reg_groups",
+             stats.regGroups);
+  setI64Attr(function, "pyc.stats.state_opt_pack_delay_groups",
+             stats.delayGroups);
+  setI64Attr(function, "pyc.stats.state_opt_packed_state_ops",
+             stats.packedStateOps);
+  setI64Attr(function, "pyc.stats.state_opt_state_primitives_removed",
+             stats.primitivesRemoved);
+  setI64Attr(function, "pyc.stats.state_opt_pack_bits", stats.packedBits);
 }
 
 static PassRegistration<PackStateLanesPass> pass;

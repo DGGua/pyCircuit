@@ -2733,38 +2733,17 @@ int main(int argc, char **argv) {
   // Verilog keeps the pre-optimization netlist.
   const bool enableStateDelayOptimization = (emitKind == "cpp");
   if (enableStateDelayOptimization) {
+    // Unified structural state optimization: equivalent-state merge rounds
+    // (with in-pass canonicalize/CSE between them), retiming, direct-chain
+    // formation/history sharing, and lane packing in one func-level pass.
+    pyc::StateOptimizeTunables stateTunables;
+    stateTunables.retimeMaxStages = stateRetimeMaxStages;
+    stateTunables.retimeMaxExtraCombOps = stateRetimeMaxExtraCombOps;
+    stateTunables.retimeMaxCombDepth =
+        std::min<unsigned>(stateRetimeMaxCombDepth, logicDepthLimit);
+    stateTunables.packMaxWidth = statePackWidth;
     pm.addNestedPass<func::FuncOp>(
-        pyc::createCombineDelayChainsPass(
-            pyc::DelayChainMode::Structural, /*accumulateStats=*/false,
-            /*cascadeRound=*/false,
-            /*mergeOnly=*/true,
-            /*skipMerge=*/false));
-    // Stage 1.5: the first state merge can expose equivalent combinational
-    // cones. Canonicalize/CSE once, then run one bounded merge refinement.
-    pm.addPass(createCanonicalizerPass(canonicalizeCfg));
-    pm.addPass(createCSEPass());
-    pm.addNestedPass<func::FuncOp>(pyc::createCombineDelayChainsPass(
-        pyc::DelayChainMode::Structural, /*accumulateStats=*/true,
-        /*cascadeRound=*/true,
-        /*mergeOnly=*/true, /*skipMerge=*/false));
-    // Run retiming after the two low-risk merge-only rounds. This prevents
-    // a local retime from consuming a state that has a more profitable
-    // global equivalent-state or direct-chain rewrite.
-    const unsigned retimeCombDepth = std::min<unsigned>(
-        stateRetimeMaxCombDepth, logicDepthLimit);
-    pm.addNestedPass<func::FuncOp>(pyc::createRetimePipelinesPass(
-        stateRetimeMaxStages, stateRetimeMaxExtraCombOps,
-        retimeCombDepth, /*accumulateStats=*/false));
-    pm.addNestedPass<func::FuncOp>(pyc::createEliminateDeadStatePass());
-    // Form ordinary direct chains only after retiming has selected the more
-    // general computed pipelines. Also share equivalent histories here.
-    pm.addNestedPass<func::FuncOp>(pyc::createCombineDelayChainsPass(
-        pyc::DelayChainMode::Structural, /*accumulateStats=*/true,
-        /*cascadeRound=*/false,
-        /*mergeOnly=*/false, /*skipMerge=*/true));
-    if (statePackWidth != 0)
-      pm.addNestedPass<func::FuncOp>(
-          pyc::createPackStateLanesPass(statePackWidth));
+        pyc::createStateOptimizePass(stateTunables));
   }
   if (!unrollVector)
     pm.addNestedPass<func::FuncOp>(pyc::createSLPPackWiresPass());
