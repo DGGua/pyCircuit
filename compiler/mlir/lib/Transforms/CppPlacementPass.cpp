@@ -1,6 +1,7 @@
 #include "pyc/Dialect/PYC/PYCOps.h"
 #include "pyc/Emit/CppEmitter.h"
 #include "pyc/Transforms/Passes.h"
+#include "pyc/Transforms/StateOptimization.h"
 
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/Attributes.h"
@@ -722,65 +723,19 @@ struct CppPlacementPass
     }
     setModuleCombChunkNodes(module, combChunkNodes);
 
-    std::optional<llvm::json::Value> tracePlan;
-    const llvm::json::Object *traceModules = nullptr;
-    if (!traceCodegenPlanPath.empty()) {
-      auto fileOrErr = llvm::MemoryBuffer::getFile(traceCodegenPlanPath);
-      if (!fileOrErr) {
-        module.emitError("cannot read C++ trace codegen plan: ")
-            << traceCodegenPlanPath;
-        return signalPassFailure();
-      }
-      auto parsed = llvm::json::parse(fileOrErr.get()->getBuffer());
-      if (!parsed || !parsed->getAsObject()) {
-        module.emitError("invalid C++ trace codegen plan JSON: ")
-            << traceCodegenPlanPath;
-        return signalPassFailure();
-      }
-      tracePlan.emplace(std::move(*parsed));
-      const auto *root = tracePlan->getAsObject();
-      auto version = root->getInteger("version");
-      traceModules = root->getObject("modules");
-      if (!version || *version != 1 || !traceModules) {
-        module.emitError(
-            "C++ trace codegen plan requires version=1 and object `modules`");
-        return signalPassFailure();
-      }
-      for (const auto &moduleEntry : *traceModules) {
-        const auto *fields = moduleEntry.second.getAsArray();
-        if (!fields) {
-          module.emitError("C++ trace codegen module entry must be an array: ")
-              << moduleEntry.first.str();
-          return signalPassFailure();
-        }
-        for (const llvm::json::Value &field : *fields) {
-          auto name = field.getAsString();
-          if (!name || name->empty()) {
-            module.emitError(
-                "C++ trace codegen module fields must be non-empty strings");
-            return signalPassFailure();
-          }
-        }
-      }
+    ObservationPlans plans;
+    if (failed(loadObservationPlans(module, /*probePlanPath=*/"",
+                                    traceCodegenPlanPath, plans))) {
+      return signalPassFailure();
     }
 
     for (auto f : module.getOps<func::FuncOp>()) {
       if (f.isDeclaration())
         continue;
       llvm::StringSet<> traceSelectedFields;
-      if (traceModules) {
-        if (const auto *fields = traceModules->getArray(f.getSymName())) {
-          for (const llvm::json::Value &field : *fields) {
-            auto name = field.getAsString();
-            if (!name || name->empty()) {
-              f.emitError(
-                  "C++ trace codegen module fields must be non-empty strings");
-              return signalPassFailure();
-            }
-            traceSelectedFields.insert(*name);
-          }
-        }
-      }
+      if (const auto it = plans.traceFieldsByModule.find(f.getSymName());
+          it != plans.traceFieldsByModule.end())
+        traceSelectedFields = it->second;
       llvm::StringSet<> foundTraceFields;
       f.walk([&](Operation *op) {
         if (auto name = op->getAttrOfType<StringAttr>("pyc.name");

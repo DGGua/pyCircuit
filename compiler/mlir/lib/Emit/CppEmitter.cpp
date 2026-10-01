@@ -3,6 +3,7 @@
 #include "pyc/Dialect/PYC/PYCOps.h"
 #include "pyc/Dialect/PYC/PYCTypes.h"
 #include "pyc/Transforms/ChangeDrivenSchedule.h"
+#include "pyc/Transforms/StateOptimization.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -471,115 +472,6 @@ struct ProbeAliasEntry {
   std::string canonicalPath;
   std::string sourcePath;
 };
-
-static std::vector<ProbeAliasEntry> loadProbeAliasesForTop(llvm::StringRef planPath, llvm::StringRef symName) {
-  std::vector<ProbeAliasEntry> out;
-  if (planPath.empty())
-    return out;
-  auto fileOrErr = llvm::MemoryBuffer::getFile(planPath);
-  if (!fileOrErr)
-    return out;
-  auto parsed = llvm::json::parse(fileOrErr.get()->getBuffer());
-  if (!parsed)
-    return out;
-  auto *obj = parsed->getAsObject();
-  if (!obj)
-    return out;
-  auto topSymbol = obj->getString("top_symbol");
-  if (!topSymbol || *topSymbol != symName)
-    return out;
-  auto *aliases = obj->getArray("aliases");
-  if (!aliases)
-    return out;
-  out.reserve(aliases->size());
-  for (const llvm::json::Value &value : *aliases) {
-    auto *entry = value.getAsObject();
-    if (!entry)
-      continue;
-    auto canonical = entry->getString("canonical_path");
-    auto source = entry->getString("source_path");
-    if (!canonical || !source)
-      continue;
-    out.push_back(ProbeAliasEntry{canonical->str(), source->str()});
-  }
-  std::sort(out.begin(), out.end(), [](const ProbeAliasEntry &a, const ProbeAliasEntry &b) {
-    return a.canonicalPath < b.canonicalPath;
-  });
-  return out;
-}
-
-struct StateProbeSource {
-  Value q;
-  unsigned lsb = 0;
-  Value tap;
-};
-
-static std::optional<StateProbeSource> findRegQFromValue(Value v) {
-  llvm::SmallVector<Value, 8> seen;
-  unsigned lsb = 0;
-  while (true) {
-    for (Value prev : seen) {
-      if (prev == v)
-        return std::nullopt;
-    }
-    seen.push_back(v);
-    while (auto a = v.getDefiningOp<pyc::AliasOp>())
-      v = a.getIn();
-    if (auto rop = v.getDefiningOp<pyc::RegOp>())
-      return StateProbeSource{rop.getQ(), lsb};
-    if (auto delay = v.getDefiningOp<pyc::DelayLineOp>())
-      return StateProbeSource{delay.getQ(), lsb};
-    if (auto tap = v.getDefiningOp<pyc::DelayTapOp>()) {
-      auto delay = tap.getLine().getDefiningOp<pyc::DelayLineOp>();
-      if (!delay)
-        return std::nullopt;
-      return StateProbeSource{delay.getQ(), lsb, tap.getTap()};
-    }
-    if (auto extract = v.getDefiningOp<pyc::ExtractOp>()) {
-      auto packedLsb =
-          extract->getAttrOfType<IntegerAttr>("pyc.state_pack_lsb");
-      if (!packedLsb || packedLsb.getInt() < 0)
-        return std::nullopt;
-      lsb += static_cast<unsigned>(packedLsb.getInt());
-      v = extract.getIn();
-      continue;
-    }
-    auto comb = v.getDefiningOp<pyc::CombOp>();
-    if (!comb)
-      return std::nullopt;
-
-    auto res = dyn_cast<OpResult>(v);
-    if (!res)
-      return std::nullopt;
-    auto yield = dyn_cast_or_null<pyc::YieldOp>(comb.getBody().front().getTerminator());
-    if (!yield)
-      return std::nullopt;
-    if (res.getResultNumber() >= yield.getNumOperands())
-      return std::nullopt;
-
-    Value y = yield.getOperand(res.getResultNumber());
-    while (auto a = y.getDefiningOp<pyc::AliasOp>())
-      y = a.getIn();
-    if (auto extract = y.getDefiningOp<pyc::ExtractOp>()) {
-      auto packedLsb =
-          extract->getAttrOfType<IntegerAttr>("pyc.state_pack_lsb");
-      if (!packedLsb || packedLsb.getInt() < 0)
-        return std::nullopt;
-      lsb += static_cast<unsigned>(packedLsb.getInt());
-      y = extract.getIn();
-      while (auto alias = y.getDefiningOp<pyc::AliasOp>())
-        y = alias.getIn();
-    }
-    auto barg = dyn_cast<BlockArgument>(y);
-    if (!barg)
-      return std::nullopt;
-    if (barg.getOwner() != &comb.getBody().front())
-      return std::nullopt;
-    if (barg.getArgNumber() >= comb.getNumOperands())
-      return std::nullopt;
-    v = comb.getOperand(barg.getArgNumber());
-  }
-}
 
 static void computeUniquePortNames(func::FuncOp f, std::vector<std::string> &inNames, std::vector<std::string> &outNames) {
   NameTable nt;
@@ -1421,7 +1313,9 @@ static LogicalResult rejectMultipleWireDrivers(func::FuncOp f) {
   return result;
 }
 
-static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEmitterOptions &opts) {
+static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
+                              const CppEmitterOptions &opts,
+                              const ObservationPlans &probePlans) {
   NameTable nt;
 
   if (failed(rejectMultipleWireDrivers(f)))
@@ -1786,14 +1680,14 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
     // Decision 0003 / 0051-0052: infer probe kind for ports and named internal
     // objects. Packed state extracts retain the logical lane's q/pending view.
     std::vector<bool> outIsReg(f.getNumResults(), false);
-    std::vector<std::optional<StateProbeSource>> outRegQ(f.getNumResults());
+    std::vector<std::optional<StateStorageSource>> outRegQ(f.getNumResults());
     std::vector<NamedProbeInfo> namedProbes;
     if (!f.isDeclaration()) {
       auto ret = dyn_cast_or_null<func::ReturnOp>(f.getBody().front().getTerminator());
       if (!ret)
         return f.emitError("missing return");
       for (unsigned i = 0; i < f.getNumResults() && i < ret.getNumOperands(); ++i)
-        outRegQ[i] = findRegQFromValue(ret.getOperand(i));
+        outRegQ[i] = findStateStorageSource(ret.getOperand(i));
       for (unsigned i = 0; i < f.getNumResults(); ++i)
         outIsReg[i] = static_cast<bool>(outRegQ[i]);
 
@@ -1818,7 +1712,7 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
         std::string fieldPath = nameAttr.getValue().str();
         if (!seenNamedFields.insert(fieldPath).second)
           return;
-        auto regQ = findRegQFromValue(value);
+        auto regQ = findStateStorageSource(value);
         std::string regInst =
             regQ ? (nt.get(regQ->q) + "_inst") : std::string();
         std::string regNext;
@@ -2072,7 +1966,7 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
 	    for (const auto &ii : instInfos)
 	      os << "    reg_child(" << ii.member << ", \"" << ii.seg << "\");\n";
 	  }
-      auto probeAliases = loadProbeAliasesForTop(opts.probePlanPath, f.getSymName());
+      auto probeAliases = probeAliasesForTop(probePlans, f.getSymName());
       if (!probeAliases.empty()) {
         for (const auto &alias : probeAliases) {
           os << "    if (const auto *src = reg.findByPath(" << cppStringLiteral(alias.sourcePath) << "))\n";
@@ -3960,6 +3854,10 @@ LogicalResult emitCpp(ModuleOp module, llvm::raw_ostream &os, const CppEmitterOp
   if (failed(requireCombChunkConfig(module)))
     return failure();
   const CppEmitterOptions effectiveOpts = effectiveEmitOpts(module, opts);
+  ObservationPlans probePlans;
+  if (failed(loadObservationPlans(module, effectiveOpts.probePlanPath,
+                                  /*traceCodegenPlanPath=*/"", probePlans)))
+    return failure();
 
   os << "// pyCircuit C++ emission (prototype)\n";
   os << "#include <array>\n";
@@ -4029,7 +3927,7 @@ LogicalResult emitCpp(ModuleOp module, llvm::raw_ostream &os, const CppEmitterOp
     return module.emitError("C++ emitter: module instance graph has a cycle");
 
   for (unsigned idx : order) {
-    if (failed(emitFunc(funcs[idx], os, effectiveOpts)))
+    if (failed(emitFunc(funcs[idx], os, effectiveOpts, probePlans)))
       return failure();
   }
 
@@ -4040,7 +3938,11 @@ LogicalResult emitCpp(ModuleOp module, llvm::raw_ostream &os, const CppEmitterOp
 LogicalResult emitCppFunc(ModuleOp module, func::FuncOp f, llvm::raw_ostream &os, const CppEmitterOptions &opts) {
   if (failed(requireCombChunkConfig(module)))
     return failure();
-  return emitFunc(f, os, effectiveEmitOpts(module, opts));
+  ObservationPlans probePlans;
+  if (failed(loadObservationPlans(module, opts.probePlanPath,
+                                  /*traceCodegenPlanPath=*/"", probePlans)))
+    return failure();
+  return emitFunc(f, os, effectiveEmitOpts(module, opts), probePlans);
 }
 
 } // namespace pyc

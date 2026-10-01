@@ -5,9 +5,12 @@
 
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/Builders.h"
+#include "mlir/IR/BuiltinOps.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringRef.h"
+#include "llvm/ADT/StringSet.h"
 
 #include <cstddef>
 #include <optional>
@@ -81,5 +84,74 @@ bool equivalentRegisterState(pyc::RegOp lhs, pyc::RegOp rhs);
 bool equivalentDelayLineState(pyc::DelayLineOp lhs, pyc::DelayLineOp rhs);
 std::size_t registerStateHash(pyc::RegOp reg);
 std::size_t delayLineStateHash(pyc::DelayLineOp delay);
+
+/// Attribute names used to carry lazy probe metadata on IR.
+llvm::StringRef lazyProbeSlicesAttrName();
+llvm::StringRef lazyProbeWiresAttrName();
+
+/// Where an observation name is served from: packed state storage (a slice of
+/// a reg/delay_line at `lsb`, optionally a delay tap). `storage` is the owning
+/// reg/delay_line op; `q` is its result value; `tap` is the delay_tap result
+/// when the slice reads through a tap (null otherwise).
+struct StateStorageSource {
+  mlir::Operation *storage = nullptr;
+  mlir::Value q{};
+  unsigned lsb = 0;
+  int64_t tapDepth = -1;
+  mlir::Value tap{};
+};
+
+/// Resolve `value` through aliases, packed extracts, and comb yields down to
+/// the reg/delay_line storage that produces it. Nullopt when the value is not
+/// backed by state storage.
+std::optional<StateStorageSource>
+findStateStorageSource(mlir::Value value);
+
+/// Resolve `value` to the host op whose emitted C++ member a named lookup
+/// should point at (a comb result or a plain op result). Nullopt for state
+/// ops, which are served via `findStateStorageSource` instead.
+struct WireProbeHostSource {
+  mlir::Operation *op = nullptr;
+  unsigned resultIndex = 0;
+};
+
+std::optional<WireProbeHostSource> findWireProbeHost(mlir::Value value);
+
+/// Append a `pyc.lazy_probe_slices` entry for `name` on `storage` (idempotent).
+mlir::LogicalResult
+appendLazyProbeSlice(mlir::Operation *storage, llvm::StringRef name,
+                     unsigned lsb, unsigned width, int64_t tapDepth);
+
+/// Append a `pyc.lazy_probe_wires` entry for `name` on `host` (idempotent).
+mlir::LogicalResult appendLazyProbeWire(mlir::Operation *host,
+                                        llvm::StringRef name, unsigned width,
+                                        unsigned resultIndex);
+
+/// One probe-plan alias: canonical path -> source path.
+struct ProbePlanAlias {
+  std::string canonicalPath;
+  std::string sourcePath;
+};
+
+/// Loaded observation plans shared by demand/placement/emit consumers.
+struct ObservationPlans {
+  /// probe_plan.json `top_symbol` (empty when no plan was loaded).
+  std::string probeTopSymbol;
+  /// probe_plan.json aliases (all modules).
+  llvm::SmallVector<ProbePlanAlias> probeAliases;
+  /// trace_codegen_plan.json: module -> selected internal fields.
+  llvm::StringMap<llvm::StringSet<>> traceFieldsByModule;
+};
+
+/// Load and validate both plan files. Empty paths are skipped. Emits errors
+/// on `module` and returns failure for malformed input.
+mlir::LogicalResult loadObservationPlans(mlir::ModuleOp module,
+                                         llvm::StringRef probePlanPath,
+                                         llvm::StringRef traceCodegenPlanPath,
+                                         ObservationPlans &out);
+
+/// Probe-plan aliases targeting `topSymbol`, sorted by canonical path.
+llvm::SmallVector<ProbePlanAlias>
+probeAliasesForTop(const ObservationPlans &plans, llvm::StringRef topSymbol);
 
 } // namespace pyc
