@@ -48,7 +48,8 @@ struct StateOptimizePass
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(StateOptimizePass)
 
   StateOptimizePass() = default;
-  StateOptimizePass(const StateOptimizePass &other) : PassWrapper(other) {}
+  StateOptimizePass(const StateOptimizePass &other)
+      : PassWrapper(other), tunables(other.tunables) {}
   explicit StateOptimizePass(const StateOptimizeTunables &tunables)
       : tunables(tunables) {}
 
@@ -104,5 +105,7 @@ std::unique_ptr<::mlir::Pass>
 createStateOptimizePass(const StateOptimizeTunables &tunables) {
   return std::make_unique<StateOptimizePass>(tunables);
 }
+
+static PassRegistration<StateOptimizePass> pass;
 
 } // namespace pyc

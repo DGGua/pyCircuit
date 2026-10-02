@@ -50,6 +50,16 @@ trap 'rm -rf "${TMP_DIR}"' EXIT
 "${FILECHECK_BIN}" "${INPUT}" --check-prefix=AGGRESSIVE \
   --input-file="${TMP_DIR}/aggressive.mlir"
 
+# The unified pycc pipeline pass: one invocation must produce the same
+# delay-line folding as the staged combine/retime/pack sequence.
+"${PYC_OPT}" "${INPUT}" \
+  --pass-pipeline='builtin.module(func.func(pyc-state-optimize))' \
+  -o "${TMP_DIR}/unified.mlir"
+if ! grep -q "pyc.delay_line" "${TMP_DIR}/unified.mlir"; then
+  echo "fail: pyc-state-optimize produced no delay_line" >&2
+  exit 1
+fi
+
 "${PYC_OPT}" "${OBSERVABILITY_INPUT}" \
   --pass-pipeline='builtin.module(func.func(pyc-eliminate-dead-state))' \
   -o "${TMP_DIR}/kept-observability.mlir"

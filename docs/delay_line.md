@@ -150,16 +150,12 @@ eliminate-wires
 eliminate-dead-state
         │
         ▼
-Stage 1/1.5: two bounded equivalent-state merge rounds with canonicalize/CSE
-        │
-        ▼
-Retiming: computed pipeline history / common delay sinking
-        │
-        ▼
-Stage 1: form direct delay lines / taps / share delay lines
-        │
-        ▼
-Stage 2: pack compatible reg/delay-line lanes
+pyc-state-optimize（单个 pass，内部按以下阶段顺序执行）
+  ├─ Stage 1/1.5: two bounded equivalent-state merge rounds with canonicalize/CSE
+  ├─ Retiming: computed pipeline history / common delay sinking
+  ├─ dead-state cleanup
+  ├─ Stage 1: form direct delay lines / taps / share delay lines
+  └─ Stage 2: pack compatible reg/delay-line lanes
         │
         ▼
 comb/clock/logic-depth gates → stats → C++ or Verilog emitter
@@ -366,16 +362,18 @@ after first state merge:
   f(q0) and f(q0) become CSE candidates
 ```
 
-因此流水线执行：
+因此流水线（`pyc-state-optimize` 内部的执行顺序）：
 
 ```text
 first equivalent-state merge (merge-only)
         ↓
-canonicalize + CSE
+canonicalize + CSE (in-pass)
         ↓
 second equivalent-state merge (merge-only)
         ↓
 retiming
+        ↓
+dead-state cleanup
         ↓
 direct chain form/share/tap
 ```
@@ -488,8 +486,9 @@ i1 lane。显式观测保留模式跳过旧 i1 packer，因为它不保留观测
 ## 10. 受约束 Retiming：把计算链变成共享历史
 
 Retiming 由 [`RetimePipelinesPass.cpp`](../compiler/mlir/lib/Transforms/RetimePipelinesPass.cpp)
-里的 `pyc-retime-pipelines` 完成。它不依赖 `pyc.generated="cycle_balance"`，默认在
-structural 性能模式中开启。
+实现，由 `pyc-state-optimize`（`pycc` C++ 路径的统一状态优化 pass）作为内部
+阶段调用；也可用 `pyc-opt` 单独跑 `pyc-retime-pipelines`。它不依赖
+`pyc.generated="cycle_balance"`，默认在 structural 性能模式中开启。
 
 ### 10.1 单源 computed pipeline
 
@@ -665,8 +664,9 @@ C++ 默认路径优化物理对象，但外部可读名字/probe 必须仍能读
 因此：
 
 - 功能回归、内部 `dut.read` 和 probe 清单都走默认 C++ 路径；
-- 需要拆开 generated 兼容改写时用 `pyc-opt` 指定 `pyc-combine-delay-chains`；
-  `pycc` 不再提供 off / generated / retime-off / preserve-observability 开关。
+- 需要拆开 generated 兼容改写时用 `pyc-opt` 指定 `pyc-combine-delay-chains`
+  或 `pyc-state-optimize` 的单个阶段；`pycc` 不再提供 off / generated /
+  retime-off / preserve-observability 开关。
 
 ## 14. 统计和诊断
 
