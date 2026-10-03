@@ -276,7 +276,7 @@ public:
     return out;
   }
 
-  friend bool operator==(Bits a, Bits b) {
+  friend bool operator==(const Bits &a, const Bits &b) {
 #if PYC_SIMD_NEON
     if constexpr (kWords >= 2)
       return simd::bitwise_eq(a.words_.data(), b.words_.data(), kWords);
@@ -290,7 +290,7 @@ public:
 
   friend bool operator!=(Bits a, Bits b) { return !(a == b); }
 
-  friend constexpr bool operator<(Bits a, Bits b) {
+  friend constexpr bool operator<(const Bits &a, const Bits &b) {
     for (unsigned i = 0; i < kWords; i++) {
       unsigned idx = (kWords - 1u) - i;
       if (a.words_[idx] < b.words_[idx])
@@ -322,32 +322,23 @@ using Wire = Bits<Width>;
 
 // SIMD-accelerated MUX: returns sel ? a : b (branch-free for wide wires)
 template <unsigned Width>
-inline Wire<Width> mux(Wire<1> sel, Wire<Width> a, Wire<Width> b) {
-#if PYC_SIMD_NEON
+inline Wire<Width> mux(const Wire<1> &sel, const Wire<Width> &a, const Wire<Width> &b) {
+  // Select one side in place. Passing the data by reference avoids copying
+  // both wide inputs before the unused side is discarded.
   if constexpr (Wire<Width>::kWords >= 2) {
     Wire<Width> out;
-    // Broadcast sel to all bits: 0 or all-ones mask
-    std::uint64_t smask = sel.toBool() ? ~std::uint64_t{0} : std::uint64_t{0};
-    uint64x2_t vm = vdupq_n_u64(smask);
-    const auto *pa = a.data();
-    const auto *pb = b.data();
-    auto *po = out.data();
-    unsigned i = 0;
-    for (; i + 2 <= Wire<Width>::kWords; i += 2) {
-      uint64x2_t va = vld1q_u64(pa + i);
-      uint64x2_t vb = vld1q_u64(pb + i);
-      vst1q_u64(po + i, vbslq_u64(vm, va, vb));
-    }
-    for (; i < Wire<Width>::kWords; i++)
-      po[i] = sel.toBool() ? pa[i] : pb[i];
+    const Wire<Width> &src = sel.toBool() ? a : b;
+    for (unsigned i = 0; i < Wire<Width>::kWords; ++i)
+      out.setWord(i, src.word(i));
     return out;
   }
-#endif
   return sel.toBool() ? a : b;
 }
 
 template <unsigned Width, std::size_t N>
-inline void appendPackedWireWords(std::array<std::uint64_t, N> &dst, std::size_t &offset, Wire<Width> v) {
+inline void appendPackedWireWords(std::array<std::uint64_t, N> &dst, std::size_t &offset, const Wire<Width> &v) {
+  if (offset + Wire<Width>::kWords > N)
+    __builtin_trap();
   for (unsigned i = 0; i < Wire<Width>::kWords; ++i)
     dst[offset++] = v.word(i);
 }
@@ -367,7 +358,7 @@ constexpr std::int64_t asSigned(Wire<Width> v) {
 }
 
 template <unsigned Width>
-constexpr Wire<Width> shl(Wire<Width> v, unsigned amount) {
+constexpr Wire<Width> shl(const Wire<Width> &v, unsigned amount) {
   if (amount == 0)
     return v;
   if (amount >= Width)
@@ -391,7 +382,7 @@ constexpr Wire<Width> shl(Wire<Width> v, unsigned amount) {
 }
 
 template <unsigned Width>
-constexpr Wire<Width> lshr(Wire<Width> v, unsigned amount) {
+constexpr Wire<Width> lshr(const Wire<Width> &v, unsigned amount) {
   if (amount == 0)
     return v;
   if (amount >= Width)
@@ -586,7 +577,7 @@ struct SumWidth<W0, Rest...> {
 } // namespace detail
 
 template <unsigned OutWidth, unsigned InWidth>
-constexpr Wire<OutWidth> trunc(Wire<InWidth> v) {
+constexpr Wire<OutWidth> trunc(const Wire<InWidth> &v) {
   static_assert(OutWidth <= InWidth, "trunc requires OutWidth <= InWidth");
   Wire<OutWidth> out;
   for (unsigned i = 0; i < Wire<OutWidth>::kWords; i++)
@@ -595,7 +586,7 @@ constexpr Wire<OutWidth> trunc(Wire<InWidth> v) {
 }
 
 template <unsigned OutWidth, unsigned InWidth>
-constexpr Wire<OutWidth> zext(Wire<InWidth> v) {
+constexpr Wire<OutWidth> zext(const Wire<InWidth> &v) {
   static_assert(OutWidth >= InWidth, "zext requires OutWidth >= InWidth");
   Wire<OutWidth> out;
   for (unsigned i = 0; i < Wire<OutWidth>::kWords; i++)
@@ -604,7 +595,7 @@ constexpr Wire<OutWidth> zext(Wire<InWidth> v) {
 }
 
 template <unsigned OutWidth, unsigned InWidth>
-constexpr Wire<OutWidth> sext(Wire<InWidth> v) {
+constexpr Wire<OutWidth> sext(const Wire<InWidth> &v) {
   static_assert(OutWidth >= InWidth, "sext requires OutWidth >= InWidth");
 
   Wire<OutWidth> out;
@@ -627,17 +618,17 @@ constexpr Wire<OutWidth> sext(Wire<InWidth> v) {
 }
 
 template <unsigned OutWidth, unsigned InWidth>
-constexpr Wire<OutWidth> extract(Wire<InWidth> v, unsigned lsb) {
+constexpr Wire<OutWidth> extract(const Wire<InWidth> &v, unsigned lsb) {
   return trunc<OutWidth, InWidth>(lshr<InWidth>(v, lsb));
 }
 
 template <unsigned A>
-constexpr Wire<A> concat(Wire<A> a) {
+constexpr Wire<A> concat(const Wire<A> &a) {
   return a;
 }
 
 template <unsigned A, unsigned B>
-constexpr Wire<A + B> concat(Wire<A> a, Wire<B> b) {
+constexpr Wire<A + B> concat(const Wire<A> &a, const Wire<B> &b) {
   static_assert(A > 0 && B > 0, "concat inputs must be non-zero width");
   Wire<A + B> aa = zext<A + B, A>(a);
   Wire<A + B> bb = zext<A + B, B>(b);
@@ -645,7 +636,8 @@ constexpr Wire<A + B> concat(Wire<A> a, Wire<B> b) {
 }
 
 template <unsigned A, unsigned B, unsigned C, unsigned... Rest>
-constexpr Wire<A + B + C + detail::SumWidth<Rest...>::value> concat(Wire<A> a, Wire<B> b, Wire<C> c, Wire<Rest>... rest) {
+constexpr Wire<A + B + C + detail::SumWidth<Rest...>::value>
+concat(const Wire<A> &a, const Wire<B> &b, const Wire<C> &c, const Wire<Rest> &...rest) {
   return concat(a, concat(b, c, rest...));
 }
 
@@ -657,12 +649,12 @@ constexpr bool slt(Wire<Width> a, Wire<Width> b) {
 }
 
 template <unsigned Width>
-constexpr Wire<1> eq(Wire<Width> a, Wire<Width> b) {
+constexpr Wire<1> eq(const Wire<Width> &a, const Wire<Width> &b) {
   return Wire<1>((a == b) ? 1u : 0u);
 }
 
 template <unsigned Width>
-constexpr Wire<1> ult(Wire<Width> a, Wire<Width> b) {
+constexpr Wire<1> ult(const Wire<Width> &a, const Wire<Width> &b) {
   return Wire<1>((a < b) ? 1u : 0u);
 }
 
