@@ -597,6 +597,14 @@ matchCommonDelayRegion(Operation *root, unsigned maxCombDepth,
   return region;
 }
 
+// Common-delay sinking: move a consumer cone across the state boundary so it
+// reads source.next instead of source.q. The cone then lives in the same
+// combinational cone as the producers of next, where downstream CSE and
+// fuse-comb merge them (shared subexpressions deduplicate, one scheduled comb
+// region instead of a producer/consumer pair split across cycles). The
+// sources themselves become deletable when nothing else observes them. This
+// fusion — not the bit delta — is the primary benefit; newStateBits <=
+// oldStateBits is only the guard that the state axis never regresses.
 static void rewriteCommonDelayRegion(CommonDelayRegion &region,
                                      RetimeStats &stats) {
   const StateSource &key = region.sources.front();
@@ -1040,7 +1048,8 @@ struct RetimePipelinesPass
   StringRef getArgument() const override { return "pyc-retime-pipelines"; }
   StringRef getDescription() const override {
     return "Collapse proven pure-combinational register pipelines into delay "
-           "histories";
+           "histories and sink consumer cones onto source.next so they fuse "
+           "with the producing combinational logic";
   }
 
   Option<unsigned> maxStagesOption{

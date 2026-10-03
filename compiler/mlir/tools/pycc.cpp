@@ -2315,6 +2315,7 @@ static void printCompileStats(const CompileStatsSummary &s) {
                << ", delay_chains=" << s.delayChainsCombined
                << ", pack_groups=" << s.stateOptPackGroups
                << ", retime_rewritten=" << s.retimeRegionsRewritten
+               << ", comb_moved=" << s.retimeCombOpsMoved
                << ", mems=" << s.memCount << " (" << s.memBits << " bits)"
                << ", max_depth=" << s.maxLogicDepth << "/" << s.logicDepthLimit
                << ", WNS=" << s.wns << ", TNS=" << s.tns

@@ -490,6 +490,26 @@ Retiming 由 [`RetimePipelinesPass.cpp`](../compiler/mlir/lib/Transforms/RetimeP
 阶段调用；也可用 `pyc-opt` 单独跑 `pyc-retime-pipelines`。它不依赖
 `pyc.generated="cycle_balance"`，默认在 structural 性能模式中开启。
 
+### 10.0 收益模型：跨拍融合，不是位宽差
+
+两类改写的收益来源是**组合逻辑的跨拍融合**，而非状态位减少：
+
+- **sinking**（10.2）把消费锥从"读 `source.q`"改写为"读 `source.next`"，
+  组合上移到打拍之前，与 `next` 的生产锥进入同一拍的表达式树。原本隔着
+  状态边界、物理上不可能共享的子表达式现在可被 CSE 去重；fuse-comb 把
+  合并后的锥收进一个 `pyc.comb` region，change-driven 调度从
+  "生产锥→状态→消费锥"三节点两跳唤醒链变成一次唤醒整锥。cycle-balance
+  对齐结构正是典型的"`delay_line` 之前的 comb"，sink 把消费逻辑直接焊进
+  对齐锥——这是实际设计上性能收益的主要来源。
+- 位宽非增（`newStateBits <= oldStateBits`）只是**护栏**：拒绝克隆/加宽
+  导致状态轴变差的改写。`retime_state_bits_removed` 记的是状态侧账面，
+  不代表融合收益；后者看 `retime_comb_ops_moved`（被搬到状态之前、参与
+  融合的锥内 op 数）。
+
+因此 `pyc-state-optimize` 在 retiming 之后、成链/packing 之前固定跑一次
+pass 内 canonicalize+CSE，让融合在后续阶段（等价 history 共享、lane 打包
+都按 `next` 的语义值分桶）看到去重后的值，而不是结构相同 SSA 不同的副本。
+
 ### 10.1 单源 computed pipeline
 
 前端或人工代码可能把组合函数夹在每级寄存器之间：
@@ -510,16 +530,18 @@ history。中间值被模块输出、assert、组合 consumer，甚至另一寄�
 
 ### 10.2 共同 delay 下沉
 
-第二种变换把多个同深度 operand history 合并为结果 history：
+第二种变换把多个同深度 operand history 合并为结果历史——**消费锥整体搬到
+打拍之前**：
 
 ```text
-原始：f(D^N(x), D^N(y), constant)
-改写：D^N(f(x, y, constant))
+原始：f(D^N(x), D^N(y), constant)     ← f 在状态边界之后，读 q
+改写：D^N(f(x, y, constant))          ← f 读 next，与 x/y 的生产锥同拍融合
 ```
 
-例如两个 depth-2 `i8` 历史只用于 equality，状态从 `2 * 2 * 8 = 32 bit` 变为
-`2 * 1 = 2 bit`。默认性能策略要求至少合并两个源状态且新 state bits 不增加，避免
-单输入窄化干扰后续 packing 却不减少 primitive。
+收益有两层：状态侧（例如两个 depth-2 `i8` 历史只用于 equality，
+`2 * 2 * 8 = 32 bit` 变为 `2 * 1 = 2 bit`）和组合侧（f 与生产锥融合，见
+10.0）。默认性能策略要求至少合并两个源状态且新 state bits 不增加——后者
+是护栏而非收益来源，防止单输入窄化干扰后续 packing 却不减少 primitive。
 
 ### 10.3 等价性证明和硬边界
 

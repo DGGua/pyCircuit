@@ -88,6 +88,16 @@ struct StateOptimizePass
                        tunables.retimeMaxExtraCombOps,
                        tunables.retimeMaxCombDepth,
                        /*accumulateStats=*/false);
+    // Sinking moves consumer cones onto source.next, placing them in the
+    // same combinational cone as the producers of next. The fusion win
+    // (shared subexpressions, one scheduled comb region) only materializes
+    // once CSE deduplicates the merged cone — run it here so chain
+    // forming, history sharing, and packing see the deduplicated values
+    // instead of structurally-identical duplicates.
+    if (failed(canonicalizeAndCSE(function))) {
+      signalPassFailure();
+      return;
+    }
     runEliminateDeadState(function);
     // Form ordinary direct chains only after retiming selected the more
     // general computed pipelines; also share equivalent histories here.
