@@ -10,3 +10,10 @@
 
 #define GET_OP_CLASSES
 #include "pyc/Dialect/PYC/PYCOps.h.inc"
+
+namespace pyc {
+// Explicit debug retention is an observation effect, never a hardware state
+// boundary. A name alone remains a codegen hint.
+bool isDebugObservation(::mlir::Operation *op);
+bool isHardwarePure(::mlir::Operation *op);
+} // namespace pyc

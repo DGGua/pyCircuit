@@ -1,0 +1,11 @@
+# Run from the repository root; decisions 0001/0004/0121/0136/0141/0147.
+ninja -C .pycircuit_out/toolchain/build -j4 pycc pyc4_runtime
+export PYCC="$PWD/.pycircuit_out/toolchain/build/bin/pycc"
+export PYC_TOOLCHAIN_ROOT="$PWD/.pycircuit_out/toolchain/install"
+PYTHONDONTWRITEBYTECODE=1 CCACHE_DISABLE=1 PYC_GATE_RUN_ID=newcircuit-integrated-20260928 bash tests/newcircuit/run_gsim_reproduction_gate.sh
+# CXX and PYC_SIM_JOBS were not explicitly overridden for this invocation.
+# PCH/active-manifest tests and historical negative evidence: pch/commands.txt.
+python3 flows/tools/check_api_hygiene.py
+python3 flows/tools/check_decision_status.py --status docs/gates/decision_status_v40.md --out docs/gates/logs/newcircuit-integrated-20260928/decision_status_report.json
+git diff --cached --check
+# Private external workload inputs/artifacts are intentionally excluded.

@@ -1,0 +1,19 @@
+module attributes {pyc.top = @top, pyc.frontend.contract = "pycircuit"} {
+  func.func @top(%a: vector<4xi8>, %b: vector<4xi8>, %amount: i3) -> (i1, i4, i8, i4, i8, i8, i8) attributes {arg_names = ["a", "b", "amount"], result_names = ["equal", "truncated", "extended", "extracted", "shifted", "arithmetic", "divided"], pyc.kind = "module", pyc.inline = "false", pyc.params = "{}", pyc.base = "top", pyc.struct.metrics = "{\"source_loc\":0,\"ast_node_count\":0,\"hardware_call_count\":0,\"loop_count\":0,\"module_call_count\":0,\"state_call_count\":0,\"estimated_inline_cost\":0,\"instance_count\":0,\"state_alloc_count\":0,\"collection_count\":0,\"collection_instance_count\":0,\"module_family_collection_count\":0,\"repeated_body_clusters\":[]}", pyc.struct.collections = "[]"} {
+    %eq = pyc.eq %a, %b : vector<4xi8>, vector<4xi8> -> vector<4xi1>
+    %equal = pyc.v_get %eq[2] : vector<4xi1> -> i1
+    %tr = pyc.trunc %a : vector<4xi8> -> vector<4xi4>
+    %truncated = pyc.v_get %tr[2] : vector<4xi4> -> i4
+    %sx = pyc.sext %tr : vector<4xi4> -> vector<4xi8>
+    %extended = pyc.v_get %sx[2] : vector<4xi8> -> i8
+    %ex = pyc.extract %a {lsb = 2 : i64, msb = 5 : i64} : vector<4xi8> -> vector<4xi4>
+    %extracted = pyc.v_get %ex[2] : vector<4xi4> -> i4
+    %sh = pyc.shl %a, %amount : vector<4xi8>, i3
+    %shifted = pyc.v_get %sh[2] : vector<4xi8> -> i8
+    %as = pyc.ashri %a {amount = 2 : i64} : vector<4xi8>
+    %arithmetic = pyc.v_get %as[2] : vector<4xi8> -> i8
+    %sd = pyc.sdiv %a, %b : vector<4xi8>, vector<4xi8> -> vector<4xi8>
+    %divided = pyc.v_get %sd[2] : vector<4xi8> -> i8
+    return %equal, %truncated, %extended, %extracted, %shifted, %arithmetic, %divided : i1, i4, i8, i4, i8, i8, i8
+  }
+}

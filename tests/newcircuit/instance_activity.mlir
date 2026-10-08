@@ -1,0 +1,17 @@
+module attributes {pyc.top = @top, pyc.frontend.contract = "pycircuit"} {
+  func.func @leaf(%clk: !pyc.clock, %rst: !pyc.reset, %en0: i1, %en1: i1, %d0: i8, %d1: i8) -> (i8, i8, i8) attributes {arg_names = ["clk", "rst", "en0", "en1", "d0", "d1"], result_names = ["q0", "q1", "y"], pyc.kind = "module", pyc.inline = "false", pyc.params = "{}", pyc.base = "leaf", pyc.struct.metrics = "{\"source_loc\":0,\"ast_node_count\":0,\"hardware_call_count\":0,\"loop_count\":0,\"module_call_count\":0,\"state_call_count\":2,\"estimated_inline_cost\":0,\"instance_count\":0,\"state_alloc_count\":2,\"collection_count\":0,\"collection_instance_count\":0,\"module_family_collection_count\":0,\"repeated_body_clusters\":[]}", pyc.struct.collections = "[]"} {
+    %i0 = pyc.constant 17 : i8
+    %i1 = pyc.constant 34 : i8
+    %q0 = pyc.reg %clk, %rst, %en0, %d0, %i0 : i8
+    %q1 = pyc.reg %clk, %rst, %en1, %d1, %i1 : i8
+    %s = pyc.add %q0, %q1 : i8, i8 -> i8
+    %y = pyc.xor %s, %q0 : i8, i8 -> i8
+    return %q0, %q1, %y : i8, i8, i8
+  }
+  func.func @top(%clk: !pyc.clock, %rst: !pyc.reset, %en0: i1, %en1: i1, %d0: i8, %d1: i8) -> (i8, i8, i8) attributes {arg_names = ["clk", "rst", "en0", "en1", "d0", "d1"], result_names = ["q0", "q1", "y"], pyc.kind = "module", pyc.inline = "false", pyc.params = "{}", pyc.base = "top", pyc.struct.metrics = "{\"source_loc\":0,\"ast_node_count\":0,\"hardware_call_count\":0,\"loop_count\":0,\"module_call_count\":0,\"state_call_count\":2,\"estimated_inline_cost\":0,\"instance_count\":0,\"state_alloc_count\":2,\"collection_count\":0,\"collection_instance_count\":0,\"module_family_collection_count\":0,\"repeated_body_clusters\":[]}", pyc.struct.collections = "[]"} {
+    %q0, %q1, %unused = pyc.instance %clk, %rst, %en0, %en1, %d0, %d1 {callee = @leaf, name = "u_state"} : (!pyc.clock, !pyc.reset, i1, i1, i8, i8) -> (i8, i8, i8)
+    %s = pyc.add %q0, %q1 : i8, i8 -> i8
+    %y = pyc.xor %s, %q0 : i8, i8 -> i8
+    return %q0, %q1, %y : i8, i8, i8
+  }
+}

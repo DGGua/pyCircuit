@@ -1,0 +1,49 @@
+$REPO_ROOT/flows/tools/test_cpp_pch_cache.py:57: SyntaxWarning: invalid escape sequence '\+'
+  with self.assertRaisesRegex(SystemExit, "missing C\+\+ compile manifest"):
+$REPO_ROOT/flows/tools/test_cpp_pch_cache.py:68: SyntaxWarning: invalid escape sequence '\+'
+  with self.assertRaisesRegex(SystemExit, "C\+\+ compile manifest"):
+$REPO_ROOT/flows/tools/test_cpp_pch_cache.py:76: SyntaxWarning: invalid escape sequence '\+'
+  with self.assertRaisesRegex(SystemExit, "missing C\+\+ source"):
+$REPO_ROOT/flows/tools/test_cpp_pch_cache.py:78: SyntaxWarning: invalid escape sequence '\+'
+  with self.assertRaisesRegex(SystemExit, "missing C\+\+ header"):
+F
+======================================================================
+FAIL: test_cli_toggle_preserves_verilog_and_jit_artifacts (__main__.TestCppPchCacheKeys.test_cli_toggle_preserves_verilog_and_jit_artifacts)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "$REPO_ROOT/flows/tools/test_cpp_pch_cache.py", line 115, in test_cli_toggle_preserves_verilog_and_jit_artifacts
+    self.assertEqual(result.returncode, 0, result.stdout[-12000:])
+AssertionError: 1 != 0 : jit-cache: hit
+$FIXTURE_OUT/cpp_build/src/CMakeLists.txt
+-- Configuring done (0.0s)
+-- Generating done (0.0s)
+-- Build files have been written to: $FIXTURE_OUT/cpp_build/build
+[1/6] Building CXX object CMakeFiles/pyc_tb.dir/cmake_pch.hxx.gch
+[2/6] Building CXX object CMakeFiles/pyc_tb.dir$FIXTURE_OUT/device/cpp/counter/obsolete__core.cpp.o
+FAILED: CMakeFiles/pyc_tb.dir$FIXTURE_OUT/device/cpp/counter/obsolete__core.cpp.o
+/usr/bin/c++  -I$FIXTURE_OUT/device/cpp -I$REPO_ROOT/runtime -I$FIXTURE_OUT/device/cpp/counter -isystem $PYC_TOOLCHAIN_ROOT/include -O3 -DNDEBUG -std=c++17 -Winvalid-pch -include $FIXTURE_OUT/cpp_build/build/CMakeFiles/pyc_tb.dir/cmake_pch.hxx -MD -MT CMakeFiles/pyc_tb.dir$FIXTURE_OUT/device/cpp/counter/obsolete__core.cpp.o -MF CMakeFiles/pyc_tb.dir$FIXTURE_OUT/device/cpp/counter/obsolete__core.cpp.o.d -o CMakeFiles/pyc_tb.dir$FIXTURE_OUT/device/cpp/counter/obsolete__core.cpp.o -c $FIXTURE_OUT/device/cpp/counter/obsolete__core.cpp
+$FIXTURE_OUT/device/cpp/counter/obsolete__core.cpp:1:2: error: #error stale shard must not be compiled
+    1 | #error stale shard must not be compiled
+      |  ^~~~~
+[3/6] Building CXX object CMakeFiles/pyc_tb.dir$FIXTURE_OUT/device/cpp/counter/counter.cpp.o
+ninja: build stopped: subcommand failed.
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "$REPO_ROOT/compiler/frontend/pycircuit/cli.py", line 2813, in <module>
+    raise SystemExit(main(sys.argv[1:]))
+                     ^^^^^^^^^^^^^^^^^^
+  File "$REPO_ROOT/compiler/frontend/pycircuit/cli.py", line 2809, in main
+    return int(ns.fn(ns))
+               ^^^^^^^^^
+  File "$REPO_ROOT/compiler/frontend/pycircuit/cli.py", line 2551, in _cmd_build
+    subprocess.run(["cmake", "--build", str(cmake_build), "-j", str(jobs)], check=True)
+  File "$PYTHON_STDLIB/subprocess.py", line 573, in run
+    raise CalledProcessError(retcode, process.args,
+subprocess.CalledProcessError: Command '['cmake', '--build', '$FIXTURE_OUT/cpp_build/build', '-j', '2']' returned non-zero exit status 1.
+
+
+----------------------------------------------------------------------
+Ran 1 test in 15.013s
+
+FAILED (failures=1)

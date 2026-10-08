@@ -1,0 +1,12 @@
+[
+  {
+    "path": "large_state_probe.log",
+    "raw_sha256": "9d32cdd11a9664721413aeb73a3d3d0337174a50814ba87fd193bbe995f5c651",
+    "transformation": "Strip line-ending whitespace for git diff --check; diagnostics and results unchanged."
+  },
+  {
+    "path": "pch/obsolete-shard.expected-failure.log",
+    "raw_sha256": "454bf0170b1c9f289fcc11c941c0ade241da3c01f1b310acc0600702438feaf6",
+    "transformation": "Strip line-ending whitespace for git diff --check; diagnostics and results unchanged."
+  }
+]

@@ -1,0 +1,114 @@
+{
+  "feature": "cpp-pch-and-active-manifest-sources",
+  "status": "pass",
+  "evidence_mode": "existing generic logs packaged without rerunning tests",
+  "compiler": {
+    "sha256": "f59660400a935a2a78bd5800e09a4fd75c6cdc7f3e6d09f08f2f8db901a48bd0",
+    "build": "study build/bin/pycc; identical compiler reported for integration"
+  },
+  "donor": {
+    "branch": "origin/feat/cpp-localize-pch",
+    "reviewed_commit": "05093c293f4d267aaff36ce83816146f30af8eb7",
+    "pch_commit": "9f21eb9d31136568349cfaa766208738cf04f1a4"
+  },
+  "runs": [
+    {
+      "name": "initial-pch-units",
+      "log": "unit.log",
+      "revision": "initial PCH port, before manifest regression extension",
+      "tests_run": 7,
+      "passed": 6,
+      "skipped": 1,
+      "failures": 0,
+      "errors": 0,
+      "seconds": 0.041
+    },
+    {
+      "name": "initial-pch-smoke",
+      "logs": [
+        "pch-smoke.stdout.log",
+        "pch-smoke.stderr.log"
+      ],
+      "revision": "initial PCH port, before manifest source selection fix",
+      "status": "pass",
+      "toolchain_build": "skipped (prebuilt compiler)",
+      "native_pch_compile_and_run": "pass",
+      "cache_tests_run": 2,
+      "cache_tests_passed": 2,
+      "cache_tests_skipped": 0,
+      "cache_test_seconds": 27.83
+    },
+    {
+      "name": "manifest-fix-units",
+      "log": "manifest-unit.log",
+      "revision": "final source hashes in source-files.sha256",
+      "tests_run": 12,
+      "passed": 11,
+      "skipped": 1,
+      "failures": 0,
+      "errors": 0,
+      "seconds": 0.053
+    },
+    {
+      "name": "manifest-fix-integration",
+      "log": "manifest-integration.log",
+      "revision": "final source hashes in source-files.sha256",
+      "tests_run": 7,
+      "passed": 7,
+      "skipped": 0,
+      "failures": 0,
+      "errors": 0,
+      "seconds": 32.284,
+      "pch_states": [
+        false,
+        true,
+        true,
+        false
+      ],
+      "counter_executable_runs": 4,
+      "retained_obsolete_sources": "ignored according to active module manifests",
+      "verilog_and_jit_cache_isolation": "pass"
+    },
+    {
+      "name": "pre-fix-obsolete-shard-negative",
+      "log": "obsolete-shard.expected-failure.log",
+      "revision": "pre-fix recursive source collection; newly extended test before raw-regex cleanup",
+      "status": "expected failure reproduced",
+      "tests_run": 1,
+      "passed": 0,
+      "skipped": 0,
+      "failures": 1,
+      "errors": 0,
+      "seconds": 15.013,
+      "reason": "obsolete__core.cpp was compiled and triggered #error stale shard must not be compiled"
+    }
+  ],
+  "counting_note": "Runs overlap; counts must not be summed into a unique test total. Unit runs deliberately skip the integration test; final integration explicitly enables it.",
+  "scope": [
+    "actual CMake device-header PCH",
+    "wheel stages helper",
+    "C++-only cache-key changes",
+    "off/on/on/off same-output-directory builds",
+    "counter execution after each build",
+    "obsolete source/header exclusion",
+    "active module list excludes removed modules",
+    "relative and absolute manifest source paths",
+    "malformed or missing manifests and active files",
+    "testbench remains a separate compilation input"
+  ],
+  "source_hash_note": "Hashes cover final tested files, verified identical in study and integrated main. Historical initial/negative runs used the earlier revisions described per run.",
+  "test_source_hashes": {
+    "flows/tools/test_cpp_pch_headers.py": "f42edc3228752d5e887cbf7bdc99f236877e2da1e6beaa0e83882aae4b6f461a",
+    "flows/tools/test_cpp_pch_cache.py": "2e727a1c1fc286afa34f91dbdf0aa8902d0d416fd561a1d4fcf5b440e428fe39",
+    "compiler/mlir/test/cpp_device_pch_smoke.sh": "eb500eaca2ec542bead9e10c64eb473871dcd2e508ce6f7fc323dde0db29fe85"
+  },
+  "log_normalization": "Only local repository/runtime/Python/temp-directory paths were replaced with named placeholders. Test counts, timings, diagnostics and failure text are retained. No private model inputs or source patches are included. Line-ending whitespace in the expected-failure log is stripped; normalization.json records its pre-strip hash.",
+  "original_log_sha256": {
+    "unit.log": "01f651d0b562ddd8161781fbbb069ec01d2df95a8d7650f3af16b1e748f2e9ae",
+    "pch-smoke.stdout.log": "0ed27363b68a019442f0f92487987a6399774012aa2fb0c782c2c4e3769cf254",
+    "pch-smoke.stderr.log": "67b3c07eb570941c6f96f61e88a81ed043161fd76092b65d7d21b8ba740558db",
+    "manifest-unit.log": "7522cd464d007c85e9fe2352bb1597a80a7640b286226f0940397261f3eab1c2",
+    "manifest-integration.log": "698a694bbf59ba0cb8da9bd79aedad6922ed22c5f7aa2074aa8c34712e70980f",
+    "obsolete-shard.expected-failure.log": "b138a67e6a0751d26e6407260664793b41534ac8ff0750300d805243332ba619"
+  }
+}

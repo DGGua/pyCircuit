@@ -1,0 +1,21 @@
+stats: regs=2 (16 bits), mems=0 (0 bits), max_depth=1/32, WNS=31, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=1/32, WNS=31, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=3/32, WNS=29, TNS=0, fuse_comb=on
+stats: regs=6 (28 bits), mems=0 (0 bits), max_depth=1/32, WNS=31, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=1/32, WNS=31, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=2 (192 bits), max_depth=1/32, WNS=31, TNS=0, fuse_comb=on
+stats: regs=2 (16 bits), mems=0 (0 bits), max_depth=1/32, WNS=31, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=1/32, WNS=31, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=3/32, WNS=29, TNS=0, fuse_comb=on
+stats: regs=6 (28 bits), mems=0 (0 bits), max_depth=1/32, WNS=31, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=1/32, WNS=31, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=2 (192 bits), max_depth=1/32, WNS=31, TNS=0, fuse_comb=on
+stats: regs=6 (28 bits), mems=0 (0 bits), max_depth=1/32, WNS=31, TNS=0, fuse_comb=on
+stats: regs=6 (28 bits), mems=0 (0 bits), max_depth=1/32, WNS=31, TNS=0, fuse_comb=on
+stats: regs=6 (48 bits), mems=0 (0 bits), max_depth=1/32, WNS=31, TNS=0, fuse_comb=on
+stats: regs=6 (48 bits), mems=0 (0 bits), max_depth=1/32, WNS=31, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=1/32, WNS=31, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=1/32, WNS=31, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=1/32, WNS=31, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=1/32, WNS=31, TNS=0, fuse_comb=on
+NewCircuit observable array lane splitting gate: PASS

@@ -93,6 +93,26 @@ public:
     posedge_compute_inner();
   }
 
+  // A SimulationPlan may batch registers with the same clock and reset.
+  // These entry points preserve the individual register's pending and qNext
+  // behavior while the generated group checks clock and reset once.
+  inline void posedge_reset_compute() {
+    clkPrev = true;
+    pending = true;
+    qNext = init;
+  }
+
+  inline void posedge_data_compute() {
+    clkPrev = true;
+    pending = en.toBool();
+    qNext = d;
+  }
+
+  inline void noedge_update() {
+    clkPrev = true;
+    pending = false;
+  }
+
   // Negedge bookkeeping — just reset clkPrev so next posedge is detected.
   // Avoids running the full tick_compute logic on the falling edge.
   inline void negedge_update() {
@@ -256,6 +276,23 @@ public:
   inline void posedge_tick_compute() {
     clkPrev = true;
     posedge_compute_inner();
+  }
+
+  inline void posedge_reset_compute() {
+    clkPrev = true;
+    pending = true;
+    qNext = init;
+  }
+
+  inline void posedge_data_compute() {
+    clkPrev = true;
+    pending = en.toBool();
+    qNext = d;
+  }
+
+  inline void noedge_update() {
+    clkPrev = true;
+    pending = false;
   }
 
   inline void negedge_update() {

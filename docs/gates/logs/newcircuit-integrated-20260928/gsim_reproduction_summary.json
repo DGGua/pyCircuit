@@ -1,0 +1,20 @@
+{
+  "status": "pass",
+  "gates": [
+    "simulation_plan",
+    "partition",
+    "replication",
+    "shared_condition",
+    "array_split",
+    "scalar_demand",
+    "scalar_fixedpoint",
+    "activity",
+    "primitive_activity",
+    "member_placement",
+    "large_state_probe",
+    "semantic"
+  ],
+  "compiler_sha256": "f59660400a935a2a78bd5800e09a4fd75c6cdc7f3e6d09f08f2f8db901a48bd0",
+  "completed_utc": "2026-09-28T06:38:44.467457+00:00",
+  "scope": "GSIM mechanisms adapted to the PYC contract"
+}

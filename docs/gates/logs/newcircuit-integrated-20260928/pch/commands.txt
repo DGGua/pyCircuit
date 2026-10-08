@@ -1,0 +1,22 @@
+# Public generic evidence only. Run from the repository root with a built
+# compiler and installed runtime. These logs were collected before integration;
+# this packaging step did not rerun the tests.
+export PYCC="$PWD/.pycircuit_out/toolchain/build/bin/pycc"
+export PYC_TOOLCHAIN_ROOT="$PWD/.pycircuit_out/toolchain/install"
+export PYTHONDONTWRITEBYTECODE=1
+export CCACHE_DIR="$(mktemp -d)"
+
+# Header/wheel/cache units. Final revision: 12 tests, 11 pass, 1 skip.
+python3 -m unittest flows/tools/test_cpp_pch_headers.py flows/tools/test_cpp_pch_cache.py
+
+# Initial PCH port: actual PCH compilation and two cache tests, both pass.
+PYC_GATE_SKIP_BUILD=1 PYC_GATE_RUN_ID=pch-recheck bash flows/scripts/run_cpp_device_pch_gate.sh
+
+# Final manifest fix: 7 tests, all pass, including real off/on/on/off builds.
+PYC_PCH_CACHE_INTEGRATION=1 python3 flows/tools/test_cpp_pch_cache.py
+
+# Historical negative evidence: this exact test selector was run against the
+# pre-fix recursive source collector with the newly extended regression test.
+# The injected obsolete shard was compiled and its #error caused the expected
+# test failure. Running it on the current fixed source must pass.
+PYC_PCH_CACHE_INTEGRATION=1 python3 flows/tools/test_cpp_pch_cache.py TestCppPchCacheKeys.test_cli_toggle_preserves_verilog_and_jit_artifacts

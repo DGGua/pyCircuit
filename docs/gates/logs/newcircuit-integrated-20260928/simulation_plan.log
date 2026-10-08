@@ -1,0 +1,160 @@
+jit-cache: miss
+/tmp/tmp.EDj3fjgHcn/default/cpp_build/src/CMakeLists.txt
+-- The CXX compiler identification is GNU 13.1.0
+-- Detecting CXX compiler ABI info
+-- Detecting CXX compiler ABI info - done
+-- Check for working CXX compiler: /usr/bin/c++ - skipped
+-- Detecting CXX compile features
+-- Detecting CXX compile features - done
+-- Configuring done (0.4s)
+-- Generating done (0.0s)
+-- Build files have been written to: /tmp/tmp.EDj3fjgHcn/default/cpp_build/build
+[1/3] Building CXX object CMakeFiles/pyc_tb.dir/tmp/tmp.EDj3fjgHcn/default/device/cpp/wire_ops/wire_ops.cpp.o
+[2/3] Building CXX object CMakeFiles/pyc_tb.dir/tmp/tmp.EDj3fjgHcn/default/tb/tb_wire_ops.cpp.o
+[3/3] Linking CXX executable pyc_tb
+/tmp/tmp.EDj3fjgHcn/default/project_manifest.json
+OK
+stats: regs=1 (8 bits), mems=0 (0 bits), max_depth=2/256, WNS=254, TNS=0, fuse_comb=off
+stats: regs=1 (8 bits), mems=0 (0 bits), max_depth=2/256, WNS=254, TNS=0, fuse_comb=on
+stats: regs=1 (8 bits), mems=0 (0 bits), max_depth=2/256, WNS=254, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=1/32, WNS=31, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=2/32, WNS=30, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=2/32, WNS=30, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=0/32, WNS=32, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=0/32, WNS=32, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=0/32, WNS=32, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=1 (32 bits), max_depth=0/32, WNS=32, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=1 (32 bits), max_depth=0/32, WNS=32, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=1 (32 bits), max_depth=0/32, WNS=32, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=2/32, WNS=30, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=1/32, WNS=31, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=1/32, WNS=31, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=0/32, WNS=32, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=0/32, WNS=32, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=3/32, WNS=29, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=3/32, WNS=29, TNS=0, fuse_comb=on
+stats: regs=3 (24 bits), mems=0 (0 bits), max_depth=2/32, WNS=30, TNS=0, fuse_comb=on
+stats: regs=3 (24 bits), mems=0 (0 bits), max_depth=2/32, WNS=30, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=1/32, WNS=31, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=1/32, WNS=31, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=1/32, WNS=31, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=3/32, WNS=29, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=3/32, WNS=29, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=3/32, WNS=29, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=2/32, WNS=30, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=2/32, WNS=30, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=4/32, WNS=28, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=4/32, WNS=28, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=2/32, WNS=30, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=3/32, WNS=29, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=3/32, WNS=29, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=3/32, WNS=29, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=3/32, WNS=29, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=2/32, WNS=30, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=1/32, WNS=31, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=1/32, WNS=31, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=1/32, WNS=31, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=3/32, WNS=29, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=3/32, WNS=29, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=2/32, WNS=30, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=6/32, WNS=26, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=4/32, WNS=28, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=4/32, WNS=28, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=4/32, WNS=28, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=3/32, WNS=29, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=1/32, WNS=31, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=1/32, WNS=31, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=1/32, WNS=31, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=1/32, WNS=31, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=1/32, WNS=31, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=1/32, WNS=31, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=1/32, WNS=31, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=1/32, WNS=31, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=2/32, WNS=30, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=2/32, WNS=30, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=2/32, WNS=30, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=2/32, WNS=30, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=3/32, WNS=29, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=3/32, WNS=29, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=4/32, WNS=28, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=4/32, WNS=28, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=3/32, WNS=29, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=3/32, WNS=29, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=3/32, WNS=29, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=3/32, WNS=29, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=3/32, WNS=29, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=3/32, WNS=29, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=3/32, WNS=29, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=3/32, WNS=29, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=3/32, WNS=29, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=3/32, WNS=29, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=40/256, WNS=216, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=40/256, WNS=216, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=1/32, WNS=31, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=1/32, WNS=31, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=2/32, WNS=30, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=2/32, WNS=30, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=3/32, WNS=29, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=3/32, WNS=29, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=3/32, WNS=29, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=3/32, WNS=29, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=2/32, WNS=30, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=2/32, WNS=30, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=3/32, WNS=29, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=3/32, WNS=29, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=2/32, WNS=30, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=2/32, WNS=30, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=2/32, WNS=30, TNS=0, fuse_comb=on
+stats: regs=65 (520 bits), mems=0 (0 bits), max_depth=0/32, WNS=32, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=2/32, WNS=30, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=2/32, WNS=30, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=2/32, WNS=30, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=2/32, WNS=30, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=3/32, WNS=29, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=3/32, WNS=29, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=3/32, WNS=29, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=3/32, WNS=29, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=3/32, WNS=29, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=3/32, WNS=29, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=3/32, WNS=29, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=2/32, WNS=30, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=2/32, WNS=30, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=2/32, WNS=30, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=2/32, WNS=30, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=2/32, WNS=30, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=2/32, WNS=30, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=2/32, WNS=30, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=2/32, WNS=30, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=2/32, WNS=30, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=1/32, WNS=31, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=1/32, WNS=31, TNS=0, fuse_comb=on
+stats: regs=1 (1 bits), mems=0 (0 bits), max_depth=0/256, WNS=256, TNS=0, fuse_comb=on
+stats: regs=1 (1 bits), mems=0 (0 bits), max_depth=0/256, WNS=256, TNS=0, fuse_comb=on
+stats: regs=2 (16 bits), mems=0 (0 bits), max_depth=1/32, WNS=31, TNS=0, fuse_comb=on
+stats: regs=2 (16 bits), mems=0 (0 bits), max_depth=1/32, WNS=31, TNS=0, fuse_comb=on
+stats: regs=1 (16 bits), mems=0 (0 bits), max_depth=1/32, WNS=31, TNS=0, fuse_comb=on
+stats: regs=1 (8 bits), mems=0 (0 bits), max_depth=0/32, WNS=32, TNS=0, fuse_comb=on
+stats: regs=2 (32 bits), mems=0 (0 bits), max_depth=0/32, WNS=32, TNS=0, fuse_comb=on
+stats: regs=1 (65 bits), mems=0 (0 bits), max_depth=2/32, WNS=30, TNS=0, fuse_comb=on
+stats: regs=1 (65 bits), mems=0 (0 bits), max_depth=2/32, WNS=30, TNS=0, fuse_comb=on
+stats: regs=3 (12 bits), mems=0 (0 bits), max_depth=1/32, WNS=31, TNS=0, fuse_comb=on
+stats: regs=3 (12 bits), mems=0 (0 bits), max_depth=1/32, WNS=31, TNS=0, fuse_comb=on
+stats: regs=2 (16 bits), mems=0 (0 bits), max_depth=0/32, WNS=32, TNS=0, fuse_comb=on
+stats: regs=2 (16 bits), mems=0 (0 bits), max_depth=0/32, WNS=32, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=1/32, WNS=31, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=1/32, WNS=31, TNS=0, fuse_comb=on
+stats: regs=2 (16 bits), mems=0 (0 bits), max_depth=0/32, WNS=32, TNS=0, fuse_comb=on
+stats: regs=2 (16 bits), mems=0 (0 bits), max_depth=0/32, WNS=32, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=1/32, WNS=31, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=1/32, WNS=31, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=2/32, WNS=30, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=2/32, WNS=30, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=20000/25000, WNS=5000, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=132/256, WNS=124, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=1/32, WNS=31, TNS=0, fuse_comb=on
+vector instance cache oracle passed (2048 lane/word changes)
+vector instance cache oracle passed (2048 lane/word changes)
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=1/32, WNS=31, TNS=0, fuse_comb=on
+vector instance cache oracle passed (2048 lane/word changes)
+NewCircuit vector instance cache gate passed
+NewCircuit simulation plan gate passed

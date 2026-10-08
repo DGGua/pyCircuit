@@ -1,0 +1,3 @@
+ok: cpp_pch and precompile_headers present in manifest
+ok: generated CMake compiled device-header PCH
+ok: cpp device pch smoke passed

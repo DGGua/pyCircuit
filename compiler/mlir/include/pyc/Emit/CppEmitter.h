@@ -7,6 +7,7 @@
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/raw_ostream.h"
+#include "pyc/Simulation/SimulationPlan.h"
 
 #include <cstdint>
 #include <optional>
@@ -84,7 +85,8 @@ struct CppEmitterOptions {
 ::mlir::LogicalResult emitCpp(::mlir::ModuleOp module, ::llvm::raw_ostream &os,
                               const CppEmitterOptions &opts = {});
 
-::mlir::LogicalResult emitCppFunc(::mlir::ModuleOp module, ::mlir::func::FuncOp f, ::llvm::raw_ostream &os,
+::mlir::LogicalResult emitCppFunc(::mlir::ModuleOp module, ::mlir::func::FuncOp f,
+                                  ::llvm::raw_ostream &os,
                                   const CppEmitterOptions &opts = {});
 
 // ---------------------------------------------------------------------------

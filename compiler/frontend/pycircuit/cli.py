@@ -1994,20 +1994,60 @@ def _emit_testbench_pyc_file(
     return tb_pyc_path
 
 
-def _gather_cpp_sources(cpp_root: Path) -> list[Path]:
-    out: list[Path] = []
-    for p in sorted(cpp_root.rglob("*.cpp")):
-        if p.is_file():
-            out.append(p)
-    return out
+def _cpp_compile_manifests(
+    cpp_root: Path, *, module_names: list[str] | None = None
+) -> list[tuple[Path, dict[str, Any]]]:
+    paths = (sorted(cpp_root.rglob("cpp_compile_manifest.json")) if module_names is None else
+             [cpp_root / name / "cpp_compile_manifest.json" for name in sorted(module_names)])
+    manifests: list[tuple[Path, dict[str, Any]]] = []
+    for path in paths:
+        if not path.is_file():
+            raise SystemExit(f"missing C++ compile manifest: {path}")
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise SystemExit(f"invalid C++ compile manifest {path}: {exc}") from exc
+        if not isinstance(data, dict):
+            raise SystemExit(f"invalid C++ compile manifest {path}: expected object")
+        manifests.append((path, data))
+    return manifests
 
 
-def _gather_cpp_headers(cpp_root: Path) -> list[Path]:
-    out: list[Path] = []
-    for p in sorted(cpp_root.rglob("*.hpp")):
-        if p.is_file():
-            out.append(p)
-    return out
+def _cpp_manifest_file(manifest: Path, raw: object, kind: str) -> Path:
+    if not isinstance(raw, str) or not raw:
+        raise SystemExit(f"invalid C++ compile manifest {manifest}: missing {kind} path")
+    path = Path(raw)
+    if not path.is_absolute():
+        path = manifest.parent / path
+    path = path.resolve()
+    if not path.is_file():
+        raise SystemExit(f"missing C++ {kind} from compile manifest {manifest}: {path}")
+    return path
+
+
+def _gather_cpp_sources(cpp_root: Path, *, module_names: list[str] | None = None) -> list[Path]:
+    manifests = _cpp_compile_manifests(cpp_root, module_names=module_names)
+    if not manifests and module_names is None:
+        return sorted(p for p in cpp_root.rglob("*.cpp") if p.is_file())
+    # An in-place regeneration can leave obsolete unsplit or numbered shards.
+    # Only the current manifests identify the translation units to compile.
+    out: set[Path] = set()
+    for manifest, data in manifests:
+        sources = data.get("sources")
+        if not isinstance(sources, list) or not sources:
+            raise SystemExit(f"invalid C++ compile manifest {manifest}: expected nonempty sources list")
+        for source in sources:
+            raw = source.get("path") if isinstance(source, dict) else None
+            out.add(_cpp_manifest_file(manifest, raw, "source"))
+    return sorted(out)
+
+
+def _gather_cpp_headers(cpp_root: Path, *, module_names: list[str] | None = None) -> list[Path]:
+    manifests = _cpp_compile_manifests(cpp_root, module_names=module_names)
+    if not manifests and module_names is None:
+        return sorted(p for p in cpp_root.rglob("*.hpp") if p.is_file())
+    return sorted({_cpp_manifest_file(manifest, data.get("top_header"), "header")
+                   for manifest, data in manifests})
 
 
 def _module_hash(path: Path) -> str:
@@ -2539,12 +2579,13 @@ def _cmd_build(args: argparse.Namespace) -> int:
                 _ = fut.result()
 
     if do_cpp:
-        cpp_sources = _gather_cpp_sources(device_cpp_root)
+        cpp_module_names = sorted(module_paths)
+        cpp_sources = _gather_cpp_sources(device_cpp_root, module_names=cpp_module_names)
         if not cpp_sources:
             raise SystemExit("build(cpp): no generated C++ sources found")
         if not tb_cpp_out.is_file():
             raise SystemExit(f"build(cpp): missing generated TB C++ source: {tb_cpp_out}")
-        cpp_headers = _gather_cpp_headers(device_cpp_root)
+        cpp_headers = _gather_cpp_headers(device_cpp_root, module_names=cpp_module_names)
         include_dirs: list[str] = []
         include_dirs.append(str(device_cpp_root))
         runtime_source_include = Path(__file__).resolve().parents[3] / "runtime"
@@ -2572,8 +2613,7 @@ def _cmd_build(args: argparse.Namespace) -> int:
             # Collect device hpp headers flagged for PCH across all module manifests.
             seen: set[str] = set()
             pch_headers: list[str] = []
-            for manifest_path in sorted(device_cpp_root.rglob("cpp_compile_manifest.json")):
-                data = json.loads(manifest_path.read_text(encoding="utf-8"))
+            for _, data in _cpp_compile_manifests(device_cpp_root, module_names=cpp_module_names):
                 profile = data.get("profile_summary") or {}
                 if not profile.get("cpp_pch"):
                     continue

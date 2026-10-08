@@ -1,0 +1,231 @@
+#pragma once
+
+#include "pyc/Simulation/SimGraph.h"
+
+#include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/IR/BuiltinOps.h"
+#include "mlir/Support/LogicalResult.h"
+#include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/SmallVector.h"
+
+#include <map>
+#include <vector>
+
+namespace pyc {
+
+struct InstanceCachePlan {
+  unsigned packedWords = 0;
+  bool usePackedWords = false;
+  bool invalidateOnCommit = true;
+};
+
+struct InstanceInterfacePlan {
+  std::vector<std::string> inputPorts;
+  std::vector<std::string> outputPorts;
+};
+
+struct ScheduledComponent {
+  llvm::SmallVector<unsigned> nodeIds;
+  bool cyclic = false;
+  unsigned iterationLimit = 0;
+};
+
+struct GroupActivationPlan {
+  llvm::SmallVector<unsigned> inputIds;
+  llvm::SmallVector<llvm::APInt> usedBits;
+  llvm::SmallVector<llvm::APInt> vectorLanes;
+  llvm::SmallVector<llvm::APInt> vectorElements;
+};
+
+struct GroupPropagationTarget {
+  unsigned groupNodeId = 0;
+  llvm::SmallVector<unsigned> valueIds;
+  llvm::SmallVector<llvm::APInt> usedBits;
+  llvm::SmallVector<llvm::APInt> vectorLanes;
+  llvm::SmallVector<llvm::APInt> vectorElements;
+};
+
+struct ActivityWordMask {
+  unsigned word = 0;
+  uint64_t mask = 0;
+};
+
+struct ActivityPublication {
+  // Targets with identical change predicates share one comparison and a set
+  // of packed stores. Predicate.groupNodeId identifies the first target only.
+  GroupPropagationTarget predicate;
+  llvm::SmallVector<ActivityWordMask> stores;
+  bool branchless = false;
+};
+
+struct ActivityBatch {
+  llvm::SmallVector<unsigned> nodeIds;
+  // All nodes in a nonzero-mask batch are adjacent packed pure groups. An
+  // effectful or externally polled node always has its own zero-mask batch.
+  unsigned word = 0;
+  uint64_t mask = 0;
+};
+
+enum class SimStatementKind : unsigned char { Expression, MuxCondition };
+
+struct PlannedMuxAssignment {
+  unsigned resultId = 0;
+  unsigned trueValueId = 0;
+  unsigned falseValueId = 0;
+};
+
+struct SimStatement {
+  SimStatementKind kind = SimStatementKind::Expression;
+  unsigned expressionId = ~0u;
+  unsigned selectorId = ~0u;
+  llvm::SmallVector<PlannedMuxAssignment> muxAssignments;
+};
+
+struct GroupStatementPlan {
+  llvm::SmallVector<unsigned> replicatedExpressionIds;
+  llvm::SmallVector<llvm::SmallVector<SimStatement>> chunks;
+};
+
+struct CombRegionStatementPlan {
+  llvm::SmallVector<llvm::SmallVector<SimCombStep>> chunks;
+};
+
+enum class SimNodeActionKind : unsigned char {
+  Skip, Group, Assign, Assert, CombRegion, Expression,
+  Fifo, AsyncFifo, ByteMem, Instance
+};
+
+struct SimNodeAction {
+  SimNodeActionKind kind = SimNodeActionKind::Skip;
+  unsigned targetId = ~0u;
+  unsigned sourceId = ~0u;
+  unsigned conditionId = ~0u;
+  std::string message;
+  unsigned regionId = ~0u;
+  unsigned expressionId = ~0u;
+};
+
+struct ResetGroupPlan {
+  unsigned clockValueId = 0;
+  unsigned resetValueId = 0;
+  llvm::SmallVector<unsigned> regNodeIds;
+  // Every path applies the same ordered register chunks after one group check.
+  llvm::SmallVector<llvm::SmallVector<unsigned>> regChunks;
+};
+
+enum class SimTickActionKind : unsigned char {
+  ResetGroup, Reg, Fifo, ByteMem, SyncMem, SyncMemDP, AsyncFifo, CdcSync
+};
+
+struct SimTickAction {
+  SimTickActionKind kind;
+  // A reset-group index for ResetGroup, otherwise a graph node ID.
+  unsigned id = 0;
+};
+
+struct OperationOrder {
+  llvm::SmallVector<unsigned> regs;
+  llvm::SmallVector<unsigned> fifos;
+  llvm::SmallVector<unsigned> byteMems;
+  llvm::SmallVector<unsigned> syncMems;
+  llvm::SmallVector<unsigned> syncMemDPs;
+  llvm::SmallVector<unsigned> asyncFifos;
+  llvm::SmallVector<unsigned> cdcSyncs;
+  llvm::SmallVector<unsigned> instances;
+  llvm::SmallVector<unsigned> combs;
+};
+
+enum class CppValueStorage : unsigned char { Struct, Local, Omitted };
+
+struct CppPlacementSummary {
+  unsigned structMembers = 0;
+  unsigned localInMethod = 0;
+  unsigned probePinnedStruct = 0;
+  unsigned crossPartPromoted = 0;
+  unsigned scheduledCrossMethod = 0;
+  uint64_t scheduledCutWeight = 0;
+  unsigned omittedValues = 0;
+};
+
+enum class SimulationPhase { Comb, TickCompute, TickCommit };
+
+struct SimulationPlan {
+  SimGraph graph;
+  // Storage is derived from actual emitted method reads/writes after scheduling.
+  llvm::SmallVector<CppValueStorage> cppValueStorage;
+  std::vector<std::string> cppValueOwners;
+  std::map<std::string, llvm::SmallVector<unsigned>> cppMethodLocals;
+  CppPlacementSummary cppPlacementSummary;
+  OperationOrder operationOrder;
+  llvm::SmallVector<llvm::SmallVector<unsigned>> instanceTickChunks;
+  llvm::SmallVector<llvm::SmallVector<unsigned>> primitiveEvalChunks;
+  llvm::SmallVector<SimulationPhase> stepPhases;
+  llvm::SmallVector<unsigned> combNodeOrder;
+  llvm::SmallVector<unsigned> evalNodeOrder;
+  bool combTopological = false;
+  bool evalTopological = false;
+  llvm::SmallVector<ScheduledComponent> sccOrder;
+  bool useSccWorklist = false;
+  llvm::DenseMap<unsigned, InstanceCachePlan> instanceCaches;
+  llvm::DenseMap<unsigned, InstanceInterfacePlan> instanceInterfaces;
+  llvm::DenseSet<unsigned> fingerprintInputs;
+  llvm::DenseSet<unsigned> invalidateCachesOnCommit;
+  // Graph node IDs and value IDs are the planning vocabulary. Source handles
+  // are resolved only when lowering effectful operations in the emitter.
+  llvm::DenseMap<unsigned, unsigned> groupByNode;
+  llvm::DenseMap<unsigned, GroupActivationPlan> groupActivations;
+  // Graph optimization is lowered to executable statement sequences before
+  // the emitter renders C++ syntax.
+  llvm::DenseMap<unsigned, GroupStatementPlan> groupStatements;
+  llvm::DenseMap<unsigned, CombRegionStatementPlan> combRegionStatements;
+  // One executable action per graph node. The emitter renders this action
+  // without choosing behavior from an MLIR operation or graph node kind.
+  llvm::SmallVector<SimNodeAction> nodeActions;
+  // A packed activity bit is valid only when every input has a unique producer
+  // that publishes changes after evaluation or at the state commit boundary.
+  llvm::DenseSet<unsigned> packedActivationGroups;
+  // Sources include pure groups, individual expressions/comb regions,
+  // assignments, evaluated primitives/instances and committed state outputs.
+  llvm::DenseMap<unsigned, llvm::SmallVector<GroupPropagationTarget, 0>>
+      groupPropagations;
+  llvm::DenseSet<unsigned> commitPropagationNodes;
+  llvm::DenseMap<unsigned, llvm::SmallVector<ActivityPublication, 0>>
+      activityPublications;
+  llvm::SmallVector<ActivityBatch> combActivityBatches;
+  llvm::SmallVector<llvm::SmallVector<ActivityBatch>> evalActivityChunks;
+  llvm::SmallVector<ResetGroupPlan> resetGroups;
+  llvm::SmallVector<SimTickAction> localTickComputeActions;
+  llvm::SmallVector<SimTickAction> localTickCommitActions;
+  llvm::SmallVector<llvm::SmallVector<SimTickAction>> localTickComputeChunks;
+  llvm::SmallVector<llvm::SmallVector<SimTickAction>> localTickCommitChunks;
+  // Observable graph values that are aliases or comb passthroughs of a local
+  // register output retain register probe semantics.
+  llvm::DenseMap<unsigned, unsigned> registerProbeTargets;
+  unsigned primitiveCount = 0;
+  unsigned fallbackIterationLimit = 0;
+  unsigned primitiveGroupSize = 64;
+  unsigned evalChunkNodes = 256;
+  unsigned combChunkNodes = 256;
+  unsigned sccChunkNodes = 256;
+  unsigned tickChunkNodes = 256;
+
+  mlir::LogicalResult verify() const;
+};
+
+struct ModuleSimulationPlan {
+  mlir::ModuleOp module;
+  std::vector<SimulationPlan> functions; // dependency order
+};
+
+struct SimulationPlanningOptions {
+  unsigned evalChunkNodes = 256;
+  unsigned combChunkNodes = 256;
+};
+
+mlir::FailureOr<SimulationPlan> buildSimulationPlan(SimGraph graph,
+                                                    const SimulationPlanningOptions &options = {});
+mlir::FailureOr<ModuleSimulationPlan> buildModuleSimulationPlan(
+    mlir::ModuleOp module, std::vector<SimulationPlan> functions);
+
+} // namespace pyc

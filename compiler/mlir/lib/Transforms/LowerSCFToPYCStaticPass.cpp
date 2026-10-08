@@ -53,7 +53,7 @@ static bool isPredicatable(Operation &op) {
   // later in this pass, and validated there.
   if (isa<scf::IfOp>(op))
     return true;
-  return isMemoryEffectFree(&op);
+  return pyc::isHardwarePure(&op);
 }
 
 static bool isAllowedInForBody(Operation &op) {

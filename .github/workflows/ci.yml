@@ -89,7 +89,7 @@ jobs:
       - name: Run API hygiene gate
         run: python flows/tools/check_api_hygiene.py compiler/frontend/pycircuit designs/examples docs README.md
 
-      - name: Test C++ PCH header selection
+      - name: Test C++ PCH header selection and cache keys
         run: |
           python flows/tools/test_cpp_pch_headers.py
           python flows/tools/test_cpp_pch_cache.py

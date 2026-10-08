@@ -1,0 +1,16 @@
+module attributes {pyc.top = @top, pyc.frontend.contract = "pycircuit"} {
+  func.func @top(%a: i16) -> (i8, i8, i8, i8, i8, i8, i4, i4) attributes {arg_names = ["a"], result_names = ["zlo", "zcross", "zhigh", "slo", "scross", "shigh", "tlo", "thi"], pyc.kind = "module", pyc.inline = "false", pyc.params = "{}", pyc.base = "top", pyc.struct.metrics = "{\"source_loc\":0,\"ast_node_count\":0,\"hardware_call_count\":0,\"loop_count\":0,\"module_call_count\":0,\"state_call_count\":0,\"estimated_inline_cost\":0,\"instance_count\":0,\"state_alloc_count\":0,\"collection_count\":0,\"collection_instance_count\":0,\"module_family_collection_count\":0,\"repeated_body_clusters\":[]}", pyc.struct.collections = "[]"} {
+    %z = pyc.zext %a : i16 -> i32
+    %s = pyc.sext %a : i16 -> i32
+    %t = pyc.trunc %a : i16 -> i8
+    %zlo = pyc.extract %z {lsb = 4 : i64, msb = 11 : i64} : i32 -> i8
+    %zcross = pyc.extract %z {lsb = 12 : i64, msb = 19 : i64} : i32 -> i8
+    %zhigh = pyc.extract %z {lsb = 24 : i64, msb = 31 : i64} : i32 -> i8
+    %slo = pyc.extract %s {lsb = 4 : i64, msb = 11 : i64} : i32 -> i8
+    %scross = pyc.extract %s {lsb = 12 : i64, msb = 19 : i64} : i32 -> i8
+    %shigh = pyc.extract %s {lsb = 24 : i64, msb = 31 : i64} : i32 -> i8
+    %tlo = pyc.extract %t {lsb = 0 : i64, msb = 3 : i64} : i8 -> i4
+    %thi = pyc.extract %t {lsb = 4 : i64, msb = 7 : i64} : i8 -> i4
+    return %zlo, %zcross, %zhigh, %slo, %scross, %shigh, %tlo, %thi : i8, i8, i8, i8, i8, i8, i4, i4
+  }
+}

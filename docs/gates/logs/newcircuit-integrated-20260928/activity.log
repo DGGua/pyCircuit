@@ -1,0 +1,17 @@
+stats: regs=2 (16 bits), mems=0 (0 bits), max_depth=2/32, WNS=30, TNS=0, fuse_comb=on
+state activity oracle passed (512 cycles)
+stats: regs=2 (16 bits), mems=0 (0 bits), max_depth=2/32, WNS=30, TNS=0, fuse_comb=on
+state activity oracle passed (512 cycles)
+stats: regs=2 (16 bits), mems=0 (0 bits), max_depth=2/32, WNS=30, TNS=0, fuse_comb=on
+state activity oracle passed (512 cycles)
+stats: regs=2 (16 bits), mems=0 (0 bits), max_depth=2/32, WNS=30, TNS=0, fuse_comb=on
+state activity oracle passed (512 cycles)
+stats: regs=0 (0 bits), mems=1 (32 bits), max_depth=2/32, WNS=30, TNS=0, fuse_comb=on
+memory activity oracle passed (512 cycles)
+stats: regs=0 (0 bits), mems=1 (32 bits), max_depth=2/32, WNS=30, TNS=0, fuse_comb=on
+memory activity oracle passed (512 cycles)
+stats: regs=1 (16 bits), mems=0 (0 bits), max_depth=8/512, WNS=504, TNS=0, fuse_comb=on
+packed fanout oracle passed: 8 lanes
+stats: regs=1 (16 bits), mems=0 (0 bits), max_depth=260/512, WNS=252, TNS=0, fuse_comb=on
+packed fanout oracle passed: 260 lanes
+NewCircuit state/instance/memory activity gate passed

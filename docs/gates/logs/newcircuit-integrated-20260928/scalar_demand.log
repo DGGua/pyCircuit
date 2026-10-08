@@ -1,0 +1,55 @@
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=4/32, WNS=28, TNS=0, fuse_comb=on
+scalar demand C++ oracle passed (4096 vectors)
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=4/32, WNS=28, TNS=0, fuse_comb=on
+scalar demand Verilog oracle passed (4096 vectors)
+PASS scalar demand single_not
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=9/32, WNS=23, TNS=0, fuse_comb=on
+scalar demand C++ oracle passed (4096 vectors)
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=9/32, WNS=23, TNS=0, fuse_comb=on
+scalar demand Verilog oracle passed (4096 vectors)
+PASS scalar demand shared_dag
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=4/32, WNS=28, TNS=0, fuse_comb=on
+scalar demand C++ oracle passed (4096 vectors)
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=4/32, WNS=28, TNS=0, fuse_comb=on
+scalar demand Verilog oracle passed (4096 vectors)
+PASS scalar demand identical_prefix
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=3/32, WNS=29, TNS=0, fuse_comb=on
+scalar demand C++ oracle passed (4096 vectors)
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=3/32, WNS=29, TNS=0, fuse_comb=on
+scalar demand Verilog oracle passed (4096 vectors)
+PASS scalar demand fullwidth_reader
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=3/32, WNS=29, TNS=0, fuse_comb=on
+scalar demand C++ oracle passed (4096 vectors)
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=3/32, WNS=29, TNS=0, fuse_comb=on
+scalar demand Verilog oracle passed (4096 vectors)
+PASS scalar demand kept_reader
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=2/32, WNS=30, TNS=0, fuse_comb=on
+dynamic left demand C++ oracle passed (4096 vectors)
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=2/32, WNS=30, TNS=0, fuse_comb=on
+dynamic left demand Verilog oracle passed (4096 vectors)
+PASS scalar demand dynamic_left_single
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=3/32, WNS=29, TNS=0, fuse_comb=on
+dynamic left demand C++ oracle passed (4096 vectors)
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=3/32, WNS=29, TNS=0, fuse_comb=on
+dynamic left demand Verilog oracle passed (4096 vectors)
+PASS scalar demand dynamic_left_shared
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=2/32, WNS=30, TNS=0, fuse_comb=on
+dynamic left demand C++ oracle passed (4096 vectors)
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=2/32, WNS=30, TNS=0, fuse_comb=on
+dynamic left demand Verilog oracle passed (4096 vectors)
+PASS scalar demand dynamic_left_full
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=5/32, WNS=27, TNS=0, fuse_comb=on
+wide shift amount C++ oracle passed (4096 vectors)
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=5/32, WNS=27, TNS=0, fuse_comb=on
+wide shift amount C++ oracle passed (4096 vectors)
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=5/32, WNS=27, TNS=0, fuse_comb=on
+wide shift amount Verilog oracle passed (4096 vectors, 12 X/Z vectors)
+PASS scalar demand wide_amount_64 (default/structural C++ and Verilog)
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=5/32, WNS=27, TNS=0, fuse_comb=on
+wide shift amount C++ oracle passed (4096 vectors)
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=5/32, WNS=27, TNS=0, fuse_comb=on
+wide shift amount C++ oracle passed (4096 vectors)
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=5/32, WNS=27, TNS=0, fuse_comb=on
+wide shift amount Verilog oracle passed (4096 vectors, 12 X/Z vectors)
+PASS scalar demand wide_amount_128 (default/structural C++ and Verilog)
+NewCircuit scalar demand gate passed

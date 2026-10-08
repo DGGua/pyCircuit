@@ -47,6 +47,7 @@ static void forceLinkPycPasses() {
   //
   // Touch each pass factory to force-link the implementations.
   (void)pyc::createCombCanonicalizePass();
+  (void)pyc::createPreserveObservationsPass();
   (void)pyc::createFuseCombPass();
   (void)pyc::createEliminateWiresPass();
   (void)pyc::createRetimePipelinesPass();

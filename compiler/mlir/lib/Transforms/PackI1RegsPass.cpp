@@ -24,6 +24,25 @@ static bool isI1(Type t) {
   return false;
 }
 
+static bool hasObservedAlias(Value value) {
+  llvm::SmallVector<Value> values{value};
+  llvm::DenseSet<Value> seen;
+  while (!values.empty()) {
+    Value current = values.pop_back_val();
+    if (!seen.insert(current).second)
+      continue;
+    for (Operation *user : current.getUsers()) {
+      auto alias = dyn_cast<pyc::AliasOp>(user);
+      if (!alias)
+        continue;
+      if (isDebugObservation(alias) || alias->hasAttr("pyc.name"))
+        return true;
+      values.push_back(alias.getResult());
+    }
+  }
+  return false;
+}
+
 struct PackI1RegsPass : public PassWrapper<PackI1RegsPass, OperationPass<func::FuncOp>> {
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(PackI1RegsPass)
 
@@ -109,7 +128,9 @@ struct PackI1RegsPass : public PassWrapper<PackI1RegsPass, OperationPass<func::F
 
       // Start/extend a run on i1 regs with the same clk/rst/en.
       if (auto r = dyn_cast<pyc::RegOp>(op)) {
-        if (!isI1(r.getType())) {
+        if (!isI1(r.getType()) || r->hasAttr("pyc.name") ||
+            isDebugObservation(r) ||
+            hasObservedAlias(r.getQ())) {
           flushRun(&op);
           continue;
         }

@@ -1,0 +1,40 @@
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=4/32, WNS=28, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=4/32, WNS=28, TNS=0, fuse_comb=on
+PASS replication compound (on/off, 4096 vectors/cycles)
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=4/32, WNS=28, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=4/32, WNS=28, TNS=0, fuse_comb=on
+PASS replication repeated (on/off, 4096 vectors/cycles)
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=4/32, WNS=28, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=4/32, WNS=28, TNS=0, fuse_comb=on
+PASS replication named (on/off, 4096 vectors/cycles)
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=3/32, WNS=29, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=3/32, WNS=29, TNS=0, fuse_comb=on
+PASS replication fanout (on/off, 4096 vectors/cycles)
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=2/32, WNS=30, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=2/32, WNS=30, TNS=0, fuse_comb=on
+PASS replication wide_input (on/off, 4096 vectors/cycles)
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=3/32, WNS=29, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=3/32, WNS=29, TNS=0, fuse_comb=on
+PASS replication array_compound (on/off, 4096 vectors/cycles)
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=2/32, WNS=30, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=2/32, WNS=30, TNS=0, fuse_comb=on
+PASS replication array_row (on/off, 4096 vectors/cycles)
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=2/32, WNS=30, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=2/32, WNS=30, TNS=0, fuse_comb=on
+PASS replication wide_result (on/off, 4096 vectors/cycles)
+stats: regs=1 (8 bits), mems=0 (0 bits), max_depth=4/32, WNS=28, TNS=0, fuse_comb=on
+stats: regs=1 (8 bits), mems=0 (0 bits), max_depth=4/32, WNS=28, TNS=0, fuse_comb=on
+PASS replication state (on/off, 4096 vectors/cycles)
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=4/32, WNS=28, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=4/32, WNS=28, TNS=0, fuse_comb=on
+PASS replication mux_compound (on/off, 4096 vectors/cycles)
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=4/32, WNS=28, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=4/32, WNS=28, TNS=0, fuse_comb=on
+PASS replication div_compound (on/off, 4096 vectors/cycles)
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=4/32, WNS=28, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=4/32, WNS=28, TNS=0, fuse_comb=on
+PASS replication compound (default partition, on/off, 4096 vectors/cycles)
+stats: regs=1 (8 bits), mems=0 (0 bits), max_depth=4/32, WNS=28, TNS=0, fuse_comb=on
+stats: regs=1 (8 bits), mems=0 (0 bits), max_depth=4/32, WNS=28, TNS=0, fuse_comb=on
+PASS replication state (default partition, on/off, 4096 vectors/cycles)
+PASS NewCircuit replication gate

@@ -12,6 +12,10 @@ using namespace mlir;
 namespace pyc {
 namespace {
 
+static bool hasObservationAttrs(Operation *op) {
+  return op->hasAttr("pyc.name") || op->hasAttr("pyc.debug_keep");
+}
+
 static VectorType vectorTypeLike(VectorType resultVT, Type laneTy) {
   if (isa<VectorType>(laneTy))
     return VectorType::get({resultVT.getDimSize(0)}, laneTy);
@@ -43,7 +47,7 @@ static LogicalResult packBinary(pyc::VCreateOp op, PatternRewriter &rewriter) {
   SmallVector<Value> rhs;
   for (Value elem : op.getElements()) {
     auto lane = elem.getDefiningOp<BinaryOpT>();
-    if (!lane->getResult(0).hasOneUse())
+    if (!lane->getResult(0).hasOneUse() || hasObservationAttrs(lane))
       return failure();
     lhs.push_back(lane->getOperand(0));
     rhs.push_back(lane->getOperand(1));
@@ -64,7 +68,7 @@ static LogicalResult packNot(pyc::VCreateOp op, PatternRewriter &rewriter) {
   SmallVector<Value> inputs;
   for (Value elem : op.getElements()) {
     auto lane = elem.getDefiningOp<pyc::NotOp>();
-    if (!lane.getResult().hasOneUse())
+    if (!lane.getResult().hasOneUse() || hasObservationAttrs(lane))
       return failure();
     inputs.push_back(lane.getIn());
   }
@@ -85,7 +89,7 @@ static LogicalResult packMux(pyc::VCreateOp op, PatternRewriter &rewriter) {
   SmallVector<Value> bs;
   for (Value elem : op.getElements()) {
     auto lane = elem.getDefiningOp<pyc::MuxOp>();
-    if (!lane.getResult().hasOneUse())
+    if (!lane.getResult().hasOneUse() || hasObservationAttrs(lane))
       return failure();
     sels.push_back(lane.getSel());
     as.push_back(lane.getA());
@@ -102,7 +106,7 @@ struct PackVCreateElementwise : public OpRewritePattern<pyc::VCreateOp> {
   using OpRewritePattern::OpRewritePattern;
 
   LogicalResult matchAndRewrite(pyc::VCreateOp op, PatternRewriter &rewriter) const override {
-    if (op.getElements().size() < 2)
+    if (op.getElements().size() < 2 || hasObservationAttrs(op))
       return failure();
 
     if (succeeded(packBinary<pyc::AndOp>(op, rewriter)) ||

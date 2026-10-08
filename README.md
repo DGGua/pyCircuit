@@ -1,4 +1,10 @@
-# pyCircuit (pyc4.0 / pyc0.40)
+# NewCircuit v1.0
+
+NewCircuit v1.0 is the C++ simulation architecture refactor being developed
+on the `newpyc` branch from the pyCircuit v4.0 (pyc0.40) codebase. It keeps the `pycc`
+command, `pycircuit` Python package, and PYC dialect interfaces. See the
+[implementation record](docs/newcircuit-v1.0-implementation.md) for current
+status and verification evidence.
 
 <p align="center">
   <img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="License">

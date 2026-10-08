@@ -516,7 +516,8 @@ def PYC_VAddReduceOp : PYC_Op<"v_add_reduce", [Pure]> {
 // This is intended as a codegen-friendly wrapper that allows backends to emit
 // a single flattened combinational block (Verilog assigns / inlined C++ function)
 // instead of instantiating lots of tiny primitives.
-def PYC_CombOp : PYC_Op<"comb", [Pure, IsolatedFromAbove]> {
+def PYC_CombOp : PYC_Op<"comb", [AlwaysSpeculatable,
+    DeclareOpInterfaceMethods<MemoryEffectsOpInterface>, IsolatedFromAbove]> {
   let summary = "Fused combinational region";
   let arguments = (ins Variadic<AnyType>:$inputs);
   let results = (outs Variadic<AnyType>:$outputs);

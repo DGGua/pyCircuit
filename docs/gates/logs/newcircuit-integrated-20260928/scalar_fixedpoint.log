@@ -1,0 +1,111 @@
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=65/256, WNS=191, TNS=0, fuse_comb=on
+scalar fixedpoint C++ oracle passed (4096 cycles)
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=65/256, WNS=191, TNS=0, fuse_comb=on
+scalar fixedpoint Verilog oracle passed (4096 cycles)
+PASS scalar fixedpoint deep_add
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=65/256, WNS=191, TNS=0, fuse_comb=on
+scalar fixedpoint C++ oracle passed (4096 cycles)
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=65/256, WNS=191, TNS=0, fuse_comb=on
+scalar fixedpoint Verilog oracle passed (4096 cycles)
+PASS scalar fixedpoint deep_mux
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=50/256, WNS=206, TNS=0, fuse_comb=on
+scalar fixedpoint C++ oracle passed (4096 cycles)
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=50/256, WNS=206, TNS=0, fuse_comb=on
+scalar fixedpoint Verilog oracle passed (4096 cycles)
+PASS scalar fixedpoint deep_mixed
+stats: regs=1 (8 bits), mems=0 (0 bits), max_depth=2/256, WNS=254, TNS=0, fuse_comb=on
+scalar fixedpoint C++ oracle passed (4096 cycles)
+stats: regs=1 (8 bits), mems=0 (0 bits), max_depth=2/256, WNS=254, TNS=0, fuse_comb=on
+scalar fixedpoint Verilog oracle passed (4096 cycles)
+PASS scalar fixedpoint reg_extract
+stats: regs=1 (8 bits), mems=0 (0 bits), max_depth=2/256, WNS=254, TNS=0, fuse_comb=on
+scalar fixedpoint C++ oracle passed (4096 cycles)
+stats: regs=1 (8 bits), mems=0 (0 bits), max_depth=2/256, WNS=254, TNS=0, fuse_comb=on
+scalar fixedpoint Verilog oracle passed (4096 cycles)
+PASS scalar fixedpoint reg_trunc
+stats: regs=1 (64 bits), mems=0 (0 bits), max_depth=1/256, WNS=255, TNS=0, fuse_comb=on
+scalar fixedpoint C++ oracle passed (4096 cycles)
+stats: regs=1 (64 bits), mems=0 (0 bits), max_depth=1/256, WNS=255, TNS=0, fuse_comb=on
+scalar fixedpoint Verilog oracle passed (4096 cycles)
+PASS scalar fixedpoint reg_fullwidth
+stats: regs=1 (64 bits), mems=0 (0 bits), max_depth=1/256, WNS=255, TNS=0, fuse_comb=on
+scalar fixedpoint C++ oracle passed (4096 cycles)
+stats: regs=1 (64 bits), mems=0 (0 bits), max_depth=1/256, WNS=255, TNS=0, fuse_comb=on
+scalar fixedpoint Verilog oracle passed (4096 cycles)
+PASS scalar fixedpoint reg_kept
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=3/256, WNS=253, TNS=0, fuse_comb=on
+scalar fixedpoint C++ oracle passed (4096 cycles)
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=3/256, WNS=253, TNS=0, fuse_comb=on
+scalar fixedpoint Verilog oracle passed (4096 cycles)
+PASS scalar fixedpoint mux_trunc
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=3/256, WNS=253, TNS=0, fuse_comb=on
+scalar fixedpoint C++ oracle passed (4096 cycles)
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=3/256, WNS=253, TNS=0, fuse_comb=on
+scalar fixedpoint Verilog oracle passed (4096 cycles)
+PASS scalar fixedpoint select_extract
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=3/256, WNS=253, TNS=0, fuse_comb=on
+scalar fixedpoint C++ oracle passed (4096 cycles)
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=3/256, WNS=253, TNS=0, fuse_comb=on
+scalar fixedpoint Verilog oracle passed (4096 cycles)
+PASS scalar fixedpoint select_trunc
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=3/256, WNS=253, TNS=0, fuse_comb=on
+scalar fixedpoint C++ oracle passed (4096 cycles)
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=3/256, WNS=253, TNS=0, fuse_comb=on
+scalar fixedpoint Verilog oracle passed (4096 cycles)
+PASS scalar fixedpoint select_fullwidth
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=3/256, WNS=253, TNS=0, fuse_comb=on
+scalar fixedpoint C++ oracle passed (4096 cycles)
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=3/256, WNS=253, TNS=0, fuse_comb=on
+scalar fixedpoint Verilog oracle passed (4096 cycles)
+PASS scalar fixedpoint select_kept
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=2/256, WNS=254, TNS=0, fuse_comb=on
+scalar fixedpoint C++ oracle passed (4096 cycles)
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=2/256, WNS=254, TNS=0, fuse_comb=on
+scalar fixedpoint Verilog oracle passed (4096 cycles)
+PASS scalar fixedpoint cast_trunc
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=2/256, WNS=254, TNS=0, fuse_comb=on
+scalar fixedpoint C++ oracle passed (4096 cycles)
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=2/256, WNS=254, TNS=0, fuse_comb=on
+scalar fixedpoint Verilog oracle passed (4096 cycles)
+PASS scalar fixedpoint cast_extract
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=3/256, WNS=253, TNS=0, fuse_comb=on
+scalar fixedpoint C++ oracle passed (4096 cycles)
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=3/256, WNS=253, TNS=0, fuse_comb=on
+scalar fixedpoint Verilog oracle passed (4096 cycles)
+PASS scalar fixedpoint shli_trunc
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=2/256, WNS=254, TNS=0, fuse_comb=on
+scalar fixedpoint C++ oracle passed (4096 cycles)
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=2/256, WNS=254, TNS=0, fuse_comb=on
+scalar fixedpoint Verilog oracle passed (4096 cycles)
+PASS scalar fixedpoint concat_trunc
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=2/256, WNS=254, TNS=0, fuse_comb=on
+scalar fixedpoint C++ oracle passed (4096 cycles)
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=2/256, WNS=254, TNS=0, fuse_comb=on
+scalar fixedpoint Verilog oracle passed (4096 cycles)
+PASS scalar fixedpoint comb_output
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=2/256, WNS=254, TNS=0, fuse_comb=on
+scalar fixedpoint C++ oracle passed (4096 cycles)
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=2/256, WNS=254, TNS=0, fuse_comb=on
+scalar fixedpoint Verilog oracle passed (4096 cycles)
+PASS scalar fixedpoint comb_fullwidth
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=2/256, WNS=254, TNS=0, fuse_comb=on
+scalar fixedpoint C++ oracle passed (4096 cycles)
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=2/256, WNS=254, TNS=0, fuse_comb=on
+scalar fixedpoint Verilog oracle passed (4096 cycles)
+PASS scalar fixedpoint comb_internal_kept
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=2/256, WNS=254, TNS=0, fuse_comb=on
+scalar fixedpoint C++ oracle passed (4096 cycles)
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=2/256, WNS=254, TNS=0, fuse_comb=on
+scalar fixedpoint Verilog oracle passed (4096 cycles)
+PASS scalar fixedpoint comb_input
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=2/256, WNS=254, TNS=0, fuse_comb=on
+scalar fixedpoint C++ oracle passed (4096 cycles)
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=2/256, WNS=254, TNS=0, fuse_comb=on
+scalar fixedpoint Verilog oracle passed (4096 cycles)
+PASS scalar fixedpoint comb_passthrough
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=4/256, WNS=252, TNS=0, fuse_comb=on
+scalar fixedpoint C++ oracle passed (4096 cycles)
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=4/256, WNS=252, TNS=0, fuse_comb=on
+scalar fixedpoint Verilog oracle passed (4096 cycles)
+PASS scalar fixedpoint comb_nested
+NewCircuit scalar fixedpoint gate passed

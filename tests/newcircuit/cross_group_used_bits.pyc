@@ -1,0 +1,11 @@
+module attributes {pyc.top = @top, pyc.frontend.contract = "pycircuit"} {
+  func.func @top(%a: i8, %b: i8) -> i1 attributes {arg_names = ["a", "b"], result_names = ["y"], pyc.kind = "module", pyc.inline = "false", pyc.params = "{}", pyc.base = "top", pyc.struct.metrics = "{\"source_loc\":0,\"ast_node_count\":0,\"hardware_call_count\":0,\"loop_count\":0,\"module_call_count\":0,\"state_call_count\":0,\"estimated_inline_cost\":0,\"instance_count\":0,\"state_alloc_count\":0,\"collection_count\":0,\"collection_instance_count\":0,\"module_family_collection_count\":0,\"repeated_body_clusters\":[]}", pyc.struct.collections = "[]"} {
+    %t0 = pyc.shli %a {amount = 1 : i64} : i8
+    %t1 = pyc.shli %t0 {amount = 1 : i64} : i8
+    %t2 = pyc.shli %t1 {amount = 1 : i64} : i8
+    %t3 = pyc.shli %t2 {amount = 1 : i64} : i8
+    %t4 = pyc.shli %t3 {amount = 1 : i64} : i8
+    %y = pyc.extract %t4 {lsb = 5 : i64, msb = 5 : i64, pyc.debug_keep} : i8 -> i1
+    return %y : i1
+  }
+}

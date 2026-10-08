@@ -1,0 +1,13 @@
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=2/32, WNS=30, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=2/32, WNS=30, TNS=0, fuse_comb=on
+FIFO activity oracle passed (1024 cycles)
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=2/32, WNS=30, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=2/32, WNS=30, TNS=0, fuse_comb=on
+async FIFO activity oracle passed (1056 clock events)
+stats: regs=0 (0 bits), mems=1 (32 bits), max_depth=2/32, WNS=30, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=1 (32 bits), max_depth=2/32, WNS=30, TNS=0, fuse_comb=on
+dual-port memory activity oracle passed (1024 cycles)
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=2/32, WNS=30, TNS=0, fuse_comb=on
+stats: regs=0 (0 bits), mems=0 (0 bits), max_depth=2/32, WNS=30, TNS=0, fuse_comb=on
+CDC activity oracle passed (1024 cycles)
+NewCircuit primitive activity gate passed

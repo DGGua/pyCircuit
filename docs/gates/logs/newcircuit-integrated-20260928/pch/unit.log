@@ -1,0 +1,12 @@
+test_cli_toggle_preserves_verilog_and_jit_artifacts (test_cpp_pch_cache.TestCppPchCacheKeys.test_cli_toggle_preserves_verilog_and_jit_artifacts) ... skipped 'enabled by the device PCH smoke gate'
+test_pch_only_invalidates_cpp_key (test_cpp_pch_cache.TestCppPchCacheKeys.test_pch_only_invalidates_cpp_key) ... ok
+test_duplicate_and_non_header_inputs (test_cpp_pch_headers.TestCppPchHeaders.test_duplicate_and_non_header_inputs) ... ok
+test_empty (test_cpp_pch_headers.TestCppPchHeaders.test_empty) ... ok
+test_multiple_modules (test_cpp_pch_headers.TestCppPchHeaders.test_multiple_modules) ... ok
+test_selects_module_primary_hpp (test_cpp_pch_headers.TestCppPchHeaders.test_selects_module_primary_hpp) ... ok
+test_wheel_stages_pch_helper (test_cpp_pch_headers.TestCppPchHeaders.test_wheel_stages_pch_helper) ... ok
+
+----------------------------------------------------------------------
+Ran 7 tests in 0.041s
+
+OK (skipped=1)

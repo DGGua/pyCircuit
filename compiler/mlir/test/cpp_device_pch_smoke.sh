@@ -4,21 +4,23 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 PYCC="${PYCC:-${ROOT}/.pycircuit_out/toolchain/build/bin/pycc}"
+export PYCC
 EXAMPLE="${ROOT}/designs/examples/counter/counter.py"
-OUT="${ROOT}/.pycircuit_out/gates/cpp_device_pch_smoke"
+OUT="${PYC_PCH_GATE_OUT:-${ROOT}/.pycircuit_out/gates/cpp_device_pch_smoke}"
 
 if [[ ! -x "${PYCC}" ]]; then
   echo "fail: pycc not built at ${PYCC}" >&2
   exit 1
 fi
-TOOLCHAIN_ROOT="$(cd -- "$(dirname -- "${PYCC}")/.." && pwd)"
+TOOLCHAIN_ROOT="${PYC_TOOLCHAIN_ROOT:-$(cd -- "$(dirname -- "${PYCC}")/.." && pwd)}"
 RUNTIME_INCLUDE="${TOOLCHAIN_ROOT}/include"
 if [[ ! -f "${RUNTIME_INCLUDE}/cpp/pyc_sim.hpp" ]]; then
   echo "fail: installed runtime headers missing under ${RUNTIME_INCLUDE}" >&2
   exit 1
 fi
 
-if ! "${PYCC}" --help 2>&1 | grep -q -- '--cpp-pch'; then
+pycc_help="$("${PYCC}" --help)"
+if ! grep -q -- '--cpp-pch' <<<"${pycc_help}"; then
   echo "fail: pycc missing --cpp-pch flag" >&2
   exit 1
 fi
@@ -122,7 +124,7 @@ runtime_include = Path(sys.argv[3]).resolve()
 data = json.loads(module_manifest.read_text(encoding="utf-8"))
 cpp_dir = module_manifest.parent.resolve()
 tb = project_manifest.parent / "pch_tb.cpp"
-tb.write_text('#include "counter.hpp"\nint main() { return 0; }\n', encoding="utf-8")
+tb.write_text('#include "counter.hpp"\nint main() { pyc::gen::counter sim; sim.eval(); }\n', encoding="utf-8")
 headers = [str(Path(p).resolve()) for p in data.get("precompile_headers") or []]
 if not headers:
     raise SystemExit("fail: no PCH headers to compile")
@@ -154,6 +156,7 @@ python3 "${ROOT}/flows/tools/gen_cmake_from_manifest.py" \
 cmake -S "${OUT}/cmake_src" -B "${OUT}/cmake_build" \
   -DCMAKE_BUILD_TYPE=Release >/dev/null
 cmake --build "${OUT}/cmake_build" --parallel 2 >/dev/null
+"${OUT}/cmake_build/pyc_tb"
 python3 - <<'PY' "${OUT}/cmake_build"
 import sys
 from pathlib import Path
@@ -164,5 +167,7 @@ if not artifacts:
     raise SystemExit(f"fail: CMake produced no PCH artifacts under {build}")
 print("ok: generated CMake compiled device-header PCH")
 PY
+
+PYC_PCH_CACHE_INTEGRATION=1 python3 "${ROOT}/flows/tools/test_cpp_pch_cache.py"
 
 echo "ok: cpp device pch smoke passed"

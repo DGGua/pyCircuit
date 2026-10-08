@@ -1,0 +1,36 @@
+module attributes {pyc.top = @top, pyc.frontend.contract = "pycircuit"} {
+  func.func @top(%a: i128) -> (i8, i8, i8, i8, i8, i8, i8, i8, i8, i8, i8, i8, i8, i8, i8, i8, i8, i8, i8, i8) attributes {arg_names = ["a"], result_names = ["sh_low", "sh_mid", "ls_low", "ls_mid", "as_low", "as_mid", "lsfill_low", "lsfill_mid", "fill_low", "fill_mid", "zero_low", "zero_mid", "sign_low", "sign_mid", "dyn_sh_low", "dyn_sh_mid", "dyn_ls_low", "dyn_ls_mid", "dyn_as_low", "dyn_as_mid"], pyc.kind = "module", pyc.inline = "false", pyc.params = "{}", pyc.base = "top", pyc.struct.metrics = "{\"source_loc\":0,\"ast_node_count\":0,\"hardware_call_count\":0,\"loop_count\":0,\"module_call_count\":0,\"state_call_count\":0,\"estimated_inline_cost\":0,\"instance_count\":0,\"state_alloc_count\":0,\"collection_count\":0,\"collection_instance_count\":0,\"module_family_collection_count\":0,\"repeated_body_clusters\":[]}", pyc.struct.collections = "[]"} {
+    %sh = pyc.shli %a {amount = 7 : i64} : i128
+    %ls = pyc.lshri %a {amount = 5 : i64} : i128
+    %as = pyc.ashri %a {amount = 6 : i64} : i128
+    %lsfill = pyc.lshri %a {amount = 120 : i64} : i128
+    %fill = pyc.ashri %a {amount = 120 : i64} : i128
+    %zero = pyc.lshri %a {amount = 130 : i64} : i128
+    %sign = pyc.ashri %a {amount = 130 : i64} : i128
+    %c3 = pyc.constant 3 : i8
+    %dyn_sh = pyc.shl %a, %c3 : i128, i8
+    %dyn_ls = pyc.lshr %a, %c3 : i128, i8
+    %dyn_as = pyc.ashr %a, %c3 : i128, i8
+    %sh_low = pyc.trunc %sh : i128 -> i8
+    %sh_mid = pyc.extract %sh {lsb = 32 : i64, msb = 39 : i64} : i128 -> i8
+    %ls_low = pyc.trunc %ls : i128 -> i8
+    %ls_mid = pyc.extract %ls {lsb = 32 : i64, msb = 39 : i64} : i128 -> i8
+    %as_low = pyc.trunc %as : i128 -> i8
+    %as_mid = pyc.extract %as {lsb = 32 : i64, msb = 39 : i64} : i128 -> i8
+    %lsfill_low = pyc.trunc %lsfill : i128 -> i8
+    %lsfill_mid = pyc.extract %lsfill {lsb = 32 : i64, msb = 39 : i64} : i128 -> i8
+    %fill_low = pyc.trunc %fill : i128 -> i8
+    %fill_mid = pyc.extract %fill {lsb = 32 : i64, msb = 39 : i64} : i128 -> i8
+    %zero_low = pyc.trunc %zero : i128 -> i8
+    %zero_mid = pyc.extract %zero {lsb = 32 : i64, msb = 39 : i64} : i128 -> i8
+    %sign_low = pyc.trunc %sign : i128 -> i8
+    %sign_mid = pyc.extract %sign {lsb = 32 : i64, msb = 39 : i64} : i128 -> i8
+    %dyn_sh_low = pyc.trunc %dyn_sh : i128 -> i8
+    %dyn_sh_mid = pyc.extract %dyn_sh {lsb = 32 : i64, msb = 39 : i64} : i128 -> i8
+    %dyn_ls_low = pyc.trunc %dyn_ls : i128 -> i8
+    %dyn_ls_mid = pyc.extract %dyn_ls {lsb = 32 : i64, msb = 39 : i64} : i128 -> i8
+    %dyn_as_low = pyc.trunc %dyn_as : i128 -> i8
+    %dyn_as_mid = pyc.extract %dyn_as {lsb = 32 : i64, msb = 39 : i64} : i128 -> i8
+    return %sh_low, %sh_mid, %ls_low, %ls_mid, %as_low, %as_mid, %lsfill_low, %lsfill_mid, %fill_low, %fill_mid, %zero_low, %zero_mid, %sign_low, %sign_mid, %dyn_sh_low, %dyn_sh_mid, %dyn_ls_low, %dyn_ls_mid, %dyn_as_low, %dyn_as_mid : i8, i8, i8, i8, i8, i8, i8, i8, i8, i8, i8, i8, i8, i8, i8, i8, i8, i8, i8, i8
+  }
+}

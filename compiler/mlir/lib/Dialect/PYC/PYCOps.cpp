@@ -11,6 +11,7 @@
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "mlir/IR/SymbolTable.h"
 #include "mlir/IR/Types.h"
+#include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "mlir/Support/LogicalResult.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/STLExtras.h"
@@ -21,6 +22,45 @@
 
 using namespace mlir;
 using namespace pyc;
+
+namespace {
+struct ObservationResource
+    : SideEffects::Resource::Base<ObservationResource> {
+  StringRef getName() final { return "PYCObservation"; }
+};
+} // namespace
+
+bool pyc::isDebugObservation(Operation *op) {
+  if (auto keep = op->getAttrOfType<BoolAttr>("pyc.debug_keep"))
+    return keep.getValue();
+  return op->hasAttrOfType<UnitAttr>("pyc.debug_keep");
+}
+
+bool pyc::isHardwarePure(Operation *op) {
+  auto effects = getEffectsRecursively(op);
+  return effects && llvm::all_of(*effects, [](const auto &effect) {
+    return effect.getResource() == ObservationResource::get();
+  });
+}
+
+void AliasOp::getEffects(
+    SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {
+  if (isDebugObservation(*this))
+    effects.emplace_back(MemoryEffects::Write::get(),
+                         ObservationResource::get());
+}
+
+void CombOp::getEffects(
+    SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {
+  for (Block &block : getBody()) {
+    for (Operation &op : block.without_terminator()) {
+      if (auto nested = getEffectsRecursively(&op))
+        effects.append(nested->begin(), nested->end());
+      else
+        effects.emplace_back(MemoryEffects::Write::get());
+    }
+  }
+}
 
 ParseResult ConstantOp::parse(OpAsmParser &parser, OperationState &result) {
   // Parse: `pyc.constant <integer> : <type>`
@@ -795,13 +835,21 @@ void AliasOp::getEffects(
 }
 
 OpFoldResult AliasOp::fold(FoldAdaptor) {
-  // Preserve aliases that carry external observation identity.
-  if (carriesExternalObservationIdentity(*this))
+  // Preserve aliases that carry external observation identity, including
+  // unnamed debug roots named via pyc.name.
+  if (carriesExternalObservationIdentity(*this) || (*this)->hasAttr("pyc.name"))
     return {};
   return getIn();
 }
 
 OpFoldResult VGetOp::fold(FoldAdaptor) {
+  // The canonicalization pass can forward named readers through an alias.
+  // A folder cannot create that alias, and must not erase aggregate probes.
+  if ((*this)->hasAttr("pyc.name") || (*this)->hasAttr("pyc.debug_keep"))
+    return {};
+  if (Operation *aggregate = getVec().getDefiningOp())
+    if (aggregate->hasAttr("pyc.name") || aggregate->hasAttr("pyc.debug_keep"))
+      return {};
   if (auto create = getVec().getDefiningOp<VCreateOp>()) {
     const int64_t index = getIndexAttr().getInt();
     if (index >= 0 && index < static_cast<int64_t>(create.getElements().size()))
@@ -1304,6 +1352,13 @@ LogicalResult CombOp::verify() {
   auto yield = dyn_cast<YieldOp>(b.getTerminator());
   if (!yield)
     return emitOpError("body must terminate with pyc.yield");
+
+  for (Operation &step : b) {
+    if (&step == b.getTerminator())
+      break;
+    if (!isHardwarePure(&step))
+      return step.emitError("pyc.comb body must contain only pure operations");
+  }
 
   if (yield.getNumOperands() != getNumResults())
     return emitOpError("pyc.yield operand count must match comb results");
