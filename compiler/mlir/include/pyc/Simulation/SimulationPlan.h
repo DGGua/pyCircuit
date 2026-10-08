@@ -138,7 +138,7 @@ struct OperationOrder {
 
 enum class CppValueStorage : unsigned char { Struct, Local, Omitted };
 
-struct CppPlacementSummary {
+struct SimCppPlacementSummary {
   unsigned structMembers = 0;
   unsigned localInMethod = 0;
   unsigned probePinnedStruct = 0;
@@ -156,7 +156,7 @@ struct SimulationPlan {
   llvm::SmallVector<CppValueStorage> cppValueStorage;
   std::vector<std::string> cppValueOwners;
   std::map<std::string, llvm::SmallVector<unsigned>> cppMethodLocals;
-  CppPlacementSummary cppPlacementSummary;
+  SimCppPlacementSummary cppPlacementSummary;
   OperationOrder operationOrder;
   llvm::SmallVector<llvm::SmallVector<unsigned>> instanceTickChunks;
   llvm::SmallVector<llvm::SmallVector<unsigned>> primitiveEvalChunks;

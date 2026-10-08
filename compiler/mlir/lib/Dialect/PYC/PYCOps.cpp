@@ -43,13 +43,6 @@ bool pyc::isHardwarePure(Operation *op) {
   });
 }
 
-void AliasOp::getEffects(
-    SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {
-  if (isDebugObservation(*this))
-    effects.emplace_back(MemoryEffects::Write::get(),
-                         ObservationResource::get());
-}
-
 void CombOp::getEffects(
     SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {
   for (Block &block : getBody()) {

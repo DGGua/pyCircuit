@@ -907,7 +907,7 @@ struct PlannedCppStorage {
   llvm::SmallVector<CppValueStorage> storage;
   std::vector<std::string> owners;
   std::map<std::string, llvm::SmallVector<unsigned>> locals;
-  CppPlacementSummary summary;
+  SimCppPlacementSummary summary;
 };
 
 // A method-local value must be defined on every execution before all of its
