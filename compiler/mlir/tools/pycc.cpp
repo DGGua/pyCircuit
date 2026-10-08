@@ -208,6 +208,11 @@ static llvm::cl::opt<unsigned> stateRetimeMaxStages(
     "state-retime-max-stages",
     llvm::cl::desc("Maximum registers per retimed region (0 is unlimited)"),
     llvm::cl::init(0));
+static llvm::cl::opt<bool> stateOptOnVerilog(
+    "state-opt-on-verilog",
+    llvm::cl::desc("Run the state-optimize pass suite (merge/retime/pack) on the "
+                   "Verilog emit path (experimental; area attribution gate)"),
+    llvm::cl::init(false));
 
 static llvm::cl::opt<unsigned> stateRetimeMaxExtraCombOps(
     "state-retime-max-extra-comb-ops",
@@ -2730,9 +2735,11 @@ int main(int argc, char **argv) {
     pm.addNestedPass<func::FuncOp>(pyc::createVectorUnrollPass());
   pm.addNestedPass<func::FuncOp>(pyc::createEliminateWiresPass());
   pm.addNestedPass<func::FuncOp>(pyc::createEliminateDeadStatePass());
-  // State merge, retiming, and packing stay on the C++ emit path only so
-  // Verilog keeps the pre-optimization netlist.
-  const bool enableStateDelayOptimization = (emitKind == "cpp");
+  // State merge, retiming, and packing: C++ emit path by default. Opt-in for
+  // Verilog via --state-opt-on-verilog (area attribution; see
+  // docs/gates/verilog-area-attribution.md).
+  const bool enableStateDelayOptimization =
+      (emitKind == "cpp") || stateOptOnVerilog;
   if (enableStateDelayOptimization) {
     // Unified structural state optimization: equivalent-state merge rounds
     // (with in-pass canonicalize/CSE between them), retiming, direct-chain
