@@ -164,7 +164,9 @@ buildCombPartition(const ChangeScheduleDag &dag, uint64_t targetSize) {
 
   llvm::SmallVector<int64_t> partOf(regionCount, -1);
   llvm::SmallVector<uint64_t> partSize;
+  llvm::SmallVector<unsigned> partRegions;
   partSize.reserve(regionCount);
+  partRegions.reserve(regionCount);
 
   for (unsigned r : g.slotOrder) {
     // Count comb dependency edges from this region into each predecessor
@@ -193,9 +195,13 @@ buildCombPartition(const ChangeScheduleDag &dag, uint64_t targetSize) {
         partSize[best] + g.weight[r] <= targetSize) {
       partOf[r] = best;
       partSize[best] += g.weight[r];
+      ++partRegions[best];
     } else {
+      // A single region larger than targetSize is kept as its own partition:
+      // targetSize bounds merging, it never forces a region to split.
       partOf[r] = static_cast<int64_t>(partSize.size());
       partSize.push_back(g.weight[r]);
+      partRegions.push_back(1);
     }
   }
 
@@ -214,8 +220,10 @@ buildCombPartition(const ChangeScheduleDag &dag, uint64_t targetSize) {
     }
   }
   if (targetSize > 0) {
-    for (uint64_t size : partSize) {
-      if (size > targetSize)
+    for (auto [size, regions] : llvm::zip(partSize, partRegions)) {
+      // Oversized singletons are legal (see above); only merged partitions
+      // must respect the coarseness bound.
+      if (regions > 1 && size > targetSize)
         return failure();
     }
   }

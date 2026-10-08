@@ -421,7 +421,15 @@ static FailureOr<EmissionSchedule> readEmissionSchedule(func::FuncOp func) {
           "C++ emitter requires a positive partition_count in the schedule "
           "summary");
     schedule.partitionCount = static_cast<unsigned>(declared);
+    unsigned externalPartition = schedule.partitionCount;
     for (EmissionScheduleNode &node : schedule.nodes) {
+      // Only comb regions are partitioned; other schedule units (regs, mems,
+      // instances) get ids outside the comb partition space. They never take
+      // or mark comb dirty bits, so those distinct ids are bookkeeping only.
+      if (!isa<pyc::CombOp>(node.operation)) {
+        node.partition = externalPartition++;
+        continue;
+      }
       auto attr =
           node.operation->getAttrOfType<IntegerAttr>(
               kChangeSchedulePartitionAttr);
@@ -429,7 +437,7 @@ static FailureOr<EmissionSchedule> readEmissionSchedule(func::FuncOp func) {
           static_cast<uint64_t>(attr.getInt()) >= schedule.partitionCount)
         return node.operation->emitError(
             "C++ emitter requires a valid pyc.change_schedule.partition on "
-            "every scheduled operation when partition_count is present");
+            "every pyc.comb operation when partition_count is present");
       node.partition = static_cast<unsigned>(attr.getInt());
     }
   } else {
