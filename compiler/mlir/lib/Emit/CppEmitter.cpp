@@ -433,15 +433,23 @@ static FailureOr<EmissionSchedule> readEmissionSchedule(func::FuncOp func) {
       node.partition = static_cast<unsigned>(attr.getInt());
     }
   } else {
-    llvm::DenseMap<Operation *, unsigned> fallbackPartition;
+    // Identity mode: comb partitions are numbered by comb slot order, which
+    // equals the emitter's comb index, so the generated dirty fanout arrays
+    // and dirty bitset stay byte-identical to the pre-partition emitter.
+    llvm::DenseMap<Operation *, unsigned> fallbackComb;
+    llvm::DenseMap<Operation *, unsigned> fallbackOther;
     for (EmissionScheduleNode &node : schedule.nodes) {
-      auto [entry, inserted] =
-          fallbackPartition.try_emplace(node.operation,
-                                        fallbackPartition.size());
-      node.partition = entry->second;
-      (void)inserted;
+      if (isa<pyc::CombOp>(node.operation)) {
+        auto [entry, unusedA] = fallbackComb.try_emplace(
+            node.operation, fallbackComb.size());
+        node.partition = entry->second;
+      } else {
+        auto [entry, unusedB] = fallbackOther.try_emplace(
+            node.operation, 0x40000000u + fallbackOther.size());
+        node.partition = entry->second;
+      }
     }
-    schedule.partitionCount = fallbackPartition.size();
+    schedule.partitionCount = fallbackComb.size();
   }
   return schedule;
 }
