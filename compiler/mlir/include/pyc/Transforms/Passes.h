@@ -25,9 +25,7 @@ createRetimePipelinesPass(unsigned maxStages = 0,
 std::unique_ptr<::mlir::Pass>
 createCombineDelayChainsPass(DelayChainMode mode = DelayChainMode::Generated,
                              bool accumulateStats = false,
-                             bool cascadeRound = false,
-                             bool mergeOnly = false,
-                             bool skipMerge = false);
+                             bool cascadeRound = false);
 std::unique_ptr<::mlir::Pass>
 createPackStateLanesPass(unsigned maxWidth = 192);
 /// Phase runners shared with the unified StateOptimizePass. Defined next to

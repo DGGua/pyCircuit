@@ -16,17 +16,6 @@ using namespace mlir;
 namespace pyc {
 namespace {
 
-static void setI64Attr(Operation *op, StringRef name, int64_t value) {
-  OpBuilder builder(op->getContext());
-  op->setAttr(name, builder.getI64IntegerAttr(value));
-}
-
-static int64_t getI64Attr(Operation *op, StringRef name, int64_t fallback) {
-  if (auto value = op->getAttrOfType<IntegerAttr>(name))
-    return value.getInt();
-  return fallback;
-}
-
 // In-pass replacement for the upstream canonicalize+CSE pass pair pycc used
 // between merge rounds: greedy folding absorbs every op's canonicalization
 // patterns and folders, then explicit CSE dedupes the exposed equivalents.

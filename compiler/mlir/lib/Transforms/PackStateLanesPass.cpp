@@ -50,33 +50,10 @@ struct PackStats {
 
 void packBlockImpl(Block &block, PackStats &stats, unsigned maxWidth);
 
-static void setI64Attr(Operation *op, llvm::StringRef name, int64_t value) {
-  OpBuilder builder(op->getContext());
-  op->setAttr(name, builder.getI64IntegerAttr(value));
-}
-
-static int64_t getI64Attr(Operation *op, llvm::StringRef name,
-                          int64_t fallback = 0) {
-  if (auto attr = op->getAttrOfType<IntegerAttr>(name))
-    return attr.getInt();
-  return fallback;
-}
-
-static std::size_t valueHash(Value value) {
-  value = stripStateAliases(value);
-  if (auto constant = value.getDefiningOp<pyc::ConstantOp>()) {
-    Attribute literal = constant->getAttr("value");
-    return static_cast<std::size_t>(llvm::hash_combine(
-        value.getType().getAsOpaquePointer(), literal.getAsOpaquePointer(), 1));
-  }
-  return static_cast<std::size_t>(llvm::hash_combine(
-      value.getType().getAsOpaquePointer(), value.getAsOpaquePointer(), 0));
-}
-
 static std::size_t controlHash(const StateLane &lane) {
   return static_cast<std::size_t>(llvm::hash_combine(
-      lane.isDelay, lane.depth, valueHash(lane.clk), valueHash(lane.rst),
-      valueHash(lane.en)));
+      lane.isDelay, lane.depth, semanticValueHash(lane.clk), semanticValueHash(lane.rst),
+      semanticValueHash(lane.en)));
 }
 
 static bool sameControlKey(const StateLane &lhs, const StateLane &rhs) {

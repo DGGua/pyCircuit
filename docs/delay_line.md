@@ -319,8 +319,9 @@ return %side, %q2
 history array 读取 tap；Verilog 从同一组 stages 的只读 history bus 取 slice。这样
 旁路值和末端值都保持原来的周期关系，状态存储仍只有一份。
 
-默认性能模式仍不会忽略真实 state dependency、写回 fanout、组合环或跨 block 边界。
-显式保留观测模式不启用 fanout tap rewrite，以保留中间状态身份。
+默认模式不会忽略真实 state dependency、写回 fanout、组合环或跨 block 边界。
+（早期草稿中的"显式保留观测模式"已删除：identity 通过 tap/slice alias 保留，
+不再需要跳过 tap rewrite。）
 
 ### 7.4 完全相同 delay-line 的共享
 
@@ -481,7 +482,7 @@ Packing：
 但超宽运算成本抵消了调度收益，因此默认选择 192。
 
 性能模式还会运行旧 `PackI1RegsPass`，收集通用 dependency-aware packer 留下的
-i1 lane。显式观测保留模式跳过旧 i1 packer，因为它不保留观测元数据。
+i1 lane。（早期草稿中的"显式观测保留模式"已删除，见第 6 节。）
 
 ## 10. 受约束 Retiming：把计算链变成共享历史
 

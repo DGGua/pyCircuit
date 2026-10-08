@@ -17,6 +17,36 @@
 
 namespace pyc {
 
+// Shared stat-attribute helpers for the state-optimization passes.
+inline void setI64Attr(mlir::Operation *op, llvm::StringRef name,
+                       std::int64_t value) {
+  op->setAttr(name, mlir::IntegerAttr::get(
+                        mlir::IntegerType::get(op->getContext(), 64), value));
+}
+
+inline void setAccumI64Attr(mlir::Operation *op, llvm::StringRef name,
+                            std::int64_t value, bool accumulate = true) {
+  if (accumulate) {
+    if (auto old = op->getAttrOfType<mlir::IntegerAttr>(name))
+      value += old.getInt();
+  }
+  setI64Attr(op, name, value);
+}
+
+inline std::int64_t getI64Attr(mlir::Operation *op, llvm::StringRef name,
+                               std::int64_t fallback = 0) {
+  if (auto attr = op->getAttrOfType<mlir::IntegerAttr>(name))
+    return attr.getInt();
+  return fallback;
+}
+
+/// Stateful ops terminate combinational scheduling: registers, delay lines,
+/// memories, FIFOs, CDC syncs, and instance boundaries.
+bool isStatefulConsumer(mlir::Operation *op);
+
+/// Semantic hash of a value (resolved through aliases; constants by literal).
+std::size_t semanticValueHash(mlir::Value value);
+
 std::optional<DelayChainMode> parseDelayChainMode(llvm::StringRef value);
 llvm::StringRef stringifyDelayChainMode(DelayChainMode mode);
 

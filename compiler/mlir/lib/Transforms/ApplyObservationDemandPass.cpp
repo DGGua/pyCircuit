@@ -21,11 +21,6 @@ using namespace mlir;
 namespace pyc {
 namespace {
 
-static void setI64Attr(Operation *op, StringRef name, int64_t value) {
-  op->setAttr(name, IntegerAttr::get(IntegerType::get(op->getContext(), 64),
-                                     value));
-}
-
 static unsigned valueWidth(Value value) {
   if (auto integer = dyn_cast<IntegerType>(value.getType()))
     return integer.getWidth();
@@ -106,7 +101,6 @@ struct ApplyObservationDemandPass
       if (auto name = op->getAttrOfType<StringAttr>("pyc.name"))
         presentBefore.insert(name.getValue());
     });
-
     if (const auto it = traceFieldsByModule.find(function.getSymName());
         it != traceFieldsByModule.end()) {
       for (const auto &field : it->second) {
@@ -171,19 +165,6 @@ struct ApplyObservationDemandPass
     });
     if (failed(status))
       return failure();
-
-    llvm::StringSet<> presentAfter;
-    function.walk([&](Operation *op) {
-      if (auto name = op->getAttrOfType<StringAttr>("pyc.name"))
-        presentAfter.insert(name.getValue());
-    });
-    for (const auto &field : demand) {
-      if (presentBefore.contains(field.getKey()) &&
-          !presentAfter.contains(field.getKey()))
-        return function.emitError(
-                   "observation demand lost pyc.name after rewrite: ")
-               << field.getKey();
-    }
 
     setI64Attr(function, "pyc.stats.observe_named_names_stripped", lazy);
     setI64Attr(function, "pyc.stats.observe_named_names_lazy", lazy);

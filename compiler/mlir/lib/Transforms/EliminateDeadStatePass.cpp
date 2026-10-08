@@ -37,65 +37,7 @@ struct EliminateDeadStatePass : public PassWrapper<EliminateDeadStatePass, Opera
     return "Eliminate dead sequential primitives with unobservable state";
   }
 
-  void runOnOperation() override {
-    func::FuncOp f = getOperation();
-    bool changed = true;
-    while (changed) {
-      changed = false;
-      llvm::SmallVector<Operation *> toErase;
-
-      f.walk([&](Operation *op) {
-        if (shouldKeep(op))
-          return;
-        if (auto r = dyn_cast<pyc::RegOp>(op)) {
-          if (r.getQ().use_empty())
-            toErase.push_back(op);
-          return;
-        }
-        if (auto delay = dyn_cast<pyc::DelayLineOp>(op)) {
-          if (delay.getQ().use_empty())
-            toErase.push_back(op);
-          return;
-        }
-        if (auto fifo = dyn_cast<pyc::FifoOp>(op)) {
-          if (allResultsUnused(fifo))
-            toErase.push_back(op);
-          return;
-        }
-        if (auto mem = dyn_cast<pyc::ByteMemOp>(op)) {
-          if (mem.getRdata().use_empty())
-            toErase.push_back(op);
-          return;
-        }
-        if (auto mem = dyn_cast<pyc::SyncMemOp>(op)) {
-          if (mem.getRdata().use_empty())
-            toErase.push_back(op);
-          return;
-        }
-        if (auto mem = dyn_cast<pyc::SyncMemDPOp>(op)) {
-          if (mem.getRdata0().use_empty() && mem.getRdata1().use_empty())
-            toErase.push_back(op);
-          return;
-        }
-        if (auto fifo = dyn_cast<pyc::AsyncFifoOp>(op)) {
-          if (allResultsUnused(fifo))
-            toErase.push_back(op);
-          return;
-        }
-        if (auto s = dyn_cast<pyc::CdcSyncOp>(op)) {
-          if (s.getOut().use_empty())
-            toErase.push_back(op);
-          return;
-        }
-      });
-
-      if (toErase.empty())
-        break;
-      for (Operation *op : toErase)
-        op->erase();
-      changed = true;
-    }
-  }
+  void runOnOperation() override { runEliminateDeadState(getOperation()); }
 };
 
 } // namespace

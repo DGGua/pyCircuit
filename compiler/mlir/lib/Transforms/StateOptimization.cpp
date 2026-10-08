@@ -36,7 +36,15 @@ static std::size_t opaqueHash(const void *ptr) {
   return static_cast<std::size_t>(llvm::hash_value(ptr));
 }
 
-static std::size_t semanticValueHash(Value value) {
+
+// A delay tap may replace only a read of an intermediate state.  A second
+// stateful consumer would impose another write/hold boundary and cannot be
+// represented by a read-only view of the compact history.
+
+} // namespace
+
+
+std::size_t semanticValueHash(Value value) {
   value = stripStateAliases(value);
   if (auto constant = value.getDefiningOp<pyc::ConstantOp>()) {
     Attribute literal = constant->getAttr("value");
@@ -47,16 +55,12 @@ static std::size_t semanticValueHash(Value value) {
       value.getType().getAsOpaquePointer(), value.getAsOpaquePointer(), 0));
 }
 
-// A delay tap may replace only a read of an intermediate state.  A second
-// stateful consumer would impose another write/hold boundary and cannot be
-// represented by a read-only view of the compact history.
-static bool isStatefulConsumer(Operation *op) {
+bool isStatefulConsumer(Operation *op) {
   return isa<pyc::RegOp, pyc::DelayLineOp, pyc::FifoOp,
              pyc::ByteMemOp, pyc::SyncMemOp, pyc::SyncMemDPOp,
              pyc::AsyncFifoOp, pyc::CdcSyncOp, pyc::InstanceOp>(op);
 }
 
-} // namespace
 
 std::optional<DelayChainMode> parseDelayChainMode(llvm::StringRef value) {
   if (value == "generated")

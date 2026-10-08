@@ -1,5 +1,7 @@
 #include "pyc/Emit/VerilogEmitter.h"
 
+#include "pyc/Emit/WireDriverCheck.h"
+
 #include "pyc/Dialect/PYC/PYCOps.h"
 #include "pyc/Dialect/PYC/PYCTypes.h"
 
@@ -925,23 +927,6 @@ static bool topoSortCombOps(ArrayRef<Operation *> ops, NameTable &nt, llvm::Smal
   for (unsigned idx : out)
     ordered.push_back(ops[idx]);
   return true;
-}
-
-static LogicalResult rejectMultipleWireDrivers(func::FuncOp f) {
-  llvm::DenseMap<Value, pyc::AssignOp> firstAssign;
-  LogicalResult result = success();
-  f.walk([&](pyc::AssignOp assign) {
-    auto [it, inserted] = firstAssign.try_emplace(assign.getDst(), assign);
-    if (inserted)
-      return WalkResult::advance();
-    // Decision 0137: wire/assign is a single driver. Successive Reg.set
-    // updates must already have been folded in the frontend.
-    result = assign.emitOpError(
-        "has multiple drivers for the same wire; fold successive updates "
-        "into one assign (Reg.set / assign(when=)) or use an explicit net");
-    return WalkResult::interrupt();
-  });
-  return result;
 }
 
 static LogicalResult emitFunc(func::FuncOp f, raw_ostream &os, const VerilogEmitterOptions &opts) {

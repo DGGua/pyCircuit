@@ -87,28 +87,12 @@ struct RetimeStats {
   int64_t blockedCost = 0;
 };
 
-static void setI64Attr(Operation *op, llvm::StringRef name, int64_t value,
-                       bool accumulate = false) {
-  if (accumulate) {
-    if (auto old = op->getAttrOfType<IntegerAttr>(name))
-      value += old.getInt();
-  }
-  OpBuilder builder(op->getContext());
-  op->setAttr(name, builder.getI64IntegerAttr(value));
-}
-
 static bool isAllowedConeOp(Operation *op) {
   return isa<pyc::AliasOp, pyc::AddOp, pyc::SubOp, pyc::MulOp, pyc::AndOp,
              pyc::OrOp, pyc::XorOp, pyc::NotOp, pyc::MuxOp, pyc::EqOp,
              pyc::UltOp, pyc::SltOp, pyc::TruncOp, pyc::ZextOp, pyc::SextOp,
              pyc::ExtractOp, pyc::ShliOp, pyc::LshriOp, pyc::AshriOp,
              pyc::ShlOp, pyc::LshrOp, pyc::AshrOp, pyc::ConcatOp>(op);
-}
-
-static bool isStateBoundary(Operation *op) {
-  return isa<pyc::RegOp, pyc::DelayLineOp, pyc::FifoOp, pyc::ByteMemOp,
-             pyc::SyncMemOp, pyc::SyncMemDPOp, pyc::AsyncFifoOp, pyc::CdcSyncOp,
-             pyc::InstanceOp>(op);
 }
 
 static std::optional<llvm::APInt> constantValue(Value value);
@@ -121,7 +105,7 @@ static unsigned downstreamCombDepth(Value value,
                                     llvm::DenseSet<Operation *> &visiting) {
   unsigned depth = 0;
   for (Operation *user : value.getUsers()) {
-    if (internal.contains(user) || isStateBoundary(user) ||
+    if (internal.contains(user) || isStatefulConsumer(user) ||
         isa<func::ReturnOp, pyc::AssertOp>(user))
       continue;
     if (!isAllowedConeOp(user) || !visiting.insert(user).second)
@@ -716,7 +700,7 @@ static void runCommonDelaySinking(func::FuncOp function, bool rewrite,
         if (!value || !seen.insert(value).second)
           return;
         Operation *def = value.getDefiningOp();
-        if (!def || isStateBoundary(def))
+        if (!def || isStatefulConsumer(def))
           return;
         claimedNextCone.insert(def);
         for (Value operand : def->getOperands())
@@ -1007,27 +991,27 @@ static RetimeStats runRetiming(func::FuncOp function, bool rewrite,
 
 static void writeStats(func::FuncOp function, const RetimeStats &stats,
                        bool accumulate = false) {
-  setI64Attr(function, "pyc.stats.retime_regions_rewritten",
-             stats.regionsRetimed, accumulate);
-  setI64Attr(function, "pyc.stats.retime_regs_rewritten", stats.regsRetimed,
+  setAccumI64Attr(function, "pyc.stats.retime_regions_rewritten",
+                stats.regionsRetimed, accumulate);
+  setAccumI64Attr(function, "pyc.stats.retime_regs_rewritten", stats.regsRetimed,
              accumulate);
-  setI64Attr(function, "pyc.stats.retime_state_primitives_removed",
+  setAccumI64Attr(function, "pyc.stats.retime_state_primitives_removed",
              stats.statePrimitivesRemoved, accumulate);
-  setI64Attr(function, "pyc.stats.retime_taps_created", stats.tapsCreated,
+  setAccumI64Attr(function, "pyc.stats.retime_taps_created", stats.tapsCreated,
              accumulate);
-  setI64Attr(function, "pyc.stats.retime_comb_ops_cloned", stats.combOpsCloned,
+  setAccumI64Attr(function, "pyc.stats.retime_comb_ops_cloned", stats.combOpsCloned,
              accumulate);
-  setI64Attr(function, "pyc.stats.retime_common_delay_sinks",
+  setAccumI64Attr(function, "pyc.stats.retime_common_delay_sinks",
              stats.commonDelaySinks, accumulate);
-  setI64Attr(function, "pyc.stats.retime_common_delay_source_states",
+  setAccumI64Attr(function, "pyc.stats.retime_common_delay_source_states",
              stats.commonDelaySourceStates, accumulate);
-  setI64Attr(function, "pyc.stats.retime_comb_ops_moved", stats.combOpsMoved,
+  setAccumI64Attr(function, "pyc.stats.retime_comb_ops_moved", stats.combOpsMoved,
              accumulate);
-  setI64Attr(function, "pyc.stats.retime_state_bits_removed",
+  setAccumI64Attr(function, "pyc.stats.retime_state_bits_removed",
              stats.stateBitsRemoved, accumulate);
-  setI64Attr(function, "pyc.stats.retime_blocked_init", stats.blockedInit,
+  setAccumI64Attr(function, "pyc.stats.retime_blocked_init", stats.blockedInit,
              accumulate);
-  setI64Attr(function, "pyc.stats.retime_blocked_cost", stats.blockedCost,
+  setAccumI64Attr(function, "pyc.stats.retime_blocked_cost", stats.blockedCost,
              accumulate);
 }
 

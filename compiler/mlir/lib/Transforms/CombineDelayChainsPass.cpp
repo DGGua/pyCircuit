@@ -47,18 +47,6 @@ struct CombineStats {
   int64_t delayTapUsesRewritten = 0;
 };
 
-static int64_t getI64Attr(Operation *op, llvm::StringRef name,
-                          int64_t fallback) {
-  if (auto value = op->getAttrOfType<IntegerAttr>(name))
-    return value.getInt();
-  return fallback;
-}
-
-static void setI64Attr(Operation *op, llvm::StringRef name, int64_t value) {
-  OpBuilder builder(op->getContext());
-  op->setAttr(name, builder.getI64IntegerAttr(value));
-}
-
 static int64_t stateBitWidth(Type type) {
   if (auto integer = dyn_cast<IntegerType>(type))
     return static_cast<int64_t>(integer.getWidth());
@@ -70,12 +58,6 @@ static int64_t stateBitWidth(Type type) {
       return lanes * static_cast<int64_t>(element.getWidth());
   }
   return 0;
-}
-
-static bool isStatefulTapConsumer(Operation *op) {
-  return isa<pyc::RegOp, pyc::DelayLineOp, pyc::FifoOp,
-             pyc::ByteMemOp, pyc::SyncMemOp, pyc::SyncMemDPOp,
-             pyc::AsyncFifoOp, pyc::CdcSyncOp, pyc::InstanceOp>(op);
 }
 
 static Value stripChainAliases(Value value, DelayChainMode mode) {
@@ -175,7 +157,7 @@ static void combineStateChains(func::FuncOp function, CombineStats &stats,
         requiredUser = requiredAlias.getOperation();
       }
       for (Operation *user : reg.getQ().getUsers()) {
-        if (user != requiredUser && isStatefulTapConsumer(user)) {
+        if (user != requiredUser && isStatefulConsumer(user)) {
           hasIllegalFanout = true;
           break;
         }
@@ -193,7 +175,7 @@ static void combineStateChains(func::FuncOp function, CombineStats &stats,
           requiredUser = nextAliasOp.getOperation();
         }
         for (Operation *user : alias.getResult().getUsers()) {
-          if (user != requiredUser && isStatefulTapConsumer(user)) {
+          if (user != requiredUser && isStatefulConsumer(user)) {
             hasIllegalFanout = true;
             break;
           }
@@ -406,12 +388,10 @@ struct CombineDelayChainsPass
   CombineDelayChainsPass(const CombineDelayChainsPass &other)
       : PassWrapper(other) {}
   CombineDelayChainsPass(DelayChainMode mode, bool accumulateStats,
-                         bool cascadeRound, bool mergeOnly, bool skipMerge) {
+                         bool cascadeRound) {
     modeOption = stringifyDelayChainMode(mode).str();
     accumulateStatsOption = accumulateStats;
     cascadeRoundOption = cascadeRound;
-    mergeOnlyOption = mergeOnly;
-    skipMergeOption = skipMerge;
   }
 
   StringRef getArgument() const override { return "pyc-combine-delay-chains"; }
@@ -431,15 +411,6 @@ struct CombineDelayChainsPass
       *this, "cascade-round",
       llvm::cl::desc("Attribute equivalent-state merges to cascade refinement"),
       llvm::cl::init(false)};
-  Option<bool> mergeOnlyOption{
-      *this, "merge-only",
-      llvm::cl::desc("Only merge equivalent registers; do not form histories"),
-      llvm::cl::init(false)};
-  Option<bool> skipMergeOption{
-      *this, "skip-merge",
-      llvm::cl::desc("Form/share histories without equivalent-register merge"),
-      llvm::cl::init(false)};
-
   void runOnOperation() override {
     auto mode = parseDelayChainMode(modeOption);
     if (!mode) {
@@ -452,22 +423,13 @@ struct CombineDelayChainsPass
 
     func::FuncOp function = getOperation();
     CombineStats stats;
-    if (mergeOnlyOption && skipMergeOption) {
-      function.emitError()
-          << "merge-only and skip-merge cannot both be enabled";
-      signalPassFailure();
-      return;
-    }
-    if (*mode == DelayChainMode::Structural && !skipMergeOption)
+    if (*mode == DelayChainMode::Structural)
       mergeEquivalentStates(function, stats);
-    if (!mergeOnlyOption) {
-      combineStateChains(function, stats, *mode);
-      shareEquivalentDelayLines(function, stats, *mode);
-    }
+    combineStateChains(function, stats, *mode);
+    shareEquivalentDelayLines(function, stats, *mode);
     writeCombineStats(function, stats, accumulateStatsOption,
                       cascadeRoundOption, *mode,
-                      *mode == DelayChainMode::Structural &&
-                          !skipMergeOption);
+                      *mode == DelayChainMode::Structural);
   }
 };
 
@@ -475,10 +437,9 @@ struct CombineDelayChainsPass
 
 std::unique_ptr<::mlir::Pass>
 createCombineDelayChainsPass(DelayChainMode mode, bool accumulateStats,
-                             bool cascadeRound, bool mergeOnly,
-                             bool skipMerge) {
-  return std::make_unique<CombineDelayChainsPass>(
-      mode, accumulateStats, cascadeRound, mergeOnly, skipMerge);
+                             bool cascadeRound) {
+  return std::make_unique<CombineDelayChainsPass>(mode, accumulateStats,
+                                                  cascadeRound);
 }
 
 void runDelayChainMergeRound(func::FuncOp function, bool cascadeRound,
