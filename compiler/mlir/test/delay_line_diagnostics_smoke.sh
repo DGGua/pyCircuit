@@ -17,12 +17,17 @@ if [[ -n "${FILECHECK:-}" ]]; then
   FILECHECK_BIN="${FILECHECK}"
 elif command -v FileCheck >/dev/null 2>&1; then
   FILECHECK_BIN="$(command -v FileCheck)"
-elif [[ -x /usr/lib/llvm-19/bin/FileCheck ]]; then
-  FILECHECK_BIN=/usr/lib/llvm-19/bin/FileCheck
-elif [[ -x /usr/lib/llvm-11/bin/FileCheck ]]; then
-  FILECHECK_BIN=/usr/lib/llvm-11/bin/FileCheck
 else
-  FILECHECK_BIN=/usr/lib/llvm-10/bin/FileCheck
+  # Any installed LLVM works; pick the highest version present. Runners
+  # ship varying LLVM versions and often lack the hardcoded 19/11/10.
+  # '|| true' keeps pipefail from aborting on unmatched globs (ls exits 2
+  # when any operand is missing even if others matched); an empty result
+  # is rejected by the guard below.
+  FILECHECK_BIN="$(ls -1v /usr/lib/llvm-*/bin/FileCheck /usr/local/opt/llvm/bin/FileCheck /opt/homebrew/opt/llvm/bin/FileCheck 2>/dev/null | tail -1)" || true
+fi
+if [[ -z "${FILECHECK_BIN}" || ! -x "${FILECHECK_BIN}" ]]; then
+  echo "fail: FileCheck not found (install any llvm package or set FILECHECK)" >&2
+  exit 1
 fi
 
 TMP_DIR="$(mktemp -d /tmp/pyc-delay-line-diagnostics.XXXXXX)"
