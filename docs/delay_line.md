@@ -431,7 +431,6 @@ extract。每个 extract 携带：
 
 ```text
 pyc.state_pack_lsb
-pyc.state_pack_source_width
 ```
 
 packed state 携带：
@@ -711,7 +710,6 @@ C++ 默认路径优化物理对象，但外部可读名字/probe 必须仍能读
 | `state_opt_policy` | `--emit=cpp` 为 `structural`，其它 emit 为 `off` |
 | `state_retime_policy` | `--emit=cpp` 为 `pipeline`，其它 emit 为 `off` |
 | `observe_named` | `--emit=cpp` 为 `demand`（默认）或 `all`；其它 emit 为 `off` |
-| `observe_named_names_stripped` | demand 模式下改成懒查找的 `pyc.name` 数（兼容旧字段名） |
 | `observe_named_names_lazy` | 与 `observe_named_names_stripped` 相同，新名字 |
 | `observe_named_names_kept` | demand 模式下因 @probe/trace/IR 属性保持急切的 `pyc.name` 数 |
 | `state_opt_pack_width` | 实际 Stage 2 width 上限 |

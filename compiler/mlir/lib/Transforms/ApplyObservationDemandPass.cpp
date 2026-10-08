@@ -166,7 +166,6 @@ struct ApplyObservationDemandPass
     if (failed(status))
       return failure();
 
-    setI64Attr(function, "pyc.stats.observe_named_names_stripped", lazy);
     setI64Attr(function, "pyc.stats.observe_named_names_lazy", lazy);
     setI64Attr(function, "pyc.stats.observe_named_names_kept", kept);
     return success();

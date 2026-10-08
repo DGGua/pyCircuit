@@ -610,8 +610,6 @@ static void rewriteCommonDelayRegion(CommonDelayRegion &region,
                                           key.clk, key.rst, key.en, movedNext,
                                           init.getResult());
     reg->setAttr("pyc.optimized_by", builder.getStringAttr(kCommonDelaySink));
-    reg->setAttr("pyc.retime_source_state_count",
-                 builder.getI64IntegerAttr(region.sources.size()));
     replacement = reg.getQ();
   } else {
     auto delay = builder.create<pyc::DelayLineOp>(
@@ -619,8 +617,6 @@ static void rewriteCommonDelayRegion(CommonDelayRegion &region,
         init.getResult());
     delay->setAttr("depth", builder.getI64IntegerAttr(key.depth));
     delay->setAttr("pyc.optimized_by", builder.getStringAttr(kCommonDelaySink));
-    delay->setAttr("pyc.retime_source_state_count",
-                   builder.getI64IntegerAttr(region.sources.size()));
     replacement = delay.getQ();
   }
   region.root->getResult(0).replaceAllUsesWith(replacement);
@@ -649,7 +645,7 @@ static void rewriteCommonDelayRegion(CommonDelayRegion &region,
   stats.statePrimitivesRemoved += region.sources.size() - 1;
 }
 
-static void runCommonDelaySinking(func::FuncOp function, bool rewrite,
+static void runCommonDelaySinking(func::FuncOp function,
                                   unsigned maxCombDepth, RetimeStats &stats) {
   llvm::SmallVector<Operation *> roots;
   function.walk([&](Operation *op) {
@@ -712,8 +708,7 @@ static void runCommonDelaySinking(func::FuncOp function, bool rewrite,
     stats.candidateRegs += region.sources.size();
     stats.candidateCombOps += region.coneOps.size();
     ++stats.commonDelayCandidates;
-    if (rewrite)
-      rewriteCommonDelayRegion(region, stats);
+    rewriteCommonDelayRegion(region, stats);
   }
 }
 
@@ -881,10 +876,6 @@ static void rewriteRegion(PipelineRegion &region, RetimeStats &stats) {
       head.getEn(), head.getNext(), head.getInit());
   line->setAttr("depth", lineBuilder.getI64IntegerAttr(depth));
   line->setAttr("pyc.optimized_by", lineBuilder.getStringAttr(kRetimedBy));
-  line->setAttr("pyc.retime_source_reg_count",
-                lineBuilder.getI64IntegerAttr(depth));
-  line->setAttr("pyc.retime_comb_ops",
-                lineBuilder.getI64IntegerAttr(region.uniqueCombOps));
 
   llvm::SmallVector<llvm::SmallVector<OpOperand *>> externalUses(
       region.regs.size());
@@ -941,11 +932,11 @@ static void rewriteRegion(PipelineRegion &region, RetimeStats &stats) {
   stats.stateBitsRemoved += region.stateBitsRemoved;
 }
 
-static RetimeStats runRetiming(func::FuncOp function, bool rewrite,
-                               unsigned maxStages, unsigned maxExtraCombOps,
+static RetimeStats runRetiming(func::FuncOp function, unsigned maxStages,
+                               unsigned maxExtraCombOps,
                                unsigned maxCombDepth) {
   RetimeStats stats;
-  runCommonDelaySinking(function, rewrite, maxCombDepth, stats);
+  runCommonDelaySinking(function, maxCombDepth, stats);
   llvm::SmallVector<pyc::RegOp> regs;
   function.walk([&](pyc::RegOp reg) {
     regs.push_back(reg);
@@ -983,8 +974,7 @@ static RetimeStats runRetiming(func::FuncOp function, bool rewrite,
     stats.candidateCombOps += region.uniqueCombOps;
     for (pyc::RegOp reg : region.regs)
       claimed.insert(reg.getOperation());
-    if (rewrite)
-      rewriteRegion(region, stats);
+  rewriteRegion(region, stats);
   }
   return stats;
 }
@@ -1054,9 +1044,8 @@ struct RetimePipelinesPass
       llvm::cl::init(false)};
 
   void runOnOperation() override {
-    RetimeStats stats = runRetiming(
-        getOperation(), /*rewrite=*/true, maxStagesOption,
-        maxExtraCombOpsOption, maxCombDepthOption);
+    RetimeStats stats = runRetiming(getOperation(), maxStagesOption,
+                                    maxExtraCombOpsOption, maxCombDepthOption);
     writeStats(getOperation(), stats, accumulateStatsOption);
   }
 };
@@ -1073,8 +1062,8 @@ createRetimePipelinesPass(unsigned maxStages, unsigned maxExtraCombOps,
 void runRetimePipelines(func::FuncOp function, unsigned maxStages,
                         unsigned maxExtraCombOps, unsigned maxCombDepth,
                         bool accumulateStats) {
-  RetimeStats stats = runRetiming(function, /*rewrite=*/true, maxStages,
-                                  maxExtraCombOps, maxCombDepth);
+  RetimeStats stats =
+      runRetiming(function, maxStages, maxExtraCombOps, maxCombDepth);
   writeStats(function, stats, accumulateStats);
 }
 

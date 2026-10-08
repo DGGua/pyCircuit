@@ -6,7 +6,6 @@
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
-#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringRef.h"
@@ -80,19 +79,6 @@ pyc::AliasOp materializeObservationAlias(mlir::OpBuilder &builder,
 /// aliases.
 void remapStateOpIdentity(mlir::OpBuilder &builder, mlir::Operation *oldState,
                           mlir::Value newSource);
-
-/// Identifies state whose logical identity must survive optimization. Value
-/// observability is handled separately by the rewrite's use/fanout proof.
-class StateObservabilityAnalysis {
-public:
-  explicit StateObservabilityAnalysis(mlir::func::FuncOp function,
-                                      bool analyze = true);
-
-  bool isPinned(mlir::Operation *op) const { return pinned.contains(op); }
-
-private:
-  llvm::DenseSet<mlir::Operation *> pinned;
-};
 
 mlir::Value stripStateAliases(mlir::Value value);
 bool equivalentStateValue(mlir::Value lhs, mlir::Value rhs);

@@ -36,13 +36,11 @@ static std::size_t opaqueHash(const void *ptr) {
   return static_cast<std::size_t>(llvm::hash_value(ptr));
 }
 
-
 // A delay tap may replace only a read of an intermediate state.  A second
 // stateful consumer would impose another write/hold boundary and cannot be
 // represented by a read-only view of the compact history.
 
 } // namespace
-
 
 std::size_t semanticValueHash(Value value) {
   value = stripStateAliases(value);
@@ -60,7 +58,6 @@ bool isStatefulConsumer(Operation *op) {
              pyc::ByteMemOp, pyc::SyncMemOp, pyc::SyncMemDPOp,
              pyc::AsyncFifoOp, pyc::CdcSyncOp, pyc::InstanceOp>(op);
 }
-
 
 std::optional<DelayChainMode> parseDelayChainMode(llvm::StringRef value) {
   if (value == "generated")
@@ -178,42 +175,6 @@ void remapStateOpIdentity(OpBuilder &builder, Operation *oldState,
     return;
   materializeObservationAlias(builder, oldState->getLoc(), newSource,
                               oldState);
-}
-
-StateObservabilityAnalysis::StateObservabilityAnalysis(func::FuncOp function,
-                                                       bool analyze) {
-  if (!analyze)
-    return;
-
-  auto inspectState = [&](Operation *state, Value q) {
-    if (shouldKeepStateOptimization(state) || hasStableStateName(state))
-      pinned.insert(state);
-
-    llvm::SmallVector<Value> worklist{q};
-    llvm::DenseSet<Value> seen;
-    while (!worklist.empty()) {
-      Value value = worklist.pop_back_val();
-      if (!seen.insert(value).second)
-        continue;
-      for (Operation *user : value.getUsers()) {
-        auto alias = dyn_cast<pyc::AliasOp>(user);
-        if (!alias)
-          continue;
-        if (shouldKeepStateOptimization(alias) || hasStableStateName(alias))
-          pinned.insert(state);
-        worklist.push_back(alias.getResult());
-      }
-    }
-  };
-
-  function.walk([&](Operation *op) {
-    if (auto reg = dyn_cast<pyc::RegOp>(op)) {
-      inspectState(op, reg.getQ());
-      return;
-    }
-    if (auto delay = dyn_cast<pyc::DelayLineOp>(op))
-      inspectState(op, delay.getQ());
-  });
 }
 
 Value stripStateAliases(Value value) {

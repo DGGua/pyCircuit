@@ -2054,32 +2054,19 @@ struct CompileStatsSummary {
   int64_t delayChainStateWritesAfter = 0;
   int64_t delayChainTapsCreated = 0;
   int64_t delayChainTapUsesRewritten = 0;
-  int64_t retimeRegsSeen = 0;
-  int64_t retimeCandidateRegions = 0;
-  int64_t retimeCandidateRegs = 0;
-  int64_t retimeCandidateCombOps = 0;
   int64_t retimeRegionsRewritten = 0;
   int64_t retimeRegsRewritten = 0;
   int64_t retimeStatePrimitivesRemoved = 0;
   int64_t retimeTapsCreated = 0;
   int64_t retimeCombOpsCloned = 0;
-  int64_t retimeCommonDelayCandidates = 0;
   int64_t retimeCommonDelaySinks = 0;
   int64_t retimeCommonDelaySourceStates = 0;
   int64_t retimeCombOpsMoved = 0;
   int64_t retimeStateBitsRemoved = 0;
   int64_t retimeBlockedInit = 0;
   int64_t retimeBlockedCost = 0;
-  int64_t stateOptRegsSeen = 0;
-  int64_t stateOptGeneratedRegs = 0;
-  int64_t stateOptPinnedRegs = 0;
-  int64_t stateOptMergeCandidates = 0;
-  int64_t stateOptGeneratedChains = 0;
-  int64_t stateOptGeneratedChainRegs = 0;
   int64_t stateOptStructuralChains = 0;
   int64_t stateOptStructuralChainRegs = 0;
-  int64_t stateOptStructuralOnlyChains = 0;
-  int64_t stateOptStructuralOnlyChainRegs = 0;
   int64_t stateOptRegsMerged = 0;
   int64_t stateOptRegBitsRemoved = 0;
   int64_t stateOptStructuralChainsCombined = 0;
@@ -2100,7 +2087,6 @@ struct CompileStatsSummary {
   int64_t logicDepthLimit = 32;
   bool fuseCombEnabled = false;
   std::string observeNamedPolicy;
-  int64_t observeNamedNamesStripped = 0;
   int64_t observeNamedNamesLazy = 0;
   int64_t observeNamedNamesKept = 0;
 };
@@ -2162,17 +2148,6 @@ static CompileStatsSummary collectCompileStats(ModuleOp module, int64_t depthLim
     s.delayChainTapUsesRewritten = satAdd(
         s.delayChainTapUsesRewritten,
         getI64Attr(f, "pyc.stats.delay_chain_tap_uses_rewritten", 0));
-    s.retimeRegsSeen = satAdd(
-        s.retimeRegsSeen, getI64Attr(f, "pyc.stats.retime_regs_seen", 0));
-    s.retimeCandidateRegions = satAdd(
-        s.retimeCandidateRegions,
-        getI64Attr(f, "pyc.stats.retime_candidate_regions", 0));
-    s.retimeCandidateRegs = satAdd(
-        s.retimeCandidateRegs,
-        getI64Attr(f, "pyc.stats.retime_candidate_regs", 0));
-    s.retimeCandidateCombOps = satAdd(
-        s.retimeCandidateCombOps,
-        getI64Attr(f, "pyc.stats.retime_candidate_comb_ops", 0));
     s.retimeRegionsRewritten = satAdd(
         s.retimeRegionsRewritten,
         getI64Attr(f, "pyc.stats.retime_regions_rewritten", 0));
@@ -2188,9 +2163,6 @@ static CompileStatsSummary collectCompileStats(ModuleOp module, int64_t depthLim
     s.retimeCombOpsCloned = satAdd(
         s.retimeCombOpsCloned,
         getI64Attr(f, "pyc.stats.retime_comb_ops_cloned", 0));
-    s.retimeCommonDelayCandidates = satAdd(
-        s.retimeCommonDelayCandidates,
-        getI64Attr(f, "pyc.stats.retime_common_delay_candidates", 0));
     s.retimeCommonDelaySinks = satAdd(
         s.retimeCommonDelaySinks,
         getI64Attr(f, "pyc.stats.retime_common_delay_sinks", 0));
@@ -2209,35 +2181,12 @@ static CompileStatsSummary collectCompileStats(ModuleOp module, int64_t depthLim
     s.retimeBlockedCost = satAdd(
         s.retimeBlockedCost,
         getI64Attr(f, "pyc.stats.retime_blocked_cost", 0));
-    s.stateOptRegsSeen = satAdd(
-        s.stateOptRegsSeen, getI64Attr(f, "pyc.stats.state_opt_regs_seen", 0));
-    s.stateOptGeneratedRegs = satAdd(
-        s.stateOptGeneratedRegs,
-        getI64Attr(f, "pyc.stats.state_opt_generated_regs", 0));
-    s.stateOptPinnedRegs = satAdd(
-        s.stateOptPinnedRegs,
-        getI64Attr(f, "pyc.stats.state_opt_pinned_regs", 0));
-    s.stateOptMergeCandidates = satAdd(
-        s.stateOptMergeCandidates,
-        getI64Attr(f, "pyc.stats.state_opt_merge_candidates", 0));
-    s.stateOptGeneratedChains = satAdd(
-        s.stateOptGeneratedChains,
-        getI64Attr(f, "pyc.stats.state_opt_generated_chains", 0));
-    s.stateOptGeneratedChainRegs = satAdd(
-        s.stateOptGeneratedChainRegs,
-        getI64Attr(f, "pyc.stats.state_opt_generated_chain_regs", 0));
     s.stateOptStructuralChains = satAdd(
         s.stateOptStructuralChains,
         getI64Attr(f, "pyc.stats.state_opt_structural_chains", 0));
     s.stateOptStructuralChainRegs = satAdd(
         s.stateOptStructuralChainRegs,
         getI64Attr(f, "pyc.stats.state_opt_structural_chain_regs", 0));
-    s.stateOptStructuralOnlyChains = satAdd(
-        s.stateOptStructuralOnlyChains,
-        getI64Attr(f, "pyc.stats.state_opt_structural_only_chains", 0));
-    s.stateOptStructuralOnlyChainRegs = satAdd(
-        s.stateOptStructuralOnlyChainRegs,
-        getI64Attr(f, "pyc.stats.state_opt_structural_only_chain_regs", 0));
     s.stateOptRegsMerged = satAdd(
         s.stateOptRegsMerged,
         getI64Attr(f, "pyc.stats.state_opt_regs_merged", 0));
@@ -2276,9 +2225,6 @@ static CompileStatsSummary collectCompileStats(ModuleOp module, int64_t depthLim
         getI64Attr(f, "pyc.stats.state_opt_pack_bits", 0));
     s.memCount = satAdd(s.memCount, getI64Attr(f, "pyc.stats.mem_count", 0));
     s.memBits = satAdd(s.memBits, getI64Attr(f, "pyc.stats.mem_bits", 0));
-    s.observeNamedNamesStripped = satAdd(
-        s.observeNamedNamesStripped,
-        getI64Attr(f, "pyc.stats.observe_named_names_stripped", 0));
     s.observeNamedNamesLazy = satAdd(
         s.observeNamedNamesLazy,
         getI64Attr(f, "pyc.stats.observe_named_names_lazy", 0));
@@ -2344,18 +2290,12 @@ static llvm::json::Object compileStatsToJson(const CompileStatsSummary &s) {
   obj["delay_chain_taps_created"] = s.delayChainTapsCreated;
   obj["delay_chain_tap_uses_rewritten"] =
       s.delayChainTapUsesRewritten;
-  obj["retime_regs_seen"] = s.retimeRegsSeen;
-  obj["retime_candidate_regions"] = s.retimeCandidateRegions;
-  obj["retime_candidate_regs"] = s.retimeCandidateRegs;
-  obj["retime_candidate_comb_ops"] = s.retimeCandidateCombOps;
   obj["retime_regions_rewritten"] = s.retimeRegionsRewritten;
   obj["retime_regs_rewritten"] = s.retimeRegsRewritten;
   obj["retime_state_primitives_removed"] =
       s.retimeStatePrimitivesRemoved;
   obj["retime_taps_created"] = s.retimeTapsCreated;
   obj["retime_comb_ops_cloned"] = s.retimeCombOpsCloned;
-  obj["retime_common_delay_candidates"] =
-      s.retimeCommonDelayCandidates;
   obj["retime_common_delay_sinks"] = s.retimeCommonDelaySinks;
   obj["retime_common_delay_source_states"] =
       s.retimeCommonDelaySourceStates;
@@ -2363,16 +2303,8 @@ static llvm::json::Object compileStatsToJson(const CompileStatsSummary &s) {
   obj["retime_state_bits_removed"] = s.retimeStateBitsRemoved;
   obj["retime_blocked_init"] = s.retimeBlockedInit;
   obj["retime_blocked_cost"] = s.retimeBlockedCost;
-  obj["state_opt_regs_seen"] = s.stateOptRegsSeen;
-  obj["state_opt_generated_regs"] = s.stateOptGeneratedRegs;
-  obj["state_opt_pinned_regs"] = s.stateOptPinnedRegs;
-  obj["state_opt_merge_candidates"] = s.stateOptMergeCandidates;
-  obj["state_opt_generated_chains"] = s.stateOptGeneratedChains;
-  obj["state_opt_generated_chain_regs"] = s.stateOptGeneratedChainRegs;
   obj["state_opt_structural_chains"] = s.stateOptStructuralChains;
   obj["state_opt_structural_chain_regs"] = s.stateOptStructuralChainRegs;
-  obj["state_opt_structural_only_chains"] = s.stateOptStructuralOnlyChains;
-  obj["state_opt_structural_only_chain_regs"] = s.stateOptStructuralOnlyChainRegs;
   obj["state_opt_regs_merged"] = s.stateOptRegsMerged;
   obj["state_opt_reg_bits_removed"] = s.stateOptRegBitsRemoved;
   obj["state_opt_structural_chains_combined"] = s.stateOptStructuralChainsCombined;
@@ -2395,7 +2327,6 @@ static llvm::json::Object compileStatsToJson(const CompileStatsSummary &s) {
   obj["tns"] = s.tns;
   obj["fuse_comb_enabled"] = s.fuseCombEnabled;
   obj["observe_named"] = s.observeNamedPolicy;
-  obj["observe_named_names_stripped"] = s.observeNamedNamesStripped;
   obj["observe_named_names_lazy"] = s.observeNamedNamesLazy;
   obj["observe_named_names_kept"] = s.observeNamedNamesKept;
   return obj;

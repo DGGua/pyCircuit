@@ -489,14 +489,13 @@ static llvm::SmallVector<pyc::CombOp> collectTopLevelCombs(func::FuncOp f) {
 }
 
 /// Returns true for values that must remain struct members (cannot be localized).
-static bool pinToStruct(Value v, const llvm::StringSet<> &traceSelectedFields) {
+static bool pinToStruct(Value v) {
   Operation *def = v.getDefiningOp();
   if (!def)
     return true;
 
   // Named values are registered as probes, and trace-selected fields are a
   // subset of those names. Their addresses must stay valid for the model.
-  (void)traceSelectedFields;
   if (def->hasAttr("pyc.name")) {
     if (auto lazy = def->getAttrOfType<BoolAttr>("pyc.observe_lazy");
         lazy && lazy.getValue()) {
@@ -618,7 +617,7 @@ runCppMemberPlacement(func::FuncOp f, unsigned combChunkNodes,
 
     // Pinned-to-struct values (block args, state ops, comb results, values
     // escaping their comb) always live on the struct.
-    if (pinToStruct(v, traceSelectedFields)) {
+    if (pinToStruct(v)) {
       annotatePlacement(v, CppStorageKind::Struct, {});
       summary.structMembers++;
       if (!def || def->hasAttr("pyc.name"))

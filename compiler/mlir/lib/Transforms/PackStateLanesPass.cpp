@@ -239,8 +239,6 @@ static void packGroup(ArrayRef<StateLane> lanes, PackStats &stats) {
         builder.getI64IntegerAttr(lsb),
         builder.getI64IntegerAttr(lsb + lane.width - 1));
     extract->setAttr("pyc.state_pack_lsb", builder.getI64IntegerAttr(lsb));
-    extract->setAttr("pyc.state_pack_source_width",
-                     builder.getI64IntegerAttr(packedWidth));
     Value replacement = extract.getResult();
     remapStateOpIdentity(builder, lane.op, replacement);
     for (pyc::AliasOp alias : lane.aliases) {

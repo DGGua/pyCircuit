@@ -24,11 +24,9 @@ static LogicalResult canonicalizeAndCSE(func::FuncOp function) {
                                                     function.getContext()),
                                           GreedyRewriteConfig())))
     return failure();
-  RewriterBase::Listener listener;
-  IRRewriter rewriter(function.getContext(), &listener);
+  IRRewriter rewriter(function.getContext());
   DominanceInfo domInfo(function);
-  bool changed = false;
-  eliminateCommonSubExpressions(rewriter, domInfo, function, &changed);
+  eliminateCommonSubExpressions(rewriter, domInfo, function);
   return success();
 }
 
