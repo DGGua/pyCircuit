@@ -211,11 +211,39 @@ def test_multi_assign_emit_has_single_next_driver(tmp_path: Path) -> None:
 
     cpp_files = list((out_dir / "device").rglob("*.cpp"))
     cpp = "\n".join(p.read_text(encoding="utf-8") for p in cpp_files)
-    comb = re.search(r"void\s+\w+::eval_comb_pass\(\)\s*\{(.*?)^\s*\}\s*$", cpp, re.M | re.S)
-    assert comb, "expected eval_comb_pass in generated C++"
-    c_counts = _next_assign_counts(comb.group(1), pattern=r"(\w+__next)\s*=")
-    assert c_counts.get(obs_v) == 1, f"C++ eval_comb_pass writes to {obs_v}: {c_counts}"
-    assert all(n == 1 for n in c_counts.values()), f"C++ repeated next writes: {c_counts}"
+    sig = re.search(r"void\s+\w+::eval_comb_pass\(\)", cpp)
+    assert sig, "expected eval_comb_pass in generated C++"
+    # Brace-match the method body: a lazy `.*?` up to the next `}` line would
+    # stop at the first indented closing brace (\s* spans newlines) and
+    # truncate the body.
+    open_brace = cpp.index("{", sig.end())
+    depth, end = 0, cpp.index("{", sig.end())
+    for i in range(open_brace, len(cpp)):
+        if cpp[i] == "{":
+            depth += 1
+        elif cpp[i] == "}":
+            depth -= 1
+            if depth == 0:
+                end = i
+                break
+    assert depth == 0, "unbalanced braces after eval_comb_pass"
+    comb_body = cpp[open_brace + 1 : end]
+
+    # C++ variables are named by the emitter, not by `pyc.name`: since
+    # --observe-named=demand, undemanded names (compiler-inserted `*_next`
+    # temporaries among them) fall back to op-based identifiers. Resolve the
+    # probe-path -> C++ variable mapping from the registration calls instead.
+    probe_vars = dict(re.findall(r'reg_path\("([^"]+)"\),\s*&(\w+)\)', cpp))
+    next_probes = {p: v for p, v in probe_vars.items() if p.endswith("__next")}
+    assert next_probes, f"no next probes registered: {sorted(probe_vars)[:5]}..."
+    obs_var = next_probes.get(obs_v)
+    assert obs_var, f"{obs_v} not registered as a probe: {sorted(next_probes)[:5]}..."
+
+    c_counts = _next_assign_counts(comb_body, pattern=rf"\b({re.escape(obs_var)})\s*=")
+    assert c_counts.get(obs_var) == 1, f"C++ eval_comb_pass writes to {obs_v} ({obs_var}): {c_counts}"
+    for probe, var in sorted(next_probes.items()):
+        n = len(re.findall(rf"\b{re.escape(var)}\s*=", comb_body))
+        assert n == 1, f"C++ {n} drivers for {probe} ({var}) in eval_comb_pass"
 
 
 def test_multi_assign_cpp_and_verilog_match_spec(tmp_path: Path) -> None:

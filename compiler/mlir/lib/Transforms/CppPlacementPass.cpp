@@ -652,6 +652,11 @@ runCppMemberPlacement(func::FuncOp f, unsigned combChunkNodes,
         continue;
       annotatePlacement(r, CppStorageKind::Struct, {});
       summary.structMembers++;
+      // Eager named values keep a named struct member for probes/trace, so
+      // they count as probe-pinned just like the Phase-B path. Lazy names
+      // (`pyc.observe_lazy`) are lookup-only and must not count.
+      if (op->hasAttr("pyc.name") && !isObserveLazy(op))
+        summary.probePinnedStruct++;
     }
   });
 
