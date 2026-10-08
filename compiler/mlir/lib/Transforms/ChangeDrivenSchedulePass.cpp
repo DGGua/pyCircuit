@@ -25,7 +25,8 @@ bool isChangeScheduleNode(Operation *op) {
                          pyc::CdcSyncOp>(op);
 }
 
-FailureOr<ChangeSchedulePlan> buildChangeDrivenSchedule(func::FuncOp func) {
+FailureOr<ChangeScheduleDag> buildChangeScheduleDag(func::FuncOp func) {
+  ChangeScheduleDag dag;
   ModuleOp module = func->getParentOfType<ModuleOp>();
   if (!module || func.isDeclaration())
     return failure();
@@ -66,7 +67,7 @@ FailureOr<ChangeSchedulePlan> buildChangeDrivenSchedule(func::FuncOp func) {
   for (auto indexed : llvm::enumerate(candidates))
     candidateIndex.try_emplace(indexed.value().valueNode, indexed.index());
 
-  llvm::SmallVector<llvm::DenseSet<unsigned>> predecessors(candidates.size());
+  llvm::SmallVector<llvm::DenseSet<unsigned>> predecessorSets(candidates.size());
   const auto nodes = (*graph)->getNodes();
   const auto edges = (*graph)->getEdges();
 
@@ -83,7 +84,7 @@ FailureOr<ChangeSchedulePlan> buildChangeDrivenSchedule(func::FuncOp func) {
       auto producerIt = candidateIndex.find(nodeId);
       if (producerIt != candidateIndex.end() &&
           producerIt->second != targetIndex) {
-        predecessors[targetIndex].insert(producerIt->second);
+        predecessorSets[targetIndex].insert(producerIt->second);
         continue;
       }
       for (unsigned edgeId : nodes[nodeId].incomingEdges)
@@ -91,11 +92,16 @@ FailureOr<ChangeSchedulePlan> buildChangeDrivenSchedule(func::FuncOp func) {
     }
   }
 
-  llvm::SmallVector<llvm::SmallVector<unsigned>> successors(candidates.size());
+  dag.predecessors.resize(candidates.size());
+  llvm::SmallVector<llvm::SmallVector<unsigned>> &successors = dag.successors;
+  successors.resize(candidates.size());
   std::vector<unsigned> indegree(candidates.size(), 0u);
   for (unsigned target = 0; target < candidates.size(); ++target) {
-    indegree[target] = predecessors[target].size();
-    for (unsigned source : predecessors[target])
+    dag.predecessors[target].assign(predecessorSets[target].begin(),
+                                    predecessorSets[target].end());
+    llvm::sort(dag.predecessors[target]);
+    indegree[target] = dag.predecessors[target].size();
+    for (unsigned source : dag.predecessors[target])
       successors[source].push_back(target);
   }
   for (auto &fanout : successors)
@@ -107,13 +113,12 @@ FailureOr<ChangeSchedulePlan> buildChangeDrivenSchedule(func::FuncOp func) {
     if (indegree[index] == 0)
       ready.push(index);
 
-  llvm::SmallVector<unsigned> textualToSchedule(candidates.size(), 0u);
-  llvm::SmallVector<uint64_t> ranks(candidates.size(), 0u);
-  llvm::SmallVector<unsigned> scheduleToTextual;
+  llvm::SmallVector<unsigned> &scheduleToTextual = dag.scheduleToTextual;
+  llvm::SmallVector<uint64_t> &ranks = dag.ranks;
+  ranks.resize(candidates.size(), 0u);
   while (!ready.empty()) {
     unsigned source = ready.top();
     ready.pop();
-    textualToSchedule[source] = scheduleToTextual.size();
     scheduleToTextual.push_back(source);
     for (unsigned target : successors[source]) {
       ranks[target] = std::max(ranks[target], ranks[source] + 1);
@@ -126,13 +131,40 @@ FailureOr<ChangeSchedulePlan> buildChangeDrivenSchedule(func::FuncOp func) {
     return failure();
   }
 
+  dag.operations.reserve(candidates.size());
+  dag.resultIndex.reserve(candidates.size());
+  for (const Candidate &candidate : candidates) {
+    dag.operations.push_back(candidate.operation);
+    dag.resultIndex.push_back(candidate.resultIndex);
+  }
+  return std::move(dag);
+}
+
+FailureOr<ChangeSchedulePlan> buildChangeDrivenSchedule(func::FuncOp func) {
+  auto dag = buildChangeScheduleDag(func);
+  if (failed(dag))
+    return failure();
+
+  const llvm::SmallVector<Operation *> &candidates = (*dag).operations;
+  const llvm::SmallVector<unsigned> &candidateResultIndex =
+      (*dag).resultIndex;
+  const llvm::SmallVector<llvm::SmallVector<unsigned>> &successors =
+      (*dag).successors;
+  const llvm::SmallVector<unsigned> &scheduleToTextual =
+      (*dag).scheduleToTextual;
+  const llvm::SmallVector<uint64_t> &ranks = (*dag).ranks;
+
+  llvm::SmallVector<unsigned> textualToSchedule(candidates.size(), 0u);
+  for (auto scheduled : llvm::enumerate(scheduleToTextual))
+    textualToSchedule[scheduled.value()] = scheduled.index();
+
   ChangeSchedulePlan plan;
   plan.nodes.reserve(candidates.size());
   for (auto scheduled : llvm::enumerate(scheduleToTextual)) {
     unsigned textualIndex = scheduled.value();
     ChangeScheduleNode node;
-    node.operation = candidates[textualIndex].operation;
-    node.resultIndex = candidates[textualIndex].resultIndex;
+    node.operation = candidates[textualIndex];
+    node.resultIndex = candidateResultIndex[textualIndex];
     node.id = scheduled.index();
     node.slot = scheduled.index();
     node.rank = ranks[textualIndex];

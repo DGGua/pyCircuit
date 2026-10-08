@@ -38,6 +38,25 @@ struct ChangeSchedulePlan {
   uint64_t rankCount = 0;
 };
 
+/// Candidate scheduling units with their same-tick dependency DAG, shared by
+/// the schedule planner and the comb partitioner.
+/// - `operations`/`resultIndex` list candidates in textual order.
+/// - `predecessors`/`successors` use textual indices; both are sorted.
+/// - `scheduleToTextual` is the deterministic topological order (schedule slot
+///   order); `ranks` are per textual index.
+struct ChangeScheduleDag {
+  llvm::SmallVector<mlir::Operation *> operations;
+  llvm::SmallVector<unsigned> resultIndex;
+  llvm::SmallVector<llvm::SmallVector<unsigned>> predecessors;
+  llvm::SmallVector<llvm::SmallVector<unsigned>> successors;
+  llvm::SmallVector<unsigned> scheduleToTextual;
+  llvm::SmallVector<uint64_t> ranks;
+};
+
+/// Builds the candidate dependency DAG shared by scheduling and partitioning.
+mlir::FailureOr<ChangeScheduleDag>
+buildChangeScheduleDag(mlir::func::FuncOp func);
+
 /// Builds the deterministic function-local schedule attached to the function.
 mlir::FailureOr<ChangeSchedulePlan>
 buildChangeDrivenSchedule(mlir::func::FuncOp func);
