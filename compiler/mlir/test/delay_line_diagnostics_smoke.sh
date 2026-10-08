@@ -116,4 +116,17 @@ if needle not in stderr:
     raise AssertionError(f"missing stderr summary: {needle}\nactual stderr:\n{stderr}")
 PY
 
+# Vector delay taps must slice the per-lane history bus after the lane
+# index: `assign tap[i] = q__history[i][stage*W +: W]`. The element-wise
+# vector walk used to rebind names per lane and corrupt the reference.
+"${PYCC:-pycc}" "${ROOT}/compiler/mlir/test/delay_line_vector_tap.mlir" \
+  --emit=verilog --include-primitives=false \
+  -o "${TMP_DIR}/vector_tap.v"
+grep -q 'assign pyc_delay_tap_3\[0\] = pyc_delay_line_2__history\[0\]\[15:8\];' \
+  "${TMP_DIR}/vector_tap.v"
+if grep -qE '\[[0-9]+\]__history' "${TMP_DIR}/vector_tap.v"; then
+  echo "fail: vector tap history reference is lane-mangled" >&2
+  exit 1
+fi
+
 echo "delay_line_diagnostics_smoke: PASS"

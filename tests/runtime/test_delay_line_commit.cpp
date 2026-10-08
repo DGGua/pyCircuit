@@ -22,27 +22,31 @@ void posedge(pyc_delay_line<8, 2> &delay, Wire<1> &clk) {
   delay.tick_compute();
 }
 
-void testScalarCommitReportsOutputChange() {
+void testScalarCommitReportsAdvance() {
   Wire<1> clk{}, rst{}, en{};
   Wire<8> d{}, init{}, q{};
   pyc_delay_line<8, 2> delay(clk, rst, en, d, init, q);
 
+  // No pending edge -> no advance, so no wake needed.
   assert(!delay.tick_commit());
 
   rst = Wire<1>(1);
   en = Wire<1>(0);
   init = Wire<8>(0);
   posedge(delay, clk);
-  // q and init are both 0, so reset does not change the visible output.
-  assert(!delay.tick_commit());
+  // A reset commit advances state and must wake tap consumers even if the
+  // tail happens to match init.
+  assert(delay.tick_commit());
   assert(q.value() == 0);
 
   rst = Wire<1>(0);
   en = Wire<1>(1);
   d = Wire<8>(7);
   posedge(delay, clk);
-  assert(!delay.tick_commit());
+  // Tail q is still 0, but tap(1) shifted from 0 to 7 - consumers must wake.
+  assert(delay.tick_commit());
   assert(q.value() == 0);
+  assert(delay.tap(1).value() == 7);
 
   d = Wire<8>(9);
   posedge(delay, clk);
@@ -58,6 +62,6 @@ void testScalarCommitReportsOutputChange() {
 } // namespace
 
 int main() {
-  testScalarCommitReportsOutputChange();
+  testScalarCommitReportsAdvance();
   return 0;
 }

@@ -432,6 +432,30 @@ public:
     return id;
   }
 
+  // Slice a specific delay-line stage: read `extract<W,StorageW>(tap(depth), lsb)`
+  // and route force-writes to that stage's own qNext.
+  template <unsigned W, unsigned StorageW, typename DelayInst>
+  std::uint64_t addRegLazyTapSlice(std::string path, DelayInst *inst,
+                                   unsigned depth, unsigned lsb,
+                                   bool *write_valid,
+                                   Wire<StorageW> *write_data) {
+    const std::uint64_t id = addImpl(std::move(path),
+                   ProbeKind::Reg,
+                   /*width_bits=*/W,
+                   static_cast<void *>(inst),
+                   write_valid,
+                   static_cast<const void *>(write_data),
+                   /*write_width_bits=*/W,
+                   /*write_storage_width_bits=*/StorageW,
+                   /*write_lsb_bits=*/lsb);
+    if (Entry *e = const_cast<Entry *>(findById(id))) {
+      e->read_u64 = [inst, depth, lsb]() -> std::uint64_t {
+        return extract<W, StorageW>(inst->tap(depth), lsb).value();
+      };
+    }
+    return id;
+  }
+
   template <typename MemT>
   std::uint64_t addMem(std::string path, MemT *mem) {
     return addImpl(std::move(path), ProbeKind::Mem, /*width_bits=*/0, static_cast<void *>(mem));

@@ -2426,10 +2426,11 @@ def _cmd_build(args: argparse.Namespace) -> int:
         # Observation demand makes emitted C++ depend on the probe plan: a
         # probe alias change keeps/strips eager storage even when the hardware
         # is unchanged, so the alias paths must participate in the C++ cache
-        # key or stale headers silently break addAlias/dut.read.
+        # key or stale headers silently break addAlias/dut.read. Both the
+        # canonical and the source path are emitted as registrations.
         sym_prefix = f"{sym}:"
         probe_paths = sorted(
-            str(alias.get("source_path", ""))
+            f"{alias.get('canonical_path', '')}->{alias.get('source_path', '')}"
             for alias in probe_plan_obj["aliases"]
             if str(alias.get("source_path", "")).startswith(sym_prefix)
         )

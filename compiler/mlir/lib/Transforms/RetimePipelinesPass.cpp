@@ -621,11 +621,18 @@ static void rewriteCommonDelayRegion(CommonDelayRegion &region,
   }
   region.root->getResult(0).replaceAllUsesWith(replacement);
 
+  // Frontend names (`pyc.name`, etc.) may live on `pyc.alias` ops of a
+  // source's `q` that also appear in `coneOps`. Preserving them keeps
+  // `dut.read` / probe / VCD lookups working on the retained history.
   for (Operation *op : llvm::reverse(region.coneOps)) {
     bool unused = llvm::all_of(op->getResults(),
                                [](Value value) { return value.use_empty(); });
-    if (unused)
-      op->erase();
+    if (!unused)
+      continue;
+    if (auto alias = dyn_cast<pyc::AliasOp>(op))
+      if (hasExternalObservationIdentity(alias))
+        continue;
+    op->erase();
   }
   for (const StateSource &source : region.sources) {
     // Named/probed sources stay as read-only histories so dut.read still
@@ -879,10 +886,17 @@ static void rewriteRegion(PipelineRegion &region, RetimeStats &stats) {
 
   llvm::SmallVector<llvm::SmallVector<OpOperand *>> externalUses(
       region.regs.size());
+  llvm::DenseSet<Operation *> rewriteAliased;
   for (unsigned i = 0; i < region.regs.size(); ++i) {
     for (OpOperand &use : region.regs[i].getQ().getUses()) {
       Operation *user = use.getOwner();
-      if (region.coneSet.contains(user))
+      // Observation-identity aliases must have their operand rewritten to the
+      // rebuilt view even when they sit inside the cone, or cone cleanup
+      // drops them and name-based lookups stop working.
+      if (auto alias = dyn_cast<pyc::AliasOp>(user))
+        if (hasExternalObservationIdentity(alias))
+          rewriteAliased.insert(alias.getOperation());
+      if (region.coneSet.contains(user) && !rewriteAliased.contains(user))
         continue;
       if (i + 1 < region.regs.size() &&
           user == region.regs[i + 1].getOperation())
@@ -919,8 +933,14 @@ static void rewriteRegion(PipelineRegion &region, RetimeStats &stats) {
     for (Operation *op : llvm::reverse(region.links[i - 1].coneOps)) {
       bool unused = llvm::all_of(op->getResults(),
                                  [](Value value) { return value.use_empty(); });
-      if (unused)
-        op->erase();
+      if (!unused)
+        continue;
+      // Observation-identity aliases were rewritten onto the rebuilt view
+      // above and must survive to keep name-based lookups working.
+      if (auto alias = dyn_cast<pyc::AliasOp>(op))
+        if (hasExternalObservationIdentity(alias))
+          continue;
+      op->erase();
     }
   }
   head.erase();

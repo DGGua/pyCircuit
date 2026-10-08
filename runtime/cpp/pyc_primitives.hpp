@@ -183,11 +183,13 @@ public:
     return depth == 1 ? sampledInput : tap(depth - 1);
   }
 
-  // Applies a pending edge and reports whether the visible delay output changed.
+  // Applies a pending edge and reports whether any visible delay output
+  // (tail `q` or any intermediate tap) may have changed. Every enabled edge
+  // shifts every tap by one slot, so a false return would leave tap
+  // consumers stale on cycles where only the tail happens to be unchanged.
   inline bool tick_commit() {
     if (__builtin_expect(!pending, 1))
       return false;
-    const bool changed = q != qNext;
     if (pendingReset) {
       stages.fill(init);
       head = 0;
@@ -197,7 +199,7 @@ public:
     }
     q = qNext;
     pending = false;
-    return changed;
+    return true;
   }
 
 private:
@@ -329,11 +331,13 @@ public:
     pending = false;
   }
 
-  // Applies a pending edge and reports whether the visible vector output changed.
+  // Applies a pending edge and reports whether any visible delay output
+  // (tail `q` or any intermediate tap) may have changed. Every enabled edge
+  // shifts every tap by one slot, so a false return would leave tap
+  // consumers stale on cycles where only the tail happens to be unchanged.
   inline bool tick_commit() {
     if (__builtin_expect(!pending, 1))
       return false;
-    const bool changed = q != qNext;
     if (pendingReset) {
       stages.fill(init);
       head = 0;
@@ -343,7 +347,7 @@ public:
     }
     q = qNext;
     pending = false;
-    return changed;
+    return true;
   }
 
   inline T tap(unsigned depth) const {
