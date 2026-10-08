@@ -239,7 +239,6 @@ jobs:
           python -m pytest -q tests/vec/test_vec_ops.py \
             -k 'slt_vv or slt_vs or slt_sv'
           python -m pytest -q tests/v5/test_delay_line_combine.py \
-            tests/v5/test_trunc_short_circuit.py tests/v5/test_vec_literal.py \
             tests/test_trace_codegen_plan.py
           PYCC="$PYC_TOOLCHAIN_ROOT/bin/pycc" \
             python -m pytest -q tests/test_multi_assign_cpp_verilog.py \

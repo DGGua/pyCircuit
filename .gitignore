@@ -255,7 +255,3 @@ designs/outerCube/
 # gate outputs
 docs/gates
 
-# Local experiment notes and harnesses.
-verification
-docs/superpowers
-reports

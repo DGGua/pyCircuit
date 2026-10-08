@@ -3607,7 +3607,7 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
     std::string key = nt.get(sync.getOut()) + "_inst";
     emitStateTickCompute(key, sync->getOperands(), "    ",
                          [&](llvm::StringRef indent) {
-                           os << indent << key << "->tick_compute();\n";
+                           os << indent << key << ".tick_compute();\n";
                          });
   }
   os << "  }\n\n";
@@ -3704,7 +3704,7 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
     std::string key = nt.get(sync.getOut()) + "_inst";
     std::string changed = "_pyc_commit_changed_" + key;
     os << "    const bool " << changed << " = " << key
-       << "->tick_commit();\n";
+       << ".tick_commit();\n";
     emitCommitWake(changed, sync.getOut());
   }
   if (!instInfos.empty()) {

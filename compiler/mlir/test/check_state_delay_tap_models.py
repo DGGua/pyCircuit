@@ -13,7 +13,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[2]
-DEFAULT_BUILD = ROOT / ".pycircuit_out/toolchain/build-delay-line/bin"
+DEFAULT_BUILD = ROOT / ".pycircuit_out/toolchain/build/bin"
 RESULT_RE = re.compile(r"cycles=(\d+) checksum=(\d+)")
 
 

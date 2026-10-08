@@ -3,8 +3,8 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
-PYC_OPT="${PYC_OPT:-${ROOT}/.pycircuit_out/toolchain/build-delay-line/bin/pyc-opt}"
-PYCC="${PYCC:-${ROOT}/.pycircuit_out/toolchain/build-delay-line/bin/pycc}"
+PYC_OPT="${PYC_OPT:-${ROOT}/.pycircuit_out/toolchain/build/bin/pyc-opt}"
+PYCC="${PYCC:-${ROOT}/.pycircuit_out/toolchain/build/bin/pycc}"
 INPUT="${ROOT}/compiler/mlir/test/state_delay_optimization.mlir"
 DEFAULT_INPUT="${ROOT}/compiler/mlir/test/state_delay_default_structural.mlir"
 STAGE15_STAGE2_INPUT="${ROOT}/compiler/mlir/test/state_optimization_stage15_stage2.mlir"
