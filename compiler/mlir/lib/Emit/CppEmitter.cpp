@@ -3661,9 +3661,20 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
   for (auto delay : delayLines) {
     std::string key = nt.get(delay.getQ()) + "_inst";
     std::string changed = "_pyc_commit_changed_" + key;
+    // Two wake domains: tail-`q` consumers re-evaluate only when the tail
+    // changes, while tap consumers must wake on every advanced edge (each
+    // enabled edge shifts every tap) even when the tail repeats.
+    std::string advanced = "_pyc_commit_advanced_" + key;
+    os << "    const bool " << advanced << " = " << key
+       << "->has_pending();\n";
     os << "    const bool " << changed << " = " << key
        << "->tick_commit();\n";
     emitCommitWake(changed, delay.getQ());
+    for (auto tap : delayTaps) {
+      if (tap.getLine() != delay.getQ())
+        continue;
+      emitCommitWake(advanced, tap.getTap());
+    }
   }
   for (auto fifo : fifos) {
     std::string key = nt.get(fifo.getInReady()) + "_inst";

@@ -183,13 +183,18 @@ public:
     return depth == 1 ? sampledInput : tap(depth - 1);
   }
 
-  // Applies a pending edge and reports whether any visible delay output
-  // (tail `q` or any intermediate tap) may have changed. Every enabled edge
-  // shifts every tap by one slot, so a false return would leave tap
-  // consumers stale on cycles where only the tail happens to be unchanged.
+  // True while an enabled edge is waiting for tick_commit. Tap consumers
+  // must wake on this (every enabled edge shifts every tap), while tail-`q`
+  // consumers can use tick_commit's tail-change result directly.
+  inline bool has_pending() const { return pending; }
+
+  // Applies a pending edge and reports whether the tail `q` changed. Tap
+  // consumers wake via has_pending(); a tail-only result would leave them
+  // stale on cycles where the tail happens to repeat.
   inline bool tick_commit() {
     if (__builtin_expect(!pending, 1))
       return false;
+    const bool changed = q != qNext;
     if (pendingReset) {
       stages.fill(init);
       head = 0;
@@ -199,7 +204,7 @@ public:
     }
     q = qNext;
     pending = false;
-    return true;
+    return changed;
   }
 
 private:
@@ -331,13 +336,16 @@ public:
     pending = false;
   }
 
-  // Applies a pending edge and reports whether any visible delay output
-  // (tail `q` or any intermediate tap) may have changed. Every enabled edge
-  // shifts every tap by one slot, so a false return would leave tap
-  // consumers stale on cycles where only the tail happens to be unchanged.
+  // True while an enabled edge is waiting for tick_commit. Tap consumers
+  // must wake on this (every enabled edge shifts every tap).
+  inline bool has_pending() const { return pending; }
+
+  // Applies a pending edge and reports whether the tail `q` changed; tap
+  // consumers wake via has_pending() (see the scalar note above).
   inline bool tick_commit() {
     if (__builtin_expect(!pending, 1))
       return false;
+    const bool changed = q != qNext;
     if (pendingReset) {
       stages.fill(init);
       head = 0;
@@ -347,7 +355,7 @@ public:
     }
     q = qNext;
     pending = false;
-    return true;
+    return changed;
   }
 
   inline T tap(unsigned depth) const {
