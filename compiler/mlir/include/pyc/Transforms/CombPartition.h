@@ -36,7 +36,8 @@ struct CombPartitionPlan {
 /// standalone scheduling units. `targetSize == 0` disables merging and yields
 /// identity partitions.
 mlir::FailureOr<CombPartitionPlan>
-buildCombPartition(const ChangeScheduleDag &dag, uint64_t targetSize);
+buildCombPartition(const ChangeScheduleDag &dag, uint64_t targetSize,
+                   mlir::func::FuncOp func = mlir::func::FuncOp());
 
 std::unique_ptr<mlir::Pass> createCombPartitionPass(uint64_t targetSize);
 
