@@ -3673,21 +3673,7 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
     for (auto tap : delayTaps) {
       if (tap.getLine() != delay.getQ())
         continue;
-      // Wake the tap's fanout only when the sampled tap value actually
-      // changed; every advanced edge shifts the tap, but a repeating value
-      // must not re-evaluate the downstream combinational cones.
-      const std::string tapWire = nt.get(tap.getTap());
-      const std::string tapQNext = tapWire + "_qNext";
-      const std::string tapChanged = tapWire + "_changed";
-      os << "    if (" << advanced << ") {\n";
-      os << "      const bool " << tapChanged << " = " << tapQNext
-         << " != " << tapWire << ";\n";
-      os << "      " << tapWire << " = " << tapQNext << ";\n";
-      os << "      if (" << tapChanged << ") {\n";
-      emitMetadataCombFanout(tap.getTap(), os, *schedule, combIndex, nt,
-                             "        ");
-      os << "      }\n";
-      os << "    }\n";
+      emitCommitWake(advanced, tap.getTap());
     }
   }
   for (auto fifo : fifos) {
