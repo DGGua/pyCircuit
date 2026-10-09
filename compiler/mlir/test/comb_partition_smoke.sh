@@ -7,7 +7,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 PYCC="${PYCC:-${ROOT}/.pycircuit_out/toolchain/build/bin/pycc}"
 CXX="${CXX:-c++}"
-INPUT="${ROOT}/compiler/mlir/test/Inputs/comb_dirty_scheduler.mlir"
+INPUT="${ROOT}/compiler/mlir/test/Inputs/comb_graph_partition.mlir"
 DRIVER="${ROOT}/compiler/mlir/test/Inputs/comb_partition_trace_driver.cpp"
 OUT="${ROOT}/.pycircuit_out/gates/comb_partition"
 
@@ -22,25 +22,25 @@ mkdir -p "${OUT}/default" "${OUT}/part"
 common=(--logic-depth=256 --build-profile=dev-fast
         --inline-policy=off --hierarchy-policy=strict)
 
-"${PYCC}" "${INPUT}" --emit=cpp -o "${OUT}/default/comb_dirty_scheduler.cpp" "${common[@]}"
-"${PYCC}" "${INPUT}" --emit=cpp -o "${OUT}/part/comb_dirty_scheduler.cpp" "${common[@]}" \
+"${PYCC}" "${INPUT}" --emit=cpp -o "${OUT}/default/graph_partition.cpp" "${common[@]}"
+"${PYCC}" "${INPUT}" --emit=cpp -o "${OUT}/part/graph_partition.cpp" "${common[@]}" \
   --comb-partition-size=64
 
 # Structural expectations for the partitioned build: all four dependent combs
 # merge into one partition, the constant comb stays standalone.
-grep -q 'eval_comb_part_0()' "${OUT}/part/comb_dirty_scheduler.cpp"
-grep -q 'eval_comb_part_1()' "${OUT}/part/comb_dirty_scheduler.cpp"
-if grep -q 'eval_comb_part_2()' "${OUT}/part/comb_dirty_scheduler.cpp"; then
+grep -q 'eval_comb_part_0()' "${OUT}/part/graph_partition.cpp"
+grep -q 'eval_comb_part_1()' "${OUT}/part/graph_partition.cpp"
+if grep -q 'eval_comb_part_2()' "${OUT}/part/graph_partition.cpp"; then
   echo "fail: expected two comb partitions, found three" >&2
   exit 1
 fi
-grep -q '_pyc_part_0_inputs_valid' "${OUT}/part/comb_dirty_scheduler.cpp"
-grep -q 'pyc::cpp::DirtyBitset<2>' "${OUT}/part/comb_dirty_scheduler.cpp"
-grep -q '_pyc_comb_0_input_0' "${OUT}/part/comb_dirty_scheduler.cpp"
+grep -q '_pyc_part_0_inputs_valid' "${OUT}/part/graph_partition.cpp"
+grep -q 'pyc::cpp::DirtyBitset<2>' "${OUT}/part/graph_partition.cpp"
+grep -q '_pyc_comb_0_input_0' "${OUT}/part/graph_partition.cpp"
 # The partition guard must compare the polled inputs of all member regions.
-grep -q '_pyc_comb_0_input_0' "${OUT}/part/comb_dirty_scheduler.cpp"
-grep -q '_pyc_comb_0_input_1' "${OUT}/part/comb_dirty_scheduler.cpp"
-grep -q '_pyc_comb_2_input_1' "${OUT}/part/comb_dirty_scheduler.cpp"
+grep -q '_pyc_comb_0_input_0' "${OUT}/part/graph_partition.cpp"
+grep -q '_pyc_comb_0_input_1' "${OUT}/part/graph_partition.cpp"
+grep -q '_pyc_comb_2_input_1' "${OUT}/part/graph_partition.cpp"
 
 for mode in default part; do
   "${CXX}" -std=c++17 -O0 \

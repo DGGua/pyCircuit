@@ -155,6 +155,8 @@ struct FuseCombPass : public PassWrapper<FuseCombPass, OperationPass<func::FuncO
       idx[op] = static_cast<unsigned>(i);
     const unsigned n = ops.size();
 
+    preds.assign(n, {});
+    succs.assign(n, {});
     for (unsigned v = 0; v < n; ++v) {
       for (Value operand : ops[v]->getOperands()) {
         Operation *def = operand.getDefiningOp();
