@@ -6,8 +6,11 @@
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/Pass/Pass.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/SmallSet.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
+
+#include <functional>
 
 using namespace mlir;
 
@@ -151,343 +154,443 @@ struct CombPartitionPass
 } // namespace
 
 FailureOr<CombPartitionPlan>
-buildAtomPartitioning(unsigned atomCount, ArrayRef<uint64_t> atomWeight,
-                      ArrayRef<SmallVector<unsigned>> atomPreds,
-                      ArrayRef<unsigned> atomSlot, uint64_t targetSize);
-
-FailureOr<CombPartitionPlan>
 buildCombPartition(const ChangeScheduleDag &dag, uint64_t targetSize,
                    mlir::func::FuncOp func) {
-  auto graph = buildRegionGraph(dag);
-  if (failed(graph)) {
-    func.emitError("comb partition: unscheduled comb region in slot order");
-    return failure();
-  }
-  const RegionGraph &g = *graph;
-  const unsigned regionCount = g.regions.size();
+  // ESSENT-style acyclic partitioning (Beamer & Donofrio, DAC 2020,
+  // Section IV): bootstrap with MFFC decomposition, then merge phases
+  // (single-parent, small+small siblings, small+any sibling) guarded by the
+  // external-path merge test.
+  //
+  // Our graph nodes are scheduled comb results (candidates) rather than raw
+  // netlist gates; comb regions are the emission unit, so candidates of one
+  // region are constrained into one partition.
 
+  // 1. Candidate-level comb-only graph.
+  const unsigned totalCandidates = dag.operations.size();
+  llvm::SmallVector<unsigned> localOf(totalCandidates, ~0u);
+  llvm::SmallVector<unsigned> globalOf;
+  globalOf.reserve(totalCandidates);
+  for (unsigned t = 0; t < totalCandidates; ++t) {
+    if (!isa<CombOp>(dag.operations[t]))
+      continue;
+    localOf[t] = globalOf.size();
+    globalOf.push_back(t);
+  }
+  const unsigned n = globalOf.size();
   CombPartitionPlan plan;
-  plan.partitionCount = regionCount;
-  if (regionCount == 0)
+  plan.partitionCount = n;
+  if (n == 0)
     return plan;
 
-  // Collapse region-level strongly connected components into atoms. The
-  // candidate DAG is acyclic, but condensing candidates into multi-result
-  // regions can create cycles at region granularity (result A of region R
-  // feeds region Q, whose result feeds result B of R). Members of one SCC
-  // are mutually dependent and must be evaluated together, so they are a
-  // single partitioning atom.
-  llvm::SmallVector<unsigned> atomOfRegion(regionCount, 0u);
+  llvm::SmallVector<llvm::SmallVector<unsigned>> succs(n), preds(n);
+  for (unsigned t = 0; t < totalCandidates; ++t) {
+    unsigned lt = localOf[t];
+    if (lt == ~0u)
+      continue;
+    for (unsigned p : dag.predecessors[t]) {
+      unsigned lp = localOf[p];
+      if (lp != ~0u)
+        preds[lt].push_back(lp);
+    }
+    for (unsigned sc : dag.successors[t]) {
+      unsigned ls = localOf[sc];
+      if (ls != ~0u)
+        succs[lt].push_back(ls);
+    }
+  }
+
+  // Union-find over partitions.
+  unsigned partCount = n;
+  llvm::SmallVector<int> parent(n);
+  llvm::SmallVector<uint64_t> psize(n, 1);
+  for (int i = 0; i < static_cast<int>(n); ++i)
+    parent[i] = i;
+  std::function<int(int)> find = [&](int x) {
+    while (parent[x] != x) {
+      parent[x] = parent[parent[x]];
+      x = parent[x];
+    }
+    return x;
+  };
+  auto members = [&](int root) {
+    llvm::SmallVector<unsigned> out;
+    for (unsigned i = 0; i < n; ++i)
+      if (find(i) == root)
+        out.push_back(i);
+    return out;
+  };
+  auto unionPartitions = [&](int a, int b) {
+    int ra = find(a), rb = find(b);
+    if (ra == rb)
+      return ra;
+    if (psize[ra] < psize[rb])
+      std::swap(ra, rb);
+    parent[rb] = ra;
+    psize[ra] += psize[rb];
+    --partCount;
+    return ra;
+  };
+
+  // 2. MFFC bootstrap: crawl upward from each unassigned candidate (slot
+  // order reversed for determinism); a predecessor joins the cone only when
+  // all of its comb successors are already inside the cone.
+  llvm::SmallVector<int> coneOf(n, -1);
+  llvm::SmallVector<llvm::SmallVector<unsigned>> cones;
+  llvm::SmallVector<unsigned> slotOrderLocal;
+  slotOrderLocal.reserve(n);
   {
-    // Iterative Tarjan over the region graph.
-    enum : unsigned char { kUnvisited = 0, kOpen = 1, kDone = 2 };
-    llvm::SmallVector<unsigned char> state(regionCount, kUnvisited);
-    llvm::SmallVector<unsigned> index(regionCount, 0u), low(regionCount, 0u);
-    llvm::SmallVector<int> onStack(regionCount, 0);
-    llvm::SmallVector<unsigned> stack;
-    llvm::SmallVector<int64_t> iter(regionCount, -1);
-    llvm::SmallVector<unsigned> frames;
-    unsigned nextIndex = 0;
-    unsigned atomCount = 0;
-    for (unsigned root = 0; root < regionCount; ++root) {
-      if (state[root] != kUnvisited)
-        continue;
-      frames.push_back(root);
-      state[root] = kOpen;
-      index[root] = low[root] = nextIndex++;
-      stack.push_back(root);
-      onStack[root] = 1;
-      while (!frames.empty()) {
-        unsigned v = frames.back();
-        if (++iter[v] < static_cast<int64_t>(g.preds[v].size())) {
-          // preds are predecessors; SCC over predecessors == over successors
-          // for condensation purposes (same components).
-          unsigned w = g.preds[v][iter[v]];
-          if (state[w] == kUnvisited) {
-            state[w] = kOpen;
-            index[w] = low[w] = nextIndex++;
-            stack.push_back(w);
-            onStack[w] = 1;
-            frames.push_back(w);
-          } else if (onStack[w]) {
-            low[v] = std::min(low[v], index[w]);
-          }
-          continue;
-        }
-        frames.pop_back();
-        if (low[v] == index[v]) {
-          unsigned w;
-          do {
-            w = stack.back();
-            stack.pop_back();
-            onStack[w] = 0;
-            atomOfRegion[w] = atomCount;
-          } while (w != v);
-          ++atomCount;
-        }
-        if (!frames.empty()) {
-          unsigned parent = frames.back();
-          low[parent] = std::min(low[parent], low[v]);
-        }
-        state[v] = kDone;
+    llvm::SmallVector<bool> seen(n, false);
+    for (unsigned t : dag.scheduleToTextual) {
+      unsigned lt = localOf[t];
+      if (lt != ~0u && !seen[lt]) {
+        seen[lt] = true;
+        slotOrderLocal.push_back(lt);
       }
     }
-
-    // Atom-level graph in slot-first order.
-    const unsigned atomTotal = atomCount;
-    llvm::SmallVector<uint64_t> atomWeight(atomTotal, 0u);
-    for (unsigned r = 0; r < regionCount; ++r) {
-      atomOfRegion[r] = atomTotal - 1 - atomOfRegion[r]; // reverse Tarjan ids
-      atomWeight[atomOfRegion[r]] += g.weight[r];
-    }
-    llvm::SmallVector<llvm::DenseSet<unsigned>> atomPredSets(atomTotal);
-    for (unsigned r = 0; r < regionCount; ++r)
-      for (unsigned p : g.preds[r])
-        if (atomOfRegion[p] != atomOfRegion[r])
-          atomPredSets[atomOfRegion[r]].insert(atomOfRegion[p]);
-    llvm::SmallVector<llvm::SmallVector<unsigned>> atomPreds(atomTotal);
-    llvm::SmallVector<unsigned> atomSlot(atomTotal, 0u);
-    llvm::SmallVector<bool> atomSeen(atomTotal, false);
-    unsigned seenCount = 0;
-    for (unsigned r : g.slotOrder) {
-      unsigned a = atomOfRegion[r];
-      if (!atomSeen[a]) {
-        atomSeen[a] = true;
-        atomSlot[a] = seenCount++;
-      }
-      for (unsigned p : atomPredSets[a])
-        atomPreds[a].push_back(p);
-    }
-    for (unsigned a = 0; a < atomTotal; ++a)
-      llvm::sort(atomPreds[a]);
-
-    // Combine over atoms (same predecessor-merge rule as before).
-    CombPartitionPlan atomPlan;
-    auto atoms = buildAtomPartitioning(atomTotal, atomWeight, atomPreds,
-                                       atomSlot, targetSize);
-    if (failed(atoms)) {
-      llvm::errs() << "[comb-partition] atom partitioning failed (cycle or size gate)\n";
-      return failure();
-    }
-
-    plan.partitionCount = atoms->partitionCount;
-    plan.partitions.assign(dag.operations.size(), 0u);
-    for (unsigned t = 0; t < dag.operations.size(); ++t) {
-      unsigned r = g.candidateToRegion[t];
-      if (r == kNoRegion)
-        continue;
-      plan.partitions[t] = atoms->partitions[atomOfRegion[r]];
-    }
-    return plan;
   }
-}
-
-FailureOr<CombPartitionPlan>
-buildAtomPartitioning(unsigned atomCount, ArrayRef<uint64_t> atomWeight,
-                      ArrayRef<SmallVector<unsigned>> atomPreds,
-                      ArrayRef<unsigned> atomSlot, uint64_t targetSize) {
-  CombPartitionPlan plan;
-  plan.partitionCount = atomCount;
-  if (atomCount == 0)
-    return plan;
-
-  llvm::SmallVector<int64_t> partOf(atomCount, -1);
-  llvm::SmallVector<uint64_t> partSize;
-  llvm::SmallVector<unsigned> partAtoms;
-  partSize.reserve(atomCount);
-  partAtoms.reserve(atomCount);
-
-  // Visit atoms in slot-first order; merge into the strongest-connected
-  // predecessor partition when the size bound allows.
-  llvm::SmallVector<unsigned> order(atomCount);
-  for (unsigned a = 0; a < atomCount; ++a)
-    order[atomSlot[a]] = a;
-  for (unsigned a : order) {
-    llvm::DenseMap<int64_t, unsigned> edgeCount;
-    for (unsigned p : atomPreds[a]) {
-      int64_t pp = partOf[p];
-      if (pp >= 0)
-        ++edgeCount[pp];
-    }
-    int64_t best = -1;
-    unsigned bestCount = 0;
-    for (unsigned p : atomPreds[a]) {
-      int64_t pp = partOf[p];
-      if (pp < 0)
-        continue;
-      unsigned c = edgeCount.lookup(pp);
-      if (c > bestCount || (c == bestCount && pp < best)) {
-        best = pp;
-        bestCount = c;
+  for (auto it = slotOrderLocal.rbegin(); it != slotOrderLocal.rend(); ++it) {
+    unsigned v = *it;
+    if (coneOf[v] >= 0)
+      continue;
+    int id = static_cast<int>(cones.size());
+    cones.emplace_back();
+    llvm::SmallVector<unsigned, 16> work{v};
+    coneOf[v] = id;
+    cones[id].push_back(v);
+    while (!work.empty()) {
+      unsigned u = work.pop_back_val();
+      for (unsigned p : preds[u]) {
+        if (coneOf[p] >= 0)
+          continue;
+        bool allInside = true;
+        for (unsigned sc : succs[p])
+          if (coneOf[sc] != id) {
+            allInside = false;
+            break;
+          }
+        if (!allInside)
+          continue;
+        coneOf[p] = id;
+        cones[id].push_back(p);
+        work.push_back(p);
       }
-    }
-    if (targetSize > 0 && best >= 0 &&
-        partSize[best] + atomWeight[a] <= targetSize) {
-      partOf[a] = best;
-      partSize[best] += atomWeight[a];
-      ++partAtoms[best];
-    } else {
-      // An atom heavier than targetSize stays its own partition: targetSize
-      // bounds merging, it never forces an atom to split.
-      partOf[a] = static_cast<int64_t>(partSize.size());
-      partSize.push_back(atomWeight[a]);
-      partAtoms.push_back(1);
     }
   }
 
-  // The merge above can create cycles at partition granularity: an atom may
-  // join one predecessor's partition while its other predecessors' partitions
-  // gain edges into that same partition. Collapse strongly connected
-  // partition groups until the partition graph is acyclic. Correctness forces
-  // these unions, so the size bound is not enforced on them.
-  bool forcedUnion = false;
-  while (true) {
-    unsigned partCount = partSize.size();
-    llvm::SmallVector<llvm::DenseSet<int64_t>> partSucc(partCount);
-    for (unsigned a = 0; a < atomCount; ++a) {
-      for (unsigned p : atomPreds[a]) {
-        int64_t from = partOf[p];
-        int64_t to = partOf[a];
-        if (from == to || from < 0 || to < 0)
+  // External-path merge test: partitions A and B may merge iff no external
+  // path exists in either direction (a path through nodes outside A∪B).
+  unsigned testEpoch = 0;
+  llvm::SmallVector<unsigned> testMark(n, 0);
+  auto externalPath = [&](int rootA, int rootB) {
+    // Returns true if an external path exists from A to B (or B to A).
+    auto direction = [&](int from, int to) {
+      ++testEpoch;
+      llvm::SmallVector<unsigned, 32> fromMembers = members(from);
+      llvm::SmallVector<unsigned, 32> toMembers = members(to);
+      for (unsigned m : fromMembers)
+        testMark[m] = testEpoch;
+      for (unsigned m : toMembers)
+        testMark[m] = testEpoch;
+      llvm::SmallVector<unsigned, 32> work;
+      for (unsigned m : fromMembers)
+        for (unsigned sc : succs[m])
+          if (find(sc) != from && find(sc) != to)
+            work.push_back(sc);
+      while (!work.empty()) {
+        unsigned u = work.pop_back_val();
+        if (testMark[u] == testEpoch)
           continue;
-        partSucc[from].insert(to);
+        testMark[u] = testEpoch;
+        if (find(u) == to)
+          return true;
+        for (unsigned sc : succs[u])
+          if (find(sc) != from && find(sc) != to)
+            work.push_back(sc);
+      }
+      return false;
+    };
+    return direction(rootA, rootB) || direction(rootB, rootA);
+  };
+
+  // Region constraint: candidates of one comb region must share a partition.
+  {
+    llvm::DenseMap<Operation *, int> regionFirst;
+    for (unsigned t = 0; t < totalCandidates; ++t) {
+      if (localOf[t] == ~0u)
+        continue;
+      Operation *op = dag.operations[t];
+      auto [it, inserted] = regionFirst.try_emplace(op, find(localOf[t]));
+      if (inserted)
+        continue;
+      int a = it->second, b = find(localOf[t]);
+      if (a == b)
+        continue;
+      // Region constraint forces this merge even if the external-path test
+      // fails; the final SCC collapse restores acyclicity.
+      unionPartitions(a, b);
+    }
+  }
+
+  // Partition input adjacency: inputsOf[Q] = set of partitions feeding Q.
+  auto buildInputs = [&]() {
+    llvm::DenseMap<int, llvm::DenseSet<int>> inputs;
+    for (unsigned v = 0; v < n; ++v) {
+      int rv = find(v);
+      for (unsigned p : preds[v]) {
+        int rp = find(p);
+        if (rp != rv)
+          inputs[rv].insert(rp);
       }
     }
-    // Kahn's algorithm to test acyclicity.
-    llvm::SmallVector<unsigned> partIndegree(partCount, 0u);
-    for (unsigned from = 0; from < partCount; ++from)
-      for (int64_t to : partSucc[from])
-        ++partIndegree[to];
-    llvm::SmallVector<int64_t> ready;
-    for (int64_t p = 0; p < static_cast<int64_t>(partCount); ++p)
-      if (partIndegree[p] == 0)
-        ready.push_back(p);
-    unsigned visited = 0;
-    while (!ready.empty()) {
-      int64_t p = ready.pop_back_val();
-      ++visited;
-      for (int64_t succ : partSucc[p])
-        if (--partIndegree[succ] == 0)
-          ready.push_back(succ);
-    }
-    if (visited == partCount)
-      break;
-
-    // Find SCCs with more than one member (iterative Tarjan) and union each
-    // into its lowest member id.
-    enum : unsigned char { kUnvisited = 0, kOpen = 1, kDone = 2 };
-    llvm::SmallVector<unsigned char> state(partCount, kUnvisited);
-    llvm::SmallVector<unsigned> index(partCount, 0u), low(partCount, 0u);
-    llvm::SmallVector<int> onStack(partCount, 0);
-    llvm::SmallVector<int64_t> tarjanStack;
-    llvm::SmallVector<int64_t> frames;
-    llvm::SmallVector<unsigned> frameNext(partCount, 0u);
-    unsigned nextIndex = 0;
-    bool unioned = false;
-    for (int64_t root = 0; root < static_cast<int64_t>(partCount); ++root) {
-      if (state[root] != kUnvisited)
-        continue;
-      frames.push_back(root);
-      state[root] = kOpen;
-      index[root] = low[root] = nextIndex++;
-      tarjanStack.push_back(root);
-      onStack[root] = 1;
-      while (!frames.empty()) {
-        int64_t v = frames.back();
-        if (frameNext[v] < partSucc[v].size()) {
-          auto it = partSucc[v].begin();
-          std::advance(it, frameNext[v]++);
-          int64_t w = *it;
-          if (state[w] == kUnvisited) {
-            state[w] = kOpen;
-            index[w] = low[w] = nextIndex++;
-            tarjanStack.push_back(w);
-            onStack[w] = 1;
-            frames.push_back(w);
-          } else if (onStack[w]) {
-            low[v] = std::min(low[v], index[w]);
-          }
+    return inputs;
+  };
+  // Undirected adjacency (cut edges between partitions, both directions).
+  auto buildAdjacency = [&]() {
+    llvm::DenseMap<int, llvm::DenseMap<int, unsigned>> adj;
+    for (unsigned v = 0; v < n; ++v) {
+      int rv = find(v);
+      for (unsigned p : preds[v]) {
+        int rp = find(p);
+        if (rp == rv)
           continue;
+        ++adj[rv][rp];
+        ++adj[rp][rv];
+      }
+    }
+    return adj;
+  };
+
+  auto mergeWithTest = [&](int a, int b) {
+    int ra = find(a), rb = find(b);
+    if (ra == rb)
+      return true;
+    if (externalPath(std::min(ra, rb), std::max(ra, rb)))
+      return false;
+    unionPartitions(ra, rb);
+    return true;
+  };
+
+  // Phase A: single-parent partitions merge into their (unique) parent.
+  bool progressed = true;
+  while (progressed && partCount > 1) {
+    progressed = false;
+    auto inputs = buildInputs();
+    for (auto &[p, ins] : inputs) {
+      if (ins.size() != 1 || find(p) != p)
+        continue;
+      int q = *ins.begin();
+      if (find(q) != q)
+        continue;
+      unionPartitions(p, q); // always acyclic-safe (paper Figure 4A)
+      progressed = true;
+      if (partCount <= 1)
+        break;
+    }
+  }
+
+  // Phases B/C: repeatedly merge small partitions with siblings.
+  auto isSmall = [&](int root) {
+    return targetSize > 0 && psize[find(root)] < targetSize;
+  };
+  for (int phase = 0; phase < 2 && partCount > 1; ++phase) {
+    bool anyMerge = true;
+    while (anyMerge && partCount > 1) {
+      anyMerge = false;
+      auto adj = buildAdjacency();
+      auto inputs = buildInputs();
+      // Deterministic scan over small partitions.
+      for (unsigned v = 0; v < n && partCount > 1; ++v) {
+        int p = find(v);
+        if (p != static_cast<int>(v) || !isSmall(p))
+          continue;
+        auto it = adj.find(p);
+        if (it == adj.end())
+          continue;
+        int best = -1;
+        uint64_t bestCut = 0;
+        double bestCommon = -1.0;
+        for (auto &[q, cut] : it->second) {
+          int rq = find(q);
+          if (rq == p)
+            continue;
+          if (phase == 0 && !isSmall(rq))
+            continue;
+          double common = 0.0;
+          auto ip = inputs.find(p);
+          auto iq = inputs.find(rq);
+          if (ip != inputs.end() && iq != inputs.end()) {
+            unsigned shared = 0;
+            for (int x : ip->second)
+              if (iq->second.contains(x) || rq == x)
+                ++shared;
+            unsigned united = ip->second.size() + iq->second.size() - shared;
+            common = united > 0 ? static_cast<double>(shared) / united : 0.0;
+          }
+          bool better = false;
+          if (phase == 0)
+            better = cut > bestCut || (cut == bestCut && rq < best);
+          else
+            better = common > bestCommon ||
+                     (common == bestCommon && cut > bestCut);
+          if (better) {
+            best = rq;
+            bestCut = cut;
+            bestCommon = common;
+          }
         }
-        frames.pop_back();
-        if (low[v] == index[v]) {
-          llvm::SmallVector<int64_t> members;
-          int64_t w;
-          do {
-            w = tarjanStack.back();
-            tarjanStack.pop_back();
-            onStack[w] = 0;
-            members.push_back(w);
-          } while (w != v);
-          if (members.size() > 1) {
-            forcedUnion = true;
-            unioned = true;
-            int64_t keep = *std::min_element(members.begin(), members.end());
-            uint64_t mergedSize = 0;
-            unsigned mergedAtoms = 0;
-            for (int64_t m : members) {
-              mergedSize += partSize[m];
-              mergedAtoms += partAtoms[m];
+        if (best >= 0 && mergeWithTest(p, best)) {
+          anyMerge = true;
+          progressed = true;
+          break; // restart scan; partition ids changed
+        }
+      }
+    }
+  }
+
+  // Final guard: collapse any residual cycles (forced region unions can
+  // introduce them). Correctness requires acyclicity for singular execution.
+  plan.partitionCount = partCount;
+  plan.partitions.assign(totalCandidates, 0u);
+  {
+    // Dense-id the union-find roots: root ids are cone ids (0..n-1), while
+    // partCount is only the surviving count, so raw ids must not index
+    // partition-sized arrays.
+    llvm::DenseMap<int, int> denseRoot;
+    llvm::SmallVector<int> denseOf(n, -1);
+    for (unsigned v = 0; v < n; ++v) {
+      auto [it, inserted] = denseRoot.try_emplace(find(v), denseRoot.size());
+      denseOf[v] = it->second;
+      (void)inserted;
+    }
+    // Build partition graph and collapse SCCs until acyclic. Dense ids are
+    // rebuilt every iteration because unions change the root set.
+    bool acyclic = false;
+    while (!acyclic) {
+      llvm::DenseMap<int, int> denseRoot;
+      llvm::SmallVector<int> denseToRoot;
+      llvm::SmallVector<int> denseOf(n, -1);
+      for (unsigned v = 0; v < n; ++v) {
+        auto [it, inserted] = denseRoot.try_emplace(find(v), denseRoot.size());
+        if (inserted)
+          denseToRoot.push_back(find(v));
+        denseOf[v] = it->second;
+        (void)inserted;
+      }
+      const unsigned pc = denseRoot.size();
+      llvm::SmallVector<llvm::DenseSet<int>> succ(pc);
+      for (unsigned v = 0; v < n; ++v) {
+        int rv = denseOf[find(v)];
+        for (unsigned p : preds[v]) {
+          int rp = denseOf[find(p)];
+          if (rp != rv)
+            succ[rp].insert(rv);
+        }
+      }
+      llvm::SmallVector<unsigned> indeg(pc, 0u);
+      for (unsigned from = 0; from < pc; ++from)
+        for (int to : succ[from])
+          ++indeg[to];
+      llvm::SmallVector<int> ready;
+      for (int p = 0; p < static_cast<int>(pc); ++p)
+        if (indeg[p] == 0)
+          ready.push_back(p);
+      unsigned visited = 0;
+      while (!ready.empty()) {
+        int p = ready.pop_back_val();
+        ++visited;
+        for (int to : succ[p])
+          if (--indeg[to] == 0)
+            ready.push_back(to);
+      }
+      if (visited == pc) {
+        acyclic = true;
+        break;
+      }
+      // Union every multi-member SCC into its lowest id (iterative Tarjan).
+      enum : unsigned char { kUnvisited = 0, kOpen = 1, kDone = 2 };
+      llvm::SmallVector<unsigned char> state(pc, kUnvisited);
+      llvm::SmallVector<unsigned> index(pc, 0u), low(pc, 0u);
+      llvm::SmallVector<int> onStack(pc, 0);
+      llvm::SmallVector<int> tstack;
+      llvm::SmallVector<int> frames;
+      llvm::SmallVector<unsigned> frameNext(pc, 0u);
+      unsigned nextIndex = 0;
+      bool unioned = false;
+      for (int root = 0; root < static_cast<int>(pc); ++root) {
+        if (state[root] != kUnvisited)
+          continue;
+        frames.push_back(root);
+        state[root] = kOpen;
+        index[root] = low[root] = nextIndex++;
+        tstack.push_back(root);
+        onStack[root] = 1;
+        while (!frames.empty()) {
+          int v = frames.back();
+          if (frameNext[v] < succ[v].size()) {
+            auto it = succ[v].begin();
+            std::advance(it, frameNext[v]++);
+            int w = *it;
+            if (state[w] == kUnvisited) {
+              state[w] = kOpen;
+              index[w] = low[w] = nextIndex++;
+              tstack.push_back(w);
+              onStack[w] = 1;
+              frames.push_back(w);
+            } else if (onStack[w]) {
+              low[v] = std::min(low[v], index[w]);
             }
-            for (unsigned a = 0; a < atomCount; ++a) {
-              bool inSCC = false;
-              for (int64_t m : members)
-                if (partOf[a] == m) {
-                  inSCC = true;
-                  break;
-                }
-              if (inSCC)
-                partOf[a] = keep;
-            }
-            partSize[keep] = mergedSize;
-            partAtoms[keep] = mergedAtoms;
-            for (int64_t m : members)
-              if (m != keep) {
-                partSize[m] = 0;
-                partAtoms[m] = 0;
+            continue;
+          }
+          frames.pop_back();
+          if (low[v] == index[v]) {
+            llvm::SmallVector<int> members;
+            int w;
+            do {
+              w = tstack.back();
+              tstack.pop_back();
+              onStack[w] = 0;
+              members.push_back(w);
+            } while (w != v);
+            if (members.size() > 1) {
+              // members are dense ids; map back to union-find roots.
+              int keepDense = *std::min_element(members.begin(), members.end());
+              int keepRoot = denseToRoot[keepDense];
+              for (int m : members) {
+                int raw = denseToRoot[m];
+                if (raw == keepRoot)
+                  continue;
+                parent[raw] = keepRoot;
+                psize[keepRoot] += psize[raw];
+                --partCount;
+                unioned = true;
               }
+            }
           }
+          if (!frames.empty()) {
+            int parentF = frames.back();
+            low[parentF] = std::min(low[parentF], low[v]);
+          }
+          state[v] = kDone;
         }
-        if (!frames.empty()) {
-          int64_t parent = frames.back();
-          low[parent] = std::min(low[parent], low[v]);
-        }
-        state[v] = kDone;
       }
-    }
-    if (!unioned)
-      return failure(); // no progress; give up safely
-
-    // Compact partition ids.
-    llvm::SmallVector<int64_t> remap(partSize.size(), -1);
-    llvm::SmallVector<uint64_t> newSize;
-    llvm::SmallVector<unsigned> newAtoms;
-    for (unsigned a = 0; a < atomCount; ++a) {
-      int64_t old = partOf[a];
-      if (remap[old] < 0) {
-        remap[old] = static_cast<int64_t>(newSize.size());
-        newSize.push_back(partSize[old]);
-        newAtoms.push_back(partAtoms[old]);
-      }
-      partOf[a] = remap[old];
-    }
-    partSize = std::move(newSize);
-    partAtoms = std::move(newAtoms);
-  }
-  if (targetSize > 0 && !forcedUnion) {
-    for (auto [size, atoms] : llvm::zip(partSize, partAtoms)) {
-      // Oversized single atoms are legal; only merged partitions must
-      // respect the coarseness bound. Forced unions (cycle collapse) are
-      // correctness-required and exempt.
-      if (atoms > 1 && size > targetSize)
+      if (!unioned) {
         return failure();
+      }
     }
+    // Emit assignments.
+    llvm::DenseMap<int, unsigned> rootId;
+    for (unsigned v = 0; v < n; ++v) {
+      int r = find(v);
+      auto [it, inserted] = rootId.try_emplace(r, rootId.size());
+      plan.partitions[globalOf[v]] = it->second;
+      (void)inserted;
+    }
+    plan.partitionCount = rootId.size();
   }
-
-  plan.partitionCount = partSize.size();
-  plan.partitions.assign(atomCount, 0u);
-  for (unsigned a = 0; a < atomCount; ++a)
-    plan.partitions[a] = static_cast<uint64_t>(partOf[a]);
+  (void)coneOf;
+  (void)cones;
+  (void)slotOrderLocal;
+  (void)testEpoch;
   return plan;
 }
 
