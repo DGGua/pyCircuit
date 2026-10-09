@@ -202,7 +202,8 @@ static llvm::cl::opt<bool> cppOnlyPreserveOps(
 
 static llvm::cl::opt<unsigned> combPartitionSize(
     "comb-partition-size",
-    llvm::cl::desc("ESSENT-style acyclic comb partition coarseness (0 disables partitioning)"),
+    llvm::cl::desc("ESSENT comb partition threshold; >0 switches fuse-comb to "
+                   "graph partitioning mode (0 = textual runs)"),
     llvm::cl::init(0));
 
 static llvm::cl::opt<bool> unrollVector(
@@ -2694,8 +2695,16 @@ int main(int argc, char **argv) {
     pm.addPass(pyc::createApplyObservationDemandPass(
         probePlanPath, traceCodegenPlanPath));
   const bool enableFuseComb = (!cppOnly) || !cppOnlyPreserveOps;
-  if (enableFuseComb)
-    pm.addNestedPass<func::FuncOp>(pyc::createFuseCombPass());
+  if (enableFuseComb) {
+    if (combPartitionSize > 0)
+      // Graph mode: fuse creates one pyc.comb per ESSENT partition; the
+      // downstream pyc-comb-partition pass must not re-merge across
+      // ordering barriers.
+      pm.addNestedPass<func::FuncOp>(
+          pyc::createFuseCombPass(combPartitionSize));
+    else
+      pm.addNestedPass<func::FuncOp>(pyc::createFuseCombPass());
+  }
   pm.addPass(createCanonicalizerPass(canonicalizeCfg));
   pm.addPass(createCSEPass());
   addRemoveDeadValuesPassIfSupported(pm);
@@ -2705,7 +2714,7 @@ int main(int argc, char **argv) {
   // still sees those dependencies, so one check after fusion is sufficient.
   pm.addPass(pyc::createCheckCombCyclesPass());
   pm.addPass(pyc::createChangeDrivenSchedulePass());
-  if (combPartitionSize > 0)
+  if (combPartitionSize > 0 && !enableFuseComb)
     pm.addNestedPass<func::FuncOp>(
         pyc::createCombPartitionPass(combPartitionSize));
   pm.addNestedPass<func::FuncOp>(pyc::createCheckFlatTypesPass());
