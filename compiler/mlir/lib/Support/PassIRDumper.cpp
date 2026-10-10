@@ -22,6 +22,17 @@ namespace pyc {
 
 namespace {
 
+/// True for MLIR's internal pipeline wrappers (`mlir::detail::OpToOpPassAdaptor`,
+/// including its variants). Their before/after IR is identical to the first/last
+/// nested pass's dump, and they run once per nested op, which is the main source
+/// of dump-file explosion. They are still tracked on the frame stack for
+/// level/pass-index accounting, but no files are written for them.
+bool isAdaptorPass(Pass *pass) {
+  if (!pass)
+    return false;
+  return pass->getName().contains("OpToOpPassAdaptor");
+}
+
 /// Strip the dialect prefix ("pyc-") from a pass argument name so file names
 /// are short and sortable. Returns "unknown" if the name is empty.
 ///
@@ -111,13 +122,34 @@ struct PassIRDumper::Impl {
   /// `<NN>` even if nested passes ran in between.
   unsigned nextPassIndex = 0;
 
-  /// Nesting frame: level + the pass index assigned at `runBeforePass`.
-  /// Top-level (module) passes are level 0; func-nested are level 1+.
+  /// Nesting frame: level, pass short name, and the pass index assigned at
+  /// `runBeforePass`. Top-level (module) passes are level 0; func-nested are
+  /// level 1+.
   struct Frame {
     unsigned level = 0;
     unsigned passIndex = 0;
+    std::string shortName;
   };
   std::vector<Frame> frameStack;
+
+  /// Build the ancestor chain for the file name, root first: each ancestor is
+  /// `<name>.<passIdx>` and segments are joined with '.'. The *current* frame
+  /// (stack back) is excluded, so call this while the frame of the pass being
+  /// dumped is still on the stack. Ancestors include adaptor wrappers (with
+  /// their own pass index for uniqueness). Returns an empty string at level 0
+  /// so top-level file names stay unchanged.
+  std::string parentChain() const {
+    if (frameStack.size() < 2)
+      return "";
+    std::string out = "via_";
+    for (size_t i = 0; i + 1 < frameStack.size(); ++i) {
+      if (i > 0)
+        out += '.';
+      out += sanitizeForFileName(frameStack[i].shortName);
+      out += '.' + formatSeq(frameStack[i].passIndex);
+    }
+    return out;
+  }
 
   /// Optional compiled regex. Constructed once. Uses llvm::Regex (no exceptions,
   /// matches LLVM/MLIR -fno-exceptions build default).
@@ -163,7 +195,8 @@ struct PassIRDumper::Impl {
   /// Write the IR of `op` for phase `which` ("before"/"after"). `failed` adds
   /// the `_FAILED` suffix and a `// PASS FAILED` header line.
   void write(const std::string &shortName, unsigned level, unsigned passIdx,
-             Operation *op, const char *which, bool failed) {
+             const std::string &viaChain, Operation *op, const char *which,
+             bool failed) {
     if (!enabled || !op)
       return;
     if (!matchesPass(shortName))
@@ -174,6 +207,10 @@ struct PassIRDumper::Impl {
                            formatSeq(passIdx) + "_" +
                            sanitizeForFileName(shortName) + "__L" +
                            std::to_string(level);
+    // Nested calls carry their ancestor chain (root first) so every file is
+    // self-describing about *which* invocation of the pass produced it.
+    if (level > 0 && !viaChain.empty())
+      fileName += "__" + viaChain;
     if (failed)
       fileName += "_FAILED";
     fileName += ".mlir";
@@ -216,16 +253,19 @@ void PassIRDumper::runBeforePass(Pass *pass, Operation *op) {
   // index on the frame so nested passes cannot steal the outer `<NN>`.
   const unsigned level = static_cast<unsigned>(impl_->frameStack.size());
   const unsigned passIdx = ++impl_->nextPassIndex;
-  impl_->frameStack.push_back({level, passIdx});
+  impl_->frameStack.push_back({level, passIdx, passShortName(pass)});
 
   const std::string name = passShortName(pass);
-  if (impl_->opts.wantBefore())
-    impl_->write(name, level, passIdx, op, "before", /*failed=*/false);
+  if (!isAdaptorPass(pass) && impl_->opts.wantBefore())
+    impl_->write(name, level, passIdx, impl_->parentChain(), op, "before",
+                 /*failed=*/false);
 }
 
 void PassIRDumper::runAfterPass(Pass *pass, Operation *op) {
   if (!impl_->enabled)
     return;
+  // Chain must be captured while this pass's frame is still on the stack.
+  const std::string viaChain = impl_->parentChain();
   unsigned level = 0;
   unsigned passIdx = 0;
   if (!impl_->frameStack.empty()) {
@@ -233,14 +273,16 @@ void PassIRDumper::runAfterPass(Pass *pass, Operation *op) {
     passIdx = impl_->frameStack.back().passIndex;
     impl_->frameStack.pop_back();
   }
-  if (impl_->opts.wantAfter())
-    impl_->write(passShortName(pass), level, passIdx, op, "after",
+  if (!isAdaptorPass(pass) && impl_->opts.wantAfter())
+    impl_->write(passShortName(pass), level, passIdx, viaChain, op, "after",
                  /*failed=*/false);
 }
 
 void PassIRDumper::runAfterPassFailed(Pass *pass, Operation *op) {
   if (!impl_->enabled)
     return;
+  // Chain must be captured while this pass's frame is still on the stack.
+  const std::string viaChain = impl_->parentChain();
   unsigned level = 0;
   unsigned passIdx = 0;
   if (!impl_->frameStack.empty()) {
@@ -249,9 +291,11 @@ void PassIRDumper::runAfterPassFailed(Pass *pass, Operation *op) {
     impl_->frameStack.pop_back();
   }
   // Always write the after-image on failure, even if phase == "before", so the
-  // failure state is never lost.
-  impl_->write(passShortName(pass), level, passIdx, op, "after",
-               /*failed=*/true);
+  // failure state is never lost. Adaptors only fail when a nested pass fails
+  // (already dumped via runAfterPassFailed), so skip them here too.
+  if (!isAdaptorPass(pass))
+    impl_->write(passShortName(pass), level, passIdx, viaChain, op, "after",
+                 /*failed=*/true);
 }
 
 } // namespace pyc
