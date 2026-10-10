@@ -2445,11 +2445,11 @@ int main(int argc, char **argv) {
   mlir::func::registerInlinerExtension(registry);
 
   MLIRContext ctx(registry);
-#ifdef _WIN32
-  // MSYS2/MinGW builds can hit non-deterministic crashes when running nested
-  // pass pipelines with multithreading enabled. Bring-up prefers robustness.
+// MSYS2/MinGW builds can hit non-deterministic crashes when running nested
+  // pass pipelines with multithreading enabled. Bring-up prefers robustness;
+  // the same nondeterminism was observed on Linux with nested func passes
+  // (FuseCombPass graph mode), so threading stays off on all platforms.
   ctx.disableMultithreading();
-#endif
   ctx.loadAllAvailableDialects();
 
   const auto tParseStart = Clock::now();

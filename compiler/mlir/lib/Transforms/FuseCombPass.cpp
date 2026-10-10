@@ -13,6 +13,7 @@
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallSet.h"
 #include <functional>
+#include <mutex>
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/STLExtras.h"
 
@@ -102,6 +103,10 @@ struct FuseCombPass : public PassWrapper<FuseCombPass, OperationPass<func::FuncO
   llvm::SmallVector<int> coneOf;
   llvm::SmallVector<llvm::SmallVector<unsigned>> cones;
   unsigned partCount = 0;
+  // Single-driver wire results -> their unique driving pyc.assign. Wires
+  // (and their assigns) stay outside the regions; the partition graph and
+  // region inputs simply route through them transparently.
+  llvm::DenseMap<Value, Operation *> wireDriverOf;
 
   void fuseBlock(Block &block) {
     llvm::SmallVector<Operation *> run;
@@ -143,12 +148,46 @@ struct FuseCombPass : public PassWrapper<FuseCombPass, OperationPass<func::FuncO
   }
 
   void fuseBlockByPartition(Block &block) {
-    // 1. Collect fusible ops (block order == topo order for SSA values).
+    // The ESSENT partition scratch lives in pass members. MLIR may execute
+    // function passes for different functions concurrently (and pass clones
+    // cannot always be assumed), so serialize graph-mode partitioning.
+    static std::mutex partitionMu;
+    std::lock_guard<std::mutex> partitionLock(partitionMu);
+    // Reset scratch state: the pass instance is reused across blocks AND
+    // (when MLIR threading is off) across functions; stale entries would be
+    // dangling Operation* from previous fusions.
+    ops.clear();
+    preds.clear();
+    succs.clear();
+    forbidden.clear();
+    cones.clear();
+    wireDriverOf.clear();
+    {
+      llvm::DenseMap<Value, llvm::SmallVector<Operation *>> wireWriters;
+      for (Operation &op : block)
+        if (auto a = dyn_cast<pyc::AssignOp>(op))
+          wireWriters[a.getDst()].push_back(&op);
+      for (auto &[dst, writers] : wireWriters)
+        if (writers.size() == 1)
+          if (Operation *wireOp = dyn_cast_or_null<pyc::WireOp>(dst.getDefiningOp()))
+            wireDriverOf[dst] = writers.front();
+    }
+    // 1. Collect graph nodes: fusible comb ops (emitted into regions) plus
+    // single-driver wire results as pseudo-nodes (never emitted; they let
+    // MFFC cones cross the declare-early/assign-late boundary so a packer
+    // like concat merges with its upstream producer cone).
     for (Operation &op : block)
       if (isFusableCombOp(&op))
         ops.push_back(&op);
-    if (ops.size() < 2)
+    const unsigned combOpCount = ops.size();
+    if (combOpCount < 2)
       return;
+    // Wire pseudo-nodes are keyed by wire op; remember their index space.
+    llvm::DenseMap<Value, unsigned> wireNodeOf;
+    for (auto &[wireRes, assign] : wireDriverOf)
+      wireNodeOf[wireRes] = static_cast<unsigned>(ops.size()),
+      ops.push_back(wireRes.getDefiningOp());
+    const bool hasWireNodes = ops.size() > combOpCount;
 
     llvm::DenseMap<Operation *, unsigned> idx;
     for (auto [i, op] : llvm::enumerate(ops))
@@ -162,6 +201,17 @@ struct FuseCombPass : public PassWrapper<FuseCombPass, OperationPass<func::FuncO
         Operation *def = operand.getDefiningOp();
         if (!def)
           continue;
+        // Naming aliases are transparent (pure renames kept outside the
+        // regions); route the dependency to their operand.
+        for (unsigned hop = 0;
+             isa_and_nonnull<pyc::AliasOp>(def) && !idx.count(def) &&
+             def->getNumOperands() > 0 && hop < 64;
+             ++hop) {
+          Operation *next = def->getOperand(0).getDefiningOp();
+          if (!next || next == def)
+            break;
+          def = next;
+        }
         auto it = idx.find(def);
         if (it == idx.end())
           continue;
@@ -169,11 +219,99 @@ struct FuseCombPass : public PassWrapper<FuseCombPass, OperationPass<func::FuncO
         succs[it->second].push_back(v);
       }
     }
+    // Wire pseudo-node edges: producer -> wire -> readers. The producer is
+    // the driving assign's source; readers are all candidate ops using the
+    // wire value. A wire only joins a cone when ALL its candidate readers
+    // are inside (standard MFFC admission), so a wire read outside the
+    // candidate set (return/probe/instance operand) keeps the boundary.
+    if (hasWireNodes) {
+      for (auto &[wireRes, assign] : wireDriverOf) {
+        unsigned w = wireNodeOf[wireRes];
+        Value src = assign->getOperand(1);
+        if (Operation *srcDef = src.getDefiningOp()) {
+          Operation *def = srcDef;
+          for (unsigned hop = 0;
+               isa_and_nonnull<pyc::AliasOp>(def) && !idx.count(def) &&
+               def->getNumOperands() > 0 && hop < 64;
+               ++hop) {
+            Operation *next = def->getOperand(0).getDefiningOp();
+            if (!next || next == def)
+              break;
+            def = next;
+          }
+          auto it = idx.find(def);
+          if (it != idx.end()) {
+            preds[w].push_back(it->second);
+            succs[it->second].push_back(w);
+          }
+        }
+        for (OpOperand &use : wireRes.getUses()) {
+          auto it = idx.find(use.getOwner());
+          if (it == idx.end() || it->second == w)
+            continue;
+          preds[it->second].push_back(w);
+          succs[w].push_back(it->second);
+        }
+      }
+    }
 
     // 2. Ordering barriers: producer(a) -> barrier -> consumer(b) forbids
+    // Precompute per-register driver/reader op sets (linear passes).
+    llvm::DenseMap<Operation *, llvm::SmallVector<unsigned>> regDrivers, regReaders;
+    for (unsigned v = 0; v < n; ++v) {
+      for (Value operand : ops[v]->getOperands()) {
+        Operation *def = operand.getDefiningOp();
+        if (!def || !isa<pyc::RegOp, pyc::DelayLineOp>(def))
+          continue;
+        if (operand == def->getResult(0)) // reading `q`
+          regReaders[def].push_back(v);
+      }
+    }
+    // Drivers: the defining op of the register's `next` operand (nothing
+    // else consumes `next`; the register itself is not a graph node), with
+    // wire/alias transparency so a `next` fed through a lifted wire still
+    // constrains the wire's source producer.
+    for (Operation &reg : block) {
+      if (!isa<pyc::RegOp, pyc::DelayLineOp>(reg))
+        continue;
+      Value next = reg.getOperand(3);
+      Operation *def = next.getDefiningOp();
+      for (unsigned hop = 0; hop < 64; ++hop) {
+        if (auto assignOp = dyn_cast_or_null<pyc::AssignOp>(def)) {
+          // next fed by a wire: the driver is the assign's source.
+          Value src = assignOp->getOperand(1);
+          def = src.getDefiningOp();
+          continue;
+        }
+        if (isa_and_nonnull<pyc::AliasOp>(def) && def->getNumOperands() > 0) {
+          Operation *nxt = def->getOperand(0).getDefiningOp();
+          if (!nxt || nxt == def)
+            break;
+          def = nxt;
+          continue;
+        }
+        break;
+      }
+      if (auto it = idx.find(def); it != idx.end())
+        regDrivers[&reg].push_back(it->second);
+    }
+    // 2. Ordering barriers: producer(a) -> barrier -> consumer(b) forbids
     // partition(a) == partition(b).
-    llvm::SmallVector<std::pair<unsigned, unsigned>> forbidden;
+    llvm::SmallVector<std::pair<unsigned, unsigned>> barrierPairs;
     for (Operation &op : block) {
+      // Register-like units need the constraint in BOTH directions: ops
+      // feeding `next` and ops reading `q` must never share a partition
+      // (a merged region driving and reading the same register is
+      // unplaceable in the linear block order). Drivers/readers are
+      // precomputed; this branch runs BEFORE the isSequentialBarrier
+      // filter because RegOp/DelayLineOp are not in that list.
+      if (isa<pyc::RegOp, pyc::DelayLineOp>(&op)) {
+        // Register feedback (drivers of `next` vs readers of `q`) no
+        // longer blocks partitioning: the cone-head relay wire emitted in
+        // buildRegionFromMembers resolves the placement cycle, so a single
+        // region may both read `q` and produce `next`.
+        continue;
+      }
       if (!isSequentialBarrier(&op))
         continue;
       llvm::SmallVector<unsigned> producers, consumers;
@@ -194,10 +332,12 @@ struct FuseCombPass : public PassWrapper<FuseCombPass, OperationPass<func::FuncO
       for (unsigned a : producers)
         for (unsigned b : consumers)
           if (a != b)
-            forbidden.emplace_back(a, b);
+            barrierPairs.emplace_back(a, b);
     }
+    forbidden.clear();
+    forbidden.append(barrierPairs.begin(), barrierPairs.end());
     auto mergeLegal = [&](unsigned a, unsigned b) {
-      for (auto &[x, y] : forbidden) {
+      for (auto &[x, y] : barrierPairs) {
         unsigned rx = findRoot(x), ry = findRoot(y);
         if (rx == ry)
           continue;
@@ -256,13 +396,24 @@ struct FuseCombPass : public PassWrapper<FuseCombPass, OperationPass<func::FuncO
     while (progressed && partCount > 1) {
       progressed = false;
       auto inputs = buildInputPartitions();
+      fprintf(stderr, "[PA] parts=%u\n", partCount);
+      for (auto &[p, ins] : inputs) {
+        if (findRoot(p) != p)
+          continue;
+        fprintf(stderr, "[PA] part %u (size %u) inputs:", p, usize[p]);
+        for (int ip : ins)
+          fprintf(stderr, " %u", ip);
+        fprintf(stderr, "\n");
+      }
       for (auto &[p, ins] : inputs) {
         if (ins.size() != 1 || findRoot(p) != p)
           continue;
         int q = *ins.begin();
         if (findRoot(q) != q)
           continue;
-        unionPartitions(p, q); // always safe (paper Figure 4A)
+        if (!mergeLegal(p, q))
+          continue;
+        unionPartitions(p, q);
         progressed = true;
         if (partCount <= 1)
           break;
@@ -314,17 +465,66 @@ struct FuseCombPass : public PassWrapper<FuseCombPass, OperationPass<func::FuncO
       }
     }
 
+    {
+      fprintf(stderr, "[GR] final groups:\n");
+      for (unsigned v = 0; v < n; ++v)
+        fprintf(stderr, "[GR] node %u (%s) -> part %d\n", v,
+                ops[v]->getName().getStringRef().str().c_str(), findRoot(v));
+    }
     // 5. Guard: the partition graph must be acyclic; collapse residual SCCs
     // (forced barrier unions can only shrink partitions, but stay safe).
     collapseResidualCycles();
 
-    // 6. Emit one region per multi-op partition.
+    // 6. Emit one region per multi-op partition. Wire pseudo-nodes join
+    // partitions during analysis but are never emitted: they are removed
+    // from the member list here, and buildRegionFromMembers records the
+    // lifted boundary (readers route to the driver's producer clone; the
+    // driving assign is rewritten to write the comb result and moved after
+    // the region) via wireDriverOf.
     llvm::DenseMap<int, llvm::SmallVector<Operation *>> groups;
     for (unsigned v = 0; v < n; ++v)
       groups[findRoot(v)].push_back(ops[v]);
-    for (auto &entry : groups)
-      if (entry.second.size() >= 2)
-        buildRegionFromMembers(entry.second);
+    for (auto &entry : groups) {
+      llvm::SmallVector<Operation *> members;
+      for (Operation *op : entry.second)
+        if (entry.second.size() >= 2)
+          if (!isa<pyc::WireOp>(op))
+            members.push_back(op);
+      if (members.size() >= 2)
+        buildRegionFromMembers(members, /*graphMode=*/true);
+    }
+    // Demote lifted wires whose only remaining reader is their driving
+    // assign (the consumer cone now reads the region-internal value): the
+    // wire+assign pair degenerates to a named alias of the comb result,
+    // which keeps the probe name addressable without the storage cell.
+    for (auto &[wireRes, assign] : llvm::make_early_inc_range(wireDriverOf)) {
+      bool onlyWriterReads = true;
+      for (OpOperand &use : wireRes.getUses())
+        if (use.getOwner() != assign) {
+          onlyWriterReads = false;
+          break;
+        }
+      if (!onlyWriterReads)
+        continue;
+      Value src = assign->getOperand(1);
+      if (!src.getDefiningOp() || !isa<pyc::CombOp>(src.getDefiningOp()))
+        continue;
+      Operation *wireOp = wireRes.getDefiningOp();
+      OpBuilder b(assign);
+      auto alias = b.create<pyc::AliasOp>(wireOp->getLoc(), src);
+      if (auto name = wireOp->getAttrOfType<StringAttr>("pyc.name"))
+        alias->setAttr("pyc.name", name);
+      if (auto lazy = wireOp->getAttrOfType<ArrayAttr>("pyc.lazy_probe_wires"))
+        alias->setAttr("pyc.lazy_probe_wires", lazy);
+      if (wireOp->getAttrOfType<BoolAttr>("pyc.observe_lazy"))
+        alias->setAttr("pyc.observe_lazy",
+                       BoolAttr::get(wireOp->getContext(), true));
+      assign->erase();
+      wireRes.replaceAllUsesWith(alias.getResult());
+      wireOp->erase();
+      wireDriverOf.erase(wireRes);
+    }
+    topologicallyReorderBlock(block);
   }
 
   int findRoot(unsigned v) {
@@ -520,12 +720,13 @@ struct FuseCombPass : public PassWrapper<FuseCombPass, OperationPass<func::FuncO
   }
 
   void fuseRun(ArrayRef<Operation *> run) {
-    buildRegionFromMembers(run);
+    buildRegionFromMembers(run, /*graphMode=*/false);
   }
 
   /// Builds one pyc.comb region around `members` (a set of fusible ops in
   /// block order). Shared by the textual and ESSENT-partition modes.
-  void buildRegionFromMembers(ArrayRef<Operation *> members) {
+  void buildRegionFromMembers(ArrayRef<Operation *> members,
+                             bool graphMode = false) {
     ArrayRef<Operation *> run = members;
     llvm::DenseSet<Operation *> runSet;
     runSet.reserve(run.size());
@@ -578,8 +779,35 @@ struct FuseCombPass : public PassWrapper<FuseCombPass, OperationPass<func::FuncO
     if (outputs.empty())
       return;
 
-    // External inputs: operands that are not defined by an op in the run.
+    // External inputs (transparent through excluded aliases and single-
+    // driver wires): operands routed through such boundaries resolve to
+    // their ultimate producer. When that producer is a member the value is
+    // region-internal (taking it as an input would create an ordering
+    // cycle); otherwise it becomes a region input and the original value
+    // maps onto the corresponding block argument.
+    auto resolveTransparent = [&](Value v) {
+      unsigned hop = 0;
+      while (Operation *def = v.getDefiningOp()) {
+        if (runSet.contains(def) || hop++ > 64)
+          break;
+        if (auto aliasOp = dyn_cast<pyc::AliasOp>(def)) {
+          v = aliasOp->getOperand(0);
+          continue;
+        }
+        if (auto wireOp = dyn_cast<pyc::WireOp>(def)) {
+          auto it2 = wireDriverOf.find(wireOp->getResult(0));
+          if (it2 == wireDriverOf.end())
+            break;
+          v = it2->second->getOperand(1);
+          continue;
+        }
+        break;
+      }
+      return v;
+    };
     llvm::SmallVector<Value> inputs;
+    llvm::DenseMap<Value, Value> routedInternal; // base is a member result
+    llvm::DenseMap<Value, Value> routedExternal; // base is a region input
     llvm::DenseSet<Value> seenInputs;
     for (Operation *op : run) {
       for (Value v : op->getOperands()) {
@@ -587,8 +815,18 @@ struct FuseCombPass : public PassWrapper<FuseCombPass, OperationPass<func::FuncO
           if (runSet.contains(def))
             continue;
         }
-        if (seenInputs.insert(v).second)
-          inputs.push_back(v);
+        Value base = resolveTransparent(v);
+        if (Operation *bdef = base.getDefiningOp()) {
+          if (runSet.contains(bdef)) {
+            if (v != base)
+              routedInternal[v] = base;
+            continue;
+          }
+        }
+        if (seenInputs.insert(base).second)
+          inputs.push_back(base);
+        if (v != base)
+          routedExternal[v] = base;
       }
     }
 
@@ -597,7 +835,18 @@ struct FuseCombPass : public PassWrapper<FuseCombPass, OperationPass<func::FuncO
     for (Value v : outputs)
       outTypes.push_back(v.getType());
 
-    OpBuilder builder(run.front());
+    Block &regionBlock = *run.front()->getBlock();
+    Operation *anchor = run.front();
+    for (Value in : inputs) {
+      Operation *def = in.getDefiningOp();
+      if (!def || def->getBlock() != &regionBlock)
+        continue;
+      if (def->isBeforeInBlock(anchor))
+        continue;
+      anchor = def;
+    }
+    OpBuilder builder(anchor);
+    builder.setInsertionPointAfter(anchor);
     auto comb = builder.create<pyc::CombOp>(run.front()->getLoc(), outTypes, inputs);
 
     // Build a single-block region and clone ops into it.
@@ -610,14 +859,84 @@ struct FuseCombPass : public PassWrapper<FuseCombPass, OperationPass<func::FuncO
     IRMapping mapping;
     for (auto [i, in] : llvm::enumerate(inputs))
       mapping.map(in, body->getArgument(i));
-
+    // Values routed to a region input read its block argument directly;
+    // ones routed to a member producer are pre-mapped to the original value
+    // and redirected to the clone after cloning.
+    for (auto &[v, base] : routedExternal)
+      mapping.map(v, mapping.lookup(base));
+    for (auto &[v, base] : routedInternal)
+      mapping.map(v, base);
     builder.setInsertionPointToStart(body);
-    for (Operation *op : run) {
-      Operation *cloned = builder.clone(*op, mapping);
-      for (auto [oldRes, newRes] : llvm::zip(op->getResults(), cloned->getResults()))
-        mapping.map(oldRes, newRes);
+    {
+      // Clone in data-dependence topological order (block order as
+      // tiebreak): a member's operand may be produced by another member
+      // that sits LATER in the block (values routed through lifted wires),
+      // which block order cannot express.
+      llvm::DenseMap<Operation *, unsigned> posOf;
+      for (auto [i, op] : llvm::enumerate(run))
+        posOf[op] = static_cast<unsigned>(i);
+      llvm::SmallVector<Operation *> ordered(run.begin(), run.end());
+      llvm::DenseMap<Operation *, llvm::SmallVector<Operation *>> memDeps;
+      llvm::DenseMap<Operation *, unsigned> indeg;
+      for (Operation *op : run) {
+        unsigned d = 0;
+        for (Value operand : op->getOperands()) {
+          // Operands routed through wires resolve to the producer that the
+          // clone will actually read; the dependence edge must follow the
+          // resolved value, not the wire.
+          Value base = resolveTransparent(operand);
+          Operation *def = base.getDefiningOp();
+          auto pit = posOf.find(def);
+          if (pit == posOf.end() || def == op)
+            continue;
+          memDeps[def].push_back(op);
+          ++d;
+        }
+        indeg[op] = d;
+      }
+      llvm::SmallVector<Operation *, 16> ready;
+      for (Operation *op : ordered)
+        if (indeg[op] == 0)
+          ready.push_back(op);
+      llvm::SmallVector<Operation *> emitted;
+      emitted.reserve(run.size());
+      llvm::DenseSet<Operation *> emittedSet;
+      while (!ready.empty()) {
+        // stable: earliest block position first
+        unsigned best = 0;
+        for (unsigned i = 1; i < ready.size(); ++i)
+          if (posOf[ready[i]] < posOf[ready[best]])
+            best = i;
+        Operation *op = ready[best];
+        ready.erase(ready.begin() + best);
+        emitted.push_back(op);
+        emittedSet.insert(op);
+        for (Operation *dep : memDeps[op])
+          if (--indeg[dep] == 0)
+            ready.push_back(dep);
+      }
+      if (emitted.size() != run.size()) {
+        // Cyclic member deps cannot happen (partition graph is acyclic);
+        // fall back to block order defensively.
+        emitted.assign(run.begin(), run.end());
+      }
+      for (Operation *op : emitted) {
+        Operation *cloned = builder.clone(*op, mapping);
+        for (auto [oldRes, newRes] : llvm::zip(op->getResults(), cloned->getResults()))
+          mapping.map(oldRes, newRes);
+      }
     }
-
+    // Redirect operands still referencing original member results (routed
+    // through wire/alias boundaries) to their clones.
+    for (Operation &bodyOp : body->getOperations()) {
+      for (OpOperand &operand : bodyOp.getOpOperands()) {
+        Operation *def = operand.get().getDefiningOp();
+        if (def && runSet.contains(def))
+          operand.set(mapping.lookup(operand.get()));
+        else if (routedInternal.count(operand.get()))
+          operand.set(mapping.lookup(routedInternal[operand.get()]));
+      }
+    }
     llvm::SmallVector<Value> yieldVals;
     yieldVals.reserve(outputs.size());
     for (Value out : outputs)
@@ -661,16 +980,139 @@ struct FuseCombPass : public PassWrapper<FuseCombPass, OperationPass<func::FuncO
       comb->setAttr("pyc.lazy_probe_wires",
                     ArrayAttr::get(comb.getContext(), lazyWires));
 
-    // Replace uses outside the run with comb results.
+    // Replace uses outside the run with comb results. A sequential unit's
+    // `next` operand cannot read the comb result directly: the unit must
+    // also dominate the region (its `q` feeds the region), so the direct
+    // edge would close a placement cycle. Route such uses through a fresh
+    // wire declared before the unit and driven by an assign after the
+    // region — the declare-early/assign-late cell the frontend itself uses
+    // for register feedback.
     for (auto [out, res] : llvm::zip(outputs, comb.getResults())) {
+      OpBuilder::InsertionGuard guard(builder);
+      for (OpOperand &use : llvm::make_early_inc_range(out.getUses())) {
+        if (!graphMode || runSet.contains(use.getOwner()))
+          continue;
+        Operation *user = use.getOwner();
+        if (!isa<pyc::RegOp, pyc::DelayLineOp>(user) ||
+            user->getOperand(3) != out)
+          continue;
+        OpBuilder wireBuilder(user);
+        auto wire = wireBuilder.create<pyc::WireOp>(user->getLoc(), out.getType());
+        builder.setInsertionPointAfter(comb.getOperation());
+        auto wireAssign = builder.create<pyc::AssignOp>(
+            comb.getLoc(), wire.getResult(), res);
+        use.set(wire.getResult());
+        wireDriverOf[wire.getResult()] = wireAssign;
+      }
       out.replaceUsesWithIf(res, [&](OpOperand &use) { return !runSet.contains(use.getOwner()); });
     }
 
     for (Operation *op : llvm::reverse(run))
       op->erase();
+
+  }
+
+  /// Stable topological reorder of the whole block after graph-mode
+  /// emission. Lifting wire boundaries relocates producers and consumers
+  /// (assigns now write comb results; sequential units read them), and any
+  /// point-wise fixup cascades. One final pass sorts every op by data
+  /// dependence (original block order as tiebreak), which is exactly how
+  /// the emitter evaluates the design, so the result is dominance-correct
+  /// and semantics-preserving: wires keep declare-early/assign-late, single
+  /// drivers keep their write order, and reg/delay-line positions are
+  /// schedule-neutral.
+  void topologicallyReorderBlock(Block &block) {
+    llvm::SmallVector<Operation *> opsInOrder;
+    for (Operation &op : block)
+      if (!isa<func::ReturnOp>(op))
+        opsInOrder.push_back(&op);
+    llvm::DenseMap<Operation *, unsigned> pos;
+    for (auto [i, op] : llvm::enumerate(opsInOrder))
+      pos[op] = static_cast<unsigned>(i);
+    llvm::DenseMap<Operation *, llvm::SmallVector<Operation *>> succsOf;
+    llvm::DenseMap<Operation *, unsigned> indeg;
+    llvm::DenseSet<std::pair<Operation *, Operation *>> edgeSeen;
+    auto addEdge = [&](Operation *from, Operation *to) {
+      if (from == to)
+        return;
+      if (!edgeSeen.insert({from, to}).second)
+        return;
+      succsOf[from].push_back(to);
+      indeg[to] += 1;
+    };
+    for (Operation *op : opsInOrder) {
+      indeg.try_emplace(op, 0u);
+      if (isa<pyc::WireOp>(op))
+        continue; // declaration: deps linked via assign below
+      if (auto a = dyn_cast<pyc::AssignOp>(op)) {
+        if (Operation *src = a.getSrc().getDefiningOp())
+          if (pos.count(src))
+            addEdge(src, op);
+        if (Operation *dstOp = a.getDst().getDefiningOp()) {
+          if (pos.count(dstOp) && isa<pyc::WireOp>(dstOp))
+            addEdge(dstOp, op); // wire declared before its driver
+          for (OpOperand &use : dstOp->getResult(0).getUses())
+            if (use.getOwner() != op && pos.count(use.getOwner()))
+              addEdge(op, use.getOwner()); // readers follow the write
+        }
+        continue;
+      }
+      if (isa<pyc::RegOp, pyc::DelayLineOp>(op)) {
+        // Sequential units are evaluation sources: `q` holds the previous
+        // commit and `next` is only sampled at commit time, so they never
+        // wait on same-tick producers (the emitter gives them their own
+        // slots). Their operands impose no ordering edges here.
+        continue;
+      }
+      for (Value operand : op->getOperands()) {
+        if (Operation *def = operand.getDefiningOp()) {
+          if (pos.count(def))
+            addEdge(def, op);
+          if (isa<pyc::WireOp>(def)) {
+            auto it = wireDriverOf.find(operand);
+            if (it != wireDriverOf.end() && pos.count(it->second))
+              addEdge(it->second, op);
+          }
+        }
+      }
+    }
+    llvm::SmallVector<Operation *, 32> ready;
+    for (Operation *op : opsInOrder)
+      if (indeg[op] == 0)
+        ready.push_back(op);
+    llvm::SmallVector<Operation *> out;
+    out.reserve(opsInOrder.size());
+    while (!ready.empty()) {
+      unsigned best = 0;
+      for (unsigned i = 1; i < ready.size(); ++i)
+        if (pos[ready[i]] < pos[ready[best]])
+          best = i;
+      Operation *op = ready[best];
+      ready.erase(ready.begin() + best);
+      out.push_back(op);
+      auto it = succsOf.find(op);
+      if (it == succsOf.end())
+        continue;
+      for (Operation *nxt : it->second)
+        if (--indeg[nxt] == 0)
+          ready.push_back(nxt);
+    }
+    if (out.size() != opsInOrder.size()) {
+      llvm::DenseSet<Operation *> emitted(out.begin(), out.end());
+      for (Operation *op : opsInOrder)
+        if (!emitted.contains(op))
+          fprintf(stderr, "[REORDER] stuck %s (indeg=%u)\n",
+                  op->getName().getStringRef().str().c_str(), indeg[op]);
+    }
+    if (out.size() != opsInOrder.size())
+      return; // cyclic (should not happen); keep current order
+    Operation *cursor = &block.front();
+    for (Operation *op : out) {
+      op->moveAfter(cursor);
+      cursor = op;
+    }
   }
 };
-
 } // namespace
 
 std::unique_ptr<mlir::Pass> createFuseCombPass() { return std::make_unique<FuseCombPass>(); }
