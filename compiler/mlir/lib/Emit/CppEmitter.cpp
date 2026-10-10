@@ -5,6 +5,7 @@
 #include "pyc/Dialect/PYC/PYCOps.h"
 #include "pyc/Dialect/PYC/PYCTypes.h"
 #include "pyc/Transforms/ChangeDrivenSchedule.h"
+#include "pyc/Transforms/CombPartition.h"
 #include "pyc/Transforms/StateOptimization.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -282,12 +283,16 @@ struct EmissionScheduleNode {
   uint64_t id = 0;
   uint64_t rank = 0;
   uint64_t slot = 0;
+  /// Comb partition id; multiple comb regions may share one partition. Ops
+  /// without partition metadata are their own partition (identity mode).
+  unsigned partition = 0;
   llvm::SmallVector<uint64_t> fanout;
 };
 
 struct EmissionSchedule {
   llvm::SmallVector<EmissionScheduleNode> nodes;
   llvm::DenseMap<Value, unsigned> valueToNode;
+  unsigned partitionCount = 0;
 };
 
 static FailureOr<uint64_t> readScheduleUnsigned(Operation *op,
@@ -402,6 +407,58 @@ static FailureOr<EmissionSchedule> readEmissionSchedule(func::FuncOp func) {
       actualEdgeCount != edgeCount || actualRankCount != rankCount)
     return func.emitError(
         "C++ emitter schedule nodes do not match summary counts");
+
+  // Resolve comb partitioning. When the summary carries partition_count, the
+  // per-op pyc.change_schedule.partition attribute is authoritative; otherwise
+  // every scheduled operation is its own partition (identity mode), which
+  // reproduces the pre-partition dispatch exactly.
+  auto partitionCountAttr = summary.getAs<IntegerAttr>(
+      kChangeSchedulePartitionCountKey);
+  if (partitionCountAttr) {
+    int64_t declared = partitionCountAttr.getInt();
+    if (declared <= 0)
+      return func.emitError(
+          "C++ emitter requires a positive partition_count in the schedule "
+          "summary");
+    schedule.partitionCount = static_cast<unsigned>(declared);
+    unsigned externalPartition = schedule.partitionCount;
+    for (EmissionScheduleNode &node : schedule.nodes) {
+      // Only comb regions are partitioned; other schedule units (regs, mems,
+      // instances) get ids outside the comb partition space. They never take
+      // or mark comb dirty bits, so those distinct ids are bookkeeping only.
+      if (!isa<pyc::CombOp>(node.operation)) {
+        node.partition = externalPartition++;
+        continue;
+      }
+      auto attr =
+          node.operation->getAttrOfType<IntegerAttr>(
+              kChangeSchedulePartitionAttr);
+      if (!attr || attr.getInt() < 0 ||
+          static_cast<uint64_t>(attr.getInt()) >= schedule.partitionCount)
+        return node.operation->emitError(
+            "C++ emitter requires a valid pyc.change_schedule.partition on "
+            "every pyc.comb operation when partition_count is present");
+      node.partition = static_cast<unsigned>(attr.getInt());
+    }
+  } else {
+    // Identity mode: comb partitions are numbered by comb slot order, which
+    // equals the emitter's comb index, so the generated dirty fanout arrays
+    // and dirty bitset stay byte-identical to the pre-partition emitter.
+    llvm::DenseMap<Operation *, unsigned> fallbackComb;
+    llvm::DenseMap<Operation *, unsigned> fallbackOther;
+    for (EmissionScheduleNode &node : schedule.nodes) {
+      if (isa<pyc::CombOp>(node.operation)) {
+        auto [entry, unusedA] = fallbackComb.try_emplace(
+            node.operation, fallbackComb.size());
+        node.partition = entry->second;
+      } else {
+        auto [entry, unusedB] = fallbackOther.try_emplace(
+            node.operation, 0x40000000u + fallbackOther.size());
+        node.partition = entry->second;
+      }
+    }
+    schedule.partitionCount = fallbackComb.size();
+  }
   return schedule;
 }
 
@@ -1128,14 +1185,18 @@ static void emitMetadataCombFanout(
   if (sourceIt == schedule.valueToNode.end())
     return;
 
+  unsigned sourcePartition = schedule.nodes[sourceIt->second].partition;
+
   llvm::SmallSet<unsigned, 8> uniqueFanouts;
   for (uint64_t targetId : schedule.nodes[sourceIt->second].fanout) {
     const EmissionScheduleNode &target = schedule.nodes[targetId];
     if (!isa<pyc::CombOp>(target.operation))
       continue;
-    auto it = combIndices.find(target.operation);
-    if (it != combIndices.end())
-      uniqueFanouts.insert(it->second);
+    // Same-partition consumers are evaluated inside the partition group, so
+    // re-marking them would only force a spurious extra pass.
+    if (target.partition == sourcePartition)
+      continue;
+    uniqueFanouts.insert(target.partition);
   }
   llvm::SmallVector<unsigned> fanouts(uniqueFanouts.begin(),
                                       uniqueFanouts.end());
@@ -1163,28 +1224,33 @@ static bool hasDirtyPolledBoundaryInput(pyc::CombOp comb) {
   });
 }
 
-static void emitCombInputGuard(
-    pyc::CombOp comb, llvm::raw_ostream &os, NameTable &nt, unsigned idx) {
-  os << "    bool _pyc_comb_should_eval = _pyc_comb_take_active(" << idx
+static void emitCombInputGuard(unsigned partition,
+                               ArrayRef<unsigned> memberIndices,
+                               MutableArrayRef<pyc::CombOp> members,
+                               llvm::raw_ostream &os, NameTable &nt) {
+  os << "    bool _pyc_comb_should_eval = _pyc_comb_take_active(" << partition
      << "u);\n";
-  os << "    bool _pyc_comb_inputs_changed = !_pyc_comb_" << idx
+  os << "    bool _pyc_comb_inputs_changed = !_pyc_part_" << partition
      << "_inputs_valid;\n";
-  for (auto [inputIndex, input] : llvm::enumerate(comb.getInputs())) {
-    if (isDirtyDrivenInput(input))
-      continue;
-    std::string cacheName = "_pyc_comb_" + std::to_string(idx) + "_input_" +
-                            std::to_string(inputIndex);
-    os << "    if (" << cacheName << " != " << nt.get(input) << ") {\n";
-    os << "      " << cacheName << " = " << nt.get(input) << ";\n";
-    os << "      _pyc_comb_inputs_changed = true;\n";
-    os << "    }\n";
+  for (auto [memberPos, comb] : llvm::enumerate(members)) {
+    unsigned idx = memberIndices[memberPos];
+    for (auto [inputIndex, input] : llvm::enumerate(comb.getInputs())) {
+      if (isDirtyDrivenInput(input))
+        continue;
+      std::string cacheName = "_pyc_comb_" + std::to_string(idx) + "_input_" +
+                              std::to_string(inputIndex);
+      os << "    if (" << cacheName << " != " << nt.get(input) << ") {\n";
+      os << "      " << cacheName << " = " << nt.get(input) << ";\n";
+      os << "      _pyc_comb_inputs_changed = true;\n";
+      os << "    }\n";
+    }
   }
   os << "    _pyc_comb_inputs_changed = _pyc_comb_inputs_changed || "
         "_pyc_comb_should_eval;\n";
   os << "    if (!_pyc_comb_inputs_changed) {\n";
   os << "      return;\n";
   os << "    }\n";
-  os << "    _pyc_comb_" << idx << "_inputs_valid = true;\n";
+  os << "    _pyc_part_" << partition << "_inputs_valid = true;\n";
 }
 
 static void emitCombResultPublish(
@@ -1203,24 +1269,79 @@ static void emitCombResultPublish(
   os << "    }\n";
 }
 
-static LogicalResult emitCombMethod(pyc::CombOp comb,
-                                    llvm::raw_ostream &os,
-                                    NameTable &nt,
-                                    unsigned idx,
-                                    const CppEmitterOptions &opts,
-                                    const EmissionSchedule &schedule,
-                                    const llvm::DenseMap<Operation *, unsigned>
-                                        &combIndices) {
+/// Maps comb region block arguments to their input values (by name). Must run
+/// before any body emission for the region.
+static void mapCombRegionArgs(pyc::CombOp comb, NameTable &nt) {
+  Block &b = comb.getBody().front();
+  for (auto [i, arg] : llvm::enumerate(b.getArguments()))
+    nt.names.try_emplace(arg, nt.get(comb.getInputs()[i]));
+}
+
+/// Emits placement shard definitions (struct scope) for a chunked comb region.
+/// Returns the shard method names in execution order.
+static LogicalResult emitCombShardDefs(pyc::CombOp comb,
+                                       llvm::raw_ostream &os, NameTable &nt,
+                                       const CppEmitterOptions &opts,
+                                       llvm::SmallVector<std::string> &shards) {
   if (comb.getBody().empty())
     return comb.emitError("pyc.comb must have a non-empty region");
+  Block &b = comb.getBody().front();
+  if (b.getNumArguments() != comb.getNumOperands())
+    return comb.emitError("pyc.comb body block argument count must match inputs");
+  mapCombRegionArgs(comb, nt);
 
+  llvm::SmallVector<Operation *> combOps;
+  combOps.reserve(b.getOperations().size());
+  for (Operation &op : b) {
+    if (isa<pyc::YieldOp>(op))
+      break;
+    combOps.push_back(&op);
+  }
+  unsigned combChunkNodes = std::max(1u, opts.combChunkNodes);
+  if (combOps.size() <= combChunkNodes)
+    return success();
+
+  CppEmitterPlacementState placement;
+  std::vector<std::pair<std::string, llvm::SmallVector<Operation *>>> parts;
+  for (Operation *op : combOps) {
+    auto method = op->getAttrOfType<StringAttr>(kCppMethodAttr);
+    if (!method)
+      return op->emitError("missing pyc.cpp.method; run pyc-cpp-placement before C++ emit");
+    if (parts.empty() || parts.back().first != method.getValue())
+      parts.emplace_back(method.getValue().str(), llvm::SmallVector<Operation *>());
+    parts.back().second.push_back(op);
+  }
+  for (auto &part : parts) {
+    const std::string &partName = part.first;
+    shards.push_back(partName);
+    os << "  inline void " << partName << "() {\n";
+    placement.beginMethod(partName);
+    for (Operation *op : part.second) {
+      if (failed(emitCombAssign(*op, os, nt, &placement)))
+        return failure();
+    }
+    os << "  }\n\n";
+  }
+  return success();
+}
+
+/// Emits the straight-line body (assigns or shard calls) plus the result
+/// publishes for one comb region inside an enclosing partition method.
+static LogicalResult emitCombRegionBody(pyc::CombOp comb, unsigned idx,
+                                        const llvm::SmallVector<std::string> &shards,
+                                        llvm::raw_ostream &os, NameTable &nt,
+                                        const CppEmitterOptions &opts,
+                                        const EmissionSchedule &schedule,
+                                        const llvm::DenseMap<Operation *, unsigned>
+                                            &combIndices) {
+  if (comb.getBody().empty())
+    return comb.emitError("pyc.comb must have a non-empty region");
   Block &b = comb.getBody().front();
   if (b.getNumArguments() != comb.getNumOperands())
     return comb.emitError("pyc.comb body block argument count must match inputs");
 
   // Map region args to the corresponding input values (by name).
-  for (auto [i, arg] : llvm::enumerate(b.getArguments()))
-    nt.names.try_emplace(arg, nt.get(comb.getInputs()[i]));
+  mapCombRegionArgs(comb, nt);
 
   llvm::SmallVector<Operation *> combOps;
   combOps.reserve(b.getOperations().size());
@@ -1231,58 +1352,14 @@ static LogicalResult emitCombMethod(pyc::CombOp comb,
   }
 
   CppEmitterPlacementState placement;
-  unsigned combChunkNodes = std::max(1u, opts.combChunkNodes);
-  if (combOps.size() > combChunkNodes) {
-    // Placement is always-on: part ownership comes from pyc.cpp.method attrs.
-    std::vector<std::pair<std::string, llvm::SmallVector<Operation *>>> parts;
+  if (!shards.empty()) {
+    for (const std::string &shardName : shards)
+      os << "    " << shardName << "();\n";
+  } else {
     for (Operation *op : combOps) {
-      auto method = op->getAttrOfType<StringAttr>(kCppMethodAttr);
-      if (!method)
-        return op->emitError("missing pyc.cpp.method; run pyc-cpp-placement before C++ emit");
-      if (parts.empty() || parts.back().first != method.getValue())
-        parts.emplace_back(method.getValue().str(), llvm::SmallVector<Operation *>());
-      parts.back().second.push_back(op);
+      if (failed(emitCombAssign(*op, os, nt, &placement)))
+        return failure();
     }
-
-    std::vector<std::string> partMethods;
-    partMethods.reserve(parts.size());
-    for (auto &part : parts) {
-      const std::string &partName = part.first;
-      partMethods.push_back(partName);
-      os << "  inline void " << partName << "() {\n";
-      placement.beginMethod(partName);
-      for (Operation *op : part.second) {
-        if (failed(emitCombAssign(*op, os, nt, &placement)))
-          return failure();
-      }
-      os << "  }\n\n";
-    }
-
-    os << "  inline void eval_comb_" << idx << "() {\n";
-    emitCombInputGuard(comb, os, nt, idx);
-    for (const std::string &partName : partMethods)
-      os << "    " << partName << "();\n";
-
-    auto y = dyn_cast_or_null<pyc::YieldOp>(b.getTerminator());
-    if (!y)
-      return comb.emitError("pyc.comb must terminate with pyc.yield");
-    if (y.getNumOperands() != comb.getNumResults())
-      return comb.emitError("pyc.yield operand count must match pyc.comb results");
-
-    for (auto [i, v] : llvm::enumerate(y.getOperands()))
-      emitCombResultPublish(comb, idx, static_cast<unsigned>(i), v, os, nt,
-                            schedule, combIndices);
-    os << "  }\n\n";
-    return success();
-  }
-
-  std::string methodName = "eval_comb_" + std::to_string(idx);
-  os << "  inline void " << methodName << "() {\n";
-  placement.beginMethod(methodName);
-  emitCombInputGuard(comb, os, nt, idx);
-  for (Operation *op : combOps) {
-    if (failed(emitCombAssign(*op, os, nt, &placement)))
-      return failure();
   }
 
   auto y = dyn_cast_or_null<pyc::YieldOp>(b.getTerminator());
@@ -1294,6 +1371,32 @@ static LogicalResult emitCombMethod(pyc::CombOp comb,
   for (auto [i, v] : llvm::enumerate(y.getOperands()))
     emitCombResultPublish(comb, idx, static_cast<unsigned>(i), v, os, nt,
                           schedule, combIndices);
+  return success();
+}
+
+/// Emits one comb partition evaluation method: a single partition-level guard
+/// (input snapshots of all member regions) followed by the member bodies in
+/// schedule order. When the partition is clean, all members are skipped
+/// together (ESSENT-style coarsened reuse).
+static LogicalResult emitCombPartitionMethod(
+    unsigned partition, ArrayRef<unsigned> memberIndices,
+    MutableArrayRef<pyc::CombOp> members, llvm::raw_ostream &os, NameTable &nt,
+    const CppEmitterOptions &opts, const EmissionSchedule &schedule,
+    const llvm::DenseMap<Operation *, unsigned> &combIndices) {
+  // Shard definitions must live at struct scope, so they precede the method.
+  llvm::SmallVector<llvm::SmallVector<std::string>> memberShards(members.size());
+  for (auto [i, comb] : llvm::enumerate(members)) {
+    if (failed(emitCombShardDefs(comb, os, nt, opts, memberShards[i])))
+      return failure();
+  }
+
+  os << "  inline void eval_comb_part_" << partition << "() {\n";
+  emitCombInputGuard(partition, memberIndices, members, os, nt);
+  for (auto [i, comb] : llvm::enumerate(members)) {
+    if (failed(emitCombRegionBody(comb, memberIndices[i], memberShards[i], os,
+                                  nt, opts, schedule, combIndices)))
+      return failure();
+  }
   os << "  }\n\n";
   return success();
 }
@@ -1489,9 +1592,11 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
 
   // Change-driven inputs use producer activity; external boundaries are polled.
   if (!combs.empty()) {
-    os << "  // Per-comb input snapshots for change-driven evaluation.\n";
+    os << "  // Per-partition validity flags and per-comb input snapshots for"
+       << " change-driven evaluation.\n";
+    for (unsigned part = 0; part < schedule->partitionCount; ++part)
+      os << "  bool _pyc_part_" << part << "_inputs_valid = false;\n";
     for (auto [index, comb] : llvm::enumerate(combs)) {
-      os << "  bool _pyc_comb_" << index << "_inputs_valid = false;\n";
       for (auto [inputIndex, input] : llvm::enumerate(comb.getInputs())) {
         if (isDirtyDrivenInput(input))
           continue;
@@ -1503,8 +1608,8 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
   }
 
   if (!combs.empty()) {
-    os << "  // Runtime-owned local fused-comb dirty set.\n";
-    os << "  pyc::cpp::DirtyBitset<" << combs.size()
+    os << "  // Runtime-owned local fused-comb dirty set (comb partitions).\n";
+    os << "  pyc::cpp::DirtyBitset<" << schedule->partitionCount
        << "> _pyc_comb_dirty{};\n";
     os << "  inline bool _pyc_comb_take_active(unsigned id) {\n";
     os << "    return _pyc_comb_dirty.take(id);\n";
@@ -2299,8 +2404,8 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
   }
   os << " {\n";
   if (!combs.empty()) {
-    os << "    for (unsigned _pyc_id = 0; _pyc_id < " << combs.size()
-       << "u; ++_pyc_id)\n";
+    os << "    for (unsigned _pyc_id = 0; _pyc_id < "
+       << schedule->partitionCount << "u; ++_pyc_id)\n";
     os << "      _pyc_comb_dirty.mark(_pyc_id);\n";
   }
   for (auto r : regs) {
@@ -2370,10 +2475,32 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
   os << "  }\n\n";
 
   // Emit fused comb helpers. Indices match body order (same as placement).
-  for (auto [i, comb] : llvm::enumerate(combs)) {
-    if (failed(emitCombMethod(comb, os, nt, static_cast<unsigned>(i), opts,
-                              *schedule, combIndex)))
-      return failure();
+  // Combs sharing a partition are emitted as one guarded group method so the
+  // whole partition is skipped together when its inputs are unchanged.
+  if (!combs.empty()) {
+    llvm::SmallVector<unsigned> combPartition(combs.size(), 0u);
+    llvm::SmallVector<llvm::SmallVector<unsigned>> partitionMembers(
+        schedule->partitionCount);
+    for (auto [i, comb] : llvm::enumerate(combs)) {
+      auto nodeIt = schedule->valueToNode.find(comb.getResult(0));
+      if (nodeIt == schedule->valueToNode.end())
+        return comb.emitError(
+            "C++ emitter cannot map comb to a schedule node for partitioning");
+      combPartition[i] = schedule->nodes[nodeIt->second].partition;
+      partitionMembers[combPartition[i]].push_back(static_cast<unsigned>(i));
+    }
+    for (unsigned part = 0; part < schedule->partitionCount; ++part) {
+      const auto &members = partitionMembers[part];
+      if (members.empty())
+        continue;
+      llvm::SmallVector<pyc::CombOp> memberOps;
+      memberOps.reserve(members.size());
+      for (unsigned idx : members)
+        memberOps.push_back(combs[idx]);
+      if (failed(emitCombPartitionMethod(part, members, memberOps, os, nt,
+                                         opts, *schedule, combIndex)))
+        return failure();
+    }
   }
 
   auto topoOrder = [&](bool includePrims, llvm::SmallVector<Operation *> &ordered) -> bool {
@@ -2508,6 +2635,25 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
     return true;
   };
 
+  // Comb partition dispatch tables: only the first member of a partition (in
+  // slot order) calls the partition group method; partitions containing any
+  // polled boundary input are always probed (their guard compares snapshots).
+  llvm::SmallVector<unsigned> combPartitionOf(combs.size(), 0u);
+  llvm::SmallVector<unsigned> partitionFirst(schedule->partitionCount, ~0u);
+  llvm::SmallVector<char> partitionPolled(schedule->partitionCount, 0);
+  for (auto [i, comb] : llvm::enumerate(combs)) {
+    auto nodeIt = schedule->valueToNode.find(comb.getResult(0));
+    if (nodeIt == schedule->valueToNode.end())
+      return comb.emitError(
+          "C++ emitter cannot map comb to a schedule node for partitioning");
+    unsigned part = schedule->nodes[nodeIt->second].partition;
+    combPartitionOf[i] = part;
+    if (partitionFirst[part] == ~0u)
+      partitionFirst[part] = static_cast<unsigned>(i);
+    if (hasDirtyPolledBoundaryInput(comb))
+      partitionPolled[part] = 1;
+  }
+
   // eval_comb_pass(): evaluate all combinational ops/assigns.
   //
   // Note: The IR is allowed to have "late" pyc.assign ops (e.g. queue wrappers
@@ -2530,13 +2676,15 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
     }
     if (auto comb = dyn_cast<pyc::CombOp>(*op)) {
       unsigned index = combIndex.lookup(comb.getOperation());
-      if (!hasDirtyPolledBoundaryInput(comb)) {
-        os << "    if (_pyc_comb_is_active(" << index << "u)) {\n";
-        os << "      eval_comb_" << index << "();\n";
-        os << "    }\n";
-      } else {
-        os << "    ";
-        os << "eval_comb_" << index << "();\n";
+      unsigned part = combPartitionOf[index];
+      if (index == partitionFirst[part]) {
+        if (!partitionPolled[part]) {
+          os << "    if (_pyc_comb_is_active(" << part << "u)) {\n";
+          os << "      eval_comb_part_" << part << "();\n";
+          os << "    }\n";
+        } else {
+          os << "    eval_comb_part_" << part << "();\n";
+        }
       }
       continue;
     }
@@ -3030,12 +3178,15 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
     }
     if (auto comb = dyn_cast<pyc::CombOp>(*op)) {
       unsigned index = combIndex.lookup(comb.getOperation());
-      if (!hasDirtyPolledBoundaryInput(comb)) {
-        os << indent << "if (_pyc_comb_is_active(" << index << "u)) {\n";
-        os << indent << "  eval_comb_" << index << "();\n";
+      unsigned part = combPartitionOf[index];
+      if (index != partitionFirst[part])
+        return success();
+      if (!partitionPolled[part]) {
+        os << indent << "if (_pyc_comb_is_active(" << part << "u)) {\n";
+        os << indent << "  eval_comb_part_" << part << "();\n";
         os << indent << "}\n";
       } else {
-        os << indent << "eval_comb_" << index << "();\n";
+        os << indent << "eval_comb_part_" << part << "();\n";
       }
       return success();
     }

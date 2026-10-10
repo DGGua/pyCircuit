@@ -81,6 +81,7 @@ add_library(pyc_transforms
   lib/Transforms/ApplyObservationDemandPass.cpp
   lib/Transforms/CombCanonicalizePass.cpp
   lib/Transforms/CombineDelayChainsPass.cpp
+  lib/Transforms/CombPartitionPass.cpp
   lib/Transforms/CollectCompileStatsPass.cpp
   lib/Transforms/EliminateDeadInstancesPass.cpp
   lib/Transforms/EliminateDeadStatePass.cpp

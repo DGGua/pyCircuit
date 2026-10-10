@@ -16,6 +16,8 @@ enum class DelayChainMode {
 std::unique_ptr<::mlir::Pass> createCombCanonicalizePass();
 std::unique_ptr<::mlir::Pass> createInlineFunctionsPass();
 std::unique_ptr<::mlir::Pass> createFuseCombPass();
+std::unique_ptr<::mlir::Pass>
+createFuseCombPass(uint64_t smallPartitionThreshold);
 std::unique_ptr<::mlir::Pass> createEliminateWiresPass();
 std::unique_ptr<::mlir::Pass>
 createRetimePipelinesPass(unsigned maxStages = 0,

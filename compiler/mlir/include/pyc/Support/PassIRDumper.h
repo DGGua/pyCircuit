@@ -33,6 +33,12 @@ struct PassIRDumperOptions {
 ///
 ///   NNNN_<before|after>_<NN>_<pass-short>__L<level>[_FAILED].mlir
 ///
+/// Nested invocations (level >= 1) additionally carry their ancestor chain,
+/// root first, so each file is self-describing about *which* invocation
+/// produced it:
+///
+///   ...__L<level>__via_<anc1>.<NN>.<anc2>.<NN>[_FAILED].mlir
+///
 /// Designed for diagnostics only: it never modifies the IR, never fails the
 /// pipeline on its own, and writes a `// PASS FAILED` marker if a pass fails.
 class PassIRDumper final : public mlir::PassInstrumentation {

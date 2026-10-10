@@ -3,6 +3,7 @@
 #include "pyc/Emit/CppEmitter.h"
 #include "pyc/Emit/VerilogEmitter.h"
 #include "pyc/Support/PassIRDumper.h"
+#include "pyc/Transforms/CombPartition.h"
 #include "pyc/Transforms/Passes.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -198,6 +199,12 @@ static llvm::cl::opt<bool> cppOnlyPreserveOps(
     "cpp-only-preserve-ops",
     llvm::cl::desc("Preserve operation-granular C++ scheduling in --sim-mode=cpp-only (disables comb fusion)"),
     llvm::cl::init(false));
+
+static llvm::cl::opt<unsigned> combPartitionSize(
+    "comb-partition-size",
+    llvm::cl::desc("ESSENT comb partition threshold; >0 switches fuse-comb to "
+                   "graph partitioning mode (0 = textual runs)"),
+    llvm::cl::init(0));
 
 static llvm::cl::opt<bool> unrollVector(
     "unroll-vector",
@@ -2438,11 +2445,11 @@ int main(int argc, char **argv) {
   mlir::func::registerInlinerExtension(registry);
 
   MLIRContext ctx(registry);
-#ifdef _WIN32
-  // MSYS2/MinGW builds can hit non-deterministic crashes when running nested
-  // pass pipelines with multithreading enabled. Bring-up prefers robustness.
+// MSYS2/MinGW builds can hit non-deterministic crashes when running nested
+  // pass pipelines with multithreading enabled. Bring-up prefers robustness;
+  // the same nondeterminism was observed on Linux with nested func passes
+  // (FuseCombPass graph mode), so threading stays off on all platforms.
   ctx.disableMultithreading();
-#endif
   ctx.loadAllAvailableDialects();
 
   const auto tParseStart = Clock::now();
@@ -2688,8 +2695,16 @@ int main(int argc, char **argv) {
     pm.addPass(pyc::createApplyObservationDemandPass(
         probePlanPath, traceCodegenPlanPath));
   const bool enableFuseComb = (!cppOnly) || !cppOnlyPreserveOps;
-  if (enableFuseComb)
-    pm.addNestedPass<func::FuncOp>(pyc::createFuseCombPass());
+  if (enableFuseComb) {
+    if (combPartitionSize > 0)
+      // Graph mode: fuse creates one pyc.comb per ESSENT partition; the
+      // downstream pyc-comb-partition pass must not re-merge across
+      // ordering barriers.
+      pm.addNestedPass<func::FuncOp>(
+          pyc::createFuseCombPass(combPartitionSize));
+    else
+      pm.addNestedPass<func::FuncOp>(pyc::createFuseCombPass());
+  }
   pm.addPass(createCanonicalizerPass(canonicalizeCfg));
   pm.addPass(createCSEPass());
   addRemoveDeadValuesPassIfSupported(pm);
@@ -2699,6 +2714,9 @@ int main(int argc, char **argv) {
   // still sees those dependencies, so one check after fusion is sufficient.
   pm.addPass(pyc::createCheckCombCyclesPass());
   pm.addPass(pyc::createChangeDrivenSchedulePass());
+  if (combPartitionSize > 0 && !enableFuseComb)
+    pm.addNestedPass<func::FuncOp>(
+        pyc::createCombPartitionPass(combPartitionSize));
   pm.addNestedPass<func::FuncOp>(pyc::createCheckFlatTypesPass());
   pm.addNestedPass<func::FuncOp>(pyc::createCheckNoDynamicPass());
   pm.addPass(pyc::createCheckLogicDepthPass(logicDepthLimit));
