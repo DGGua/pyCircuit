@@ -507,20 +507,39 @@ struct FuseCombPass : public PassWrapper<FuseCombPass, OperationPass<func::FuncO
       if (!onlyWriterReads)
         continue;
       Value src = assign->getOperand(1);
-      if (!src.getDefiningOp() || !isa<pyc::CombOp>(src.getDefiningOp()))
+      auto srcRes = dyn_cast<OpResult>(src);
+      pyc::CombOp srcComb;
+      if (srcRes)
+        if (auto c = dyn_cast_or_null<pyc::CombOp>(srcRes.getDefiningOp()))
+          srcComb = c;
+      if (!srcComb)
         continue;
       Operation *wireOp = wireRes.getDefiningOp();
-      OpBuilder b(assign);
-      auto alias = b.create<pyc::AliasOp>(wireOp->getLoc(), src);
+      // Fold the probe record straight into the comb's lazy_probe_wires
+      // (same format copyLazyWires emits) instead of materializing a
+      // top-level named alias.
+      llvm::SmallVector<Attribute> records;
+      if (auto existing =
+              srcComb->getAttrOfType<ArrayAttr>("pyc.lazy_probe_wires"))
+        records.append(existing.getValue().begin(), existing.getValue().end());
+      NamedAttrList fields;
       if (auto name = wireOp->getAttrOfType<StringAttr>("pyc.name"))
-        alias->setAttr("pyc.name", name);
-      if (auto lazy = wireOp->getAttrOfType<ArrayAttr>("pyc.lazy_probe_wires"))
-        alias->setAttr("pyc.lazy_probe_wires", lazy);
-      if (wireOp->getAttrOfType<BoolAttr>("pyc.observe_lazy"))
-        alias->setAttr("pyc.observe_lazy",
-                       BoolAttr::get(wireOp->getContext(), true));
+        fields.set("name", name);
+      if (auto width = wireOp->getAttrOfType<IntegerAttr>("pyc.width"))
+        fields.set("width", width);
+      else if (auto ty = dyn_cast<IntegerType>(wireRes.getType()))
+        fields.set("width",
+                   Builder(wireOp->getContext()).getI64IntegerAttr(ty.getWidth()));
+      fields.set("result",
+                 Builder(wireOp->getContext())
+                     .getI64IntegerAttr(static_cast<int64_t>(
+                         srcRes.getResultNumber())));
+      records.push_back(
+          DictionaryAttr::get(wireOp->getContext(), fields));
+      srcComb->setAttr("pyc.lazy_probe_wires",
+                       ArrayAttr::get(wireOp->getContext(), records));
       assign->erase();
-      wireRes.replaceAllUsesWith(alias.getResult());
+      wireRes.replaceAllUsesWith(src);
       wireOp->erase();
       wireDriverOf.erase(wireRes);
     }
